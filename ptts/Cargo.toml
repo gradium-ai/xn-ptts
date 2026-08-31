@@ -45,6 +45,10 @@ name = "pocket_tts"
 required-features = ["sp"]
 
 [[example]]
+name = "bench"
+required-features = ["sp"]
+
+[[example]]
 name = "quantize"
 
 [[example]]

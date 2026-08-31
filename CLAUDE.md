@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Cargo workspace (resolver "3", edition 2024) with three members:
 
-- `ptts/` — core TTS library. Pure Rust, depends on the `xn` tensor/nn crate. Two examples live under `ptts/examples/`: `pocket_tts` (end-to-end CLI; requires the `sp` feature for SentencePiece) and `quantize` (safetensors → GGUF converter that selectively quantizes `flow_lm.transformer.layers.*` weights).
+- `ptts/` — core TTS library. Pure Rust, depends on the `xn` tensor/nn crate. Examples live under `ptts/examples/`: `pocket_tts` (end-to-end CLI) and `bench` (benchmark harness) both require the `sp` feature for SentencePiece; `quantize` (safetensors → GGUF converter that selectively quantizes `flow_lm.transformer.layers.*` weights) and `create_voice` (voice embeddings from audio samples) do not.
 - `ptts-pyo3/` — PyO3 bindings exposing `TTSModel` to Python. Built with maturin; the cdylib is named `ptts`. Has its own `pyproject.toml` and `uv.lock`.
 - `ptts-wasm/` — browser build via `wasm-bindgen` / `wasm-pack`. Ships a demo in `ptts-wasm/www/` (`index.html` + `worker.js`).
 
@@ -27,7 +27,7 @@ CI deletes `.cargo/config.toml` before building because it pins `target-cpu=nati
 
 Cargo features that gate optional functionality:
 
-- `ptts`: `sp` (SentencePiece tokenizer, required by the `pocket_tts` example), `cuda`, `accelerate`.
+- `ptts`: `sp` (SentencePiece tokenizer, required by the `pocket_tts` and `bench` examples), `cuda`, `accelerate`.
 - `ptts-pyo3`: `cuda`, `accelerate` (each forwards to both `xn/*` and `ptts/*`).
 
 Run the CLI example:
@@ -37,6 +37,16 @@ cargo run --release --example pocket_tts --features sp -- "hello world" -o out.w
 ```
 
 It downloads weights from the `kyutai/pocket-tts` HuggingFace repo on first run. Built-in voice IDs: `alba`, `marius`, `javert`, `jean`, `fantine`, `cosette`, `eponine`, `azelma`. `--voice` also accepts a path to a 10s audio file or a precomputed voice safetensors.
+
+Benchmark a local model:
+
+```
+cargo run --release --features sp,accelerate --example bench -- \
+  --model model/model.q8.gguf --config model/config.json --quant q8 \
+  --voice voices/freya.safetensors --threads 8 --iters 20
+```
+
+`bench` takes explicit paths and a precomputed voice embedding, never downloads, and reports time-to-first-audio, per-frame time, total generate time and RTF over `--iters` runs. Model load and voice conditioning are timed once and excluded from the statistics. It decodes each frame on the generating thread instead of overlapping Mimi with the next frame's sampling as `pocket_tts` does, so per-frame times attribute sampling and decoding to the frame that caused them and its RTF reads lower than `pocket_tts` for the same weights. `--threads` defaults to xn's one-per-logical-core, which is usually too many for a single autoregressive stream. For profiling rather than measuring, `pocket_tts --chrome-tracing` writes a Chrome trace for https://ui.perfetto.dev.
 
 ## WASM build
 
