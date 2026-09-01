@@ -65,6 +65,9 @@ http.createServer((req, res) => {
   }
   const file = resolve(req.url);
   fs.stat(file, (err, st) => {
+    if (process.env.PTTS_LOG_REQUESTS) {
+      console.log(`[req] ${req.url} -> ${file}${err || !st.isFile() ? ' (404)' : ''}`);
+    }
     if (err || !st.isFile()) {
       res.writeHead(404, { 'content-type': 'text/plain' });
       return res.end(`not found: ${req.url}\n`);

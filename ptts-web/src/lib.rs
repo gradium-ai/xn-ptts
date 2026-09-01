@@ -193,10 +193,19 @@ pub async fn load_model(
     // dense weights, xn would have to read every weight back off the device to
     // quantize it, and a browser cannot block on a readback.
     if dtype.starts_with("q8") && !is_gguf {
-        return Err(err(
+        // Report the magic and length: the usual cause is the page having fetched
+        // the wrong file, and "it wasn't a gguf" alone does not say which.
+        let magic: String = model_bytes
+            .iter()
+            .take(8)
+            .map(|b| if b.is_ascii_graphic() { *b as char } else { '.' })
+            .collect();
+        return Err(err(format!(
             "a q8 dtype needs gguf weights in a browser: quantizing from safetensors reads every \
-             weight back to the host, which deadlocks here. Load model.q8.gguf instead.",
-        ));
+             weight back to the host, which deadlocks here. Got {} bytes starting {magic:?} -- \
+             load model.q8.gguf instead.",
+            model_bytes.len(),
+        )));
     }
 
     let vb = if is_gguf {

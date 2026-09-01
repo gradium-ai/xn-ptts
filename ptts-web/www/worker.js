@@ -59,8 +59,11 @@ async function setup({ base, dtype, temperature, voices, configUrl, weightsUrl }
 
   // The container is the caller's choice because the dtype dictates it: a q8 run
   // needs pre-quantized blocks, which only the gguf has.
-  status('downloading weights…');
-  const weights = await fetchWithProgress(weightsUrl || `${base}/model.safetensors`, 'weights');
+  const wUrl = weightsUrl || `${base}/model.safetensors`;
+  status(`downloading weights from ${wUrl}…`);
+  const weights = await fetchWithProgress(wUrl, 'weights');
+  const magic = String.fromCharCode(...weights.slice(0, 4));
+  post('weights', { url: wUrl, bytes: weights.length, magic });
 
   status(`building the model on the GPU (${dtype})…`);
   const info = JSON.parse(await load_model(weights, configJson, dtype, temperature));
