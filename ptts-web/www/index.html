@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Pocket TTS on WebGPU</title>
+<title>Voice agent on WebGPU</title>
 <style>
   :root {
     --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#2a3140;
@@ -54,17 +54,54 @@
   td { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
   td.txt { font-family:inherit; }
   .empty { color:var(--dim); font-size:13px; }
+  .tabs { display:flex; gap:6px; margin:14px 0 18px; }
+  .tab-btn { background:var(--panel); color:var(--dim); border:1px solid var(--line);
+             border-radius:8px; padding:7px 16px; font-size:13px; font-weight:600; }
+  .tab-btn.active { background:var(--panel2); color:var(--fg); border-color:var(--accent); }
+  .chat { display:flex; flex-direction:column; gap:10px; }
+  .msg { padding:9px 13px; border-radius:10px; max-width:78%; font-size:14px; line-height:1.45; }
+  .msg.you { align-self:flex-end; background:var(--panel2); border:1px solid var(--line); }
+  .msg.bot { align-self:flex-start; background:#12233a; border:1px solid #23405f; }
+  .msg.partial { opacity:.6; font-style:italic; }
+  .transcript { font-size:15px; line-height:1.6; min-height:60px; }
+  .transcript .part { color:var(--dim); }
+  button.rec { background:var(--bad); color:#fff; }
 </style>
 </head>
 <body>
 
 <header>
-  <h1>Pocket TTS on WebGPU</h1>
+  <h1>Voice agent on WebGPU</h1>
   <span class="badge" id="gpu-badge">checking WebGPU…</span>
   <span class="badge" id="dev-badge" hidden></span>
   <span class="badge" id="threads-note" hidden></span>
   <span class="badge" id="build-badge" hidden></span>
 </header>
+<nav class="tabs">
+  <button class="tab-btn active" data-tab="agent">Agent</button>
+  <button class="tab-btn" data-tab="tts">TTS</button>
+  <button class="tab-btn" data-tab="asr">ASR</button>
+</nav>
+
+<section id="tab-agent" class="tab">
+  <div class="panel">
+    <div class="row" style="margin-top:0">
+      <div><button id="ag-load">Load models</button></div>
+      <div><button id="ag-talk" disabled>Hold to talk</button></div>
+      <div><button id="ag-reset" class="ghost" disabled>Clear</button></div>
+      <div class="grow"><div id="ag-status"></div></div>
+    </div>
+    <div class="bar"><div id="ag-prog"></div></div>
+  </div>
+  <div class="panel">
+    <div id="ag-chat" class="chat"><p class="empty">Load the models, then hold the button and speak.</p></div>
+  </div>
+  <div class="panel">
+    <div class="cards" id="ag-cards"><p class="empty">No turns yet.</p></div>
+  </div>
+</section>
+
+<section id="tab-tts" class="tab" hidden>
 <div class="panel">
   <div class="row" style="margin-top:0">
     <div class="grow">
@@ -115,6 +152,36 @@
   <h2>Run history</h2>
   <div id="history"><p class="empty">No runs yet.</p></div>
 </div>
+</section>
+
+<section id="tab-asr" class="tab" hidden>
+  <div class="panel">
+    <div class="row" style="margin-top:0">
+      <div>
+        <label for="asr-dtype">dtype</label>
+        <select id="asr-dtype" style="width:110px">
+          <option value="f32" selected>f32</option>
+          <option value="f16">f16</option>
+        </select>
+      </div>
+      <div>
+        <label for="asr-lang">Language</label>
+        <input id="asr-lang" placeholder="auto" style="width:90px">
+      </div>
+      <div><button id="asr-load">Load ASR</button></div>
+      <div><button id="asr-mic" disabled>Hold to talk</button></div>
+      <div><button id="asr-clear" class="ghost" disabled>Clear</button></div>
+    </div>
+    <div class="bar"><div id="asr-prog"></div></div>
+    <div id="asr-status"></div>
+  </div>
+  <div class="panel">
+    <div id="asr-text" class="transcript"><p class="empty">No audio yet.</p></div>
+  </div>
+  <div class="panel">
+    <div class="cards" id="asr-cards"><p class="empty">No frames yet.</p></div>
+  </div>
+</section>
 
 <script type="module">
 const $ = id => document.getElementById(id);
@@ -189,15 +256,23 @@ if (!navigator.gpu) {
 
 // ---- audio -------------------------------------------------------------
 let ctx = null;
-function audioCtx() {
-  if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: info.sample_rate });
+// The agent tab plays audio before the TTS tab has ever loaded, so the rate is a
+// parameter rather than being read off that tab's `info`.
+function audioCtx(rate) {
+  const r = rate || (info && info.sample_rate) || 24000;
+  if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: r });
   if (ctx.state === 'suspended') ctx.resume();
   return ctx;
 }
 class Player {
-  constructor() { this.ac = audioCtx(); this.head = 0; this.startAt = null; }
+  constructor(rate) {
+    this.rate = rate || (info && info.sample_rate) || 24000;
+    this.ac = audioCtx(this.rate);
+    this.head = 0;
+    this.startAt = null;
+  }
   push(f32) {
-    const b = this.ac.createBuffer(1, f32.length, info.sample_rate);
+    const b = this.ac.createBuffer(1, f32.length, this.rate);
     b.copyToChannel(f32, 0);
     const s = this.ac.createBufferSource();
     s.buffer = b; s.connect(this.ac.destination);
@@ -213,9 +288,10 @@ class Player {
     return Math.max(0, this.ac.currentTime - this.startAt);
   }
 }
-function playAll(f32) {
-  const ac = audioCtx();
-  const b = ac.createBuffer(1, f32.length, info.sample_rate);
+function playAll(f32, rate) {
+  const r = rate || (info && info.sample_rate) || 24000;
+  const ac = audioCtx(r);
+  const b = ac.createBuffer(1, f32.length, r);
   b.copyToChannel(f32, 0);
   const s = ac.createBufferSource();
   s.buffer = b; s.connect(ac.destination); s.start();
@@ -562,6 +638,407 @@ addEventListener('resize', () => {
   }
 });
 
+// ---- tabs ---------------------------------------------------------------
+function showTab(name) {
+  for (const o of document.querySelectorAll('.tab-btn')) o.classList.toggle('active', o.dataset.tab === name);
+  for (const t of document.querySelectorAll('.tab')) t.hidden = t.id !== `tab-${name}`;
+  // A hidden canvas has no width, so anything drawn while the tab was away was
+  // drawn into a zero-sized bitmap. Re-take the geometry now it is visible.
+  if (name === 'tts') {
+    if (wave.live) { const { g, w, h, mid } = waveCtx(); Object.assign(wave, { g, w, h, mid }); }
+    else if (lastPcm) drawWave(lastPcm);
+  }
+}
+for (const b of document.querySelectorAll('.tab-btn')) b.onclick = () => showTab(b.dataset.tab);
+
+// ---- microphone ---------------------------------------------------------
+// The AudioContext is created at the model's rate so the browser resamples the
+// input; the worklet then only has to regroup quanta into whole frames.
+const ASR_RATE = 24000, ASR_FRAME = 1920;
+
+class Mic {
+  constructor(onFrame) { this.onFrame = onFrame; this.ac = null; this.node = null; this.stream = null; }
+  async start() {
+    if (this.node) return;
+    this.stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+    });
+    this.ac = new AudioContext({ sampleRate: ASR_RATE });
+    if (this.ac.state === 'suspended') await this.ac.resume();
+    await this.ac.audioWorklet.addModule('./mic-worklet.js');
+    const src = this.ac.createMediaStreamSource(this.stream);
+    this.node = new AudioWorkletNode(this.ac, 'mic', {
+      numberOfInputs: 1, numberOfOutputs: 0,
+      processorOptions: { frameSize: ASR_FRAME },
+    });
+    this.node.port.onmessage = e => this.onFrame(e.data);
+    src.connect(this.node);
+  }
+  async stop() {
+    if (this.node) { this.node.port.onmessage = null; this.node.disconnect(); this.node = null; }
+    if (this.stream) { for (const t of this.stream.getTracks()) t.stop(); this.stream = null; }
+    if (this.ac) { await this.ac.close().catch(() => {}); this.ac = null; }
+  }
+}
+
+// ---- ASR worker ---------------------------------------------------------
+// Its own worker, so the ASR model gets its own thread and its own WebGPU
+// device rather than sharing the TTS one.
+function makeAsrWorker(handlers) {
+  const w = new Worker('./asr-worker.js', { type: 'module' });
+  w.onmessage = ev => {
+    const h = handlers[ev.data.type];
+    if (h) h(ev.data);
+  };
+  return w;
+}
+
+// ---- ASR tab ------------------------------------------------------------
+const asr = { worker: null, mic: null, words: [], frames: [], sent: 0, ready: false };
+
+function asrCards() {
+  const f = asr.frames;
+  if (!f.length) return;
+  const sorted = [...f].sort((a, b) => a - b);
+  const mean = f.reduce((a, b) => a + b, 0) / f.length;
+  // Each frame is 80 ms of audio, so the ratio says whether it keeps up live.
+  const rt = 80 / mean;
+  const cards = [
+    ['Realtime', fmt(rt, 2), '×', rt >= 1 ? 'rtf-good' : rt >= 0.7 ? 'rtf-warn' : 'rtf-bad'],
+    ['Per-frame', fmt(mean, 1), 'ms'],
+    ['p95', fmt(sorted[Math.floor(sorted.length * 0.95)], 1), 'ms'],
+    ['Frames', f.length, ''],
+    ['Words', asr.words.length, ''],
+  ];
+  $('asr-cards').innerHTML = cards.map(([k, v, u, c]) =>
+    `<div class="card"><div class="k">${k}</div><div class="v ${c || ''}">${v}` +
+    (u ? ` <span class="u">${u}</span>` : '') + '</div></div>').join('');
+}
+
+function asrRender(finalText) {
+  const t = $('asr-text');
+  const live = asr.words.join('');
+  t.innerHTML = finalText != null
+    ? `${finalText || '<span class="part">(nothing recognised)</span>'}`
+    : (live ? `${live}<span class="part"> …</span>` : '<p class="empty">Listening…</p>');
+}
+
+$('asr-load').onclick = () => {
+  $('asr-load').disabled = true;
+  asr.worker = makeAsrWorker({
+    status: m => { $('asr-status').textContent = m.message; },
+    progress: m => {
+      const p = m.total ? m.received / m.total * 100 : 0;
+      $('asr-prog').style.width = p + '%';
+      $('asr-status').textContent = `${m.label}: ${(m.received / 1e6).toFixed(1)} MB` +
+        (m.total ? ` / ${(m.total / 1e6).toFixed(1)} MB` : '');
+    },
+    ready: m => {
+      asr.ready = true;
+      $('asr-prog').style.width = '100%';
+      $('asr-status').textContent =
+        `${m.info.device} · ${m.info.dtype} · delay ${m.info.delay_frames} frames · loaded ${fmt(m.info.load_ms)} ms`;
+      $('asr-mic').disabled = false;
+      $('asr-clear').disabled = false;
+    },
+    word: m => { asr.words.push(m.text); asrRender(); },
+    frame_done: m => { asr.frames.push(m.ms); asrCards(); },
+    final: m => { asrRender(m.text); $('asr-status').textContent = 'done'; },
+    error: m => { $('asr-status').textContent = m.message; $('asr-status').className = 'err'; },
+  });
+  asr.worker.postMessage({
+    type: 'setup', base: '/asr', dtype: $('asr-dtype').value, language: $('asr-lang').value.trim(),
+  });
+};
+
+async function asrListen(on) {
+  const btn = $('asr-mic');
+  if (on) {
+    asr.words = []; asr.frames = []; asrRender();
+    asr.worker.postMessage({ type: 'reset' });
+    asr.mic = asr.mic || new Mic(pcm => asr.worker.postMessage({ type: 'frame', pcm }, [pcm.buffer]));
+    try { await asr.mic.start(); } catch (e) { $('asr-status').textContent = e.message; return; }
+    btn.classList.add('rec'); btn.textContent = 'Release to stop';
+    $('asr-status').textContent = 'listening…';
+  } else {
+    await asr.mic.stop();
+    btn.classList.remove('rec'); btn.textContent = 'Hold to talk';
+    $('asr-status').textContent = 'finishing…';
+    asr.worker.postMessage({ type: 'flush' });
+  }
+}
+$('asr-mic').onpointerdown = () => asrListen(true);
+$('asr-mic').onpointerup = () => asrListen(false);
+$('asr-mic').onpointerleave = e => { if (e.buttons) asrListen(false); };
+$('asr-clear').onclick = () => {
+  asr.words = []; asr.frames = [];
+  asr.worker.postMessage({ type: 'reset' });
+  $('asr-text').innerHTML = '<p class="empty">No audio yet.</p>';
+};
+
+// ---- Agent tab ----------------------------------------------------------
+// ASR -> LLM -> TTS. The two models sit in separate workers; the LLM is an API
+// call proxied by the dev server so the key never reaches the page.
+const agent = {
+  asrWorker: null, ttsWorker: null, mic: null,
+  history: [{ role: 'system', content:
+    'You are a voice assistant. Reply in one or two short spoken sentences. No markdown, no lists, no emoji.' }],
+  words: [], ready: { asr: false, tts: false }, timings: {},
+};
+
+const agStatus = m => { $('ag-status').textContent = m; };
+
+function agChat(role, text, cls = '') {
+  const box = $('ag-chat');
+  if (box.querySelector('.empty')) box.innerHTML = '';
+  const d = document.createElement('div');
+  d.className = `msg ${role === 'user' ? 'you' : 'bot'} ${cls}`;
+  d.textContent = text;
+  box.appendChild(d);
+  box.scrollTop = box.scrollHeight;
+  return d;
+}
+
+function agCards() {
+  const t = agent.timings;
+  const cards = [
+    ['ASR', fmt(t.asr_ms), 'ms'],
+    ['LLM', fmt(t.llm_ms), 'ms'],
+    ['TTS', fmt(t.tts_ms), 'ms'],
+    ['Turn', fmt(t.turn_ms), 'ms'],
+    ['Speech', fmt(t.speech_ms), 'ms'],
+  ];
+  $('ag-cards').innerHTML = cards.map(([k, v, u]) =>
+    `<div class="card"><div class="k">${k}</div><div class="v">${v}` +
+    (u ? ` <span class="u">${u}</span>` : '') + '</div></div>').join('');
+}
+
+$('ag-load').onclick = () => {
+  $('ag-load').disabled = true;
+  agStatus('loading ASR and TTS…');
+
+  agent.asrWorker = makeAsrWorker({
+    status: m => agStatus(`asr: ${m.message}`),
+    progress: m => {
+      const p = m.total ? m.received / m.total * 100 : 0;
+      $('ag-prog').style.width = p / 2 + '%';
+      agStatus(`asr ${m.label}: ${(m.received / 1e6).toFixed(0)} MB`);
+    },
+    ready: () => { agent.ready.asr = true; agMaybeReady(); },
+    word: m => { agent.words.push(m.text); },
+    final: m => agTurn(m.text),
+    error: m => agStatus(`asr error: ${m.message}`),
+  });
+  agent.asrWorker.postMessage({ type: 'setup', base: '/asr', dtype: 'f32', language: '' });
+
+  agent.ttsWorker = new Worker('./worker.js', { type: 'module' });
+  agent.ttsWorker.onmessage = ev => {
+    const m = ev.data;
+    if (m.type === 'progress') {
+      $('ag-prog').style.width = (50 + (m.total ? m.received / m.total * 50 : 0)) + '%';
+      agStatus(`tts ${m.label}: ${(m.received / 1e6).toFixed(0)} MB`);
+    } else if (m.type === 'ready') {
+      agent.ttsInfo = m.info; agent.ready.tts = true; agMaybeReady();
+    } else if (m.type === 'voice') {
+      agent.voice = agent.voice || m.name;
+    } else if (m.type === 'frame') {
+      const f = new Float32Array(m.pcm);
+      agent.chunks.push(f);
+      if (agent.player) agent.player.push(f);
+    } else if (m.type === 'gen_done') {
+      agent.timings.tts_ms = m.stats.total_ms;
+      agent.timings.speech_ms = m.stats.audio_ms;
+      agent.timings.turn_ms = performance.now() - agent.turnStart;
+      agCards();
+      agStatus('ready — hold to talk');
+      $('ag-talk').disabled = false;
+    } else if (m.type === 'error') {
+      agStatus(`tts error: ${m.message}`);
+      $('ag-talk').disabled = false;
+    }
+  };
+  agent.ttsWorker.postMessage({
+    type: 'setup', base: '/model', dtype: 'f16', temperature: 0.4,
+    weightsUrl: '/model/model.safetensors', configUrl: '/model/config.json',
+    voices: [{ name: 'Freya', url: '/voices/Freya.safetensors' }],
+  });
+};
+
+function agMaybeReady() {
+  if (!agent.ready.asr || !agent.ready.tts) return;
+  $('ag-prog').style.width = '100%';
+  agStatus('ready — hold to talk');
+  $('ag-talk').disabled = false;
+  $('ag-reset').disabled = false;
+}
+
+async function agListen(on) {
+  const btn = $('ag-talk');
+  if (on) {
+    agent.words = [];
+    agent.asrWorker.postMessage({ type: 'reset' });
+    agent.mic = agent.mic || new Mic(pcm => agent.asrWorker.postMessage({ type: 'frame', pcm }, [pcm.buffer]));
+    try { await agent.mic.start(); } catch (e) { return agStatus(e.message); }
+    agent.turnStart = performance.now();
+    agent.asrStart = performance.now();
+    btn.classList.add('rec'); btn.textContent = 'Release to send';
+    agStatus('listening…');
+  } else {
+    await agent.mic.stop();
+    btn.classList.remove('rec'); btn.textContent = 'Hold to talk';
+    btn.disabled = true;
+    agStatus('transcribing…');
+    agent.asrWorker.postMessage({ type: 'flush' });
+  }
+}
+$('ag-talk').onpointerdown = () => agListen(true);
+$('ag-talk').onpointerup = () => agListen(false);
+$('ag-talk').onpointerleave = e => { if (e.buttons) agListen(false); };
+
+async function agTurn(text) {
+  agent.timings.asr_ms = performance.now() - agent.asrStart;
+  if (!text) {
+    agStatus('nothing heard — hold to talk');
+    $('ag-talk').disabled = false;
+    agCards();
+    return;
+  }
+  agChat('user', text);
+  agent.history.push({ role: 'user', content: text });
+
+  // The free tier shares an upstream pool and the proxy retries through its
+  // rate limits, which can take tens of seconds. Tick so it does not read as a hang.
+  const t0 = performance.now();
+  agStatus('thinking…');
+  const tick = setInterval(() => {
+    const s = (performance.now() - t0) / 1000;
+    agStatus(s > 6 ? `thinking… ${s.toFixed(0)}s (free model may be rate-limited)` : 'thinking…');
+  }, 1000);
+  let reply;
+  try {
+    const r = await fetch('/api/chat', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ messages: agent.history }),
+    });
+    const d = await r.json();
+    if (!r.ok || !d.text) throw new Error(d.error || 'no reply');
+    reply = d.text;
+  } catch (e) {
+    clearInterval(tick);
+    agStatus(`llm: ${e.message}`);
+    $('ag-talk').disabled = false;
+    return;
+  }
+  clearInterval(tick);
+  agent.timings.llm_ms = performance.now() - t0;
+  agent.history.push({ role: 'assistant', content: reply });
+  agChat('assistant', reply);
+
+  agStatus('speaking…');
+  agent.chunks = [];
+  agent.player = new Player(agent.ttsInfo ? agent.ttsInfo.sample_rate : 24000);
+  agent.ttsWorker.postMessage({
+    type: 'generate', text: reply, voice: agent.voice || 'Freya', seed: 42,
+  });
+}
+
+$('ag-reset').onclick = () => {
+  agent.history = agent.history.slice(0, 1);
+  agent.words = [];
+  $('ag-chat').innerHTML = '<p class="empty">Load the models, then hold the button and speak.</p>';
+  agent.asrWorker.postMessage({ type: 'reset' });
+};
+
+// Drives the ASR from a file, for checking it where there is no microphone.
+// Same worker and same model as the mic path; only the source of frames differs.
+window.__asrFromFile = async (url, dtype) => {
+  const done = new Promise((res, rej) => {
+    let loaded = false;
+    const frames = [];
+    asr.worker = makeAsrWorker({
+      status: m => { $('asr-status').textContent = m.message; },
+      progress: m => { $('asr-status').textContent = `${m.label}: ${(m.received / 1e6).toFixed(0)} MB`; },
+      ready: async m => {
+        loaded = true;
+        window.__asrInfo = m.info;
+        $('asr-status').textContent = 'decoding audio…';
+        const buf = await (await fetch(url)).arrayBuffer();
+        // Decoded through a context at the model's rate, so the browser does the
+        // resampling exactly as it does for a live microphone.
+        const oc = new OfflineAudioContext(1, 1, ASR_RATE);
+        const audio = await oc.decodeAudioData(buf);
+        const pcm = audio.getChannelData(0);
+        const n = Math.floor(pcm.length / ASR_FRAME);
+        // Two frames of leading silence, as the serving path does.
+        for (let i = 0; i < 2; i++) asr.worker.postMessage({ type: 'frame', pcm: new Float32Array(ASR_FRAME) });
+        for (let i = 0; i < n; i++) {
+          asr.worker.postMessage({ type: 'frame', pcm: pcm.slice(i * ASR_FRAME, (i + 1) * ASR_FRAME) });
+        }
+        $('asr-status').textContent = `fed ${n} frames, transcribing…`;
+        asr.worker.postMessage({ type: 'flush' });
+      },
+      word: m => { asr.words.push(m.text); asrRender(); },
+      frame_done: m => { frames.push(m.ms); asr.frames.push(m.ms); asrCards(); },
+      final: m => {
+        const mean = frames.length ? frames.reduce((a, b) => a + b, 0) / frames.length : 0;
+        res({ text: m.text, frames: frames.length, mean_ms: mean, realtime: mean ? 80 / mean : 0,
+              info: window.__asrInfo });
+      },
+      error: m => rej(new Error(m.message)),
+    });
+    setTimeout(() => { if (!loaded) rej(new Error('asr did not load in time')); }, 300000);
+  });
+  asr.worker.postMessage({ type: 'setup', base: '/asr', dtype: dtype || 'f32', language: '' });
+  return done;
+};
+
+// End-to-end agent turn without a microphone: the ASR leg is fed from a file,
+// the LLM and TTS legs are the real ones.
+window.__agentTest = async url => {
+  const ready = new Promise(res => {
+    const t = setInterval(() => {
+      if (agent.ready.asr && agent.ready.tts) { clearInterval(t); res(); }
+    }, 300);
+  });
+  $('ag-load').onclick();
+  await ready;
+
+  const spoken = new Promise((res, rej) => {
+    const orig = agent.ttsWorker.onmessage;
+    agent.ttsWorker.onmessage = ev => {
+      orig(ev);
+      if (ev.data.type === 'gen_done') res(ev.data.stats);
+      if (ev.data.type === 'error') rej(new Error(ev.data.message));
+    };
+    setTimeout(() => rej(new Error('no speech within 180s')), 180000);
+  });
+
+  const buf = await (await fetch(url)).arrayBuffer();
+  const oc = new OfflineAudioContext(1, 1, ASR_RATE);
+  const audio = await oc.decodeAudioData(buf);
+  const pcm = audio.getChannelData(0);
+  agent.words = [];
+  agent.turnStart = performance.now();
+  agent.asrStart = performance.now();
+  for (let i = 0; i < 2; i++) agent.asrWorker.postMessage({ type: 'frame', pcm: new Float32Array(ASR_FRAME) });
+  const n = Math.floor(pcm.length / ASR_FRAME);
+  for (let i = 0; i < n; i++) {
+    agent.asrWorker.postMessage({ type: 'frame', pcm: pcm.slice(i * ASR_FRAME, (i + 1) * ASR_FRAME) });
+  }
+  agent.asrWorker.postMessage({ type: 'flush' });
+
+  const stats = await spoken;
+  const msgs = [...$('ag-chat').querySelectorAll('.msg')].map(m => m.textContent);
+  return {
+    heard: msgs[0] || null,
+    reply: msgs[1] || null,
+    timings: agent.timings,
+    speech_ms: stats.audio_ms,
+    tts_rtf: stats.rtf,
+    asr_device: agent.asrDevice || null,
+  };
+};
+
 // ---- headless mode -----------------------------------------------------
 // `?auto=1&dtype=f16&iters=3` loads, generates, and POSTs the result to
 // /report, so the same page doubles as a check runnable from a shell.
@@ -596,6 +1073,7 @@ if (q.get('auto')) {
   let done = 0;
   let guard = 0;
 
+  showTab(q.get('tab') || 'tts');
   if (q.get('dtype')) $('dtype').value = q.get('dtype');
   if (q.get('base')) $('base').value = q.get('base');
   if (q.get('text')) $('text').value = q.get('text');

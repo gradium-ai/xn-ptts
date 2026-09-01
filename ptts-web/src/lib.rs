@@ -476,3 +476,172 @@ pub fn prepare_text(text: &str) -> js_sys::Array {
     out.push(&JsValue::from_f64(frames_after_eos as f64));
     out
 }
+
+// ---------------------------------------------------------------------------
+// ASR
+// ---------------------------------------------------------------------------
+//
+// Loaded and driven independently of the TTS model above, so a page can put the
+// two in separate workers and give each its own WebGPU device and thread.
+
+use ptts::asr::{AsrModel, AsrState, Event, FRAME_SIZE as ASR_FRAME};
+
+struct AsrEngine<Q: BackendQ<B = WebGpuDevice>> {
+    model: AsrModel<Q>,
+    state: AsrState<Q>,
+}
+
+enum AnyAsr {
+    F32(AsrEngine<Unquantized<f32, WebGpuDevice>>),
+    F16(AsrEngine<Unquantized<f16, WebGpuDevice>>),
+}
+
+struct LoadedAsr {
+    engine: AnyAsr,
+    device: WebGpuDevice,
+    dtype: String,
+    temperature: f32,
+}
+
+thread_local! {
+    static ASR: RefCell<Option<LoadedAsr>> = const { RefCell::new(None) };
+}
+
+/// Build the ASR model from the two checkpoints it needs.
+///
+/// `mimi_bytes` is the Mimi encoder, `lm_bytes` the ASR LM, both safetensors.
+/// `config_json` is the checkpoint's `config.json`.
+#[wasm_bindgen]
+pub async fn load_asr(
+    mimi_bytes: Vec<u8>,
+    lm_bytes: Vec<u8>,
+    config_json: String,
+    dtype: String,
+    temperature: f32,
+    language: Option<String>,
+) -> Result<JsValue, JsValue> {
+    let t0 = now_ms();
+    let device = WebGpuDevice::new_async(0).await.map_err(err)?;
+    let cfg: ptts::asr_lm::Config = serde_json::from_str(&config_json).map_err(err)?;
+
+    let dtype = dtype.to_ascii_lowercase();
+    if dtype == "f16" && !device.supports_f16() {
+        return Err(err("dtype 'f16' needs WGSL shader-f16, which this adapter does not report"));
+    }
+
+    // Mimi stays f32 whatever the LM is, matching the native path.
+    let mimi_vb =
+        VB::from_bytes_with_key_map(vec![mimi_bytes], device.clone(), ptts::asr::remap_key).map_err(err)?;
+    let mimi_root = mimi_vb.root();
+    let lm_vb =
+        VB::from_bytes_with_key_map(vec![lm_bytes], device.clone(), ptts::asr::remap_key).map_err(err)?;
+    let lm_root = lm_vb.root();
+    let language = language.as_deref().filter(|s| !s.is_empty());
+
+    let delay;
+    let engine = match dtype.as_str() {
+        "f32" => {
+            let model: AsrModel<Unquantized<f32, WebGpuDevice>> =
+                AsrModel::load(&mimi_root, &lm_root, cfg, language).map_err(err)?;
+            delay = model.delay_frames();
+            let state = model.init_state().map_err(err)?;
+            AnyAsr::F32(AsrEngine { model, state })
+        }
+        "f16" => {
+            let model: AsrModel<Unquantized<f16, WebGpuDevice>> =
+                AsrModel::load(&mimi_root, &lm_root, cfg, language).map_err(err)?;
+            delay = model.delay_frames();
+            let state = model.init_state().map_err(err)?;
+            AnyAsr::F16(AsrEngine { model, state })
+        }
+        other => return Err(err(format!("unknown asr dtype '{other}'"))),
+    };
+
+    device.flush_async().await.map_err(err)?;
+    let info = serde_json::json!({
+        "device": xn::Backend::name(&device),
+        "dtype": dtype,
+        "frame_size": ASR_FRAME,
+        "sample_rate": ptts::asr::SAMPLE_RATE,
+        "delay_frames": delay,
+        "load_ms": now_ms() - t0,
+    });
+    ASR.with(|c| {
+        *c.borrow_mut() = Some(LoadedAsr { engine, device, dtype, temperature });
+    });
+    Ok(JsValue::from_str(&info.to_string()))
+}
+
+/// Reset the streaming state, so the next frame starts a fresh utterance.
+#[wasm_bindgen]
+pub fn asr_reset() -> Result<(), JsValue> {
+    ASR.with(|c| {
+        let mut slot = c.borrow_mut();
+        let loaded = slot.as_mut().ok_or_else(|| err("no asr model loaded"))?;
+        match &mut loaded.engine {
+            AnyAsr::F32(e) => e.state = e.model.init_state().map_err(err)?,
+            AnyAsr::F16(e) => e.state = e.model.init_state().map_err(err)?,
+        }
+        Ok(())
+    })
+}
+
+/// Push one 80 ms frame and return whatever words it closed.
+///
+/// Two readbacks per frame, both awaited: the codebook indices the LM consumes,
+/// and the token it sampled. Nothing else leaves the device.
+#[wasm_bindgen]
+pub async fn asr_frame(pcm: Vec<f32>) -> Result<JsValue, JsValue> {
+    let mut loaded = ASR
+        .with(|c| c.borrow_mut().take())
+        .ok_or_else(|| err("no asr model loaded (or a frame is already in flight)"))?;
+    let res = asr_frame_inner(&mut loaded, &pcm).await;
+    ASR.with(|c| *c.borrow_mut() = Some(loaded));
+    res
+}
+
+async fn asr_frame_inner(loaded: &mut LoadedAsr, pcm: &[f32]) -> Result<JsValue, JsValue> {
+    let temperature = loaded.temperature;
+    let events = match &mut loaded.engine {
+        AnyAsr::F32(e) => asr_step(&mut e.model, &mut e.state, pcm, temperature).await,
+        AnyAsr::F16(e) => asr_step(&mut e.model, &mut e.state, pcm, temperature).await,
+    }
+    .map_err(err)?;
+
+    let words: Vec<serde_json::Value> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            Event::Word { tokens, start_time } => {
+                Some(serde_json::json!({ "tokens": tokens, "start": start_time }))
+            }
+            _ => None,
+        })
+        .collect();
+    let eos = events.iter().any(|e| matches!(e, Event::EndOfStream));
+    Ok(JsValue::from_str(&serde_json::json!({ "words": words, "eos": eos }).to_string()))
+}
+
+async fn asr_step<Q: BackendQ<B = WebGpuDevice>>(
+    model: &mut AsrModel<Q>,
+    state: &mut AsrState<Q>,
+    pcm: &[f32],
+    temperature: f32,
+) -> xn::Result<Vec<Event>> {
+    let dev = model.lm.device().clone();
+    let code_tensors = model.encode_frame(state, pcm)?;
+    // One await per codebook, but only the first is a real wait: it flushes the
+    // frame and the rest read work that has already finished.
+    let mut codes = Vec::with_capacity(code_tensors.len());
+    for t in &code_tensors {
+        codes.push(dev.tensor_to_vec(t).await?[0] as u32);
+    }
+    let sampled = model.lm_step(state, &codes, temperature)?;
+    let token = dev.tensor_to_vec(&sampled).await?[0] as u32;
+    Ok(model.push_token(state, token))
+}
+
+/// The ASR's own frame size, so the page can slice the microphone to match.
+#[wasm_bindgen]
+pub fn asr_frame_size() -> usize {
+    ASR_FRAME
+}

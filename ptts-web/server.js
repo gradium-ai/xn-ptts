@@ -13,11 +13,27 @@ const MODEL = process.env.PTTS_MODEL_DIR ||
   path.join(__dirname, '..', '..', 'phonon-inference', 'model');
 const VOICES = process.env.PTTS_VOICE_DIR ||
   path.join(__dirname, '..', '..', 'phonon-inference', 'voices');
+// The ASR checkpoint, as huggingface-cli left it. Resolved through the snapshot
+// symlinks so the served paths are stable across re-downloads.
+const ASR = process.env.PTTS_ASR_DIR || (() => {
+  const base = path.join(process.env.HOME || '', '.cache', 'huggingface', 'hub',
+    'models--gr4d--asr-23b5a198.500', 'snapshots');
+  try {
+    const snap = fs.readdirSync(base).map(d => path.join(base, d))
+      .find(d => fs.existsSync(path.join(d, 'config.json')));
+    if (snap) return snap;
+  } catch { /* not downloaded; /asr just 404s */ }
+  return path.join(base, 'missing');
+})();
+
+const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || '';
+const LLM_MODEL = process.env.PTTS_LLM_MODEL || 'liquid/lfm-2.5-2.6b:free';
 
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
   '.wasm': 'application/wasm', '.json': 'application/json',
   '.safetensors': 'application/octet-stream', '.model': 'application/octet-stream',
+  '.wav': 'audio/wav',
   '.gguf': 'application/octet-stream', '.map': 'application/json',
 };
 
@@ -25,7 +41,7 @@ const MIME = {
 // is invisible to a browser that already has the page, which looks exactly like a
 // change that did not work.
 function cacheControl(file) {
-  const inWeights = file.startsWith(MODEL) || file.startsWith(VOICES);
+  const inWeights = file.startsWith(MODEL) || file.startsWith(VOICES) || file.startsWith(ASR);
   return inWeights ? 'public, max-age=86400' : 'no-cache';
 }
 
@@ -38,12 +54,58 @@ function resolve(urlPath) {
   const safe = path.normalize(clean).replace(/^(\.\.[/\\])+/, '');
   if (safe.startsWith('/model/')) return path.join(MODEL, safe.slice('/model/'.length));
   if (safe.startsWith('/voices/')) return path.join(VOICES, safe.slice('/voices/'.length));
+  if (safe.startsWith('/asr/')) return path.join(ASR, safe.slice('/asr/'.length));
+  // Sample audio, so the ASR can be driven from a file where there is no mic.
+  if (safe.startsWith('/audio/')) return path.join(MODEL, '..', safe.slice('/audio/'.length));
   return path.join(PKG, safe);
 }
 
 function handler(req, res) {
   // A headless run POSTs its result here; printing it and exiting is what makes
   // the browser run usable as a check from a shell.
+  // The LLM leg. Proxied rather than called from the page so the OpenRouter key
+  // stays on this machine and never reaches the browser.
+  if (req.method === 'POST' && req.url.split('?')[0] === '/api/chat') {
+    let body = '';
+    req.on('data', c => { body += c; });
+    req.on('end', async () => {
+      const json = h => { res.writeHead(h.code, { 'content-type': 'application/json' }); res.end(JSON.stringify(h.body)); };
+      if (!OPENROUTER_KEY) {
+        return json({ code: 500, body: { error: 'OPENROUTER_API_KEY is not set in this server process' } });
+      }
+      let messages;
+      try { ({ messages } = JSON.parse(body)); } catch { return json({ code: 400, body: { error: 'bad json' } }); }
+      if (!Array.isArray(messages)) return json({ code: 400, body: { error: 'messages must be an array' } });
+
+      // The free tier shares an upstream pool and 429s regularly, with a
+      // Retry-After that is worth honouring rather than failing the turn.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        let r, data;
+        try {
+          r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+            method: 'POST',
+            headers: { 'authorization': `Bearer ${OPENROUTER_KEY}`, 'content-type': 'application/json' },
+            body: JSON.stringify({ model: LLM_MODEL, messages, max_tokens: 160, temperature: 0.7 }),
+          });
+          data = await r.json();
+        } catch (e) {
+          return json({ code: 502, body: { error: `openrouter unreachable: ${e.message}` } });
+        }
+        const text = data?.choices?.[0]?.message?.content;
+        if (text) return json({ code: 200, body: { text, model: data.model || LLM_MODEL } });
+        const retryAfter = data?.error?.metadata?.retry_after_seconds;
+        const rateLimited = data?.error?.code === 429 || r.status === 429;
+        if (rateLimited && attempt < 2) {
+          const wait = Math.min(20, retryAfter || 5);
+          console.log(`[llm] ${LLM_MODEL} rate limited upstream, retrying in ${wait}s (attempt ${attempt + 1}/3)`);
+          await new Promise(z => setTimeout(z, wait * 1000));
+          continue;
+        }
+        return json({ code: 502, body: { error: data?.error?.message || 'no completion returned', detail: data?.error || null } });
+      }
+    });
+    return;
+  }
   if (req.method === 'POST' && req.url.split('?')[0] === '/progress') {
     let body = '';
     req.on('data', c => { body += c; });

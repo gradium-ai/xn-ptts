@@ -1,5 +1,66 @@
 # ptts-web
 
+Three tabs, all inference in the browser on xn's WebGPU backend:
+
+| Tab | What it is |
+| --- | --- |
+| **Agent** | ASR -> LLM -> TTS. Hold to talk, it talks back. |
+| **TTS** | Pocket TTS on its own, with the timings below. |
+| **ASR** | Streaming ASR on its own, with per-frame timings. |
+
+ASR and TTS run in **separate workers**, so each gets its own thread and its own
+WebGPU device. Only the LLM leg leaves the machine: it is an OpenRouter call,
+proxied by `server.js` so the API key stays out of the page.
+
+```bash
+export OPENROUTER_API_KEY=...        # the Agent tab needs this; the other two do not
+make serve
+```
+
+The LLM is `liquid/lfm-2.5-2.6b:free` by default (`PTTS_LLM_MODEL` overrides it).
+Being free, it shares an upstream pool and returns 429 often; the proxy honours
+`Retry-After` and retries up to three times, and the page shows the elapsed wait
+rather than looking hung. A turn that waits 40 s for the LLM is the free tier,
+not the models.
+
+Measured in headless Chrome on an Apple M5, one turn end to end:
+
+| Leg | Time |
+| --- | --- |
+| ASR (5.4 s of speech) | 1.9 s, 2.71x realtime |
+| LLM (free tier, rate-limited) | 43 s |
+| TTS (3.8 s of speech) | 0.6 s, 6.48x realtime |
+
+## Weights
+
+`server.js` maps `/model` and `/voices` to the local TTS checkpoint and `/asr` to
+the ASR one (`gr4d/asr-23b5a198.500` as `huggingface-cli` leaves it; override with
+`PTTS_ASR_DIR`). The ASR is ~960 MB across two safetensors, the TTS ~317 MB.
+
+## ASR on WebGPU: what was slow
+
+The ASR is a Mimi encoder feeding a causal LM, one 80 ms frame at a time. Two
+values per frame have to reach the host -- the codebook indices the LM consumes
+and the token it sampled -- so `ptts::asr` splits the step in two and the browser
+awaits each, the same shape the TTS path uses.
+
+Native WebGPU first ran this at **0.49x realtime**. Almost all of it was
+`Tensor::stack` on the per-codebook index tensors: WGSL has no 64-bit integer, so
+xn's WebGPU backend computes in float dtypes only and every i64 op falls back to
+a host round trip. Stacking cost one such trip per codebook per frame, ~70 in
+all, each forcing a flush.
+
+`asr_quantizer` now returns the indices unstacked and the loop stays on-device
+(`decode` consumes the index tensor directly), which took native to 0.80x. The
+browser reaches **2.71x** on the same code, because awaiting a readback avoids
+the blocking `poll(Wait)` that costs ~2.7 ms whether or not the work is done.
+
+The remaining native gap is that floor, 33 flushes per frame. Fixing it properly
+means giving the WebGPU backend an i64 `copy2d` -- which needs no arithmetic,
+only data movement, so it could dispatch the u32 kernel over doubled strides.
+That is a change in xn, not here.
+
+
 Pocket TTS running **entirely in the browser** on xn's WebGPU backend. The
 flow-matching LM and the Mimi decoder are WGSL compute shaders; no server does
 any inference, it only serves files.

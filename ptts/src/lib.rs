@@ -1,3 +1,6 @@
+pub mod asr;
+pub mod asr_lm;
+pub mod asr_quantizer;
 pub mod conditioners;
 pub mod conv;
 pub mod dummy_quantizer;

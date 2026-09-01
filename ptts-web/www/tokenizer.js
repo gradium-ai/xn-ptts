@@ -150,4 +150,29 @@ class UnigramTokenizer {
   }
 }
 
+/// Ids back to text. The ASR emits token ids, so the page needs the inverse of
+/// `encode`: join the pieces, turn the byte-fallback pieces (`<0xHH>`) back into
+/// bytes and decode them as UTF-8, and map the SentencePiece space marker.
+UnigramTokenizer.prototype.decode = function (ids) {
+  let out = '';
+  let bytes = [];
+  const flush = () => {
+    if (!bytes.length) return;
+    out += new TextDecoder().decode(new Uint8Array(bytes));
+    bytes = [];
+  };
+  for (const id of ids) {
+    const p = this.pieces[id];
+    if (!p) continue;
+    const m = /^<0x([0-9A-Fa-f]{2})>$/.exec(p.piece);
+    if (m) { bytes.push(parseInt(m[1], 16)); continue; }
+    flush();
+    // type 3 is a control piece (<pad>, </s>, ...) and carries no text.
+    if (p.type === 3) continue;
+    out += p.piece.replace(/\u2581/g, ' ');
+  }
+  flush();
+  return out;
+};
+
 export { decodeSentencepieceModel, UnigramTokenizer };
