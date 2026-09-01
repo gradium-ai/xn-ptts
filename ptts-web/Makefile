@@ -5,7 +5,7 @@ WASM := target/wasm32-unknown-unknown/release/ptts_web.wasm
 build:
 	cargo build --release --target wasm32-unknown-unknown
 	wasm-bindgen --target web --out-dir pkg $(WASM)
-	cp www/index.html www/worker.js www/tokenizer.js pkg/
+	cp www/index.html www/diag.html www/worker.js www/tokenizer.js pkg/
 	@# A stamp the page can compare against, so a tab left open across a rebuild
 	@# says so instead of failing in a way that looks like a code bug.
 	@printf '%s %s\n' "$$(git rev-parse --short HEAD 2>/dev/null || echo nogit)" \

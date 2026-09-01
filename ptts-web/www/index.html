@@ -21,7 +21,6 @@
            border:1px solid var(--line); }
   .badge.ok { border-color:#1f6f3c; color:var(--good); }
   .badge.bad { border-color:#6e2620; color:var(--bad); }
-  .sub { color:var(--dim); font-size:13px; margin:6px 0 24px; }
   .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px;
            padding:18px; margin-bottom:18px; }
   label { display:block; font-size:12px; font-weight:600; color:var(--dim); margin-bottom:5px; }
@@ -48,7 +47,6 @@
   .rtf-good{color:var(--good)} .rtf-warn{color:var(--warn)} .rtf-bad{color:var(--bad)}
   canvas { width:100%; height:90px; display:block; background:var(--bg);
            border:1px solid var(--line); border-radius:8px; margin-top:14px; }
-  .hint { font-size:12px; color:var(--dim); margin-top:10px; }
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th,td { text-align:right; padding:7px 9px; border-bottom:1px solid var(--line); }
   th:first-child,td:first-child { text-align:left; }
@@ -67,24 +65,17 @@
   <span class="badge" id="threads-note" hidden></span>
   <span class="badge" id="build-badge" hidden></span>
 </header>
-<p class="sub">
-  The whole model runs in this tab: the flow-matching LM and the Mimi decoder are WGSL compute
-  shaders driven by <code>xn</code>'s WebGPU backend through wasm. No server does any inference —
-  the page only downloads weights.
-</p>
-
 <div class="panel">
-  <h2>Load</h2>
   <div class="row" style="margin-top:0">
     <div class="grow">
-      <label for="base">Weights base URL</label>
+      <label for="base">Weights</label>
       <select id="base">
         <option value="/model" selected>/model (served locally)</option>
         <option value="https://huggingface.co/kyutai/pocket-tts-without-voice-cloning/resolve/main">HuggingFace · kyutai/pocket-tts-without-voice-cloning</option>
       </select>
     </div>
     <div>
-      <label for="dtype">Compute dtype</label>
+      <label for="dtype">dtype</label>
       <select id="dtype" style="width:150px">
         <option value="f32" selected>f32</option>
         <option value="f16">f16</option>
@@ -95,16 +86,10 @@
     <div><button id="load">Load model</button></div>
   </div>
   <div class="bar"><div id="prog"></div></div>
-  <p class="hint">
-    f16 needs the adapter to report WGSL <code>shader-f16</code>. The q8_0 dtypes load
-    <code>model.q8.gguf</code>, whose blocks are already quantized: 136 MB instead of 317 MB, and no
-    host round trip. f32 and f16 load the dense safetensors.
-  </p>
-  <div id="status">Pick a source and load. Weights are a few hundred MB and the browser caches them.</div>
+  <div id="status"></div>
 </div>
 
 <div class="panel">
-  <h2>Speak</h2>
   <label for="text">Text</label>
   <textarea id="text" rows="3">Hello, this is a test of the pocket text to speech system, running entirely in the browser on WebGPU.</textarea>
   <div class="row">
@@ -124,11 +109,6 @@
   <h2>Last run</h2>
   <div class="cards" id="cards"><p class="empty">No runs yet.</p></div>
   <canvas id="wave"></canvas>
-  <p class="hint">
-    RTF is audio produced per unit of wall time; above 1.0 is faster than realtime. TTFA is the
-    delay before the first audio frame. Per-frame is the interval between frames, each of which is
-    one sampling step plus a Mimi decode plus two GPU readbacks.
-  </p>
 </div>
 
 <div class="panel">
@@ -164,7 +144,7 @@ async function fetchBuild() {
 fetchBuild().then(b => {
   loadedBuild = b;
   if (b) {
-    $('build-badge').textContent = `build ${b}`;
+    $('build-badge').textContent = b.split(' ')[0];
     $('build-badge').hidden = false;
   }
 });
@@ -180,7 +160,7 @@ async function buildChanged() {
 if (!navigator.gpu) {
   $('gpu-badge').textContent = 'WebGPU unavailable';
   $('gpu-badge').className = 'badge bad';
-  setStatus('This browser exposes no navigator.gpu, so nothing here can run. Chrome 113+, Edge, or Safari 18+ works.', true);
+  setStatus('No navigator.gpu — needs Chrome 113+, Edge, or Safari 18+.', true);
   $('load').disabled = true;
 } else {
   $('gpu-badge').textContent = 'WebGPU available';
@@ -365,7 +345,7 @@ function pct(a, p) {
 }
 function renderCards(s) {
   const cards = [
-    ['RTF', fmt(s.rtf, 2), '× realtime', rtfClass(s.rtf)],
+    ['RTF', fmt(s.rtf, 2), '×', rtfClass(s.rtf)],
     ['TTFA', fmt(s.ttfa_ms), 'ms'],
     ['Total', fmt(s.total_ms), 'ms'],
     ['Audio', fmt(s.audio_ms), 'ms'],
@@ -452,8 +432,7 @@ $('load').onclick = async () => {
       case 'threads':
         // Not a setting: this build has no `atomics`, so it is one thread, and the
         // WebGPU backend has no rayon call that would read a count anyway.
-        $('threads-note').textContent =
-          `${m.threads} thread · ${m.cpus} cpu · all compute on the GPU`;
+        $('threads-note').textContent = `${m.threads} thread · ${m.cpus} cpu`;
         $('threads-note').hidden = false;
         break;
       case 'device':
@@ -476,8 +455,8 @@ $('load').onclick = async () => {
         // page; each Load spawns a fresh worker, so the old model goes away.
         $('load').disabled = false;
         $('prog').style.width = '100%';
-        setStatus(`ready — ${info.device}, ${info.dtype} from ${info.container}, ` +
-          `${info.sample_rate} Hz, loaded in ${fmt(info.load_ms)} ms`);
+        setStatus(`${info.device} · ${info.dtype} · ${info.container} · ` +
+          `${info.sample_rate} Hz · loaded ${fmt(info.load_ms)} ms`);
         $('go').disabled = false;
         break;
       case 'gen_start':
@@ -488,7 +467,7 @@ $('load').onclick = async () => {
         // Streaming playback is the clock straight away; "after run" gets one at
         // gen_done; with playback off there is none and the fill is immediate.
         if (player) wave.source = player;
-        setStatus(`generating — ${m.tokens} tokens`);
+        setStatus(`generating · ${m.tokens} tokens`);
         break;
       case 'frame': {
         const f = new Float32Array(m.pcm);
@@ -511,7 +490,7 @@ $('load').onclick = async () => {
         // "after run", the clock it should follow.
         endWave(playMode === 'end' ? playAll(all) : null);
         if (playMode === 'off') drawWave(all);
-        setStatus(`done — ${fmt(s.rtf, 2)}× realtime on ${s.device} (${s.dtype})`);
+        setStatus(`done · ${fmt(s.rtf, 2)}× realtime · ${s.dtype}`);
         $('go').disabled = false;
         break;
       }

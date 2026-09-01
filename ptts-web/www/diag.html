@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebGPU adapter probe</title>
+<style>
+  body { font-family: system-ui, sans-serif; background:#0d1117; color:#e6edf3;
+         margin:0; padding:20px; line-height:1.45; font-size:15px; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  p.sub { color:#8b949e; font-size:13px; margin:0 0 16px; }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:#8b949e;
+       margin:18px 0 6px; }
+  .row { display:flex; gap:8px; padding:6px 0; border-bottom:1px solid #2a3140; }
+  .row b { flex:1 1 auto; font-weight:500; }
+  .ok { color:#3fb950; } .bad { color:#f85149; } .warn { color:#d29922; }
+  pre { background:#161b22; border:1px solid #2a3140; border-radius:6px; padding:10px;
+        overflow-x:auto; font-size:12px; white-space:pre-wrap; word-break:break-all; }
+</style>
+</head>
+<body>
+<h1>WebGPU adapter probe</h1>
+<p class="sub">Which adapter requests this device will actually satisfy, on the main thread and in a worker.</p>
+<div id="out"></div>
+<h2>Copy this</h2>
+<pre id="dump">running…</pre>
+
+<script>
+const out = document.getElementById('out');
+const results = {};
+
+function row(label, value, cls) {
+  const d = document.createElement('div');
+  d.className = 'row';
+  d.innerHTML = `<b>${label}</b><span class="${cls || ''}">${value}</span>`;
+  out.appendChild(d);
+}
+function head(t) {
+  const h = document.createElement('h2');
+  h.textContent = t;
+  out.appendChild(h);
+}
+
+// The four ways of asking, in the order a caller would fall back through.
+const REQUESTS = [
+  ['high-performance', { powerPreference: 'high-performance' }],
+  ['low-power', { powerPreference: 'low-power' }],
+  ['default (no options)', {}],
+  ['forceFallbackAdapter', { forceFallbackAdapter: true }],
+];
+
+async function probeHere(where) {
+  const res = { gpu: typeof navigator !== 'undefined' && !!navigator.gpu, adapters: {} };
+  if (!res.gpu) return res;
+  for (const [name, opts] of REQUESTS) {
+    try {
+      const a = await navigator.gpu.requestAdapter(opts);
+      if (!a) { res.adapters[name] = 'null'; continue; }
+      const info = a.info || {};
+      res.adapters[name] = {
+        vendor: info.vendor || '?', architecture: info.architecture || '?',
+        device: info.device || '?', description: info.description || '?',
+        f16: a.features.has('shader-f16'),
+        maxBufferSize: a.limits.maxBufferSize,
+        maxStorageBufferBindingSize: a.limits.maxStorageBufferBindingSize,
+        maxComputeWorkgroupStorageSize: a.limits.maxComputeWorkgroupStorageSize,
+      };
+    } catch (e) {
+      res.adapters[name] = 'threw: ' + (e && e.message || e);
+    }
+  }
+  return res;
+}
+
+function workerProbe() {
+  return new Promise(resolve => {
+    const src = `
+      const REQUESTS = ${JSON.stringify(REQUESTS)};
+      (async () => {
+        const res = { gpu: !!self.navigator.gpu, adapters: {} };
+        if (res.gpu) {
+          for (const [name, opts] of REQUESTS) {
+            try {
+              const a = await navigator.gpu.requestAdapter(opts);
+              if (!a) { res.adapters[name] = 'null'; continue; }
+              res.adapters[name] = { f16: a.features.has('shader-f16'),
+                maxBufferSize: a.limits.maxBufferSize };
+            } catch (e) { res.adapters[name] = 'threw: ' + (e && e.message || e); }
+          }
+        }
+        self.postMessage(res);
+      })();`;
+    const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+    const w = new Worker(url);
+    const timer = setTimeout(() => { w.terminate(); resolve({ error: 'worker timed out' }); }, 15000);
+    w.onmessage = e => { clearTimeout(timer); w.terminate(); resolve(e.data); };
+    w.onerror = e => { clearTimeout(timer); w.terminate(); resolve({ error: 'worker failed: ' + e.message }); };
+  });
+}
+
+(async () => {
+  results.userAgent = navigator.userAgent;
+  results.secureContext = window.isSecureContext;
+  results.origin = location.origin;
+
+  head('Context');
+  row('secure context', String(window.isSecureContext), window.isSecureContext ? 'ok' : 'bad');
+  row('navigator.gpu (main)', String(!!navigator.gpu), navigator.gpu ? 'ok' : 'bad');
+
+  head('Main thread');
+  const main = await probeHere('main');
+  results.main = main;
+  if (!main.gpu) row('navigator.gpu', 'missing', 'bad');
+  for (const [k, v] of Object.entries(main.adapters)) {
+    const ok = typeof v === 'object';
+    row(k, ok ? `adapter (f16 ${v.f16})` : v, ok ? 'ok' : 'bad');
+  }
+
+  head('Worker');
+  const wk = await workerProbe();
+  results.worker = wk;
+  if (wk.error) row('worker', wk.error, 'bad');
+  else {
+    row('navigator.gpu', String(!!wk.gpu), wk.gpu ? 'ok' : 'bad');
+    for (const [k, v] of Object.entries(wk.adapters || {})) {
+      const ok = typeof v === 'object';
+      row(k, ok ? `adapter (f16 ${v.f16})` : v, ok ? 'ok' : 'bad');
+    }
+  }
+
+  // Every request returning null, on both threads, means the browser exposes the
+  // API but has no usable adapter -- on Android that is almost always the GPU or
+  // driver being blocklisted, not a bug in the page.
+  const anyAdapter = [main, wk].some(r =>
+    r && r.adapters && Object.values(r.adapters).some(v => typeof v === 'object'));
+  if (!anyAdapter && navigator.gpu) {
+    const android = /Android/i.test(navigator.userAgent);
+    const chrome = /Chrome\//.test(navigator.userAgent);
+    head('No adapter — what to check');
+    const steps = android && chrome ? [
+      ['chrome://gpu', 'find the "WebGPU" line; it states the reason outright'],
+      ['chrome://flags/#enable-unsafe-webgpu', 'set Enabled — this overrides the blocklist'],
+      ['chrome://flags/#enable-vulkan', 'set Enabled — WebGPU on Android runs on Vulkan'],
+      ['battery saver', 'turn it off; it can disable GPU features'],
+    ] : [
+      ['browser version', 'needs iOS/Safari 18+, or Chrome 121+'],
+      ['low power mode', 'turn it off'],
+    ];
+    for (const [what, why] of steps) row(what, why, 'warn');
+    const note = document.createElement('p');
+    note.className = 'sub';
+    note.style.marginTop = '10px';
+    note.textContent = 'Relaunch the browser fully after changing a flag, then reload this page.';
+    out.appendChild(note);
+  }
+
+  document.getElementById('dump').textContent = JSON.stringify(results, null, 2);
+})();
+</script>
+</body>
+</html>
