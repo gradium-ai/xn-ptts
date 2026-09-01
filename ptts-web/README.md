@@ -43,6 +43,24 @@ Pick **q8_0** on a phone: 136 MB rather than 317 MB to pull over wifi, and
 correspondingly less GPU memory for the weights. Needs iOS 18+ / Safari 18+, or
 Chrome 121+ on Android; older versions have no WebGPU.
 
+### If it hangs instead of erroring
+
+macOS stealth mode (on by default with the firewall) silently drops packets to
+ports with nothing listening, rather than refusing them. So a server that is not
+running looks identical to a slow one: the other device just spins. Check in this
+order:
+
+1. `lsof -nP -iTCP -sTCP:LISTEN | grep 8789` -- is it actually up? Backgrounded
+   shells kill it more often than you would expect; `make phone` in its own
+   terminal is the reliable way.
+2. Are you on the LAN address? The console also prints a `100.x` tailnet address,
+   and a device without Tailscale has no route to it, so it hangs forever with no
+   error. Use the `192.168.x` one.
+3. `/usr/libexec/ApplicationFirewall/socketfilterfw --listapps | grep -A1 node`
+   -- node needs "Allow incoming connections".
+4. Some routers isolate wireless clients from each other ("AP isolation" /
+   "client isolation"), which blocks this entirely.
+
 `certs/` is gitignored -- it holds a private key, and the cert only covers the
 addresses this machine had when it was generated. Re-run `make cert` after
 changing networks.

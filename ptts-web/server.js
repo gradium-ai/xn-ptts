@@ -49,7 +49,7 @@ function handler(req, res) {
     req.on('data', c => { body += c; });
     req.on('end', () => {
       res.writeHead(204); res.end();
-      console.log('[progress] ' + body);
+      console.log(`${new Date().toISOString().slice(11, 23)} [progress] ${body}`);
     });
     return;
   }
@@ -69,7 +69,8 @@ function handler(req, res) {
   const file = resolve(req.url);
   fs.stat(file, (err, st) => {
     if (process.env.PTTS_LOG_REQUESTS) {
-      console.log(`[req] ${req.url} -> ${file}${err || !st.isFile() ? ' (404)' : ''}`);
+      const t = new Date().toISOString().slice(11, 23);
+      console.log(`${t} [req] ${req.url}${err || !st.isFile() ? ' (404)' : ''}`);
     }
     if (err || !st.isFile()) {
       res.writeHead(404, { 'content-type': 'text/plain' });
@@ -84,11 +85,20 @@ function handler(req, res) {
   });
 }
 
-function lanAddresses() {
-  return Object.values(os.networkInterfaces())
+// Split by address range, because they are not interchangeable and printing them
+// as a plain list is actively misleading: 100.64/10 is Tailscale's CGNAT range,
+// and a device without Tailscale has no route to it. It does not get refused, it
+// hangs, which looks exactly like the server being down.
+function addresses() {
+  const all = Object.values(os.networkInterfaces())
     .flat()
     .filter(i => i && i.family === 'IPv4' && !i.internal)
     .map(i => i.address);
+  const isTailnet = a => {
+    const [x, y] = a.split('.').map(Number);
+    return x === 100 && y >= 64 && y <= 127;
+  };
+  return { lan: all.filter(a => !isTailnet(a)), tailnet: all.filter(isTailnet) };
 }
 
 // http on localhost, which is a secure context by definition and is what the
@@ -107,8 +117,19 @@ const CRT = path.join(__dirname, 'certs', 'dev.crt');
 if (fs.existsSync(KEY) && fs.existsSync(CRT)) {
   const opts = { key: fs.readFileSync(KEY), cert: fs.readFileSync(CRT) };
   https.createServer(opts, handler).listen(TLS_PORT, '0.0.0.0', () => {
-    console.log(`\nOn your phone (same wifi), accept the certificate warning once:`);
-    for (const a of lanAddresses()) console.log(`  https://${a}:${TLS_PORT}`);
+    const { lan, tailnet } = addresses();
+    console.log(`\nOn another device on the same wifi (accept the cert warning once):`);
+    for (const a of lan) console.log(`  https://${a}:${TLS_PORT}`);
+    if (!lan.length) console.log('  (no LAN address found -- is wifi up?)');
+    for (const a of tailnet) {
+      console.log(`\nTailnet only, needs Tailscale on the other device too:`);
+      console.log(`  https://${a}:${TLS_PORT}`);
+    }
+    console.log(
+      `\nIf a browser hangs instead of erroring: macOS stealth mode drops packets\n` +
+      `to ports with nothing listening, so a dead server looks like a slow one.\n` +
+      `Check this process is still up, and that wifi client isolation is off.`,
+    );
   });
 } else {
   console.log(`\nNo cert: run scripts/make-cert.sh to enable https for phones.`);
