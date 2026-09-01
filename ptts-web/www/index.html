@@ -203,7 +203,7 @@ function wavBlob(f32, rate) {
 // nothing is redrawn on the generation's hot path. `wave.budget` is the frame
 // budget, which fixes the x-axis up front; eos usually ends a run short of it,
 // so `finishWave` rescales to the real length once the length is known.
-const wave = { g: null, w: 0, h: 0, mid: 0, budget: 0, live: false };
+const wave = { g: null, w: 0, h: 0, mid: 0, budget: 0, live: false, pending: [], raf: 0 };
 
 function waveCtx() {
   const c = $('wave'), dpr = devicePixelRatio || 1;
@@ -234,17 +234,48 @@ function drawSpan(g, f32, from, to, x0, x1, mid) {
 function beginWave(budget) {
   const { g, w, h, mid } = waveCtx();
   Object.assign(wave, { g, w, h, mid, budget: Math.max(1, budget), live: true });
+  wave.pending = [];
+  wave.raf = 0;
 }
 
-/// One frame, placed at the share of the budget it occupies.
-function pushWave(f32, index) {
-  if (!wave.live || !f32.length) return;
+/// Draw one frame at the share of the budget it occupies.
+function paintFrame(f32, index) {
   const x0 = Math.floor(index / wave.budget * wave.w);
   const x1 = Math.max(x0 + 1, Math.floor((index + 1) / wave.budget * wave.w));
   drawSpan(wave.g, f32, 0, f32.length, x0, Math.min(x1, wave.w), wave.mid);
 }
 
+/// Queue a frame and flush on the next animation frame.
+///
+/// Frames land far faster than the display refreshes -- ~13 ms apart against
+/// 16.7 ms -- and drawing straight from the message handler only updates the
+/// canvas bitmap. Whether that ever reaches the screen before the run ends is up
+/// to the compositor, and in practice it did not. Painting from rAF ties the
+/// canvas to the display instead, so the waveform visibly grows.
+function pushWave(f32, index) {
+  if (!wave.live || !f32.length) return;
+  wave.pending.push([f32, index]);
+  if (wave.raf) return;
+  wave.raf = requestAnimationFrame(() => {
+    wave.raf = 0;
+    if (!wave.live) return;
+    for (const [f, i] of wave.pending) paintFrame(f, i);
+    wave.pending.length = 0;
+  });
+}
+
+/// Draw anything still queued, so the last frames are not dropped by a run that
+/// finishes before its final animation frame runs.
+function flushWave() {
+  if (wave.raf) { cancelAnimationFrame(wave.raf); wave.raf = 0; }
+  if (wave.live && wave.pending && wave.pending.length) {
+    for (const [f, i] of wave.pending) paintFrame(f, i);
+    wave.pending.length = 0;
+  }
+}
+
 function drawWave(f32) {
+  flushWave();
   wave.live = false;
   const { g, mid, w } = waveCtx();
   if (!f32 || !f32.length) return;

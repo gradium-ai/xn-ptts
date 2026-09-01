@@ -100,6 +100,15 @@ drawn into its own slice as it arrives, so nothing is redrawn on the generation'
 hot path. eos usually ends a run short of the budget, so the waveform is redrawn
 once at the end against the length actually produced.
 
+Frames are queued and flushed from `requestAnimationFrame` rather than painted
+straight out of the worker's message handler. They arrive ~13 ms apart against a
+16.7 ms refresh, and drawing from the handler only guarantees the canvas *bitmap*
+is updated -- whether that reaches the screen before the run ends is up to the
+compositor, and in practice it did not. Note that reading the canvas back
+(`getImageData`) cannot tell the two apart: it sees the bitmap either way. The
+check that can is `scripts/shots.mjs`, which drives the page over CDP and
+compares composited screenshots.
+
 ## Measured
 
 Apple M5, Chrome headless, 94 frames (7.5 s of audio), 3 runs, phonon model:
@@ -120,3 +129,23 @@ These are **not** comparable to `ptts-ws-server`'s numbers on the same machine
 it in JSON and pushes it through a websocket inside the measured loop; this page
 hands a `Float32Array` straight to WebAudio. The two measure different pipelines,
 not two WebGPU implementations.
+
+To run it:
+
+```bash
+node server.js &
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --headless=new --enable-unsafe-webgpu --no-first-run --no-sandbox \
+  --remote-debugging-port=9222 --window-size=1200,900 \
+  --user-data-dir=/tmp/ptts-shots-cd about:blank &
+WS=$(curl -s http://127.0.0.1:9222/json | python3 -c \
+  "import json,sys; print([t for t in json.load(sys.stdin) if t['type']=='page'][0]['webSocketDebuggerUrl'])")
+node scripts/shots.mjs "$WS" "http://127.0.0.1:8788/?auto=1&dtype=f16&iters=3"
+```
+
+## Caching
+
+`server.js` sends `no-cache` for everything in `pkg/` and a day of caching only
+for `/model` and `/voices`. Caching the app shell means a rebuild is invisible to
+a browser that already has the page, which looks exactly like a change that did
+not work.

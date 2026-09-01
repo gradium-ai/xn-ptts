@@ -18,6 +18,14 @@ const MIME = {
   '.gguf': 'application/octet-stream', '.map': 'application/json',
 };
 
+// Only the weights are worth caching. Caching the app shell means every rebuild
+// is invisible to a browser that already has the page, which looks exactly like a
+// change that did not work.
+function cacheControl(file) {
+  const inWeights = file.startsWith(MODEL) || file.startsWith(VOICES);
+  return inWeights ? 'public, max-age=86400' : 'no-cache';
+}
+
 function resolve(urlPath) {
   // Strip the query before routing: a '/?mode=x' that still carries its query
   // compares unequal to '/' and silently falls through to a directory read.
@@ -64,8 +72,7 @@ http.createServer((req, res) => {
     res.writeHead(200, {
       'content-type': MIME[path.extname(file)] || 'application/octet-stream',
       'content-length': st.size,
-      // The weights are immutable and large; let the browser keep them.
-      'cache-control': 'public, max-age=86400',
+      'cache-control': cacheControl(file),
     });
     fs.createReadStream(file).pipe(res);
   });
