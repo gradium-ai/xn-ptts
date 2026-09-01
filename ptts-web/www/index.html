@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pocket TTS on WebGPU</title>
+<style>
+  :root {
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#2a3140;
+    --fg:#e6edf3; --dim:#8b949e; --accent:#4493f8; --good:#3fb950; --warn:#d29922; --bad:#f85149;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family:system-ui,-apple-system,sans-serif; background:var(--bg); color:var(--fg);
+         max-width:1000px; margin:0 auto; padding:32px 20px 64px; line-height:1.5; }
+  h1 { font-size:22px; font-weight:650; }
+  h2 { font-size:13px; font-weight:650; text-transform:uppercase; letter-spacing:.06em;
+       color:var(--dim); margin-bottom:10px; }
+  code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  header { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
+  .badge { font-size:12px; padding:3px 9px; border-radius:999px; background:var(--panel2);
+           border:1px solid var(--line); }
+  .badge.ok { border-color:#1f6f3c; color:var(--good); }
+  .badge.bad { border-color:#6e2620; color:var(--bad); }
+  .sub { color:var(--dim); font-size:13px; margin:6px 0 24px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+           padding:18px; margin-bottom:18px; }
+  label { display:block; font-size:12px; font-weight:600; color:var(--dim); margin-bottom:5px; }
+  textarea, select, input { font-family:inherit; font-size:14px; color:var(--fg);
+    background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:8px 10px; width:100%; }
+  textarea { resize:vertical; }
+  .row { display:flex; gap:14px; flex-wrap:wrap; align-items:flex-end; margin-top:14px; }
+  .row > div { flex:0 0 auto; }
+  .grow { flex:1 1 150px; }
+  button { font-family:inherit; font-size:14px; font-weight:600; padding:9px 20px; border:none;
+           border-radius:6px; background:var(--accent); color:#06101d; cursor:pointer; }
+  button.ghost { background:var(--panel2); color:var(--fg); border:1px solid var(--line); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  #status { margin-top:14px; font-size:13px; color:var(--dim); white-space:pre-wrap; }
+  #status.err { color:var(--bad); }
+  .bar { height:6px; background:var(--panel2); border-radius:3px; overflow:hidden; margin-top:8px; }
+  .bar > div { height:100%; background:var(--accent); width:0; transition:width .1s; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:12px; }
+  .card { background:var(--panel2); border:1px solid var(--line); border-radius:8px; padding:12px 14px; }
+  .card .k { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--dim); }
+  .card .v { font-size:22px; font-weight:650; margin-top:3px;
+             font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .card .u { font-size:12px; color:var(--dim); font-weight:400; }
+  .rtf-good{color:var(--good)} .rtf-warn{color:var(--warn)} .rtf-bad{color:var(--bad)}
+  canvas { width:100%; height:90px; display:block; background:var(--bg);
+           border:1px solid var(--line); border-radius:8px; margin-top:14px; }
+  .hint { font-size:12px; color:var(--dim); margin-top:10px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:right; padding:7px 9px; border-bottom:1px solid var(--line); }
+  th:first-child,td:first-child { text-align:left; }
+  th { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--dim); font-weight:600; }
+  td { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  td.txt { font-family:inherit; }
+  .empty { color:var(--dim); font-size:13px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Pocket TTS on WebGPU</h1>
+  <span class="badge" id="gpu-badge">checking WebGPU…</span>
+  <span class="badge" id="dev-badge" hidden></span>
+</header>
+<p class="sub">
+  The whole model runs in this tab: the flow-matching LM and the Mimi decoder are WGSL compute
+  shaders driven by <code>xn</code>'s WebGPU backend through wasm. No server does any inference —
+  the page only downloads weights.
+</p>
+
+<div class="panel">
+  <h2>Load</h2>
+  <div class="row" style="margin-top:0">
+    <div class="grow">
+      <label for="base">Weights base URL</label>
+      <select id="base">
+        <option value="/model" selected>/model (served locally)</option>
+        <option value="https://huggingface.co/kyutai/pocket-tts-without-voice-cloning/resolve/main">HuggingFace · kyutai/pocket-tts-without-voice-cloning</option>
+      </select>
+    </div>
+    <div>
+      <label for="dtype">Compute dtype</label>
+      <select id="dtype" style="width:150px">
+        <option value="f32" selected>f32</option>
+        <option value="f16">f16</option>
+        <option value="q8">q8_0 / f32 — native only</option>
+        <option value="q8f16">q8_0 / f16 — native only</option>
+      </select>
+    </div>
+    <div><button id="load">Load model</button></div>
+  </div>
+  <div class="bar"><div id="prog"></div></div>
+  <p class="hint">
+    f16 needs the adapter to report WGSL <code>shader-f16</code>. The q8_0 dtypes do not work in a
+    browser yet: xn quantizes weights by reading them back to the host
+    (<code>Q8Tensor::quantize</code>), and a browser cannot block on a readback. They are listed
+    because the same build runs them natively.
+  </p>
+  <div id="status">Pick a source and load. Weights are a few hundred MB and the browser caches them.</div>
+</div>
+
+<div class="panel">
+  <h2>Speak</h2>
+  <label for="text">Text</label>
+  <textarea id="text" rows="3">Hello, this is a test of the pocket text to speech system, running entirely in the browser on WebGPU.</textarea>
+  <div class="row">
+    <div class="grow"><label for="voice">Voice</label><select id="voice" disabled></select></div>
+    <div><label for="seed">Seed</label><input id="seed" type="number" value="42" style="width:100px"></div>
+    <div><label for="play">Playback</label><select id="play" style="width:130px">
+      <option value="stream" selected>Stream live</option>
+      <option value="end">After run</option>
+      <option value="off">Off</option>
+    </select></div>
+    <div><button id="go" disabled>Generate</button></div>
+    <div><button id="save" class="ghost" disabled>Download WAV</button></div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Last run</h2>
+  <div class="cards" id="cards"><p class="empty">No runs yet.</p></div>
+  <canvas id="wave"></canvas>
+  <p class="hint">
+    RTF is audio produced per unit of wall time; above 1.0 is faster than realtime. TTFA is the
+    delay before the first audio frame. Per-frame is the interval between frames, each of which is
+    one sampling step plus a Mimi decode plus two GPU readbacks.
+  </p>
+</div>
+
+<div class="panel">
+  <h2>Run history</h2>
+  <div id="history"><p class="empty">No runs yet.</p></div>
+</div>
+
+<script type="module">
+const $ = id => document.getElementById(id);
+let worker = null, info = null, runs = [], chunks = [], lastPcm = null, player = null, playMode = 'stream';
+// Set by the auto block below; the worker error handler calls it if present.
+let reportFailure = null;
+
+const fmt = (v, d = 1) => (v == null || !isFinite(v)) ? 'n/a' : v.toFixed(d);
+const rtfClass = r => r >= 1 ? 'rtf-good' : r >= 0.7 ? 'rtf-warn' : 'rtf-bad';
+const setStatus = (m, err = false) => { $('status').textContent = m; $('status').className = err ? 'err' : ''; };
+
+// ---- WebGPU presence, before anything expensive -------------------------
+if (!navigator.gpu) {
+  $('gpu-badge').textContent = 'WebGPU unavailable';
+  $('gpu-badge').className = 'badge bad';
+  setStatus('This browser exposes no navigator.gpu, so nothing here can run. Chrome 113+, Edge, or Safari 18+ works.', true);
+  $('load').disabled = true;
+} else {
+  $('gpu-badge').textContent = 'WebGPU available';
+  $('gpu-badge').className = 'badge ok';
+}
+
+// ---- audio -------------------------------------------------------------
+let ctx = null;
+function audioCtx() {
+  if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: info.sample_rate });
+  if (ctx.state === 'suspended') ctx.resume();
+  return ctx;
+}
+class Player {
+  constructor() { this.ac = audioCtx(); this.head = 0; }
+  push(f32) {
+    const b = this.ac.createBuffer(1, f32.length, info.sample_rate);
+    b.copyToChannel(f32, 0);
+    const s = this.ac.createBufferSource();
+    s.buffer = b; s.connect(this.ac.destination);
+    const floor = this.ac.currentTime + 0.2;
+    if (this.head < floor) this.head = floor;
+    s.start(this.head);
+    this.head += b.duration;
+  }
+}
+function playAll(f32) {
+  const ac = audioCtx();
+  const b = ac.createBuffer(1, f32.length, info.sample_rate);
+  b.copyToChannel(f32, 0);
+  const s = ac.createBufferSource();
+  s.buffer = b; s.connect(ac.destination); s.start();
+}
+function wavBlob(f32, rate) {
+  const buf = new ArrayBuffer(44 + f32.length * 2), dv = new DataView(buf);
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, 'RIFF'); dv.setUint32(4, 36 + f32.length * 2, true); str(8, 'WAVEfmt ');
+  dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+  dv.setUint32(24, rate, true); dv.setUint32(28, rate * 2, true);
+  dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+  str(36, 'data'); dv.setUint32(40, f32.length * 2, true);
+  for (let i = 0; i < f32.length; i++) {
+    const s = Math.max(-1, Math.min(1, f32[i]));
+    dv.setInt16(44 + i * 2, s * 32767, true);
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+// ---- waveform ----------------------------------------------------------
+function drawWave(f32) {
+  const c = $('wave'), dpr = devicePixelRatio || 1;
+  c.width = c.clientWidth * dpr; c.height = c.clientHeight * dpr;
+  const g = c.getContext('2d'); g.scale(dpr, dpr);
+  const w = c.clientWidth, h = c.clientHeight, mid = h / 2;
+  g.clearRect(0, 0, w, h);
+  g.strokeStyle = '#2a3140'; g.beginPath(); g.moveTo(0, mid); g.lineTo(w, mid); g.stroke();
+  if (!f32 || !f32.length) return;
+  const per = Math.max(1, Math.floor(f32.length / w));
+  g.fillStyle = '#4493f8';
+  for (let x = 0; x < w; x++) {
+    let lo = 0, hi = 0;
+    for (let i = x * per, e = Math.min(f32.length, i + per); i < e; i++) {
+      if (f32[i] < lo) lo = f32[i];
+      if (f32[i] > hi) hi = f32[i];
+    }
+    g.fillRect(x, mid + lo * mid, 1, Math.max(1, (hi - lo) * mid));
+  }
+}
+
+// ---- rendering ---------------------------------------------------------
+function pct(a, p) {
+  if (!a || !a.length) return null;
+  const v = [...a].sort((x, y) => x - y);
+  return v[Math.min(v.length - 1, Math.max(0, Math.ceil(p / 100 * v.length) - 1))];
+}
+function renderCards(s) {
+  const cards = [
+    ['RTF', fmt(s.rtf, 2), '× realtime', rtfClass(s.rtf)],
+    ['TTFA', fmt(s.ttfa_ms), 'ms'],
+    ['Total', fmt(s.total_ms), 'ms'],
+    ['Audio', fmt(s.audio_ms), 'ms'],
+    ['Conditioning', fmt(s.prompt_ms), 'ms'],
+    ['Per-frame p50', fmt(pct(s.frame_ms, 50), 2), 'ms'],
+    ['Per-frame p95', fmt(pct(s.frame_ms, 95), 2), 'ms'],
+    ['Frames', s.frames, ''],
+  ];
+  $('cards').innerHTML = cards.map(([k, v, u, cls]) =>
+    `<div class="card"><div class="k">${k}</div><div class="v ${cls || ''}">${v}` +
+    (u ? ` <span class="u">${u}</span>` : '') + '</div></div>').join('');
+}
+function renderHistory() {
+  if (!runs.length) { $('history').innerHTML = '<p class="empty">No runs yet.</p>'; return; }
+  const rows = runs.map((s, i) => `<tr>
+    <td class="txt">${runs.length - i}</td><td class="txt">${s.dtype}</td>
+    <td class="${rtfClass(s.rtf)}">${fmt(s.rtf, 2)}</td>
+    <td>${fmt(s.ttfa_ms)}</td><td>${fmt(s.total_ms)}</td><td>${fmt(s.audio_ms)}</td>
+    <td>${fmt(pct(s.frame_ms, 50), 2)}</td><td>${fmt(pct(s.frame_ms, 95), 2)}</td>
+    <td>${s.frames}</td></tr>`).join('');
+  $('history').innerHTML = `<table><thead><tr><th>#</th><th>dtype</th><th>rtf</th>
+    <th>ttfa ms</th><th>total ms</th><th>audio ms</th><th>frame p50</th><th>frame p95</th>
+    <th>frames</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+// ---- worker wiring -----------------------------------------------------
+const VOICES = ['alba', 'marius', 'javert', 'fantine', 'cosette', 'eponine', 'azelma'];
+
+function voiceList(base) {
+  // The local dir keeps voices next to the model; the HF repo keeps them under
+  // embeddings_v2/, which is also where its own demo reads them from.
+  if (base === '/model') {
+    return ['Archie','Damon','Elodie-Rose','Freddie','Freya','Garrett','Marlowe','Zoey']
+      .map(n => ({ name: n, url: `/voices/${n}.safetensors` }));
+  }
+  return VOICES.map(n => ({ name: n, url: `${base}/embeddings_v2/${n}.safetensors` }));
+}
+
+$('load').onclick = () => {
+  const base = $('base').value, dtype = $('dtype').value;
+  $('load').disabled = true;
+  runs = []; renderHistory();
+  worker = new Worker('./worker.js', { type: 'module' });
+  worker.onerror = e => { setStatus('worker failed: ' + e.message, true); $('load').disabled = false; };
+  worker.onmessage = ev => {
+    const m = ev.data;
+    switch (m.type) {
+      case 'status': setStatus(m.message); break;
+      case 'warn': console.warn(m.message); break;
+      case 'progress': {
+        const p = m.total ? (m.received / m.total * 100) : 0;
+        $('prog').style.width = p + '%';
+        setStatus(`${m.label}: ${(m.received / 1e6).toFixed(1)} MB` +
+          (m.total ? ` / ${(m.total / 1e6).toFixed(1)} MB` : ''));
+        break;
+      }
+      case 'device':
+        $('dev-badge').textContent = m.device + (m.f16 ? ' · shader-f16' : ' · no shader-f16');
+        $('dev-badge').hidden = false;
+        break;
+      case 'voice': {
+        const o = document.createElement('option');
+        o.value = m.name; o.textContent = m.name;
+        $('voice').appendChild(o);
+        $('voice').disabled = false;
+        break;
+      }
+      case 'ready':
+        info = m.info;
+        $('prog').style.width = '100%';
+        setStatus(`ready — ${info.device}, ${info.dtype}, ${info.sample_rate} Hz, loaded in ${fmt(info.load_ms)} ms`);
+        $('go').disabled = false;
+        break;
+      case 'gen_start':
+        chunks = [];
+        playMode = $('play').value;
+        player = playMode === 'stream' ? new Player() : null;
+        setStatus(`generating — ${m.tokens} tokens`);
+        break;
+      case 'frame': {
+        const f = new Float32Array(m.pcm);
+        chunks.push(f);
+        if (player) player.push(f);
+        break;
+      }
+      case 'gen_done': {
+        const s = m.stats;
+        runs.unshift(s);
+        const total = chunks.reduce((n, c) => n + c.length, 0);
+        const all = new Float32Array(total);
+        let o = 0; for (const c of chunks) { all.set(c, o); o += c.length; }
+        lastPcm = all;
+        $('save').disabled = !all.length;
+        renderCards(s); drawWave(all); renderHistory();
+        if (playMode === 'end') playAll(all);
+        setStatus(`done — ${fmt(s.rtf, 2)}× realtime on ${s.device} (${s.dtype})`);
+        $('go').disabled = false;
+        break;
+      }
+      case 'error':
+        setStatus(m.message, true);
+        $('go').disabled = false;
+        $('load').disabled = false;
+        // In auto mode nothing else will ever fire, so report now rather than
+        // sitting until the guard timeout.
+        if (typeof reportFailure === 'function') reportFailure(m.message);
+        break;
+    }
+  };
+  worker.postMessage({
+    type: 'setup', base, dtype, temperature: 0.4,
+    configUrl: base === '/model' ? '/model/config.json' : null,
+    voices: voiceList(base),
+  });
+};
+
+$('go').onclick = () => {
+  const text = $('text').value.trim();
+  if (!text) return setStatus('nothing to say', true);
+  $('go').disabled = true;
+  worker.postMessage({
+    type: 'generate', text, voice: $('voice').value,
+    seed: parseInt($('seed').value, 10) || 42,
+  });
+};
+
+$('save').onclick = () => {
+  if (!lastPcm) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(wavBlob(lastPcm, info.sample_rate));
+  a.download = 'ptts-webgpu.wav';
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+
+addEventListener('resize', () => drawWave(lastPcm));
+
+// ---- headless mode -----------------------------------------------------
+// `?auto=1&dtype=f16&iters=3` loads, generates, and POSTs the result to
+// /report, so the same page doubles as a check runnable from a shell.
+const q = new URLSearchParams(location.search);
+if (q.get('auto')) {
+  const report = obj => fetch('/report', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(obj, null, 2),
+  });
+  const iters = parseInt(q.get('iters') || '1', 10);
+  const checkpoints = [];
+  let done = 0;
+  let guard = 0;
+
+  if (q.get('dtype')) $('dtype').value = q.get('dtype');
+  if (q.get('base')) $('base').value = q.get('base');
+  if (q.get('text')) $('text').value = q.get('text');
+  $('play').value = 'off';
+
+  // A failure anywhere must still produce a report, or a headless run just hangs.
+  const fail = msg => report({ error: msg, checkpoints });
+  reportFailure = msg => { clearTimeout(guard); fail(msg); };
+  addEventListener('error', e => fail('page error: ' + e.message));
+  addEventListener('unhandledrejection', e => fail('unhandled rejection: ' + e.reason));
+  guard = setTimeout(() => fail('timed out after 900s; checkpoints: ' + checkpoints.join(' > ')), 900000);
+
+  if (!navigator.gpu) {
+    clearTimeout(guard);
+    fail('navigator.gpu is undefined in this browser');
+  } else {
+    const origStatus = setStatus;
+    // Record progress so a hang says where it stopped.
+    const mark = m => {
+      if (m.startsWith('weights:') || m.startsWith('tokenizer:') || m.startsWith('voice ')) return;
+      checkpoints.push(m);
+      // Beaconed as it happens, so a stall is visible live rather than only in
+      // the final report -- which a stall means never arrives.
+      fetch('/progress', { method: 'POST', body: `${Math.round(performance.now())}ms ${m}` })
+        .catch(() => {});
+    };
+    const obs = new MutationObserver(() => mark($('status').textContent));
+    obs.observe($('status'), { childList: true, characterData: true, subtree: true });
+
+    // Looped rather than spread: these arrays are 100k+ samples and
+    // `Math.max(...arr)` overflows the call stack well before that.
+    const audioOf = () => {
+      const a = lastPcm;
+      if (!a || !a.length) return { samples: 0, rms: 0, peak: 0, nonfinite: 0 };
+      let sum = 0, peak = 0, nonfinite = 0;
+      for (let i = 0; i < a.length; i++) {
+        const v = a[i];
+        if (!isFinite(v)) { nonfinite++; continue; }
+        sum += v * v;
+        const m = Math.abs(v);
+        if (m > peak) peak = m;
+      }
+      return { samples: a.length, rms: Math.sqrt(sum / a.length), peak, nonfinite };
+    };
+
+    const origGo = $('go').onclick;
+    const step = () => {
+      done++;
+      if (done <= iters) { origGo(); }
+      else {
+        clearTimeout(guard);
+        report({ ok: true, device: $('dev-badge').textContent, info, runs, audio: audioOf(), checkpoints });
+      }
+    };
+    // Chain: ready -> generate xN -> report.
+    const hookReady = setInterval(() => {
+      if (!$('go').disabled && info && done === 0) { clearInterval(hookReady); step(); }
+    }, 200);
+    const hookDone = setInterval(() => {
+      if (info && done > 0 && done <= iters && !$('go').disabled && runs.length === done) { step(); }
+    }, 200);
+  }
+  $('load').onclick();
+}
+</script>
+</body>
+</html>

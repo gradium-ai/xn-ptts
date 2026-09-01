@@ -482,7 +482,6 @@ pub fn generate_chunks<Q: BackendQ>(
     frames_after_eos: usize,
     audio_tx: tokio::sync::mpsc::UnboundedSender<Vec<f32>>,
 ) -> Result<(), xn::Error> {
-    let device = model.device();
     let num_tokens = tokens.len();
     let max_frames = ((num_tokens as f64 / 3.0 + 2.0) * 12.5).ceil() as usize;
     let mut rng = StdRng::new(temperature, seed);
@@ -490,10 +489,10 @@ pub fn generate_chunks<Q: BackendQ>(
 
     model.prompt_text(&mut state, &tokens)?;
 
-    let ldim = model.flow_lm.ldim;
-    let nan_data = vec![f32::NAN; ldim];
-    let mut prev_latent: Tensor<Q::T, Q::B> =
-        Tensor::from_vec(nan_data, (1, 1, ldim), device)?.to::<Q::T>()?;
+    // `None` is the first step. The older API signals that with a NaN-filled
+    // latent, which the model can only notice by reading the whole sequence back
+    // off the device -- a full round trip per frame on a gpu backend.
+    let mut prev_latent: Option<Tensor<Q::T, Q::B>> = None;
 
     let (latent_tx, latent_rx) = std::sync::mpsc::channel::<Tensor<Q::T, Q::B>>();
 
@@ -513,7 +512,13 @@ pub fn generate_chunks<Q: BackendQ>(
 
     let mut eos_countdown: Option<usize> = None;
     for _ in 0..max_frames {
-        let (next_latent, is_eos) = model.generate_step(&mut state, &prev_latent, &mut rng)?;
+        let input = match &prev_latent {
+            None => ptts::flow_lm::StepInput::Bos { batch: 1 },
+            Some(t) => ptts::flow_lm::StepInput::Latent(t),
+        };
+        let (next_latent, eos_logit) = model.generate_step_parts(&mut state, input, &mut rng)?;
+        // One tiny readback per frame instead of that plus a whole-sequence one.
+        let is_eos = model.eos_from_logit(&eos_logit.to_vec()?);
         if latent_tx.send(next_latent.clone()).is_err() {
             break;
         }
@@ -526,7 +531,7 @@ pub fn generate_chunks<Q: BackendQ>(
             }
             *countdown -= 1;
         }
-        prev_latent = next_latent;
+        prev_latent = Some(next_latent);
     }
     drop(latent_tx);
     decode_handle.join().map_err(|_| xn::Error::msg("decode thread panicked"))??;

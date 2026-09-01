@@ -1,0 +1,4 @@
+# `getrandom` needs its wasm backend named explicitly; simd128 is what makes the
+# residual CPU work (sampling, safetensors parsing) tolerable.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128,+relaxed-simd", "--cfg", "getrandom_backend=\"wasm_js\""]

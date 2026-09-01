@@ -58,16 +58,30 @@ pub struct FlowLM<Q: BackendQ> {
     pub transformer: StreamingTransformer<Q>,
     pub emb_std: Tensor<Q::T, Q::B>,
     pub emb_mean: Tensor<Q::T, Q::B>,
-    /// Host copy of `bos_emb`. `replace_nan_with_bos` runs on the host and needs
-    /// it every step; the tensor itself is never used on-device, and reading it
-    /// back each step costs a full device round trip on a gpu backend.
-    bos_emb: Vec<Q::T>,
+    /// `bos_emb` on the device. Kept as a tensor rather than a host `Vec` so that
+    /// loading the model needs no readback: a browser cannot block on one.
+    bos_emb: Tensor<Q::T, Q::B>,
+    /// Host copy of `bos_emb`, filled on first use by [`Self::replace_nan_with_bos`].
+    /// That path is host-side and needs the values every step, so they are cached;
+    /// the readback-free path never touches this and so never triggers the read.
+    bos_emb_host: std::sync::OnceLock<Vec<Q::T>>,
     pub input_linear: Linear<Q::T, Q::B>,
     out_norm_weight: Tensor<Q::T, Q::B>,
     out_norm_bias: Tensor<Q::T, Q::B>,
     out_eos: Linear<Q::T, Q::B>,
     pub dim: usize,
     pub ldim: usize,
+}
+
+/// What a sampling step is conditioned on: the beginning-of-sequence embedding,
+/// or the previous step's latent.
+///
+/// The older API marks "first step" by filling the latent with NaN, which the
+/// model then has to read back off the device to notice. Stating it in the type
+/// keeps the whole step on the device.
+pub enum StepInput<'a, Q: BackendQ> {
+    Bos { batch: usize },
+    Latent(&'a Tensor<Q::T, Q::B>),
 }
 
 #[derive(Clone, Debug)]
@@ -123,7 +137,7 @@ impl<Q: BackendQ> FlowLM<Q> {
 
         let emb_std = vb.tensor("emb_std", (cfg.ldim,))?;
         let emb_mean = vb.tensor("emb_mean", (cfg.ldim,))?;
-        let bos_emb = vb.tensor("bos_emb", (cfg.ldim,))?.to_vec()?;
+        let bos_emb = vb.tensor("bos_emb", (cfg.ldim,))?;
         let input_linear = Linear::load(vb.pp("input_linear"), cfg.ldim, cfg.d_model)?;
         let out_norm_weight = vb.pp("out_norm").tensor("weight", (cfg.d_model,))?;
         let out_norm_bias = vb.pp("out_norm").tensor("bias", (cfg.d_model,))?;
@@ -137,6 +151,7 @@ impl<Q: BackendQ> FlowLM<Q> {
             emb_std,
             emb_mean,
             bos_emb,
+            bos_emb_host: std::sync::OnceLock::new(),
             input_linear,
             out_norm_weight,
             out_norm_bias,
@@ -184,10 +199,50 @@ impl<Q: BackendQ> FlowLM<Q> {
         rng: &mut impl Rng,
         eos_threshold: f32,
     ) -> Result<(Tensor<Q::T, Q::B>, bool)> {
+        let sequence = self.replace_nan_with_bos(sequence)?;
+        let (latent, eos_logit) = self.sample_next_latent_parts(
+            StepInput::Latent(&sequence),
+            text_embeddings,
+            state,
+            lsd_decode_steps,
+            rng,
+        )?;
+        Ok((latent, Self::eos_from_logit(&eos_logit.to_vec()?, eos_threshold)))
+    }
+
+    /// Record a sampling step without reading anything back, returning the latent
+    /// and the raw (unthresholded) eos logit.
+    ///
+    /// [`Self::sample_next_latent`] thresholds the logit for the caller, which means
+    /// it has to read it back, and a browser cannot block on a readback. Here the
+    /// logit stays a tensor and the caller chooses when to resolve it: awaiting
+    /// `Device::tensor_to_vec` on wasm, or [`Self::eos_from_logit`] natively.
+    ///
+    /// Every other op merely records into the backend's batch, so this whole
+    /// function is safe to call from a browser through the synchronous API.
+    #[allow(clippy::type_complexity)]
+    pub fn sample_next_latent_parts(
+        &self,
+        input: StepInput<'_, Q>,
+        text_embeddings: &Tensor<Q::T, Q::B>,
+        state: &mut FlowLMState<Q>,
+        lsd_decode_steps: usize,
+        rng: &mut impl Rng,
+    ) -> Result<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>)> {
+        let sequence = match input {
+            StepInput::Latent(t) => t.clone(),
+            // The same substitution `replace_nan_with_bos` makes, but on the device:
+            // the caller states that this is the first step instead of encoding it
+            // as NaN in a tensor that then has to be read back to be discovered.
+            StepInput::Bos { batch } => self
+                .bos_emb
+                .reshape((1, 1, self.ldim))?
+                .broadcast_as((batch, 1, self.ldim))?
+                .contiguous()?,
+        };
         let (b, s, _) = sequence.dims3()?;
         let dev = sequence.device();
 
-        let sequence = self.replace_nan_with_bos(sequence)?;
         let input = self.input_linear.forward(&sequence)?;
         let transformer_out = self.backbone(&input, text_embeddings, s, state)?;
         let t_len = transformer_out.dim(1usize)?;
@@ -195,14 +250,17 @@ impl<Q: BackendQ> FlowLM<Q> {
         let transformer_out = transformer_out.reshape((b, self.dim))?;
 
         let eos_logit = self.out_eos.forward(&transformer_out)?;
-        let eos_val = eos_logit.to_vec()?;
-        let is_eos = eos_val[0].to_f32() > eos_threshold;
         let noise_data: Vec<Q::T> =
             (0..b * self.ldim).map(|_| Q::T::from_f32(rng.sample())).collect();
         let noise = Tensor::from_vec(noise_data, (b, self.ldim), dev)?;
         let latent = lsd_decode(&self.flow_net, &transformer_out, &noise, lsd_decode_steps)?;
         let latent = latent.reshape((b, 1, self.ldim))?;
-        Ok((latent, is_eos))
+        Ok((latent, eos_logit))
+    }
+
+    /// Threshold an eos logit that is already on the host.
+    pub fn eos_from_logit(eos_val: &[Q::T], eos_threshold: f32) -> bool {
+        eos_val.first().is_some_and(|v| v.to_f32() > eos_threshold)
     }
 
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -232,8 +290,7 @@ impl<Q: BackendQ> FlowLM<Q> {
         let s = Q::T::from_f32(cfg_coef);
         let t_out = t_out.sub(&null_out)?.scale(s)?.add(&null_out)?;
         let eos_logit = self.out_eos.forward(&t_out)?;
-        let eos_val = eos_logit.to_vec()?;
-        let is_eos = eos_val[0].to_f32() > eos_threshold;
+        let is_eos = Self::eos_from_logit(&eos_logit.to_vec()?, eos_threshold);
         let noise_data: Vec<Q::T> =
             (0..b * self.ldim).map(|_| Q::T::from_f32(rng.sample())).collect();
         let noise = Tensor::from_vec(noise_data, (b, self.ldim), dev)?;
@@ -242,12 +299,27 @@ impl<Q: BackendQ> FlowLM<Q> {
         Ok((latent, is_eos))
     }
 
+    /// `bos_emb` on the host, read back once on first use and cached.
+    ///
+    /// Only the NaN-marker path below needs these values. Reading them at load
+    /// would make loading a model impossible in a browser, where a blocking
+    /// readback deadlocks; callers that use [`StepInput::Bos`] never get here.
+    fn bos_emb_host(&self) -> Result<&[Q::T]> {
+        if let Some(v) = self.bos_emb_host.get() {
+            return Ok(v);
+        }
+        let v = self.bos_emb.to_vec()?;
+        Ok(self.bos_emb_host.get_or_init(|| v))
+    }
+
     /// Replace NaN values in sequence with bos_emb.
+    ///
+    /// Costs a device round trip per step, so gpu callers should prefer
+    /// [`Self::sample_next_latent_parts`] with [`StepInput::Bos`], which says the
+    /// same thing without moving the sequence to the host and back.
     fn replace_nan_with_bos(&self, sequence: &Tensor<Q::T, Q::B>) -> Result<Tensor<Q::T, Q::B>> {
         let data = sequence.to_vec()?;
-        // TODO(laurent): avoid the `to_vec` below. For this, we could introduce
-        // something like torch.where.
-        let bos_data = &self.bos_emb;
+        let bos_data = self.bos_emb_host()?;
         let mut out_data = data.clone();
         let ldim = self.ldim;
 

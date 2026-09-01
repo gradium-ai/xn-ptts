@@ -299,6 +299,34 @@ impl<Q: BackendQ> TTSModel<Q> {
         Ok((latent, is_eos))
     }
 
+    /// [`Self::generate_step`] without the eos readback: returns the latent and the
+    /// raw eos logit, leaving the caller to resolve it. The browser-safe entry point.
+    ///
+    /// `input` states whether this is the first step rather than encoding it as NaN
+    /// in the previous latent, so nothing has to come back off the device to find out.
+    #[allow(clippy::type_complexity)]
+    pub fn generate_step_parts(
+        &self,
+        state: &mut TTSState<Q>,
+        input: crate::flow_lm::StepInput<'_, Q>,
+        rng: &mut impl crate::flow_lm::Rng,
+    ) -> Result<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>)> {
+        let dev = self.device();
+        let empty_text = Tensor::zeros((1, 0, self.flow_lm.conditioner.dim), dev)?;
+        self.flow_lm.sample_next_latent_parts(
+            input,
+            &empty_text,
+            &mut state.flow_lm_state,
+            self.lsd_decode_steps,
+            rng,
+        )
+    }
+
+    /// Threshold an eos logit the caller has brought back to the host.
+    pub fn eos_from_logit(&self, eos_val: &[Q::T]) -> bool {
+        crate::flow_lm::FlowLM::<Q>::eos_from_logit(eos_val, self.eos_threshold)
+    }
+
     #[allow(clippy::type_complexity)]
     pub fn generate_step_cfg(
         &self,

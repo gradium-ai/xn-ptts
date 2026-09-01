@@ -1,0 +1,40 @@
+[package]
+name = "ptts-web"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Pocket TTS in the browser on xn's WebGPU backend"
+
+# Standalone, like xn's own browser harness: the xn-ptts workspace only ever
+# builds for native, this only ever builds for wasm32-unknown-unknown.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ptts = { path = "../ptts", features = ["webgpu"] }
+xn = { version = "0.2", features = ["webgpu"] }
+half = "2.7.1"
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+console_error_panic_hook = "0.1"
+rand = { version = "0.9.0", default-features = false, features = ["std_rng"] }
+rand_distr = "0.5.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
+web-sys = { version = "0.3", features = ["Window", "Performance"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
+[profile.release]
+opt-level = "s"
+
+# `ptts` resolves its own `xn` through the xn-ptts-bench workspace, which points at
+# the local xn-perf checkout via the same patch. Without repeating it here this
+# standalone crate would link a second, published `xn` and every type would mismatch.
+[patch.crates-io]
+xn = { path = "../../xn-perf/xn-core" }
+gemm = { path = "../../gemm-integration/gemm" }
