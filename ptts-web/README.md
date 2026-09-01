@@ -36,6 +36,22 @@ That is with the turn closed by the silence detector, not a button. A rate-limit
 LLM turn measured 43 s instead of 1 s, which is the free tier rather than
 anything local.
 
+## What streams
+
+Both legs are rendered as they happen, not at the end of the turn.
+
+* **Transcription.** The ASR posts each word as the model closes it, and the
+  Agent tab shows the utterance so far in its own bubble, replaced by the final
+  text when the turn closes. An abandoned turn removes it.
+* **The reply.** The bubble starts empty and its words are revealed against
+  `AudioContext.currentTime`, so the text tracks what is being said rather than
+  appearing whole before the audio starts. Same idea as the TTS tab's waveform.
+
+That reveal loop also decides when to listen again. `gen_done` means generation
+finished, and generation runs several times faster than realtime, so resuming
+there would put the microphone back on while the agent is still talking. It
+resumes when the audio has actually finished instead.
+
 ## Turn-taking
 
 The Agent tab has no push-to-talk. The microphone stays open once started, and

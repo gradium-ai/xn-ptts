@@ -804,9 +804,20 @@ const agent = {
   // microphone stays open across a whole session, so frames arriving while the
   // agent is transcribing or speaking are dropped rather than transcribed.
   listening: false, phase: 'idle', speech: 0, silence: 0, preroll: [],
+  partialEl: null, replyEl: null, replyWords: [], audioSamples: 0, speechDone: false, revealRaf: 0,
 };
 
 const agStatus = m => { $('ag-status').textContent = m; };
+
+/// The utterance so far, in its own bubble, replaced by the final text when the
+/// turn closes. Words arrive from the ASR as the model closes them, so this is
+/// what makes the transcription visible while someone is still speaking.
+function agPartial(text) {
+  if (!text) return;
+  if (!agent.partialEl) agent.partialEl = agChat('user', '', 'partial');
+  agent.partialEl.textContent = text;
+  $('ag-chat').scrollTop = $('ag-chat').scrollHeight;
+}
 
 function agChat(role, text, cls = '') {
   const box = $('ag-chat');
@@ -845,7 +856,7 @@ $('ag-load').onclick = () => {
       agStatus(`asr ${m.label}: ${(m.received / 1e6).toFixed(0)} MB`);
     },
     ready: () => { agent.ready.asr = true; agMaybeReady(); },
-    word: m => { agent.words.push(m.text); },
+    word: m => { agent.words.push(m.text); agPartial(agent.words.join('')); },
     final: m => agTurn(m.text),
     error: m => agStatus(`asr error: ${m.message}`),
   });
@@ -866,13 +877,20 @@ $('ag-load').onclick = () => {
     } else if (m.type === 'frame') {
       const f = new Float32Array(m.pcm);
       agent.chunks.push(f);
+      agent.audioSamples += f.length;
       if (agent.player) agent.player.push(f);
+      agReveal();
     } else if (m.type === 'gen_done') {
       agent.timings.tts_ms = m.stats.total_ms;
       agent.timings.speech_ms = m.stats.audio_ms;
       agent.timings.turn_ms = performance.now() - agent.turnStart;
       agCards();
-      agResume();
+      // Not `agResume()`: generation finishes several times faster than
+      // realtime, so the agent is still speaking. Listening again now would put
+      // the microphone back on its own voice. The reveal loop resumes once the
+      // audio has actually finished.
+      agent.speechDone = true;
+      agReveal();
     } else if (m.type === 'error') {
       agStatus(`tts error: ${m.message}`);
       agResume();
@@ -999,6 +1017,35 @@ async function agListen(on) {
 }
 $('ag-talk').onclick = () => agListen(!agent.listening);
 
+/// Reveal the reply in step with playback, and hand the microphone back once the
+/// audio has finished rather than when generation did.
+function agReveal() {
+  if (agent.revealRaf) return;
+  const step = () => {
+    agent.revealRaf = 0;
+    if (agent.phase !== 'speak') return;
+    const rate = agent.ttsInfo ? agent.ttsInfo.sample_rate : 24000;
+    const total = agent.audioSamples / rate;
+    const heard = agent.player ? agent.player.played() : 0;
+    // Before generation ends `total` is still growing, so this is the fraction
+    // of what exists so far; it converges as soon as the last frame lands.
+    const frac = total > 0 ? Math.min(1, heard / total) : 0;
+    const words = agent.replyWords || [];
+    if (agent.replyEl && words.length) {
+      const n = agent.speechDone && frac >= 1 ? words.length : Math.floor(frac * words.length);
+      agent.replyEl.textContent = words.slice(0, n).join(' ');
+      $('ag-chat').scrollTop = $('ag-chat').scrollHeight;
+    }
+    if (agent.speechDone && heard >= total) {
+      if (agent.replyEl && words.length) agent.replyEl.textContent = words.join(' ');
+      agResume();
+      return;
+    }
+    agent.revealRaf = requestAnimationFrame(step);
+  };
+  agent.revealRaf = requestAnimationFrame(step);
+}
+
 /// Back to listening after a turn, if the user has not stopped in the meantime.
 function agResume() {
   if (!agent.listening) { agStatus('stopped'); return; }
@@ -1014,11 +1061,18 @@ function agResume() {
 async function agTurn(text) {
   agent.timings.asr_ms = performance.now() - agent.asrStart;
   if (!text) {
+    if (agent.partialEl) { agent.partialEl.remove(); agent.partialEl = null; }
     agCards();
     agResume();
     return;
   }
-  agChat('user', text);
+  if (agent.partialEl) {
+    agent.partialEl.textContent = text;
+    agent.partialEl.classList.remove('partial');
+    agent.partialEl = null;
+  } else {
+    agChat('user', text);
+  }
   agent.history.push({ role: 'user', content: text });
 
   // The free tier shares an upstream pool and the proxy retries through its
@@ -1047,7 +1101,12 @@ async function agTurn(text) {
   clearInterval(tick);
   agent.timings.llm_ms = performance.now() - t0;
   agent.history.push({ role: 'assistant', content: reply });
-  agChat('assistant', reply);
+  // Empty to begin with: the words are revealed as they are actually spoken, so
+  // the bubble tracks the audio instead of appearing whole before it starts.
+  agent.replyEl = agChat('assistant', '');
+  agent.replyWords = reply.split(/\s+/).filter(Boolean);
+  agent.audioSamples = 0;
+  agent.speechDone = false;
 
   agStatus('speaking…');
   agent.phase = 'speak';
@@ -1110,6 +1169,13 @@ window.__asrFromFile = async (url, dtype) => {
 
 // End-to-end agent turn without a microphone: the ASR leg is fed from a file,
 // the LLM and TTS legs are the real ones.
+window.__agentProbe = () => ({
+  phase: agent.phase,
+  partial: agent.partialEl ? agent.partialEl.textContent : '',
+  reply: agent.replyEl ? agent.replyEl.textContent : '',
+  msgs: [...document.getElementById('ag-chat').querySelectorAll('.msg')].map(m => m.textContent.length),
+});
+
 window.__agentTest = async (url, ttsDtype, asrDtype) => {
   if (ttsDtype) $('ag-tts-dtype').value = ttsDtype;
   if (asrDtype) $('ag-asr-dtype').value = asrDtype;
@@ -1154,6 +1220,14 @@ window.__agentTest = async (url, ttsDtype, asrDtype) => {
   }
 
   const stats = await spoken;
+  // gen_done only means generation finished. The reply is revealed as it is
+  // spoken, so the bubble is still filling; wait for the turn to actually end.
+  await new Promise(res => {
+    const t = setInterval(() => {
+      if (agent.phase !== 'speak') { clearInterval(t); res(); }
+    }, 100);
+    setTimeout(() => { clearInterval(t); res(); }, 60000);
+  });
   const msgs = [...$('ag-chat').querySelectorAll('.msg')].map(m => m.textContent);
   return {
     heard: msgs[0] || null,
