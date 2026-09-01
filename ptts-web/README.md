@@ -47,6 +47,14 @@ Both legs are rendered as they happen, not at the end of the turn.
   `AudioContext.currentTime`, so the text tracks what is being said rather than
   appearing whole before the audio starts. Same idea as the TTS tab's waveform.
 
+A level meter sits under the progress bar for the whole session. While speaking
+it reads the agent's own output through an `AnalyserNode` spliced into the
+player's graph, so it shows what is actually audible rather than what has been
+queued; while listening it shows the microphone, reusing the RMS the turn
+detector already computes, and turns green above the VAD threshold. That makes
+it a usable check on the microphone as well as an indication that the agent is
+talking.
+
 That reveal loop also decides when to listen again. `gen_done` means generation
 finished, and generation runs several times faster than realtime, so resuming
 there would put the microphone back on while the agent is still talking. It

@@ -66,6 +66,12 @@
   .transcript { font-size:15px; line-height:1.6; min-height:60px; }
   .transcript .part { color:var(--dim); }
   button.rec { background:var(--bad); color:#fff; }
+  .meter { height:10px; background:var(--panel2); border:1px solid var(--line);
+           border-radius:5px; overflow:hidden; margin-top:10px; }
+  .meter > div { height:100%; width:0; background:var(--dim); border-radius:5px;
+                 transition:width .06s linear; }
+  .meter > div.speaking { background:var(--accent); }
+  .meter > div.hot { background:var(--good); }
 </style>
 </head>
 <body>
@@ -108,6 +114,9 @@
       <div class="grow"><div id="ag-status"></div></div>
     </div>
     <div class="bar"><div id="ag-prog"></div></div>
+    <div class="meter" title="input level while listening, output level while speaking">
+      <div id="ag-level"></div>
+    </div>
   </div>
   <div class="panel">
     <div id="ag-chat" class="chat"><p class="empty">Load the models, start listening, and just talk.</p></div>
@@ -286,12 +295,29 @@ class Player {
     this.ac = audioCtx(this.rate);
     this.head = 0;
     this.startAt = null;
+    // Sources go through an analyser rather than straight to the destination, so
+    // a level meter reads what is actually audible instead of guessing from the
+    // buffers that have been queued.
+    this.analyser = this.ac.createAnalyser();
+    this.analyser.fftSize = 256;
+    this.analyser.connect(this.ac.destination);
+    this.scope = new Uint8Array(this.analyser.fftSize);
+  }
+  /// RMS of what is playing right now, roughly 0..1.
+  level() {
+    this.analyser.getByteTimeDomainData(this.scope);
+    let sum = 0;
+    for (let i = 0; i < this.scope.length; i++) {
+      const x = (this.scope[i] - 128) / 128;
+      sum += x * x;
+    }
+    return Math.sqrt(sum / this.scope.length);
   }
   push(f32) {
     const b = this.ac.createBuffer(1, f32.length, this.rate);
     b.copyToChannel(f32, 0);
     const s = this.ac.createBufferSource();
-    s.buffer = b; s.connect(this.ac.destination);
+    s.buffer = b; s.connect(this.analyser);
     const floor = this.ac.currentTime + 0.2;
     if (this.head < floor) this.head = floor;
     if (this.startAt === null) this.startAt = this.head;
@@ -805,6 +831,7 @@ const agent = {
   // agent is transcribing or speaking are dropped rather than transcribed.
   listening: false, phase: 'idle', speech: 0, silence: 0, preroll: [],
   partialEl: null, replyEl: null, replyWords: [], audioSamples: 0, speechDone: false, revealRaf: 0,
+  micLevel: 0, level: 0, meterOn: false,
 };
 
 const agStatus = m => { $('ag-status').textContent = m; };
@@ -909,6 +936,7 @@ $('ag-load').onclick = () => {
 
 function agMaybeReady() {
   if (!agent.ready.asr || !agent.ready.tts) return;
+  if (!agent.meterOn) { agent.meterOn = true; agMeterLoop(); }
   $('ag-prog').style.width = '100%';
   agStatus('ready — press start and talk');
   $('ag-talk').disabled = false;
@@ -946,7 +974,9 @@ function agFrame(pcm) {
   // straight back. Simplest correct thing is to stop listening until it stops.
   if (agent.phase !== 'listen') return;
 
-  const loud = rms(pcm) >= VAD.threshold;
+  const level = rms(pcm);
+  agent.micLevel = level;
+  const loud = level >= VAD.threshold;
 
   // Before anything has been heard, hold the last few frames and feed the model
   // nothing: otherwise it spends the whole session transcribing room tone.
@@ -1017,6 +1047,29 @@ async function agListen(on) {
 }
 $('ag-talk').onclick = () => agListen(!agent.listening);
 
+/// One meter for the whole turn: the microphone while listening, the agent's own
+/// output while speaking. It runs for the life of the session so the bar is
+/// always there, sitting at zero when nothing is making sound.
+///
+/// The decay is one-sided -- it takes the new value immediately but falls back
+/// slowly -- because a bar driven straight off per-frame RMS flickers badly at
+/// speech rates.
+function agMeterLoop() {
+  const bar = $('ag-level');
+  const step = () => {
+    let raw = 0;
+    if (agent.phase === 'speak' && agent.player) raw = agent.player.level();
+    else if (agent.phase === 'listen') raw = agent.micLevel || 0;
+    agent.level = Math.max(raw, (agent.level || 0) * 0.88);
+    // 0.15 RMS is a comfortably loud voice; past that the bar just pins.
+    bar.style.width = `${Math.min(100, (agent.level / 0.15) * 100)}%`;
+    bar.classList.toggle('speaking', agent.phase === 'speak');
+    bar.classList.toggle('hot', agent.phase === 'listen' && raw >= VAD.threshold);
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
 /// Reveal the reply in step with playback, and hand the microphone back once the
 /// audio has finished rather than when generation did.
 function agReveal() {
@@ -1033,7 +1086,9 @@ function agReveal() {
     const words = agent.replyWords || [];
     if (agent.replyEl && words.length) {
       const n = agent.speechDone && frac >= 1 ? words.length : Math.floor(frac * words.length);
-      agent.replyEl.textContent = words.slice(0, n).join(' ');
+      // An empty bubble renders as a stray pill, so hold an ellipsis until the
+      // first word is actually due.
+      agent.replyEl.textContent = n ? words.slice(0, n).join(' ') : '…';
       $('ag-chat').scrollTop = $('ag-chat').scrollHeight;
     }
     if (agent.speechDone && heard >= total) {
@@ -1103,7 +1158,7 @@ async function agTurn(text) {
   agent.history.push({ role: 'assistant', content: reply });
   // Empty to begin with: the words are revealed as they are actually spoken, so
   // the bubble tracks the audio instead of appearing whole before it starts.
-  agent.replyEl = agChat('assistant', '');
+  agent.replyEl = agChat('assistant', '…');
   agent.replyWords = reply.split(/\s+/).filter(Boolean);
   agent.audioSamples = 0;
   agent.speechDone = false;
@@ -1174,6 +1229,8 @@ window.__agentProbe = () => ({
   partial: agent.partialEl ? agent.partialEl.textContent : '',
   reply: agent.replyEl ? agent.replyEl.textContent : '',
   msgs: [...document.getElementById('ag-chat').querySelectorAll('.msg')].map(m => m.textContent.length),
+  meter: document.getElementById('ag-level').style.width,
+  level: agent.level,
 });
 
 window.__agentTest = async (url, ttsDtype, asrDtype) => {
