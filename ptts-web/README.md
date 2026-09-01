@@ -23,6 +23,35 @@ without downloading weights from HuggingFace every time. The other source in the
 picker is the public `kyutai/pocket-tts-without-voice-cloning` repo, which is what
 a real deployment would use.
 
+## Why a server at all?
+
+Nothing here is served *by* a server in the sense of doing work: inference is
+entirely in the browser, and the server only hands over files. Any static file
+host does, with no configuration:
+
+```bash
+cd pkg && python3 -m http.server 8790     # verified: full q8 run, start to finish
+```
+
+`server.js` exists for two conveniences, not because the app needs it: it maps
+`/model` and `/voices` to a local directory so a run does not pull weights over
+the network, and it serves https so a phone can reach it (WebGPU needs a secure
+context). For a real deployment, put `pkg/` on GitHub Pages or any object store
+and pick the HuggingFace source in the page -- then nothing is self-hosted at all.
+
+What does **not** work is opening `pkg/index.html` from disk. A `file://` page has
+an opaque origin (`null`), and CORS blocks everything the app is built from:
+
+```
+Access to fetch at 'file:///build.txt' from origin 'null' has been blocked by CORS
+policy: Cross origin requests are only supported for protocol schemes: chrome,
+chrome-extension, chrome-untrusted, data, http, https, isolated-app.
+```
+
+The same rule stops the ES module imports, the module worker, and the streaming
+instantiation of the wasm. So it needs an `http://` or `https://` origin -- but
+only an origin, not a backend.
+
 ## On a phone
 
 ```bash
