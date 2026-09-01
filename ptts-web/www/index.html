@@ -90,8 +90,18 @@
         <option value="q8f16">q8_0 / f16 — native only</option>
       </select>
     </div>
+    <div>
+      <label for="threads">Threads</label>
+      <input id="threads" type="number" min="1" max="64" value="1" style="width:90px">
+    </div>
     <div><button id="load">Load model</button></div>
   </div>
+  <p class="hint" id="threads-note">
+    Threads set xn's worker count. On this page that changes nothing: xn's threading
+    lives in its CPU backend and the WebGPU backend makes no rayon call, and this wasm
+    build has no <code>atomics</code>, so it is single-threaded either way. Kept as a
+    control because it is one natively, where it matters a great deal.
+  </p>
   <div class="bar"><div id="prog"></div></div>
   <p class="hint">
     f16 needs the adapter to report WGSL <code>shader-f16</code>. The q8_0 dtypes do not work in a
@@ -199,24 +209,56 @@ function wavBlob(f32, rate) {
 }
 
 // ---- waveform ----------------------------------------------------------
-function drawWave(f32) {
+// The canvas is prepared once per run and then drawn into frame by frame, so
+// nothing is redrawn on the generation's hot path. `wave.budget` is the frame
+// budget, which fixes the x-axis up front; eos usually ends a run short of it,
+// so `finishWave` rescales to the real length once the length is known.
+const wave = { g: null, w: 0, h: 0, mid: 0, budget: 0, live: false };
+
+function waveCtx() {
   const c = $('wave'), dpr = devicePixelRatio || 1;
   c.width = c.clientWidth * dpr; c.height = c.clientHeight * dpr;
-  const g = c.getContext('2d'); g.scale(dpr, dpr);
+  const g = c.getContext('2d');
+  g.scale(dpr, dpr);
   const w = c.clientWidth, h = c.clientHeight, mid = h / 2;
   g.clearRect(0, 0, w, h);
   g.strokeStyle = '#2a3140'; g.beginPath(); g.moveTo(0, mid); g.lineTo(w, mid); g.stroke();
-  if (!f32 || !f32.length) return;
-  const per = Math.max(1, Math.floor(f32.length / w));
   g.fillStyle = '#4493f8';
-  for (let x = 0; x < w; x++) {
+  return { g, w, h, mid };
+}
+
+/// Min/max of `f32[from..to)` drawn across the pixels `[x0, x1)`.
+function drawSpan(g, f32, from, to, x0, x1, mid) {
+  const px = Math.max(1, x1 - x0);
+  const per = Math.max(1, Math.ceil((to - from) / px));
+  for (let x = x0, i = from; x < x0 + px && i < to; x++, i += per) {
     let lo = 0, hi = 0;
-    for (let i = x * per, e = Math.min(f32.length, i + per); i < e; i++) {
-      if (f32[i] < lo) lo = f32[i];
-      if (f32[i] > hi) hi = f32[i];
+    for (let j = i, e = Math.min(to, i + per); j < e; j++) {
+      if (f32[j] < lo) lo = f32[j];
+      if (f32[j] > hi) hi = f32[j];
     }
     g.fillRect(x, mid + lo * mid, 1, Math.max(1, (hi - lo) * mid));
   }
+}
+
+function beginWave(budget) {
+  const { g, w, h, mid } = waveCtx();
+  Object.assign(wave, { g, w, h, mid, budget: Math.max(1, budget), live: true });
+}
+
+/// One frame, placed at the share of the budget it occupies.
+function pushWave(f32, index) {
+  if (!wave.live || !f32.length) return;
+  const x0 = Math.floor(index / wave.budget * wave.w);
+  const x1 = Math.max(x0 + 1, Math.floor((index + 1) / wave.budget * wave.w));
+  drawSpan(wave.g, f32, 0, f32.length, x0, Math.min(x1, wave.w), wave.mid);
+}
+
+function drawWave(f32) {
+  wave.live = false;
+  const { g, mid, w } = waveCtx();
+  if (!f32 || !f32.length) return;
+  drawSpan(g, f32, 0, f32.length, 0, w, mid);
 }
 
 // ---- rendering ---------------------------------------------------------
@@ -284,6 +326,13 @@ $('load').onclick = () => {
           (m.total ? ` / ${(m.total / 1e6).toFixed(1)} MB` : ''));
         break;
       }
+      case 'threads':
+        $('threads-note').innerHTML =
+          `xn reports <code>${m.threads}</code> thread(s) over <code>${m.cpus}</code> visible cpu(s). ` +
+          'That number changes nothing here: xn\'s threading lives in its CPU backend and the ' +
+          'WebGPU backend makes no rayon call, and this wasm build has no <code>atomics</code>, ' +
+          'so it is single-threaded either way. Kept as a control because it is one natively.';
+        break;
       case 'device':
         $('dev-badge').textContent = m.device + (m.f16 ? ' · shader-f16' : ' · no shader-f16');
         $('dev-badge').hidden = false;
@@ -305,12 +354,14 @@ $('load').onclick = () => {
         chunks = [];
         playMode = $('play').value;
         player = playMode === 'stream' ? new Player() : null;
+        beginWave(m.maxFrames);
         setStatus(`generating — ${m.tokens} tokens`);
         break;
       case 'frame': {
         const f = new Float32Array(m.pcm);
         chunks.push(f);
         if (player) player.push(f);
+        pushWave(f, m.index);
         break;
       }
       case 'gen_done': {
@@ -339,6 +390,7 @@ $('load').onclick = () => {
   };
   worker.postMessage({
     type: 'setup', base, dtype, temperature: 0.4,
+    threads: Math.max(1, parseInt($('threads').value, 10) || 1),
     configUrl: base === '/model' ? '/model/config.json' : null,
     voices: voiceList(base),
   });
@@ -363,7 +415,17 @@ $('save').onclick = () => {
   URL.revokeObjectURL(a.href);
 };
 
-addEventListener('resize', () => drawWave(lastPcm));
+addEventListener('resize', () => {
+  // Mid-run the canvas is being filled incrementally, and resizing clears it, so
+  // repaint from the frames received so far and carry on live from there.
+  if (wave.live && chunks.length) {
+    const budget = wave.budget;
+    beginWave(budget);
+    for (let i = 0; i < chunks.length; i++) pushWave(chunks[i], i);
+  } else {
+    drawWave(lastPcm);
+  }
+});
 
 // ---- headless mode -----------------------------------------------------
 // `?auto=1&dtype=f16&iters=3` loads, generates, and POSTs the result to
@@ -382,6 +444,7 @@ if (q.get('auto')) {
   if (q.get('dtype')) $('dtype').value = q.get('dtype');
   if (q.get('base')) $('base').value = q.get('base');
   if (q.get('text')) $('text').value = q.get('text');
+  if (q.get('threads')) $('threads').value = q.get('threads');
   $('play').value = 'off';
 
   // A failure anywhere must still produce a report, or a headless run just hangs.
@@ -424,13 +487,36 @@ if (q.get('auto')) {
       return { samples: a.length, rms: Math.sqrt(sum / a.length), peak, nonfinite };
     };
 
+    // Proof that the waveform fills in during the run rather than at the end:
+    // sample the count of accent-coloured pixels while frames are arriving.
+    const inkSeries = [];
+    const inkCount = () => {
+      const c = $('wave');
+      if (!c.width || !c.height) return 0;
+      const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+      let n = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        // #4493f8, the waveform colour; the centre rule is #2a3140.
+        if (d[i] === 0x44 && d[i + 1] === 0x93 && d[i + 2] === 0xf8) n++;
+      }
+      return n;
+    };
+    setInterval(() => { if (wave.live) inkSeries.push(inkCount()); }, 150);
+
     const origGo = $('go').onclick;
     const step = () => {
       done++;
       if (done <= iters) { origGo(); }
       else {
         clearTimeout(guard);
-        report({ ok: true, device: $('dev-badge').textContent, info, runs, audio: audioOf(), checkpoints });
+        report({
+          ok: true, device: $('dev-badge').textContent, info, runs,
+          audio: audioOf(), threadsNote: $('threads-note').textContent.trim().slice(0, 120),
+          // Non-zero entries here mean the waveform was drawn mid-run.
+          inkDuringRun: inkSeries.filter(v => v > 0).length,
+          inkSamples: inkSeries.length, inkSeries: inkSeries.slice(0, 12),
+          checkpoints,
+        });
       }
     };
     // Chain: ready -> generate xN -> report.

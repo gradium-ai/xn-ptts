@@ -266,6 +266,42 @@ fn max_frames_for(num_tokens: usize) -> usize {
     ((num_tokens as f64 / 3.0 + 2.0) * 12.5).ceil() as usize
 }
 
+/// The frame budget an utterance is allowed, so the page can size a waveform it
+/// draws as frames arrive. Exported rather than reimplemented in JS to keep one
+/// definition of the budget.
+#[wasm_bindgen]
+pub fn max_frames_for_tokens(num_tokens: usize) -> usize {
+    max_frames_for(num_tokens)
+}
+
+/// xn's worker count, which on this path controls nothing.
+///
+/// Threading in xn lives entirely in the CPU backend; the WebGPU backend does no
+/// rayon work, and this wasm build has no `atomics`/shared memory, so it is
+/// single-threaded regardless. Exposed so the page can *report* the value rather
+/// than imply a knob that does nothing -- see `threads_effective`.
+#[wasm_bindgen]
+pub fn set_threads(n: usize) {
+    if n > 0 {
+        xn::set_num_threads(n);
+    }
+}
+
+/// What xn now reports, and how many cpus it can see.
+#[wasm_bindgen]
+pub fn threads_info() -> JsValue {
+    let info = serde_json::json!({
+        "threads": xn::get_num_threads(),
+        "cpus": xn::get_num_cpus(),
+        // True for every build this page can produce: no `+atomics` in the
+        // wasm32 rustflags means `std::thread` cannot spawn.
+        "wasm_single_threaded": true,
+        // The WebGPU backend contains no rayon call at all.
+        "affects_gpu_compute": false,
+    });
+    JsValue::from_str(&info.to_string())
+}
+
 /// One utterance. `on_frame(Float32Array, frame_index)` is called per Mimi frame,
 /// as it becomes available, so the page can play audio while the rest generates.
 #[wasm_bindgen]

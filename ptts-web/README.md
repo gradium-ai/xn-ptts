@@ -37,6 +37,19 @@ pre-quantized GGUF, so they download the same file `f32` does and pay a
 quantization pass on the GPU when the model is built. GGUF input is rejected with
 a message saying so.
 
+## Threads
+
+The page has a threads control, and it does set xn's worker count -- but nothing
+on this path reads it. xn's threading lives in its CPU backend; the WebGPU backend
+contains no rayon call, and this wasm build has no `atomics`, so it is
+single-threaded whatever the number says. The control is there because it is a
+real one natively, and the page reports what xn ended up with rather than
+implying an effect it does not have.
+
+`xn::set_num_threads` used to panic on wasm: it set `RAYON_NUM_THREADS`, and
+`std::env::set_var` is unsupported on `wasm32-unknown-unknown`. It is now guarded,
+so the atomic alone carries the value on wasm.
+
 ## Headless check
 
 The page drives itself when given `?auto=1`, and POSTs its result to `/report`:
@@ -52,6 +65,8 @@ PTTS_EXIT_ON_REPORT=1 node server.js &
 The server prints the JSON report and exits. Parameters: `dtype`, `iters`, `text`,
 `base`. The report carries per-run timings plus rms/peak/non-finite counts over
 the produced audio, so a run that "succeeds" while emitting silence is visible.
+It also counts waveform pixels while frames are arriving, which is what shows the
+waveform is drawn during the run rather than at the end of it.
 Any failure — no `navigator.gpu`, a load error, a timeout — still reports, with
 the checkpoints it reached, so a hang says where it stopped.
 
@@ -76,6 +91,13 @@ That second point helps the native WebGPU backend too, which is why
 might suggest. Measured there, same text and 3 runs each: 3.80x -> 4.13x RTF and
 18.1 ms -> 16.6 ms per frame, so about 9%. The readbacks it removes are small; the
 per-frame cost is dominated by dispatch count, not by round trips.
+
+## Waveform
+
+The canvas is laid out from the frame budget at `gen_start` and each frame is
+drawn into its own slice as it arrives, so nothing is redrawn on the generation's
+hot path. eos usually ends a run short of the budget, so the waveform is redrawn
+once at the end against the length actually produced.
 
 ## Measured
 

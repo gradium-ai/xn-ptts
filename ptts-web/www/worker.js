@@ -1,7 +1,10 @@
 // Everything model-related happens here, off the UI thread: fetching weights,
 // building the WebGPU device, and the generation loop. Audio frames are posted
 // to the page as they are produced.
-import init, { probe, load_model, add_voice, generate, prepare_text } from './ptts_web.js';
+import init, {
+  probe, load_model, add_voice, generate, prepare_text,
+  set_threads, threads_info, max_frames_for_tokens,
+} from './ptts_web.js';
 import { decodeSentencepieceModel, UnigramTokenizer } from './tokenizer.js';
 
 let tokenizer = null;
@@ -30,9 +33,12 @@ async function fetchWithProgress(url, label) {
   return out;
 }
 
-async function setup({ base, dtype, temperature, voices, configUrl }) {
+async function setup({ base, dtype, temperature, voices, configUrl, threads }) {
   status('starting wasm…');
   await init();
+
+  if (threads > 0) set_threads(threads);
+  post('threads', JSON.parse(threads_info()));
 
   status('asking the browser for a WebGPU adapter…');
   const dev = JSON.parse(await probe());
@@ -76,7 +82,11 @@ async function run({ text, voice, seed }) {
   if (!ready) throw new Error('model is not loaded yet');
   const [prepared, framesAfterEos] = prepare_text(text);
   const ids = Array.from(tokenizer.encode(prepared));
-  post('gen_start', { tokens: ids.length, prepared });
+  // The budget, not the outcome: eos can end the utterance early, so the page
+  // uses this to lay out a waveform it fills in as frames arrive.
+  post('gen_start', {
+    tokens: ids.length, prepared, maxFrames: max_frames_for_tokens(ids.length),
+  });
 
   const onFrame = (pcm, index) => {
     // `pcm` is a view into wasm memory and is reused, so copy before transfer.
