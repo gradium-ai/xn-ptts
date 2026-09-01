@@ -56,3 +56,16 @@ debug = true
 [profile.release-no-debug]
 inherits = "release"
 debug = false
+
+# Local integration build: xn = upstream/main + davencyw perf/xn-threadpool-upstream +
+# davencyw perf/q8-repack-layout (branch `integration/threadpool-q8repack`), gemm = gradium-ai
+# main. Both live in git worktrees so the primary xn/ and gemm/ checkouts stay untouched.
+# Drop this section to go back to the published crates.
+[patch.crates-io]
+# xn: perf/threadpool-repack-and-elemwise-tuning -- upstream/main + perf/xn-threadpool-upstream
+# + perf/q8-repack-layout, plus the two commits that combination was missing. Measured 14.8x
+# RTF here, matching perf/q8-neon-quantize, on a clean upstream base.
+xn = { path = "../xn-perf/xn-core" }
+# gemm: gradium-ai main. Measured no-op for this workload (hot path is xn's own NEON q8
+# kernels, not gemm) but kept because it was explicitly requested.
+gemm = { path = "../gemm-integration/gemm" }

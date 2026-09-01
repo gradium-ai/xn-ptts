@@ -58,7 +58,10 @@ pub struct FlowLM<Q: BackendQ> {
     pub transformer: StreamingTransformer<Q>,
     pub emb_std: Tensor<Q::T, Q::B>,
     pub emb_mean: Tensor<Q::T, Q::B>,
-    bos_emb: Tensor<Q::T, Q::B>,
+    /// Host copy of `bos_emb`. `replace_nan_with_bos` runs on the host and needs
+    /// it every step; the tensor itself is never used on-device, and reading it
+    /// back each step costs a full device round trip on a gpu backend.
+    bos_emb: Vec<Q::T>,
     pub input_linear: Linear<Q::T, Q::B>,
     out_norm_weight: Tensor<Q::T, Q::B>,
     out_norm_bias: Tensor<Q::T, Q::B>,
@@ -120,7 +123,7 @@ impl<Q: BackendQ> FlowLM<Q> {
 
         let emb_std = vb.tensor("emb_std", (cfg.ldim,))?;
         let emb_mean = vb.tensor("emb_mean", (cfg.ldim,))?;
-        let bos_emb = vb.tensor("bos_emb", (cfg.ldim,))?;
+        let bos_emb = vb.tensor("bos_emb", (cfg.ldim,))?.to_vec()?;
         let input_linear = Linear::load(vb.pp("input_linear"), cfg.ldim, cfg.d_model)?;
         let out_norm_weight = vb.pp("out_norm").tensor("weight", (cfg.d_model,))?;
         let out_norm_bias = vb.pp("out_norm").tensor("bias", (cfg.d_model,))?;
@@ -244,7 +247,7 @@ impl<Q: BackendQ> FlowLM<Q> {
         let data = sequence.to_vec()?;
         // TODO(laurent): avoid the `to_vec` below. For this, we could introduce
         // something like torch.where.
-        let bos_data = self.bos_emb.to_vec()?;
+        let bos_data = &self.bos_emb;
         let mut out_data = data.clone();
         let ldim = self.ldim;
 

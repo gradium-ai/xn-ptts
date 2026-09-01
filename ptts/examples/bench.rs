@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use ptts::tts_model::{TTSConfig, TTSModel, TTSState};
 use xn::nn::VB;
-use xn::{BackendQ, Tensor};
+use xn::{Backend, BackendQ, Tensor};
 
 /// Frames of Mimi decoder context, matching `pocket_tts`.
 const MIMI_CONTEXT_SIZE: usize = 250;
@@ -83,6 +83,13 @@ struct Args {
     /// Print a line per iteration as well as the summary.
     #[arg(long, default_value_t = false)]
     per_iter: bool,
+
+    /// Overlap Mimi decoding with the next frame's sampling on a second thread, as
+    /// `pocket_tts` does. Frame N+1 needs only frame N's latent, never its PCM, so the decode
+    /// is off the critical path. `per-frame` then reports the interval between PCM chunks --
+    /// the cadence a streaming consumer sees -- instead of sampling plus decoding.
+    #[arg(long, default_value_t = false)]
+    pipeline: bool,
 }
 
 struct SpTokenizer(sentencepiece::SentencePieceProcessor);
@@ -184,6 +191,10 @@ struct Run {
     ttfa: Duration,
     /// Per frame, sampling plus Mimi decoding.
     frames: Vec<Duration>,
+    /// Per frame, the `generate_step` half of `frames`.
+    sample_t: Vec<Duration>,
+    /// Per frame, the `decode_latent` half of `frames`.
+    decode_t: Vec<Duration>,
     total: Duration,
     samples: usize,
 }
@@ -199,6 +210,8 @@ fn one<Q: BackendQ>(
     let ldim = model.flow_lm.ldim;
     let mut rng = StdRng::new(args.temperature, args.seed)?;
     let mut frames = Vec::new();
+    let mut sample_t = Vec::new();
+    let mut decode_t = Vec::new();
     let mut ttfa = None;
     let mut samples = 0usize;
     let start = Instant::now();
@@ -216,10 +229,14 @@ fn one<Q: BackendQ>(
         for _ in 0..max_frames_for(tokens.len()) {
             let frame_start = Instant::now();
             let (next_latent, is_eos) = model.generate_step(&mut state, &prev_latent, &mut rng)?;
+            let sampled = frame_start.elapsed();
             // Decoding on this thread rather than overlapped, so the measurement attributes
             // sampling and decoding to the frame that caused them.
             let pcm = model.decode_latent(&next_latent, &mut mimi_state)?.to_vec()?;
-            frames.push(frame_start.elapsed());
+            let frame = frame_start.elapsed();
+            frames.push(frame);
+            sample_t.push(sampled);
+            decode_t.push(frame - sampled);
             if !pcm.is_empty() {
                 ttfa.get_or_insert_with(|| start.elapsed());
                 samples += pcm.len();
@@ -240,7 +257,109 @@ fn one<Q: BackendQ>(
 
     let total = start.elapsed();
     let ttfa = ttfa.context("no audio produced")?;
-    Ok(Run { ttfa, frames, total, samples })
+    Ok(Run { ttfa, frames, sample_t, decode_t, total, samples })
+}
+
+/// What the decode thread reports back.
+struct Decoded {
+    /// Per frame, the `decode_latent` call itself.
+    decode_t: Vec<Duration>,
+    /// When each non-empty PCM chunk became available.
+    arrivals: Vec<Instant>,
+    samples: usize,
+}
+
+/// Generates the utterance once with Mimi decoding overlapped on a second thread.
+///
+/// The sampling thread sends each latent onward and immediately starts the next frame; a
+/// scoped thread owns the `MimiDecoderState` and decodes as latents arrive. Scoped rather than
+/// `spawn` so the model can be borrowed instead of shared through an `Arc`, which keeps the
+/// `WithQ` impl free of a `'static` bound.
+fn one_pipelined<Q: BackendQ>(
+    model: &TTSModel<Q>,
+    base_state: &TTSState<Q>,
+    chunks: &[(Vec<u32>, usize)],
+    args: &Args,
+) -> Result<Run> {
+    let dev = model.device();
+    let ldim = model.flow_lm.ldim;
+    let mut rng = StdRng::new(args.temperature, args.seed)?;
+    let mut frames = Vec::new();
+    let mut sample_t = Vec::new();
+    let mut decode_t = Vec::new();
+    let mut ttfa = None;
+    let mut samples = 0usize;
+    let start = Instant::now();
+
+    for (tokens, frames_after_eos) in chunks.iter() {
+        let mut state = base_state.clone();
+        model.prompt_text(&mut state, tokens)?;
+
+        let (tx, rx) = std::sync::mpsc::channel::<Tensor<Q::T, Q::B>>();
+        let decoded = std::thread::scope(|scope| -> Result<Decoded> {
+            let decoder = scope.spawn(move || -> Result<Decoded> {
+                let mut mimi_state = model.init_mimi_state(1, MIMI_CONTEXT_SIZE)?;
+                let mut out = Decoded { decode_t: Vec::new(), arrivals: Vec::new(), samples: 0 };
+                while let Ok(latent) = rx.recv() {
+                    let t = Instant::now();
+                    let pcm = model.decode_latent(&latent, &mut mimi_state)?.to_vec()?;
+                    out.decode_t.push(t.elapsed());
+                    if !pcm.is_empty() {
+                        out.arrivals.push(Instant::now());
+                        out.samples += pcm.len();
+                    }
+                }
+                Ok(out)
+            });
+
+            // BOS marker: an all-NaN latent.
+            let nan: Tensor<f32, Q::B> = Tensor::from_vec(vec![f32::NAN; ldim], (1, 1, ldim), dev)?;
+            let mut prev_latent = nan.to::<Q::T>()?;
+            let mut eos_countdown: Option<usize> = None;
+
+            for _ in 0..max_frames_for(tokens.len()) {
+                let frame_start = Instant::now();
+                let (next_latent, is_eos) =
+                    model.generate_step(&mut state, &prev_latent, &mut rng)?;
+                sample_t.push(frame_start.elapsed());
+                // A send failure means the decoder died; its error surfaces on join.
+                if tx.send(next_latent.clone()).is_err() {
+                    break;
+                }
+
+                if is_eos && eos_countdown.is_none() {
+                    eos_countdown = Some(*frames_after_eos);
+                }
+                if let Some(countdown) = eos_countdown.as_mut() {
+                    if *countdown == 0 {
+                        break;
+                    }
+                    *countdown -= 1;
+                }
+                prev_latent = next_latent;
+            }
+            // Close the channel so the decoder finishes, then wait for the tail of the audio.
+            drop(tx);
+            decoder.join().map_err(|_| anyhow::anyhow!("decode thread panicked"))?
+        })?;
+
+        // Intervals between PCM chunks, with the first measured from the start of the
+        // iteration, so the series sums to the streaming wall time.
+        let mut prev = start;
+        for a in decoded.arrivals.iter() {
+            frames.push(a.duration_since(prev));
+            prev = *a;
+        }
+        if let Some(first) = decoded.arrivals.first() {
+            ttfa.get_or_insert_with(|| first.duration_since(start));
+        }
+        decode_t.extend(decoded.decode_t);
+        samples += decoded.samples;
+    }
+
+    let total = start.elapsed();
+    let ttfa = ttfa.context("no audio produced")?;
+    Ok(Run { ttfa, frames, sample_t, decode_t, total, samples })
 }
 
 fn ms(d: Duration) -> f64 {
@@ -285,6 +404,8 @@ fn row(label: &str, unit: &str, prec: usize, st: &Stats) {
 struct Bench<'a>(&'a Args);
 
 impl xn::WithQ for Bench<'_> {
+    type Output = ();
+
     fn run<Q: BackendQ>(self, dev: Q::B) -> xn::Result<()> {
         self.bench::<Q>(dev).map_err(|e| xn::Error::msg(format!("{e:?}")))
     }
@@ -354,12 +475,19 @@ impl Bench<'_> {
         model.prompt_audio(&mut base_state, &voice_emb)?;
         let voice_ms = ms(t_voice.elapsed());
 
+        let generate = |m: &TTSModel<Q>, st: &TTSState<Q>| {
+            if args.pipeline {
+                one_pipelined(m, st, &chunks, args)
+            } else {
+                one(m, st, &chunks, args)
+            }
+        };
         for _ in 0..args.warmup {
-            one(&model, &base_state, &chunks, args)?;
+            generate(&model, &base_state)?;
         }
         let mut runs = Vec::with_capacity(args.iters);
         for i in 0..args.iters {
-            let r = one(&model, &base_state, &chunks, args)?;
+            let r = generate(&model, &base_state)?;
             if args.per_iter {
                 println!(
                     "iter {i:>3}: total {:>8.2}ms  ttfa {:>7.2}ms  frames {:>4}",
@@ -384,12 +512,16 @@ impl Bench<'_> {
         let rtfs: Vec<f64> = totals.iter().map(|t| audio_ms / t).collect();
 
         println!();
+        // The device the `Runner` actually chose, not the one requested: it falls back to cpu
+        // for any dtype a gpu backend can't handle, and a fallback is otherwise invisible here.
         println!(
-            "model {}  threads {}  input {} chars  audio {audio_ms:.0}ms  frames/iter {}",
+            "device {}  model {}  threads {}  input {} chars  audio {audio_ms:.0}ms  frames/iter {}{}",
+            dev.name(),
             args.model.display(),
             xn::get_num_threads(),
             args.input.len(),
             runs[0].frames.len(),
+            if args.pipeline { "  [pipelined]" } else { "" },
         );
         println!("load {load_ms:.1}ms, voice conditioning {voice_ms:.1}ms (both excluded below)");
         println!();
@@ -405,6 +537,16 @@ impl Bench<'_> {
         }
         if let Some(s) = Stats::of(&frames) {
             row("per-frame", "ms", 3, &s);
+        }
+        let sample_t: Vec<f64> =
+            runs.iter().flat_map(|r| r.sample_t.iter().copied().map(ms)).collect();
+        let decode_t: Vec<f64> =
+            runs.iter().flat_map(|r| r.decode_t.iter().copied().map(ms)).collect();
+        if let Some(s) = Stats::of(&sample_t) {
+            row("  flow_lm sample", "ms", 3, &s);
+        }
+        if let Some(s) = Stats::of(&decode_t) {
+            row("  mimi decode", "ms", 3, &s);
         }
         if let Some(s) = Stats::of(&rtfs) {
             row("rtf (higher is better)", "x realtime", 2, &s);
