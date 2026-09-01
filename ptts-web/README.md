@@ -235,6 +235,35 @@ Measured, f16, 7.5 s of audio: `play=stream` fills 849 -> 6644 bright px over th
 7.35 s of playback with dim reaching 0; `play=end` fills 0 -> 6643; `play=off`
 completes with generation at 6734 bright px.
 
+## Proving a page really runs on the GPU
+
+"Uses WebGPU" is easy to claim and easy to get wrong in both directions, so
+`scripts/gpu-calls.mjs` counts the calls. It drives a page over CDP and wraps the
+WebGPU entry points, reporting adapters, devices, shader modules, pipelines,
+queue submissions and workgroup dispatches per target.
+
+```bash
+node scripts/gpu-calls.mjs "$(curl -s http://127.0.0.1:9233/json/version \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["webSocketDebuggerUrl"])')" \
+  https://example.com/some-page/
+```
+
+Two things it has to get right, both of which produced confident wrong answers
+first:
+
+* **Attach to the worker.** A model normally runs in a dedicated worker, and those
+  attach under their *page's* session, not the browser's. Watching only the
+  browser-level targets reports zeros from contexts that never touch the GPU.
+* **Wrap instances, not prototypes.** With `waitForDebuggerOnStart` the worker is
+  paused before its globals are populated, so `GPUAdapter.prototype` does not
+  exist yet and patching it silently no-ops -- which looks exactly like a page
+  that never used the GPU. Wrapping what `requestAdapter` returns cannot miss,
+  since every device, queue, encoder and pass descends from it.
+
+Sanity check on the output: dispatches should be in the tens of thousands for an
+utterance, and dispatches/submit should land near xn's batch size (~165-190).
+Single-digit numbers mean the counters are watching the wrong context.
+
 ## Caching
 
 `server.js` sends `no-cache` for everything in `pkg/` and a day of caching only
