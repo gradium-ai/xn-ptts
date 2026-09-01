@@ -65,6 +65,7 @@
   <span class="badge" id="gpu-badge">checking WebGPU…</span>
   <span class="badge" id="dev-badge" hidden></span>
   <span class="badge" id="threads-note" hidden></span>
+  <span class="badge" id="build-badge" hidden></span>
 </header>
 <p class="sub">
   The whole model runs in this tab: the flow-matching LM and the Mimi decoder are WGSL compute
@@ -145,6 +146,36 @@ const fmt = (v, d = 1) => (v == null || !isFinite(v)) ? 'n/a' : v.toFixed(d);
 const rtfClass = r => r >= 1 ? 'rtf-good' : r >= 0.7 ? 'rtf-warn' : 'rtf-bad';
 const setStatus = (m, err = false) => { $('status').textContent = m; $('status').className = err ? 'err' : ''; };
 
+// ---- build stamp -------------------------------------------------------
+// `pkg/` is assembled by copying files, so a rebuild mid-session can leave a tab
+// holding a page and a wasm from different builds. That fails in ways that look
+// like code bugs, so the page carries the stamp it loaded with and checks it.
+let loadedBuild = null;
+
+async function fetchBuild() {
+  try {
+    const r = await fetch('/build.txt', { cache: 'no-store' });
+    return r.ok ? (await r.text()).trim() : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+fetchBuild().then(b => {
+  loadedBuild = b;
+  if (b) {
+    $('build-badge').textContent = `build ${b}`;
+    $('build-badge').hidden = false;
+  }
+});
+
+/// True if the server has been rebuilt since this tab loaded, so it is stale.
+async function buildChanged() {
+  if (!loadedBuild) return false;
+  const now = await fetchBuild();
+  return now !== null && now !== loadedBuild;
+}
+
 // ---- WebGPU presence, before anything expensive -------------------------
 if (!navigator.gpu) {
   $('gpu-badge').textContent = 'WebGPU unavailable';
@@ -164,7 +195,7 @@ function audioCtx() {
   return ctx;
 }
 class Player {
-  constructor() { this.ac = audioCtx(); this.head = 0; }
+  constructor() { this.ac = audioCtx(); this.head = 0; this.startAt = null; }
   push(f32) {
     const b = this.ac.createBuffer(1, f32.length, info.sample_rate);
     b.copyToChannel(f32, 0);
@@ -172,8 +203,14 @@ class Player {
     s.buffer = b; s.connect(this.ac.destination);
     const floor = this.ac.currentTime + 0.2;
     if (this.head < floor) this.head = floor;
+    if (this.startAt === null) this.startAt = this.head;
     s.start(this.head);
     this.head += b.duration;
+  }
+  /// Seconds of audio the listener has actually heard, from the audio clock.
+  played() {
+    if (this.startAt === null) return 0;
+    return Math.max(0, this.ac.currentTime - this.startAt);
   }
 }
 function playAll(f32) {
@@ -182,6 +219,8 @@ function playAll(f32) {
   b.copyToChannel(f32, 0);
   const s = ac.createBufferSource();
   s.buffer = b; s.connect(ac.destination); s.start();
+  const startAt = ac.currentTime;
+  return { played: () => Math.max(0, ac.currentTime - startAt) };
 }
 function wavBlob(f32, rate) {
   const buf = new ArrayBuffer(44 + f32.length * 2), dv = new DataView(buf);
@@ -199,87 +238,123 @@ function wavBlob(f32, rate) {
 }
 
 // ---- waveform ----------------------------------------------------------
-// The canvas is prepared once per run and then drawn into frame by frame, so
-// nothing is redrawn on the generation's hot path. `wave.budget` is the frame
-// budget, which fixes the x-axis up front; eos usually ends a run short of it,
-// so `finishWave` rescales to the real length once the length is known.
-const wave = { g: null, w: 0, h: 0, mid: 0, budget: 0, live: false, pending: [], raf: 0 };
+// The waveform tracks the *audio clock*, not frame arrival. Generation finishes
+// several times faster than realtime -- ~1.2 s of compute for 7.5 s of speech --
+// so filling the canvas as frames arrive completes it long before the listener
+// has heard any of it, which reads as "it did not draw while streaming".
+//
+// So two layers: generated audio is drawn dim as it arrives, and the portion the
+// listener has actually heard is drawn bright over it, advancing with playback.
+// With playback off there is no clock to follow and everything is bright at once.
+const DIM = '#27476b';
+const BRIGHT = '#4493f8';
+const HEAD = '#8b949e';
+
+const wave = {
+  g: null, w: 0, h: 0, mid: 0,
+  buf: null,      // generated samples, contiguous
+  len: 0,         // how many of them are valid
+  axis: 0,        // samples the x-axis currently spans
+  live: false,
+  raf: 0,
+  source: null,   // something with played() -> seconds, or null
+  done: false,    // generation finished, so `len` is final
+};
 
 function waveCtx() {
   const c = $('wave'), dpr = devicePixelRatio || 1;
   c.width = c.clientWidth * dpr; c.height = c.clientHeight * dpr;
   const g = c.getContext('2d');
   g.scale(dpr, dpr);
-  const w = c.clientWidth, h = c.clientHeight, mid = h / 2;
-  g.clearRect(0, 0, w, h);
-  g.strokeStyle = '#2a3140'; g.beginPath(); g.moveTo(0, mid); g.lineTo(w, mid); g.stroke();
-  g.fillStyle = '#4493f8';
-  return { g, w, h, mid };
+  return { g, w: c.clientWidth, h: c.clientHeight, mid: c.clientHeight / 2 };
 }
 
-/// Min/max of `f32[from..to)` drawn across the pixels `[x0, x1)`.
-function drawSpan(g, f32, from, to, x0, x1, mid) {
-  const px = Math.max(1, x1 - x0);
-  const per = Math.max(1, Math.ceil((to - from) / px));
-  for (let x = x0, i = from; x < x0 + px && i < to; x++, i += per) {
+/// Min/max columns for `buf[0..len)` across `[0, w)`, where the x-axis spans
+/// `axis` samples. Only columns below `upTo` samples are drawn.
+function paint(g, buf, len, axis, upTo, w, mid, colour) {
+  if (!len) return;
+  g.fillStyle = colour;
+  const perPx = Math.max(1, axis / w);
+  const lastX = Math.min(w, Math.ceil(Math.min(len, upTo) / perPx));
+  for (let x = 0; x < lastX; x++) {
+    const from = Math.floor(x * perPx);
+    const to = Math.min(len, Math.floor((x + 1) * perPx));
     let lo = 0, hi = 0;
-    for (let j = i, e = Math.min(to, i + per); j < e; j++) {
-      if (f32[j] < lo) lo = f32[j];
-      if (f32[j] > hi) hi = f32[j];
+    for (let i = from; i < to; i++) {
+      if (buf[i] < lo) lo = buf[i];
+      if (buf[i] > hi) hi = buf[i];
     }
     g.fillRect(x, mid + lo * mid, 1, Math.max(1, (hi - lo) * mid));
   }
 }
 
-function beginWave(budget) {
-  const { g, w, h, mid } = waveCtx();
-  Object.assign(wave, { g, w, h, mid, budget: Math.max(1, budget), live: true });
-  wave.pending = [];
-  wave.raf = 0;
-}
-
-/// Draw one frame at the share of the budget it occupies.
-function paintFrame(f32, index) {
-  const x0 = Math.floor(index / wave.budget * wave.w);
-  const x1 = Math.max(x0 + 1, Math.floor((index + 1) / wave.budget * wave.w));
-  drawSpan(wave.g, f32, 0, f32.length, x0, Math.min(x1, wave.w), wave.mid);
-}
-
-/// Queue a frame and flush on the next animation frame.
-///
-/// Frames land far faster than the display refreshes -- ~13 ms apart against
-/// 16.7 ms -- and drawing straight from the message handler only updates the
-/// canvas bitmap. Whether that ever reaches the screen before the run ends is up
-/// to the compositor, and in practice it did not. Painting from rAF ties the
-/// canvas to the display instead, so the waveform visibly grows.
-function pushWave(f32, index) {
-  if (!wave.live || !f32.length) return;
-  wave.pending.push([f32, index]);
-  if (wave.raf) return;
-  wave.raf = requestAnimationFrame(() => {
-    wave.raf = 0;
-    if (!wave.live) return;
-    for (const [f, i] of wave.pending) paintFrame(f, i);
-    wave.pending.length = 0;
-  });
-}
-
-/// Draw anything still queued, so the last frames are not dropped by a run that
-/// finishes before its final animation frame runs.
-function flushWave() {
-  if (wave.raf) { cancelAnimationFrame(wave.raf); wave.raf = 0; }
-  if (wave.live && wave.pending && wave.pending.length) {
-    for (const [f, i] of wave.pending) paintFrame(f, i);
-    wave.pending.length = 0;
+function repaint() {
+  const { g, w, h, mid } = wave;
+  g.clearRect(0, 0, w, h);
+  g.strokeStyle = '#2a3140'; g.beginPath(); g.moveTo(0, mid); g.lineTo(w, mid); g.stroke();
+  if (!wave.len) return;
+  const axis = wave.axis || wave.len;
+  // Everything generated, dim; then the heard part over it, bright.
+  paint(g, wave.buf, wave.len, axis, wave.len, w, mid, DIM);
+  const heard = wave.source
+    ? Math.round(wave.source.played() * info.sample_rate)
+    : wave.len;
+  paint(g, wave.buf, wave.len, axis, heard, w, mid, BRIGHT);
+  if (wave.source && heard > 0 && heard < wave.len) {
+    const x = Math.min(w - 1, Math.floor(heard / (axis / w)));
+    g.fillStyle = HEAD;
+    g.fillRect(x, 0, 1, h);
   }
 }
 
+/// Repaint on every animation frame, so the fill advances with the audio rather
+/// than with whenever a message happens to arrive.
+function waveLoop() {
+  if (!wave.live) return;
+  wave.loops = (wave.loops || 0) + 1;
+  try { repaint(); wave.paints = (wave.paints || 0) + 1; }
+  catch (e) { wave.err = String(e && e.message || e); }
+  const heard = wave.source ? wave.source.played() * info.sample_rate : wave.len;
+  if (wave.done && heard >= wave.len) { wave.live = false; wave.raf = 0; return; }
+  wave.raf = requestAnimationFrame(waveLoop);
+}
+
+function beginWave(maxFrames, frameSize) {
+  const { g, w, h, mid } = waveCtx();
+  const cap = Math.max(1, maxFrames) * frameSize;
+  Object.assign(wave, {
+    g, w, h, mid, buf: new Float32Array(cap), len: 0, axis: cap,
+    live: true, source: null, done: false,
+  });
+  if (wave.raf) cancelAnimationFrame(wave.raf);
+  wave.raf = requestAnimationFrame(waveLoop);
+}
+
+function pushWave(f32) {
+  if (!wave.buf || wave.len + f32.length > wave.buf.length) return;
+  wave.buf.set(f32, wave.len);
+  wave.len += f32.length;
+}
+
+/// Generation is over, so the true length is known: tighten the axis onto it and
+/// let the loop keep filling until playback catches up.
+function endWave(source) {
+  wave.done = true;
+  wave.axis = wave.len || 1;
+  if (source) wave.source = source;
+  if (!wave.live) { wave.live = true; wave.raf = requestAnimationFrame(waveLoop); }
+}
+
+/// Static draw of a finished buffer (resize when idle, or playback off).
 function drawWave(f32) {
-  flushWave();
   wave.live = false;
-  const { g, mid, w } = waveCtx();
+  if (wave.raf) { cancelAnimationFrame(wave.raf); wave.raf = 0; }
+  const { g, w, h, mid } = waveCtx();
+  Object.assign(wave, { g, w, h, mid });
+  g.clearRect(0, 0, w, h);
+  g.strokeStyle = '#2a3140'; g.beginPath(); g.moveTo(0, mid); g.lineTo(w, mid); g.stroke();
   if (!f32 || !f32.length) return;
-  drawSpan(g, f32, 0, f32.length, 0, w, mid);
+  paint(g, f32, f32.length, f32.length, f32.length, w, mid, BRIGHT);
 }
 
 // ---- rendering ---------------------------------------------------------
@@ -341,7 +416,13 @@ function voiceList(base) {
   return VOICES.map(n => ({ name: n, url: `${base}/embeddings_v2/${n}.safetensors` }));
 }
 
-$('load').onclick = () => {
+$('load').onclick = async () => {
+  if (await buildChanged()) {
+    setStatus(
+      'This tab was loaded from an older build than the server is now serving, so its page and ' +
+      'wasm may disagree. Reload (Cmd-Shift-R) before loading a model.', true);
+    return;
+  }
   const base = $('base').value, dtype = $('dtype').value;
   $('load').disabled = true;
   runs = []; renderHistory();
@@ -386,8 +467,14 @@ $('load').onclick = () => {
         $('voice').disabled = false;
         break;
       }
+      case 'weights':
+        console.log(`weights: ${m.bytes} bytes, magic ${JSON.stringify(m.magic)}, from ${m.url}`);
+        break;
       case 'ready':
         info = m.info;
+        // Re-enabled so a different dtype can be loaded without reloading the
+        // page; each Load spawns a fresh worker, so the old model goes away.
+        $('load').disabled = false;
         $('prog').style.width = '100%';
         setStatus(`ready — ${info.device}, ${info.dtype} from ${info.container}, ` +
           `${info.sample_rate} Hz, loaded in ${fmt(info.load_ms)} ms`);
@@ -397,14 +484,17 @@ $('load').onclick = () => {
         chunks = [];
         playMode = $('play').value;
         player = playMode === 'stream' ? new Player() : null;
-        beginWave(m.maxFrames);
+        beginWave(m.maxFrames, info.frame_size);
+        // Streaming playback is the clock straight away; "after run" gets one at
+        // gen_done; with playback off there is none and the fill is immediate.
+        if (player) wave.source = player;
         setStatus(`generating — ${m.tokens} tokens`);
         break;
       case 'frame': {
         const f = new Float32Array(m.pcm);
         chunks.push(f);
         if (player) player.push(f);
-        pushWave(f, m.index);
+        pushWave(f);
         break;
       }
       case 'gen_done': {
@@ -415,8 +505,12 @@ $('load').onclick = () => {
         let o = 0; for (const c of chunks) { all.set(c, o); o += c.length; }
         lastPcm = all;
         $('save').disabled = !all.length;
-        renderCards(s); drawWave(all); renderHistory();
-        if (playMode === 'end') playAll(all);
+        renderCards(s); renderHistory();
+        // Not drawWave: that would finish the waveform instantly, which is the
+        // thing this is meant to avoid. Hand the loop the true length and, for
+        // "after run", the clock it should follow.
+        endWave(playMode === 'end' ? playAll(all) : null);
+        if (playMode === 'off') drawWave(all);
         setStatus(`done — ${fmt(s.rtf, 2)}× realtime on ${s.device} (${s.dtype})`);
         $('go').disabled = false;
         break;
@@ -459,12 +553,11 @@ $('save').onclick = () => {
 };
 
 addEventListener('resize', () => {
-  // Mid-run the canvas is being filled incrementally, and resizing clears it, so
-  // repaint from the frames received so far and carry on live from there.
-  if (wave.live && chunks.length) {
-    const budget = wave.budget;
-    beginWave(budget);
-    for (let i = 0; i < chunks.length; i++) pushWave(chunks[i], i);
+  // The live loop repaints from `wave.buf` every frame, so it only needs the new
+  // canvas geometry; a finished waveform has to be redrawn here.
+  if (wave.live) {
+    const { g, w, h, mid } = waveCtx();
+    Object.assign(wave, { g, w, h, mid });
   } else {
     drawWave(lastPcm);
   }
@@ -475,6 +568,26 @@ addEventListener('resize', () => {
 // /report, so the same page doubles as a check runnable from a shell.
 const q = new URLSearchParams(location.search);
 if (q.get('auto')) {
+  // The page script is a module, so nothing in it is reachable from
+  // `Runtime.evaluate`. Publish exactly what the screenshot harness needs.
+  window.__probe = () => ({
+    st: $('status').textContent.slice(0, 24),
+    heard: wave.source ? wave.source.played() : null,
+    len: wave.len, live: wave.live, done: wave.done,
+    playMode: $('play').value, hasSource: !!wave.source,
+    loops: wave.loops || 0, paints: wave.paints || 0, err: wave.err || null,
+    ...(() => {
+      const c = $('wave');
+      if (!c.width) return { bright: -1, dim: -1 };
+      const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+      let bright = 0, dim = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        if (d[i] === 0x44 && d[i + 1] === 0x93 && d[i + 2] === 0xf8) bright++;
+        else if (d[i] === 0x27 && d[i + 1] === 0x47 && d[i + 2] === 0x6b) dim++;
+      }
+      return { bright, dim };
+    })(),
+  });
   const report = obj => fetch('/report', {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify(obj, null, 2),
@@ -487,7 +600,7 @@ if (q.get('auto')) {
   if (q.get('dtype')) $('dtype').value = q.get('dtype');
   if (q.get('base')) $('base').value = q.get('base');
   if (q.get('text')) $('text').value = q.get('text');
-  $('play').value = 'off';
+  $('play').value = q.get('play') || 'off';
 
   // A failure anywhere must still produce a report, or a headless run just hangs.
   const fail = msg => report({ error: msg, checkpoints });

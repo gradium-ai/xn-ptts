@@ -102,68 +102,45 @@ well.
 
 ## Waveform
 
-The canvas is laid out from the frame budget at `gen_start` and each frame is
-drawn into its own slice as it arrives, so nothing is redrawn on the generation's
-hot path. eos usually ends a run short of the budget, so the waveform is redrawn
-once at the end against the length actually produced.
+The fill follows the **audio clock**, not frame arrival. Generation runs several
+times faster than realtime -- ~1.2 s of compute for 7.5 s of speech -- so a
+waveform drawn as frames arrive is complete about six seconds before the listener
+has heard any of it, which is indistinguishable from not animating at all.
 
-Frames are queued and flushed from `requestAnimationFrame` rather than painted
-straight out of the worker's message handler. They arrive ~13 ms apart against a
-16.7 ms refresh, and drawing from the handler only guarantees the canvas *bitmap*
-is updated -- whether that reaches the screen before the run ends is up to the
-compositor, and in practice it did not. Note that reading the canvas back
-(`getImageData`) cannot tell the two apart: it sees the bitmap either way. The
-check that can is `scripts/shots.mjs`, which drives the page over CDP and
-compares composited screenshots.
+So there are two layers. Generated audio is drawn dim as it arrives, which shows
+generation progress; the portion actually heard is drawn bright over it, advancing
+with `AudioContext.currentTime`, with a playhead line between them. `Player.played()`
+is the clock for streaming playback, `playAll` returns one for "after run", and
+with playback off there is no clock and the waveform simply completes with
+generation.
 
-## Measured
+The whole canvas is repainted from `requestAnimationFrame` off a single contiguous
+sample buffer, so painting is tied to the display rather than to whenever a worker
+message lands.
 
-Apple M5, Chrome headless, 94 frames (7.5 s of audio), 3 runs, phonon model:
+### Checking it
 
-| dtype | container | RTF (mean of 4) | TTFA | frame p50 | load | download |
-| --- | --- | --- | --- | --- | --- | --- |
-| f32 | safetensors | 6.21x | 115 ms | 11.5 ms | 432 ms | 317 MB |
-| f16 | safetensors | 8.18x | 100 ms | 8.6 ms | 213 ms | 317 MB |
-| q8 | gguf | 8.40x | 111 ms | 8.4 ms | 176 ms | 136 MB |
-| **q8f16** | gguf | **8.56x** | 111 ms | 8.0 ms | 194 ms | 136 MB |
-
-All four produce the same audio (rms 0.064-0.066, peak ~0.57, no non-finite
-samples), so neither f16 nor q8 is silently degrading.
-
-**Use `q8f16`.** It is at least as fast as f16 and less than half the download.
-Do not read too much into the f16-vs-q8 ordering, though: an earlier sweep on the
-same machine put q8 at 7.11x and q8f16 at 7.89x, below f16, and q8's run-to-run
-spread has been as wide as 4.69x-8.55x. Something about the quantized path is
-sensitive to state this benchmark does not control -- see the end-to-end q8
-regression documented at the top of xn's `webgpu_backend/quantization.rs`, where
-quantized layers slow down unrelated f32 work in later submits. Treat f16 and q8
-as roughly equal on throughput and pick on size.
-
-What q8 unambiguously buys: 136 MB instead of 317 MB, ~90 MB of weight VRAM
-instead of ~340 MB, and the fastest load. For a page a stranger opens, that
-matters more than a throughput tie.
-
-Browsers mask the adapter name, so the device reports as
-`WebGPU (Other BrowserWebGpu)` rather than naming the GPU.
-
-These are **not** comparable to `ptts-ws-server`'s numbers on the same machine
-(4.13x f32, 5.20x f16). That server encodes each frame to s16, base64s it, wraps
-it in JSON and pushes it through a websocket inside the measured loop; this page
-hands a `Float32Array` straight to WebAudio. The two measure different pipelines,
-not two WebGPU implementations.
-
-To run it:
+`scripts/shots.mjs` drives the page over CDP and samples the canvas while it runs.
+Verdicts come from counting waveform pixels, not from screenshots: this headless
+setup stops producing composited frames once the DOM settles, so screenshots go
+byte-identical even while the canvas provably changes. The script prints both and
+says which one is the verdict.
 
 ```bash
 node server.js &
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
   --headless=new --enable-unsafe-webgpu --no-first-run --no-sandbox \
+  --autoplay-policy=no-user-gesture-required \
   --remote-debugging-port=9222 --window-size=1200,900 \
   --user-data-dir=/tmp/ptts-shots-cd about:blank &
 WS=$(curl -s http://127.0.0.1:9222/json | python3 -c \
   "import json,sys; print([t for t in json.load(sys.stdin) if t['type']=='page'][0]['webSocketDebuggerUrl'])")
-node scripts/shots.mjs "$WS" "http://127.0.0.1:8788/?auto=1&dtype=f16&iters=3"
+node scripts/shots.mjs "$WS" "http://127.0.0.1:8788/?auto=1&dtype=f16&iters=1&play=stream"
 ```
+
+Measured, f16, 7.5 s of audio: `play=stream` fills 849 -> 6644 bright px over the
+7.35 s of playback with dim reaching 0; `play=end` fills 0 -> 6643; `play=off`
+completes with generation at 6734 bright px.
 
 ## Caching
 
