@@ -157,10 +157,30 @@ async function buildChanged() {
 }
 
 // ---- WebGPU presence, before anything expensive -------------------------
+// `navigator.gpu` existing is not the same as there being an adapter: Android
+// blocklists WebGPU on many GPU/driver pairs, and the API stays exposed while
+// every requestAdapter returns null. Checked here so that fails in a second
+// rather than after a 136 MB download.
 if (!navigator.gpu) {
   $('gpu-badge').textContent = 'WebGPU unavailable';
   $('gpu-badge').className = 'badge bad';
   setStatus('No navigator.gpu — needs Chrome 113+, Edge, or Safari 18+.', true);
+  $('load').disabled = true;
+} else if (!(await navigator.gpu.requestAdapter().catch(() => null))) {
+  $('gpu-badge').textContent = 'no WebGPU adapter';
+  $('gpu-badge').className = 'badge bad';
+  const android = /Android/i.test(navigator.userAgent);
+  setStatus(
+    'WebGPU is exposed but the browser offers no adapter, so nothing here can run.\n' +
+    (android
+      ? 'On Android this is nearly always the GPU or driver being blocklisted. Open chrome://gpu ' +
+        'and read the WebGPU line for the reason, then try setting ' +
+        'chrome://flags/#enable-unsafe-webgpu and chrome://flags/#enable-vulkan to Enabled and ' +
+        'relaunching Chrome.'
+      : 'Check the browser version (iOS/Safari 18+, Chrome 121+) and turn off low power mode.') +
+    '\nOpen /diag.html for the full adapter probe.',
+    true,
+  );
   $('load').disabled = true;
 } else {
   $('gpu-badge').textContent = 'WebGPU available';

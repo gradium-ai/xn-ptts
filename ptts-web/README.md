@@ -43,6 +43,24 @@ Pick **q8_0** on a phone: 136 MB rather than 317 MB to pull over wifi, and
 correspondingly less GPU memory for the weights. Needs iOS 18+ / Safari 18+, or
 Chrome 121+ on Android; older versions have no WebGPU.
 
+### "WebGPU is exposed but the browser offers no adapter"
+
+`navigator.gpu` existing does not mean there is an adapter. Android Chrome
+blocklists WebGPU on many GPU and driver pairs, and when it does the API stays
+exposed while every `requestAdapter()` returns null -- including
+`forceFallbackAdapter`, and identically on the main thread and in a worker. That
+is not fixable from the page; the device has to allow it.
+
+On the phone: open `chrome://gpu` and read the WebGPU line, which states the
+reason outright. Then try `chrome://flags/#enable-unsafe-webgpu` and
+`chrome://flags/#enable-vulkan` set to Enabled (WebGPU on Android runs on
+Vulkan), and fully relaunch Chrome. Battery saver can also disable it.
+
+`/diag.html` probes all four request forms on both the main thread and in a
+worker and prints a JSON summary to paste elsewhere. It is plain JS with no wasm,
+so it answers in a second rather than after a 136 MB download. The main page runs
+the same check before offering to load anything.
+
 ### If it hangs instead of erroring
 
 macOS stealth mode (on by default with the firewall) silently drops packets to
