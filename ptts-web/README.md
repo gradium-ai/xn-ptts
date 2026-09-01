@@ -25,17 +25,18 @@ a real deployment would use.
 
 ## Compute dtypes
 
-| dtype | needs | notes |
-| --- | --- | --- |
-| `f32` | — | baseline |
-| `f16` | adapter reports WGSL `shader-f16` | errors rather than silently downgrading |
-| `q8` | — | `q8_0` weights, f32 activations |
-| `q8f16` | `shader-f16` | `q8_0` weights, f16 activations |
+| dtype | weights file | needs | notes |
+| --- | --- | --- | --- |
+| `f32` | `model.safetensors` | — | baseline |
+| `f16` | `model.safetensors` | adapter reports WGSL `shader-f16` | fastest; errors rather than silently downgrading |
+| `q8` | `model.q8.gguf` | — | `q8_0` weights, f32 activations |
+| `q8f16` | `model.q8.gguf` | `shader-f16` | `q8_0` weights, f16 activations |
 
-The q8 paths quantize from the f32 safetensors at load rather than reading a
-pre-quantized GGUF, so they download the same file `f32` does and pay a
-quantization pass on the GPU when the model is built. GGUF input is rejected with
-a message saying so.
+The dtype dictates the container. f32 and f16 need dense weights; the q8 dtypes
+need blocks that are *already* quantized, because quantizing dense weights means
+reading each one back to the host (`Q8Tensor::quantize`), and a browser cannot
+block on a readback. Asking for a q8 dtype without a GGUF fails with that
+explanation rather than hanging.
 
 ## Threads: one, and not configurable
 
@@ -93,6 +94,12 @@ might suggest. Measured there, same text and 3 runs each: 3.80x -> 4.13x RTF and
 18.1 ms -> 16.6 ms per frame, so about 9%. The readbacks it removes are small; the
 per-frame cost is dominated by dispatch count, not by round trips.
 
+The third readback, the one that blocked q8, was at load: `Q8Tensor::quantize`
+pulled every weight back to quantize it on the host. `Q8Tensor::from_q8_0` now
+takes the blocks straight from a GGUF instead, so nothing but the upload touches
+the device. That is an xn change, and it made native loads about 2x faster as
+well.
+
 ## Waveform
 
 The canvas is laid out from the frame budget at `gen_start` and each frame is
@@ -113,13 +120,28 @@ compares composited screenshots.
 
 Apple M5, Chrome headless, 94 frames (7.5 s of audio), 3 runs, phonon model:
 
-| dtype | RTF | TTFA | frame p50 |
-| --- | --- | --- | --- |
-| f32 | 6.53x | 109 ms | 11.1 ms |
-| f16 | 7.78x | 141 ms | 8.7 ms |
+| dtype | container | RTF (mean of 4) | TTFA | frame p50 | load | download |
+| --- | --- | --- | --- | --- | --- | --- |
+| f32 | safetensors | 6.21x | 115 ms | 11.5 ms | 432 ms | 317 MB |
+| f16 | safetensors | 8.18x | 100 ms | 8.6 ms | 213 ms | 317 MB |
+| q8 | gguf | 8.40x | 111 ms | 8.4 ms | 176 ms | 136 MB |
+| **q8f16** | gguf | **8.56x** | 111 ms | 8.0 ms | 194 ms | 136 MB |
 
-Both produce the same audio (rms 0.065, peak ~0.58, no non-finite samples), so
-f16 is not silently degrading.
+All four produce the same audio (rms 0.064-0.066, peak ~0.57, no non-finite
+samples), so neither f16 nor q8 is silently degrading.
+
+**Use `q8f16`.** It is at least as fast as f16 and less than half the download.
+Do not read too much into the f16-vs-q8 ordering, though: an earlier sweep on the
+same machine put q8 at 7.11x and q8f16 at 7.89x, below f16, and q8's run-to-run
+spread has been as wide as 4.69x-8.55x. Something about the quantized path is
+sensitive to state this benchmark does not control -- see the end-to-end q8
+regression documented at the top of xn's `webgpu_backend/quantization.rs`, where
+quantized layers slow down unrelated f32 work in later submits. Treat f16 and q8
+as roughly equal on throughput and pick on size.
+
+What q8 unambiguously buys: 136 MB instead of 317 MB, ~90 MB of weight VRAM
+instead of ~340 MB, and the fastest load. For a page a stranger opens, that
+matters more than a throughput tie.
 
 Browsers mask the adapter name, so the device reports as
 `WebGPU (Other BrowserWebGpu)` rather than naming the GPU.
