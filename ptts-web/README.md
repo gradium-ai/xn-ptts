@@ -4,7 +4,7 @@ Three tabs, all inference in the browser on xn's WebGPU backend:
 
 | Tab | What it is |
 | --- | --- |
-| **Agent** | ASR -> LLM -> TTS. Hold to talk, it talks back. |
+| **Agent** | ASR -> LLM -> TTS. Always listening; talk and it talks back. Both models' quantization is picked here. |
 | **TTS** | Pocket TTS on its own, with the timings below. |
 | **ASR** | Streaming ASR on its own, with per-frame timings. |
 
@@ -27,9 +27,34 @@ Measured in headless Chrome on an Apple M5, one turn end to end:
 
 | Leg | Time |
 | --- | --- |
-| ASR (5.4 s of speech) | 1.9 s, 2.71x realtime |
-| LLM (free tier, rate-limited) | 43 s |
-| TTS (3.8 s of speech) | 0.6 s, 6.48x realtime |
+| ASR (5.4 s of speech) | 2.0 s, 2.71x realtime |
+| LLM (free tier, when not rate-limited) | 1.0 s |
+| TTS (4.9 s of speech, q8_0/f16) | 0.8 s, 6.49x realtime |
+| **Whole turn** | **4.1 s** |
+
+That is with the turn closed by the silence detector, not a button. A rate-limited
+LLM turn measured 43 s instead of 1 s, which is the free tier rather than
+anything local.
+
+## Turn-taking
+
+The Agent tab has no push-to-talk. The microphone stays open once started, and
+each 80 ms frame's RMS decides where an utterance ends: speech has to be heard
+for 3 frames before one opens, and ~720 ms of silence closes it and sends the
+turn. Three points that are easy to get wrong and are handled:
+
+* **Pre-roll.** The gate needs a few frames to trip, so the frames just before it
+  are held and fed in when it does. Without them "Hello, this is a test" arrives
+  as "this is a test" -- which is exactly what happened before it was added.
+* **False starts.** A cough trips the gate without becoming speech. If the
+  hangover expires before `minSpeech` frames are heard, the utterance is dropped
+  and the ASR state reset, rather than the session waiting forever for a turn.
+* **The agent's own voice.** Frames arriving while it is transcribing or
+  speaking are dropped, so it does not transcribe itself. That also means no
+  barge-in: it cannot be interrupted mid-sentence.
+
+The thresholds are in the `VAD` object at the top of the agent section, in frames
+rather than milliseconds since the frame is the model's unit.
 
 ## Weights
 

@@ -86,15 +86,31 @@
 <section id="tab-agent" class="tab">
   <div class="panel">
     <div class="row" style="margin-top:0">
+      <div>
+        <label for="ag-tts-dtype">TTS</label>
+        <select id="ag-tts-dtype" style="width:130px">
+          <option value="f32">f32</option>
+          <option value="f16" selected>f16</option>
+          <option value="q8">q8_0 / f32</option>
+          <option value="q8f16">q8_0 / f16</option>
+        </select>
+      </div>
+      <div>
+        <label for="ag-asr-dtype">ASR</label>
+        <select id="ag-asr-dtype" style="width:100px">
+          <option value="f32" selected>f32</option>
+          <option value="f16">f16</option>
+        </select>
+      </div>
       <div><button id="ag-load">Load models</button></div>
-      <div><button id="ag-talk" disabled>Hold to talk</button></div>
+      <div><button id="ag-talk" disabled>Start listening</button></div>
       <div><button id="ag-reset" class="ghost" disabled>Clear</button></div>
       <div class="grow"><div id="ag-status"></div></div>
     </div>
     <div class="bar"><div id="ag-prog"></div></div>
   </div>
   <div class="panel">
-    <div id="ag-chat" class="chat"><p class="empty">Load the models, then hold the button and speak.</p></div>
+    <div id="ag-chat" class="chat"><p class="empty">Load the models, start listening, and just talk.</p></div>
   </div>
   <div class="panel">
     <div class="cards" id="ag-cards"><p class="empty">No turns yet.</p></div>
@@ -784,6 +800,10 @@ const agent = {
   history: [{ role: 'system', content:
     'You are a voice assistant. Reply in one or two short spoken sentences. No markdown, no lists, no emoji.' }],
   words: [], ready: { asr: false, tts: false }, timings: {},
+  // `listening` is what the user asked for; `phase` is where the turn is. The
+  // microphone stays open across a whole session, so frames arriving while the
+  // agent is transcribing or speaking are dropped rather than transcribed.
+  listening: false, phase: 'idle', speech: 0, silence: 0, preroll: [],
 };
 
 const agStatus = m => { $('ag-status').textContent = m; };
@@ -829,7 +849,9 @@ $('ag-load').onclick = () => {
     final: m => agTurn(m.text),
     error: m => agStatus(`asr error: ${m.message}`),
   });
-  agent.asrWorker.postMessage({ type: 'setup', base: '/asr', dtype: 'f32', language: '' });
+  agent.asrWorker.postMessage({
+    type: 'setup', base: '/asr', dtype: $('ag-asr-dtype').value, language: '',
+  });
 
   agent.ttsWorker = new Worker('./worker.js', { type: 'module' });
   agent.ttsWorker.onmessage = ev => {
@@ -850,16 +872,19 @@ $('ag-load').onclick = () => {
       agent.timings.speech_ms = m.stats.audio_ms;
       agent.timings.turn_ms = performance.now() - agent.turnStart;
       agCards();
-      agStatus('ready — hold to talk');
-      $('ag-talk').disabled = false;
+      agResume();
     } else if (m.type === 'error') {
       agStatus(`tts error: ${m.message}`);
-      $('ag-talk').disabled = false;
+      agResume();
     }
   };
+  const ttsDtype = $('ag-tts-dtype').value;
   agent.ttsWorker.postMessage({
-    type: 'setup', base: '/model', dtype: 'f16', temperature: 0.4,
-    weightsUrl: '/model/model.safetensors', configUrl: '/model/config.json',
+    type: 'setup', base: '/model', dtype: ttsDtype, temperature: 0.4,
+    // q8 reads pre-quantized blocks, so it needs the gguf; f32/f16 need the
+    // dense safetensors. Same rule as the TTS tab.
+    weightsUrl: ttsDtype.startsWith('q8') ? '/model/model.q8.gguf' : '/model/model.safetensors',
+    configUrl: '/model/config.json',
     voices: [{ name: 'Freya', url: '/voices/Freya.safetensors' }],
   });
 };
@@ -867,40 +892,130 @@ $('ag-load').onclick = () => {
 function agMaybeReady() {
   if (!agent.ready.asr || !agent.ready.tts) return;
   $('ag-prog').style.width = '100%';
-  agStatus('ready — hold to talk');
+  agStatus('ready — press start and talk');
   $('ag-talk').disabled = false;
   $('ag-reset').disabled = false;
+}
+
+// Turn-taking without a button. The microphone stays open and each frame's energy
+// decides where an utterance ends: speech has to be heard for a few frames, then
+// silence for about three quarters of a second, before the turn is sent.
+//
+// The frame is 80 ms, so these are frame counts, not milliseconds.
+const VAD = {
+  // RMS over a frame. Ambient noise sits well under this on a normal mic.
+  threshold: 0.012,
+  // Frames of speech needed before an utterance counts as started, which keeps
+  // a cough or a keystroke from opening a turn.
+  minSpeech: 3,
+  // Frames of silence that close it: ~720 ms, long enough to survive the pause
+  // in the middle of a sentence.
+  hangover: 9,
+  // Frames kept from before the gate tripped. The gate needs `minSpeech` frames
+  // to open, so without these the first word arrives already clipped -- "Hello,
+  // this is a test" came through as "this is a test".
+  preroll: 3,
+};
+
+function rms(f32) {
+  let s = 0;
+  for (let i = 0; i < f32.length; i++) s += f32[i] * f32[i];
+  return Math.sqrt(s / f32.length);
+}
+
+function agFrame(pcm) {
+  // While the agent is speaking, its own output would otherwise be transcribed
+  // straight back. Simplest correct thing is to stop listening until it stops.
+  if (agent.phase !== 'listen') return;
+
+  const loud = rms(pcm) >= VAD.threshold;
+
+  // Before anything has been heard, hold the last few frames and feed the model
+  // nothing: otherwise it spends the whole session transcribing room tone.
+  if (agent.speech === 0 && !loud) {
+    agent.preroll.push(pcm);
+    if (agent.preroll.length > VAD.preroll) agent.preroll.shift();
+    return;
+  }
+
+  if (loud) {
+    if (agent.speech === 0) {
+      agent.asrStart = performance.now();
+      for (const p of agent.preroll) agent.asrWorker.postMessage({ type: 'frame', pcm: p }, [p.buffer]);
+      agent.preroll = [];
+    }
+    agent.speech++;
+    agent.silence = 0;
+  } else {
+    agent.silence++;
+  }
+  agent.asrWorker.postMessage({ type: 'frame', pcm }, [pcm.buffer]);
+
+  // A cough or a door trips the gate without ever becoming speech. Drop it and
+  // start the utterance over rather than feeding silence for the rest of the
+  // session waiting for a turn that will not come.
+  if (agent.speech < VAD.minSpeech && agent.silence >= VAD.hangover) {
+    agent.speech = 0;
+    agent.silence = 0;
+    agent.preroll = [];
+    agent.asrWorker.postMessage({ type: 'reset' });
+    return;
+  }
+
+  if (agent.speech >= VAD.minSpeech && agent.silence >= VAD.hangover) {
+    agent.phase = 'transcribe';
+    agent.speech = 0;
+    agent.silence = 0;
+    agent.preroll = [];
+    agent.turnStart = agent.asrStart;
+    agStatus('transcribing…');
+    agent.asrWorker.postMessage({ type: 'flush' });
+  }
 }
 
 async function agListen(on) {
   const btn = $('ag-talk');
   if (on) {
     agent.words = [];
+    agent.speech = 0;
+    agent.silence = 0;
+    agent.preroll = [];
+    agent.phase = 'listen';
     agent.asrWorker.postMessage({ type: 'reset' });
-    agent.mic = agent.mic || new Mic(pcm => agent.asrWorker.postMessage({ type: 'frame', pcm }, [pcm.buffer]));
-    try { await agent.mic.start(); } catch (e) { return agStatus(e.message); }
-    agent.turnStart = performance.now();
-    agent.asrStart = performance.now();
-    btn.classList.add('rec'); btn.textContent = 'Release to send';
+    agent.mic = agent.mic || new Mic(agFrame);
+    try { await agent.mic.start(); } catch (e) { agent.phase = 'idle'; return agStatus(e.message); }
+    agent.listening = true;
+    btn.classList.add('rec');
+    btn.textContent = 'Stop listening';
     agStatus('listening…');
   } else {
-    await agent.mic.stop();
-    btn.classList.remove('rec'); btn.textContent = 'Hold to talk';
-    btn.disabled = true;
-    agStatus('transcribing…');
-    agent.asrWorker.postMessage({ type: 'flush' });
+    agent.listening = false;
+    agent.phase = 'idle';
+    if (agent.mic) await agent.mic.stop();
+    btn.classList.remove('rec');
+    btn.textContent = 'Start listening';
+    agStatus('stopped');
   }
 }
-$('ag-talk').onpointerdown = () => agListen(true);
-$('ag-talk').onpointerup = () => agListen(false);
-$('ag-talk').onpointerleave = e => { if (e.buttons) agListen(false); };
+$('ag-talk').onclick = () => agListen(!agent.listening);
+
+/// Back to listening after a turn, if the user has not stopped in the meantime.
+function agResume() {
+  if (!agent.listening) { agStatus('stopped'); return; }
+  agent.words = [];
+  agent.speech = 0;
+  agent.silence = 0;
+  agent.preroll = [];
+  agent.phase = 'listen';
+  agent.asrWorker.postMessage({ type: 'reset' });
+  agStatus('listening…');
+}
 
 async function agTurn(text) {
   agent.timings.asr_ms = performance.now() - agent.asrStart;
   if (!text) {
-    agStatus('nothing heard — hold to talk');
-    $('ag-talk').disabled = false;
     agCards();
+    agResume();
     return;
   }
   agChat('user', text);
@@ -926,7 +1041,7 @@ async function agTurn(text) {
   } catch (e) {
     clearInterval(tick);
     agStatus(`llm: ${e.message}`);
-    $('ag-talk').disabled = false;
+    agResume();
     return;
   }
   clearInterval(tick);
@@ -935,6 +1050,7 @@ async function agTurn(text) {
   agChat('assistant', reply);
 
   agStatus('speaking…');
+  agent.phase = 'speak';
   agent.chunks = [];
   agent.player = new Player(agent.ttsInfo ? agent.ttsInfo.sample_rate : 24000);
   agent.ttsWorker.postMessage({
@@ -945,7 +1061,7 @@ async function agTurn(text) {
 $('ag-reset').onclick = () => {
   agent.history = agent.history.slice(0, 1);
   agent.words = [];
-  $('ag-chat').innerHTML = '<p class="empty">Load the models, then hold the button and speak.</p>';
+  $('ag-chat').innerHTML = '<p class="empty">Load the models, start listening, and just talk.</p>';
   agent.asrWorker.postMessage({ type: 'reset' });
 };
 
@@ -994,7 +1110,9 @@ window.__asrFromFile = async (url, dtype) => {
 
 // End-to-end agent turn without a microphone: the ASR leg is fed from a file,
 // the LLM and TTS legs are the real ones.
-window.__agentTest = async url => {
+window.__agentTest = async (url, ttsDtype, asrDtype) => {
+  if (ttsDtype) $('ag-tts-dtype').value = ttsDtype;
+  if (asrDtype) $('ag-asr-dtype').value = asrDtype;
   const ready = new Promise(res => {
     const t = setInterval(() => {
       if (agent.ready.asr && agent.ready.tts) { clearInterval(t); res(); }
@@ -1017,15 +1135,23 @@ window.__agentTest = async url => {
   const oc = new OfflineAudioContext(1, 1, ASR_RATE);
   const audio = await oc.decodeAudioData(buf);
   const pcm = audio.getChannelData(0);
+
+  // Fed through `agFrame`, not straight to the worker, so this exercises the
+  // real path: energy gating, the speech/silence counters, and the turn that
+  // the hangover closes. The trailing silence stands in for the user stopping.
   agent.words = [];
-  agent.turnStart = performance.now();
-  agent.asrStart = performance.now();
-  for (let i = 0; i < 2; i++) agent.asrWorker.postMessage({ type: 'frame', pcm: new Float32Array(ASR_FRAME) });
+  agent.speech = 0;
+  agent.silence = 0;
+  agent.listening = true;
+  agent.phase = 'listen';
+  agent.asrWorker.postMessage({ type: 'reset' });
   const n = Math.floor(pcm.length / ASR_FRAME);
-  for (let i = 0; i < n; i++) {
-    agent.asrWorker.postMessage({ type: 'frame', pcm: pcm.slice(i * ASR_FRAME, (i + 1) * ASR_FRAME) });
+  for (let i = 0; i < n; i++) agFrame(pcm.slice(i * ASR_FRAME, (i + 1) * ASR_FRAME));
+  const silenceFrames = VAD.hangover + 3;
+  for (let i = 0; i < silenceFrames; i++) agFrame(new Float32Array(ASR_FRAME));
+  if (agent.phase !== 'transcribe') {
+    throw new Error(`vad did not close the turn (phase ${agent.phase}, speech ${agent.speech}, silence ${agent.silence})`);
   }
-  agent.asrWorker.postMessage({ type: 'flush' });
 
   const stats = await spoken;
   const msgs = [...$('ag-chat').querySelectorAll('.msg')].map(m => m.textContent);
@@ -1033,6 +1159,7 @@ window.__agentTest = async url => {
     heard: msgs[0] || null,
     reply: msgs[1] || null,
     timings: agent.timings,
+    vad_closed_turn: true,
     speech_ms: stats.audio_ms,
     tts_rtf: stats.rtf,
     asr_device: agent.asrDevice || null,
