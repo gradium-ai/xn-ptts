@@ -1,6 +1,6 @@
 WASM := target/wasm32-unknown-unknown/release/ptts_web.wasm
 
-.PHONY: build serve clean
+.PHONY: build serve phone cert clean
 
 build:
 	cargo build --release --target wasm32-unknown-unknown
@@ -17,5 +17,15 @@ build:
 serve: build
 	node server.js
 
+# Same server, reachable from a phone on the same wifi. WebGPU needs a secure
+# context and a LAN address over plain http is not one, so this serves https with
+# a self-signed cert; the phone warns once and you tap through.
+phone: build
+	./scripts/make-cert.sh
+	node server.js
+
+cert:
+	./scripts/make-cert.sh
+
 clean:
-	rm -rf pkg target
+	rm -rf pkg target certs

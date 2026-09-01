@@ -1,10 +1,13 @@
 // Static server for the demo: pkg/ at /, plus the local model and voices.
 // WebGPU needs a secure context, and localhost counts as one, so no TLS here.
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const PORT = process.env.PORT || 8788;
+const TLS_PORT = process.env.TLS_PORT || 8789;
 const PKG = path.join(__dirname, 'pkg');
 const MODEL = process.env.PTTS_MODEL_DIR ||
   path.join(__dirname, '..', '..', 'phonon-inference', 'model');
@@ -38,7 +41,7 @@ function resolve(urlPath) {
   return path.join(PKG, safe);
 }
 
-http.createServer((req, res) => {
+function handler(req, res) {
   // A headless run POSTs its result here; printing it and exiting is what makes
   // the browser run usable as a check from a shell.
   if (req.method === 'POST' && req.url.split('?')[0] === '/progress') {
@@ -79,8 +82,34 @@ http.createServer((req, res) => {
     });
     fs.createReadStream(file).pipe(res);
   });
-}).listen(PORT, '127.0.0.1', () => {
+}
+
+function lanAddresses() {
+  return Object.values(os.networkInterfaces())
+    .flat()
+    .filter(i => i && i.family === 'IPv4' && !i.internal)
+    .map(i => i.address);
+}
+
+// http on localhost, which is a secure context by definition and is what the
+// local tooling talks to.
+http.createServer(handler).listen(PORT, '127.0.0.1', () => {
   console.log(`http://127.0.0.1:${PORT}`);
   console.log(`  /model  -> ${MODEL}`);
   console.log(`  /voices -> ${VOICES}`);
 });
+
+// https on every interface, for phones. WebGPU needs a secure context, and a LAN
+// address over plain http is not one -- `navigator.gpu` would be undefined and
+// nothing on the page could run. Run scripts/make-cert.sh to create the cert.
+const KEY = path.join(__dirname, 'certs', 'dev.key');
+const CRT = path.join(__dirname, 'certs', 'dev.crt');
+if (fs.existsSync(KEY) && fs.existsSync(CRT)) {
+  const opts = { key: fs.readFileSync(KEY), cert: fs.readFileSync(CRT) };
+  https.createServer(opts, handler).listen(TLS_PORT, '0.0.0.0', () => {
+    console.log(`\nOn your phone (same wifi), accept the certificate warning once:`);
+    for (const a of lanAddresses()) console.log(`  https://${a}:${TLS_PORT}`);
+  });
+} else {
+  console.log(`\nNo cert: run scripts/make-cert.sh to enable https for phones.`);
+}

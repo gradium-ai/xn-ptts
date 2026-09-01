@@ -23,6 +23,34 @@ without downloading weights from HuggingFace every time. The other source in the
 picker is the public `kyutai/pocket-tts-without-voice-cloning` repo, which is what
 a real deployment would use.
 
+## On a phone
+
+```bash
+make phone
+```
+
+That builds, generates a self-signed cert, and serves. The console prints the URL
+to open, e.g. `https://192.168.68.55:8789`. Your phone has to be on the same wifi.
+
+It must be **https**, and that is not a detail: WebGPU only runs in a secure
+context. `localhost` counts as one automatically, but a LAN address over plain
+http does not, so `http://192.168.x.x:8788` gives `navigator.gpu === undefined`
+and the page cannot start at all. The self-signed cert is the cheapest way to get
+a secure context on a LAN -- the phone shows a warning once ("Show Details" ->
+"visit this website" on iOS Safari, "Advanced" -> "Proceed" on Android Chrome).
+
+Pick **q8_0** on a phone: 136 MB rather than 317 MB to pull over wifi, and
+correspondingly less GPU memory for the weights. Needs iOS 18+ / Safari 18+, or
+Chrome 121+ on Android; older versions have no WebGPU.
+
+`certs/` is gitignored -- it holds a private key, and the cert only covers the
+addresses this machine had when it was generated. Re-run `make cert` after
+changing networks.
+
+If your phone is on the same Tailscale tailnet, `tailscale serve https:443 /
+http://127.0.0.1:8788` gives a real certificate and no warning at all, but it
+needs HTTPS enabled for the tailnet and the Tailscale app on the phone.
+
 ## Compute dtypes
 
 | dtype | weights file | needs | notes |
