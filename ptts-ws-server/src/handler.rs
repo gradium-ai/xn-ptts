@@ -12,25 +12,7 @@ pub async fn ws_handler(
     ws: WebSocketUpgrade,
 ) -> axum::response::Response {
     async fn handle_socket(socket: WebSocket, app: AppState) {
-        let result = match app {
-            AppState::Cpu(s) => serve_q(socket, s).await,
-            AppState::Q80(s) => serve_q(socket, s).await,
-            AppState::Q81(s) => serve_q(socket, s).await,
-            AppState::Q8k(s) => serve_q(socket, s).await,
-            AppState::Q6k(s) => serve_q(socket, s).await,
-            AppState::Q50(s) => serve_q(socket, s).await,
-            AppState::Q51(s) => serve_q(socket, s).await,
-            AppState::Q5k(s) => serve_q(socket, s).await,
-            AppState::Q40(s) => serve_q(socket, s).await,
-            AppState::Q41(s) => serve_q(socket, s).await,
-            AppState::Q4k(s) => serve_q(socket, s).await,
-            #[cfg(feature = "cuda")]
-            AppState::Cuda(s) => serve_q(socket, s).await,
-            #[cfg(feature = "vulkan")]
-            AppState::Vulkan(s) => serve_q(socket, s).await,
-            #[cfg(feature = "metal")]
-            AppState::Metal(s) => serve_q(socket, s).await,
-        };
+        let result = crate::model::dispatch!(app, |s| serve_q(socket, s).await);
         if let Err(e) = result {
             tracing::error!(error = %e, "ws session terminated");
         }
@@ -276,11 +258,26 @@ async fn generate_one<Q: xn::BackendQ>(
     let seed = app.seed_base ^ (stream_id as u64).wrapping_mul(0x9E3779B97F4A7C15);
 
     let (audio_tx, mut audio_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f32>>();
+    let num_tokens = tokens.len();
+    // Timed from here, so the measurement covers what a client actually waits
+    // for: text prompting, sampling, Mimi decoding and encoding. Model load and
+    // voice conditioning happened once at setup and are excluded.
+    let t0 = std::time::Instant::now();
     let join = tokio::task::spawn_blocking(move || {
         generate_chunks(model, state, tokens, temperature, seed, frames_after_eos, audio_tx)
     });
 
+    let mut ttfa: Option<std::time::Duration> = None;
+    let mut frame_ms: Vec<f64> = Vec::new();
+    let mut samples: usize = 0;
+    let mut last = t0;
     while let Some(pcm) = audio_rx.recv().await {
+        let now = std::time::Instant::now();
+        samples += pcm.len();
+        // Interval between PCM chunks -- the cadence a streaming consumer sees --
+        // rather than the cost of one sampling step in isolation.
+        frame_ms.push((now - last).as_secs_f64() * 1e3);
+        last = now;
         let encoded = encoder.encode(&pcm)?;
         let audio = base64::engine::general_purpose::STANDARD.encode(&encoded.data);
         if reply_tx
@@ -294,10 +291,65 @@ async fn generate_one<Q: xn::BackendQ>(
         {
             break;
         }
+        if ttfa.is_none() {
+            ttfa = Some(now - t0);
+        }
     }
     drop(audio_rx);
+    let total = t0.elapsed();
     join.await??;
+
+    let total_ms = total.as_secs_f64() * 1e3;
+    let audio_ms = samples as f64 / app.sample_rate as f64 * 1e3;
+    let stats = crate::protocol::GenStats {
+        backend: app.backend.clone(),
+        device: xn::Backend::name(app.model.device()),
+        stream_id,
+        chars: text.chars().count(),
+        tokens: num_tokens,
+        frames: frame_ms.len(),
+        audio_ms,
+        total_ms,
+        ttfa_ms: ttfa.map(|d| d.as_secs_f64() * 1e3),
+        // Audio produced per unit of wall time, so >1 is faster than realtime.
+        rtf: if total_ms > 0.0 { audio_ms / total_ms } else { 0.0 },
+        frame_ms_mean: fin(mean(&frame_ms)),
+        frame_ms_p50: fin(percentile(&frame_ms, 50.0)),
+        frame_ms_p95: fin(percentile(&frame_ms, 95.0)),
+        frame_ms_max: fin(frame_ms.iter().copied().fold(f64::NAN, f64::max)),
+        threads: xn::get_num_threads(),
+    };
+    tracing::info!(
+        backend = %stats.backend,
+        frames = stats.frames,
+        ttfa_ms = ?stats.ttfa_ms.map(|v| (v * 10.0).round() / 10.0),
+        total_ms = (stats.total_ms * 10.0).round() / 10.0,
+        rtf = (stats.rtf * 100.0).round() / 100.0,
+        "generation complete"
+    );
+    let _ = reply_tx.send(TtsReply::Stats { json_stats: serde_json::to_string(&stats)? });
     Ok(())
+}
+
+/// `None` for the empty-stream case, so the UI shows "n/a" rather than relying
+/// on how the JSON encoder happens to render NaN.
+fn fin(v: f64) -> Option<f64> {
+    v.is_finite().then_some(v)
+}
+
+fn mean(v: &[f64]) -> f64 {
+    if v.is_empty() { f64::NAN } else { v.iter().sum::<f64>() / v.len() as f64 }
+}
+
+/// Nearest-rank percentile over a copy of `v`; `v` itself stays in arrival order.
+fn percentile(v: &[f64], p: f64) -> f64 {
+    if v.is_empty() {
+        return f64::NAN;
+    }
+    let mut sorted = v.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let rank = (p / 100.0 * sorted.len() as f64).ceil() as usize;
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
 }
 
 fn send_error(

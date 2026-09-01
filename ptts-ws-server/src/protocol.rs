@@ -63,6 +63,31 @@ pub enum TtsReply {
     },
 }
 
+/// Per-generation timings, sent as the `json_stats` payload of `TtsReply::Stats`
+/// once a stream finishes. This is what the web app renders, so it is also the
+/// definition of "how well it works" for a given backend.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct GenStats {
+    /// How the server was built and launched, e.g. `webgpu f16`.
+    pub backend: String,
+    /// The adapter/device xn actually chose.
+    pub device: String,
+    pub stream_id: u32,
+    pub chars: usize,
+    pub tokens: usize,
+    pub frames: usize,
+    pub audio_ms: f64,
+    pub total_ms: f64,
+    pub ttfa_ms: Option<f64>,
+    /// Audio produced per unit of wall time; >1 is faster than realtime.
+    pub rtf: f64,
+    pub frame_ms_mean: Option<f64>,
+    pub frame_ms_p50: Option<f64>,
+    pub frame_ms_p95: Option<f64>,
+    pub frame_ms_max: Option<f64>,
+    pub threads: usize,
+}
+
 pub mod error_codes {
     pub const BAD_REQUEST: u32 = 400;
     pub const NOT_FOUND: u32 = 404;

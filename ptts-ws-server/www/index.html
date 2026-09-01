@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pocket TTS — backend bench</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --panel-2: #1c2230; --line: #2a3140;
+    --fg: #e6edf3; --dim: #8b949e; --accent: #4493f8; --good: #3fb950; --warn: #d29922; --bad: #f85149;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--fg);
+         max-width: 1000px; margin: 0 auto; padding: 32px 20px 64px; line-height: 1.5; }
+  h1 { font-size: 22px; font-weight: 650; }
+  h2 { font-size: 13px; font-weight: 650; text-transform: uppercase; letter-spacing: .06em;
+       color: var(--dim); margin-bottom: 10px; }
+  a { color: var(--accent); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 6px; }
+  .badge { font-size: 12px; padding: 3px 9px; border-radius: 999px; background: var(--panel-2);
+           border: 1px solid var(--line); color: var(--fg); }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 24px; }
+
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+           padding: 18px; margin-bottom: 18px; }
+  label { display: block; font-size: 12px; font-weight: 600; color: var(--dim); margin-bottom: 5px; }
+  textarea, select, input[type=number] {
+    font-family: inherit; font-size: 14px; color: var(--fg); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; width: 100%; }
+  textarea { resize: vertical; }
+  .row { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end; margin-top: 14px; }
+  .row > div { flex: 0 0 auto; }
+  .grow { flex: 1 1 160px; }
+  button { font-family: inherit; font-size: 14px; font-weight: 600; padding: 9px 20px; border: none;
+           border-radius: 6px; background: var(--accent); color: #06101d; cursor: pointer; }
+  button.ghost { background: var(--panel-2); color: var(--fg); border: 1px solid var(--line); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+
+  #status { margin-top: 14px; font-size: 13px; color: var(--dim); min-height: 20px; }
+  #status.err { color: var(--bad); }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+  .card { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+  .card .k { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); }
+  .card .v { font-size: 22px; font-weight: 650; margin-top: 3px;
+             font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .card .u { font-size: 12px; color: var(--dim); font-weight: 400; }
+
+  canvas { width: 100%; height: 90px; display: block; background: var(--bg);
+           border: 1px solid var(--line); border-radius: 8px; margin-top: 14px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: right; padding: 7px 9px; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; }
+  th { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); font-weight: 600; }
+  td { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  td.txt { font-family: inherit; }
+  tbody tr:last-child td { border-bottom: none; }
+  .empty { color: var(--dim); font-size: 13px; }
+  .rtf-good { color: var(--good); } .rtf-warn { color: var(--warn); } .rtf-bad { color: var(--bad); }
+  .hint { font-size: 12px; color: var(--dim); margin-top: 10px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Pocket TTS</h1>
+  <span class="badge" id="backend-badge">connecting…</span>
+  <span class="badge" id="device-badge" hidden></span>
+  <span class="badge" id="threads-badge" hidden></span>
+</header>
+<p class="sub">
+  Streaming TTS over a websocket, served by <code>ptts-ws-server</code>. Every run is timed
+  server-side from text to encoded audio, so the numbers below describe the backend this server
+  was launched with — restart it with a different flag to compare.
+</p>
+
+<div class="panel">
+  <label for="text">Text</label>
+  <textarea id="text" rows="3">Hello, this is a test of the pocket text to speech system, running on the WebGPU backend.</textarea>
+  <div class="row">
+    <div class="grow"><label for="voice">Voice</label><select id="voice"></select></div>
+    <div><label for="iters">Iterations</label><input type="number" id="iters" value="1" min="1" max="50" style="width:90px"></div>
+    <div><label for="play">Playback</label><select id="play" style="width:130px">
+      <option value="stream" selected>Stream live</option>
+      <option value="end">After run</option>
+      <option value="off">Off</option>
+    </select></div>
+    <div><button id="go">Generate</button></div>
+    <div><button id="save" class="ghost" disabled>Download WAV</button></div>
+  </div>
+  <div id="status"></div>
+</div>
+
+<div class="panel">
+  <h2>Last run</h2>
+  <div class="cards" id="cards"></div>
+  <canvas id="wave"></canvas>
+  <p class="hint">
+    RTF is audio produced per unit of wall time: above 1.0 is faster than realtime. TTFA is the
+    delay before the first audio chunk. Per-frame is the interval between chunks — the cadence a
+    streaming client actually sees.
+  </p>
+</div>
+
+<div class="panel">
+  <h2>Run history</h2>
+  <div id="history"><p class="empty">No runs yet.</p></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let info = null, runs = [], lastPcm = null;
+
+const fmt = (v, d = 1) => (v === null || v === undefined || !isFinite(v)) ? "n/a" : v.toFixed(d);
+const rtfClass = r => r >= 1.0 ? "rtf-good" : r >= 0.7 ? "rtf-warn" : "rtf-bad";
+
+function setStatus(msg, isErr = false) {
+  $("status").textContent = msg;
+  $("status").className = isErr ? "err" : "";
+}
+
+async function loadInfo() {
+  try {
+    info = await (await fetch("/api/info")).json();
+  } catch (e) {
+    setStatus("could not reach /api/info: " + e.message, true);
+    return;
+  }
+  $("backend-badge").textContent = info.backend;
+  $("device-badge").textContent = info.device;
+  $("device-badge").hidden = false;
+  $("threads-badge").textContent = info.threads ? info.threads + " threads" : "";
+  const sel = $("voice");
+  sel.innerHTML = "";
+  for (const v of info.voices) {
+    const o = document.createElement("option");
+    o.value = v; o.textContent = v;
+    if (v === info.default_voice) o.selected = true;
+    sel.appendChild(o);
+  }
+  setStatus(`ready — ${info.sample_rate} Hz, frame ${info.frame_size} samples, temp ${info.temperature}`);
+}
+
+// ---- audio ---------------------------------------------------------------
+let ctx = null;
+function audioCtx() {
+  if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: info.sample_rate });
+  if (ctx.state === "suspended") ctx.resume();
+  return ctx;
+}
+
+// Schedules chunks back to back. The 150 ms lead-in absorbs jitter; if generation
+// falls behind realtime the head is re-clamped, which is audible on purpose.
+class Player {
+  constructor() { this.head = 0; this.ac = audioCtx(); }
+  push(f32) {
+    const buf = this.ac.createBuffer(1, f32.length, info.sample_rate);
+    buf.copyToChannel(f32, 0);
+    const src = this.ac.createBufferSource();
+    src.buffer = buf;
+    src.connect(this.ac.destination);
+    const floor = this.ac.currentTime + 0.15;
+    if (this.head < floor) this.head = floor;
+    src.start(this.head);
+    this.head += buf.duration;
+  }
+}
+
+function playAll(f32) {
+  const ac = audioCtx();
+  const buf = ac.createBuffer(1, f32.length, info.sample_rate);
+  buf.copyToChannel(f32, 0);
+  const src = ac.createBufferSource();
+  src.buffer = buf; src.connect(ac.destination); src.start();
+}
+
+// Raw s16le from the server's `pcm` output format.
+function s16ToF32(bytes) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const n = Math.floor(bytes.byteLength / 2);
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) out[i] = dv.getInt16(i * 2, true) / 32768;
+  return out;
+}
+
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function wavBlob(f32, rate) {
+  const buf = new ArrayBuffer(44 + f32.length * 2);
+  const dv = new DataView(buf);
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, "RIFF"); dv.setUint32(4, 36 + f32.length * 2, true); str(8, "WAVEfmt ");
+  dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+  dv.setUint32(24, rate, true); dv.setUint32(28, rate * 2, true);
+  dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+  str(36, "data"); dv.setUint32(40, f32.length * 2, true);
+  for (let i = 0; i < f32.length; i++) {
+    const s = Math.max(-1, Math.min(1, f32[i]));
+    dv.setInt16(44 + i * 2, s * 32767, true);
+  }
+  return new Blob([buf], { type: "audio/wav" });
+}
+
+// ---- waveform ------------------------------------------------------------
+function drawWave(f32) {
+  const c = $("wave"), dpr = window.devicePixelRatio || 1;
+  c.width = c.clientWidth * dpr; c.height = c.clientHeight * dpr;
+  const g = c.getContext("2d");
+  g.scale(dpr, dpr);
+  const w = c.clientWidth, h = c.clientHeight, mid = h / 2;
+  g.clearRect(0, 0, w, h);
+  g.strokeStyle = "#2a3140"; g.beginPath(); g.moveTo(0, mid); g.lineTo(w, mid); g.stroke();
+  if (!f32 || !f32.length) return;
+  const per = Math.max(1, Math.floor(f32.length / w));
+  g.fillStyle = "#4493f8";
+  for (let x = 0; x < w; x++) {
+    let lo = 0, hi = 0;
+    for (let i = x * per, e = Math.min(f32.length, i + per); i < e; i++) {
+      if (f32[i] < lo) lo = f32[i];
+      if (f32[i] > hi) hi = f32[i];
+    }
+    g.fillRect(x, mid + lo * mid, 1, Math.max(1, (hi - lo) * mid));
+  }
+}
+
+// ---- rendering -----------------------------------------------------------
+function renderCards(s) {
+  const cards = [
+    ["RTF", fmt(s.rtf, 2), "× realtime", rtfClass(s.rtf)],
+    ["TTFA", fmt(s.ttfa_ms), "ms"],
+    ["Total", fmt(s.total_ms), "ms"],
+    ["Audio", fmt(s.audio_ms), "ms"],
+    ["Per-frame p50", fmt(s.frame_ms_p50, 2), "ms"],
+    ["Per-frame p95", fmt(s.frame_ms_p95, 2), "ms"],
+    ["Frames", s.frames, ""],
+    ["Tokens", s.tokens, ""],
+  ];
+  $("cards").innerHTML = cards.map(([k, v, u, cls]) =>
+    `<div class="card"><div class="k">${k}</div><div class="v ${cls || ""}">${v}` +
+    (u ? ` <span class="u">${u}</span>` : "") + `</div></div>`).join("");
+}
+
+function renderHistory() {
+  if (!runs.length) { $("history").innerHTML = '<p class="empty">No runs yet.</p>'; return; }
+  const rows = runs.map((s, i) => `<tr>
+    <td class="txt">${runs.length - i}</td>
+    <td class="txt">${s.backend}</td>
+    <td class="${rtfClass(s.rtf)}">${fmt(s.rtf, 2)}</td>
+    <td>${fmt(s.ttfa_ms)}</td>
+    <td>${fmt(s.total_ms)}</td>
+    <td>${fmt(s.audio_ms)}</td>
+    <td>${fmt(s.frame_ms_p50, 2)}</td>
+    <td>${fmt(s.frame_ms_p95, 2)}</td>
+    <td>${s.frames}</td></tr>`).join("");
+
+  // Aggregate only over runs that share the current backend, so a table spanning
+  // a server restart does not average two different things together.
+  const cur = runs.filter(s => s.backend === (info && info.backend));
+  const agg = (key, d = 1) => {
+    const v = cur.map(s => s[key]).filter(x => x !== null && isFinite(x)).sort((a, b) => a - b);
+    if (!v.length) return "n/a";
+    const mean = v.reduce((a, b) => a + b, 0) / v.length;
+    return `${fmt(mean, d)} <span class="u">(min ${fmt(v[0], d)} / max ${fmt(v[v.length - 1], d)})</span>`;
+  };
+  $("history").innerHTML = `<table>
+    <thead><tr><th>#</th><th>backend</th><th>rtf</th><th>ttfa ms</th><th>total ms</th>
+    <th>audio ms</th><th>frame p50</th><th>frame p95</th><th>frames</th></tr></thead>
+    <tbody>${rows}</tbody></table>
+    <p class="hint">Mean over the ${cur.length} run(s) on <code>${info ? info.backend : "?"}</code> —
+    rtf ${agg("rtf", 2)} · ttfa ${agg("ttfa_ms")} ms · total ${agg("total_ms")} ms</p>`;
+}
+
+// ---- generation ----------------------------------------------------------
+// One websocket per batch: setup (which conditions the voice) runs once, then
+// each iteration is a Text + Flush round-trip, matching how a server is used.
+function runBatch(text, voice, iters, playMode) {
+  return new Promise((resolve, reject) => {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(`${proto}://${location.host}/speech/tts`);
+    let iter = 0, chunks = [], player = null, done = false;
+
+    const fail = m => { if (!done) { done = true; try { ws.close(); } catch (e) {} reject(new Error(m)); } };
+
+    const startIter = () => {
+      iter++;
+      chunks = [];
+      player = playMode === "stream" ? new Player() : null;
+      setStatus(`generating ${iter}/${iters}…`);
+      ws.send(JSON.stringify({ type: "text", text }));
+      ws.send(JSON.stringify({ type: "flush", flush_id: iter }));
+    };
+
+    ws.onopen = () => {
+      setStatus("conditioning voice…");
+      ws.send(JSON.stringify({
+        type: "setup", json_config: "", model_name: "",
+        output_format: "pcm", voice: null, voice_id: voice, voice_emb: null,
+      }));
+    };
+    ws.onerror = () => fail("websocket error");
+    ws.onclose = () => { if (!done) fail("websocket closed unexpectedly"); };
+
+    ws.onmessage = ev => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch (e) { return fail("bad message from server"); }
+      switch (msg.type) {
+        case "ready": startIter(); break;
+        case "audio": {
+          const f32 = s16ToF32(b64ToBytes(msg.audio));
+          if (!f32.length) break;
+          chunks.push(f32);
+          if (player) player.push(f32);
+          break;
+        }
+        case "stats": {
+          const s = JSON.parse(msg.json_stats);
+          runs.unshift(s);
+          const total = chunks.reduce((n, c) => n + c.length, 0);
+          const all = new Float32Array(total);
+          let o = 0;
+          for (const c of chunks) { all.set(c, o); o += c.length; }
+          lastPcm = all;
+          $("save").disabled = !all.length;
+          renderCards(s); drawWave(all); renderHistory();
+          if (playMode === "end") playAll(all);
+          break;
+        }
+        case "flushed":
+          if (iter < iters) startIter();
+          else { done = true; ws.send(JSON.stringify({ type: "end_of_stream" })); ws.close(); resolve(); }
+          break;
+        case "error": fail(`server: ${msg.message} (${msg.code})`); break;
+      }
+    };
+  });
+}
+
+$("go").onclick = async () => {
+  const text = $("text").value.trim();
+  if (!text) return setStatus("nothing to say", true);
+  if (!info) return setStatus("server info not loaded", true);
+  const iters = Math.max(1, Math.min(50, parseInt($("iters").value, 10) || 1));
+  $("go").disabled = true;
+  try {
+    await runBatch(text, $("voice").value, iters, $("play").value);
+    setStatus(`done — ${iters} run(s) on ${info.backend}`);
+  } catch (e) {
+    setStatus(e.message, true);
+  } finally {
+    $("go").disabled = false;
+  }
+};
+
+$("save").onclick = () => {
+  if (!lastPcm) return;
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(wavBlob(lastPcm, info.sample_rate));
+  a.download = "ptts.wav";
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+
+window.addEventListener("resize", () => drawWave(lastPcm));
+loadInfo();
+</script>
+</body>
+</html>

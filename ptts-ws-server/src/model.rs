@@ -117,6 +117,9 @@ pub struct AppStateB<Q: BackendQ> {
     pub seed_base: u64,
     pub sample_rate: u32,
     pub frame_size: u32,
+    /// How this state was built (`webgpu f16`, `cpu q8_0`, ...). Reported to the
+    /// browser so a measurement is always labelled with what produced it.
+    pub backend: String,
 }
 
 #[derive(Clone)]
@@ -138,6 +141,85 @@ pub enum AppState {
     Vulkan(Arc<AppStateB<xn::Unquantized<f32, xn::VulkanDevice>>>),
     #[cfg(feature = "metal")]
     Metal(Arc<AppStateB<xn::Unquantized<f32, xn::MetalDevice>>>),
+    #[cfg(feature = "webgpu")]
+    WebGpu(Arc<AppStateB<xn::Unquantized<f32, xn::WebGpuDevice>>>),
+    #[cfg(feature = "webgpu")]
+    WebGpuF16(Arc<AppStateB<xn::Unquantized<half::f16, xn::WebGpuDevice>>>),
+    #[cfg(feature = "webgpu")]
+    WebGpuQ80(Arc<AppStateB<xn::webgpu_backend::quantization::Q80F32>>),
+    #[cfg(feature = "webgpu")]
+    WebGpuQ80F16(Arc<AppStateB<xn::webgpu_backend::quantization::Q80F16>>),
+}
+
+/// Runs `$body` with `$s` bound to the concrete `Arc<AppStateB<Q>>` inside an
+/// `AppState`. Every arm has a different `Q`, so this has to be a macro rather
+/// than a method: the arms only agree once `$body` is generic over `Q`.
+macro_rules! dispatch {
+    ($state:expr, |$s:ident| $body:expr) => {
+        match $state {
+            AppState::Cpu($s) => $body,
+            AppState::Q80($s) => $body,
+            AppState::Q81($s) => $body,
+            AppState::Q8k($s) => $body,
+            AppState::Q6k($s) => $body,
+            AppState::Q50($s) => $body,
+            AppState::Q51($s) => $body,
+            AppState::Q5k($s) => $body,
+            AppState::Q40($s) => $body,
+            AppState::Q41($s) => $body,
+            AppState::Q4k($s) => $body,
+            #[cfg(feature = "cuda")]
+            AppState::Cuda($s) => $body,
+            #[cfg(feature = "vulkan")]
+            AppState::Vulkan($s) => $body,
+            #[cfg(feature = "metal")]
+            AppState::Metal($s) => $body,
+            #[cfg(feature = "webgpu")]
+            AppState::WebGpu($s) => $body,
+            #[cfg(feature = "webgpu")]
+            AppState::WebGpuF16($s) => $body,
+            #[cfg(feature = "webgpu")]
+            AppState::WebGpuQ80($s) => $body,
+            #[cfg(feature = "webgpu")]
+            AppState::WebGpuQ80F16($s) => $body,
+        }
+    };
+}
+pub(crate) use dispatch;
+
+/// What `/api/info` reports: enough for the UI to label a run and populate its
+/// voice picker without a websocket round-trip.
+#[derive(serde::Serialize)]
+pub struct AppInfo {
+    pub backend: String,
+    pub device: String,
+    pub sample_rate: u32,
+    pub frame_size: u32,
+    pub temperature: f32,
+    pub max_seq_len: usize,
+    pub default_voice: String,
+    pub voices: Vec<String>,
+    pub threads: usize,
+}
+
+impl AppState {
+    pub fn info(&self) -> AppInfo {
+        dispatch!(self, |s| {
+            let mut voices: Vec<String> = s.voices.keys().cloned().collect();
+            voices.sort();
+            AppInfo {
+                backend: s.backend.clone(),
+                device: xn::Backend::name(s.model.device()),
+                sample_rate: s.sample_rate,
+                frame_size: s.frame_size,
+                temperature: s.temperature,
+                max_seq_len: s.max_seq_len,
+                default_voice: s.default_voice.clone(),
+                voices,
+                threads: xn::get_num_threads(),
+            }
+        })
+    }
 }
 
 struct LoadedModel<Q: BackendQ> {
@@ -219,28 +301,22 @@ impl<Q: BackendQ> LoadedModel<Q> {
             );
         };
         let tokenizer_path = parent_dir.join("tokenizer.model");
+        // Voices come from a `voices/` subdirectory when there is one, and from a
+        // sibling `default-voice.safetensors` otherwise. Neither is required here:
+        // `--voice-dir` can supply them, and having none at all is reported later
+        // by `load_ptts` with a clearer message than a `read_dir` error.
         let mut voices: HashMap<String, Tensor<Q::T, Q::B>> = HashMap::new();
-        for voice in parent_dir.join("voices").read_dir()? {
-            let voice = match voice {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let voice = voice.path();
-            if voice.extension().and_then(|e| e.to_str()) != Some("safetensors") {
-                continue;
-            }
-            let voice_name =
-                voice.file_stem().and_then(|s| s.to_str()).context("invalid voice file name")?;
-            match load_voice_embedding(&voice, dev) {
-                Ok(emb) => match emb.to::<Q::T>() {
-                    Ok(emb) => {
-                        voices.insert(voice_name.to_string(), emb);
-                    }
-                    Err(e) => {
-                        tracing::warn!(?voice_name, error = %e, "failed to convert voice embedding")
-                    }
-                },
-                Err(e) => tracing::warn!(?voice_name, error = %e, "failed to load voice embedding"),
+        let voices_dir = parent_dir.join("voices");
+        if voices_dir.is_dir() {
+            load_voices_from_dir::<Q>(&voices_dir, dev, &mut voices);
+        }
+        let default_voice_file = parent_dir.join("default-voice.safetensors");
+        if default_voice_file.is_file() {
+            match load_voice_embedding(&default_voice_file, dev).and_then(|e| Ok(e.to::<Q::T>()?)) {
+                Ok(emb) => {
+                    voices.insert("default".to_string(), emb);
+                }
+                Err(e) => tracing::warn!(error = %e, "failed to load default voice embedding"),
             }
         }
         tracing::info!(num_voices = voices.len(), "voice embeddings loaded");
@@ -295,14 +371,33 @@ fn load_voices_from_dir<Q: BackendQ>(
     }
 }
 
-pub fn load_ptts<Q: BackendQ>(
-    config: Option<&std::path::PathBuf>,
-    voice_dir: Option<&std::path::PathBuf>,
-    temperature: f32,
-    seed_base: u64,
-    max_seq_len: usize,
-    dev: Q::B,
-) -> Result<AppStateB<Q>> {
+/// Everything `load_ptts` needs that does not depend on the backend type, so the
+/// many `AppState` arms in `main` can share one value instead of threading seven
+/// positional arguments through each.
+pub struct LoadOpts<'a> {
+    pub config: Option<&'a std::path::PathBuf>,
+    /// Explicit weights file, overriding the `model.safetensors` / `model.q8.gguf`
+    /// lookup next to the config. A gpu backend that quantizes at load time wants
+    /// the f32 safetensors even when a gguf sits beside it.
+    pub model: Option<&'a std::path::PathBuf>,
+    pub voice_dir: Option<&'a std::path::PathBuf>,
+    pub temperature: f32,
+    pub seed_base: u64,
+    pub max_seq_len: usize,
+    pub backend: String,
+}
+
+pub fn load_ptts<Q: BackendQ>(opts: &LoadOpts<'_>, dev: Q::B) -> Result<AppStateB<Q>> {
+    let LoadOpts {
+        config,
+        model: model_override,
+        voice_dir,
+        temperature,
+        seed_base,
+        max_seq_len,
+        backend,
+    } = opts;
+    let (temperature, seed_base, max_seq_len) = (*temperature, *seed_base, *max_seq_len);
     let mut m = match config {
         Some(config) if config.is_file() || config.extension().is_some_and(|v| v == "json") => {
             LoadedModel::<Q>::load_from_path(config, temperature, &dev)?
@@ -313,6 +408,15 @@ pub fn load_ptts<Q: BackendQ>(
         }
         None => LoadedModel::<Q>::load_pocket_from_hf(temperature, &dev)?,
     };
+    if let Some(model_override) = model_override {
+        anyhow::ensure!(
+            model_override.is_file(),
+            "--model {} does not exist",
+            model_override.display()
+        );
+        tracing::info!(model = %model_override.display(), "using explicit model weights");
+        m.model_path = (*model_override).clone();
+    }
     if let Some(voice_dir) = voice_dir {
         load_voices_from_dir::<Q>(voice_dir, &dev, &mut m.voices);
         tracing::info!(num_voices = m.voices.len(), "voice embeddings loaded (incl. voice-dir)");
@@ -353,6 +457,7 @@ pub fn load_ptts<Q: BackendQ>(
         Some(name) => name.clone(),
         None => anyhow::bail!("no voice embeddings found in model"),
     };
+    tracing::info!(backend = %backend, device = %xn::Backend::name(model.device()), "model ready");
     Ok(AppStateB {
         model: Arc::new(model),
         voices: m.voices,
@@ -362,6 +467,7 @@ pub fn load_ptts<Q: BackendQ>(
         seed_base,
         sample_rate,
         frame_size,
+        backend: backend.clone(),
     })
 }
 
