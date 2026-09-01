@@ -37,18 +37,19 @@ pre-quantized GGUF, so they download the same file `f32` does and pay a
 quantization pass on the GPU when the model is built. GGUF input is rejected with
 a message saying so.
 
-## Threads
+## Threads: one, and not configurable
 
-The page has a threads control, and it does set xn's worker count -- but nothing
-on this path reads it. xn's threading lives in its CPU backend; the WebGPU backend
-contains no rayon call, and this wasm build has no `atomics`, so it is
-single-threaded whatever the number says. The control is there because it is a
-real one natively, and the page reports what xn ended up with rather than
-implying an effect it does not have.
+There is no threads setting, because there is nothing for it to do. xn's threading
+lives entirely in its CPU backend -- the WebGPU backend contains no rayon call --
+and the wasm32 rustflags carry no `+atomics`, so `std::thread` cannot spawn and
+`num_cpus` reports one core. The page states the fact in a badge
+(`1 thread · 1 cpu · all compute on the GPU`) rather than offering a knob that
+silently changes nothing.
 
-`xn::set_num_threads` used to panic on wasm: it set `RAYON_NUM_THREADS`, and
-`std::env::set_var` is unsupported on `wasm32-unknown-unknown`. It is now guarded,
-so the atomic alone carries the value on wasm.
+There is deliberately no setter binding either: `xn::set_num_threads` writes
+`RAYON_NUM_THREADS`, and `std::env::set_var` is unsupported on
+`wasm32-unknown-unknown`, so calling it traps the module. That is worth guarding
+in xn for any other wasm caller, but nothing here calls it.
 
 ## Headless check
 

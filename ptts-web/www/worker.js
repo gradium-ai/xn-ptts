@@ -3,7 +3,7 @@
 // to the page as they are produced.
 import init, {
   probe, load_model, add_voice, generate, prepare_text,
-  set_threads, threads_info, max_frames_for_tokens,
+  threads_info, max_frames_for_tokens,
 } from './ptts_web.js';
 import { decodeSentencepieceModel, UnigramTokenizer } from './tokenizer.js';
 
@@ -33,11 +33,10 @@ async function fetchWithProgress(url, label) {
   return out;
 }
 
-async function setup({ base, dtype, temperature, voices, configUrl, threads }) {
+async function setup({ base, dtype, temperature, voices, configUrl, weightsUrl }) {
   status('starting wasm…');
   await init();
 
-  if (threads > 0) set_threads(threads);
   post('threads', JSON.parse(threads_info()));
 
   status('asking the browser for a WebGPU adapter…');
@@ -58,8 +57,10 @@ async function setup({ base, dtype, temperature, voices, configUrl, threads }) {
   const tokBytes = await fetchWithProgress(`${base}/tokenizer.model`, 'tokenizer');
   tokenizer = new UnigramTokenizer(decodeSentencepieceModel(tokBytes));
 
+  // The container is the caller's choice because the dtype dictates it: a q8 run
+  // needs pre-quantized blocks, which only the gguf has.
   status('downloading weights…');
-  const weights = await fetchWithProgress(`${base}/model.safetensors`, 'weights');
+  const weights = await fetchWithProgress(weightsUrl || `${base}/model.safetensors`, 'weights');
 
   status(`building the model on the GPU (${dtype})…`);
   const info = JSON.parse(await load_model(weights, configJson, dtype, temperature));

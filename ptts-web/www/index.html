@@ -64,6 +64,7 @@
   <h1>Pocket TTS on WebGPU</h1>
   <span class="badge" id="gpu-badge">checking WebGPU…</span>
   <span class="badge" id="dev-badge" hidden></span>
+  <span class="badge" id="threads-note" hidden></span>
 </header>
 <p class="sub">
   The whole model runs in this tab: the flow-matching LM and the Mimi decoder are WGSL compute
@@ -86,28 +87,17 @@
       <select id="dtype" style="width:150px">
         <option value="f32" selected>f32</option>
         <option value="f16">f16</option>
-        <option value="q8">q8_0 / f32 — native only</option>
-        <option value="q8f16">q8_0 / f16 — native only</option>
+        <option value="q8">q8_0 / f32</option>
+        <option value="q8f16">q8_0 / f16</option>
       </select>
-    </div>
-    <div>
-      <label for="threads">Threads</label>
-      <input id="threads" type="number" min="1" max="64" value="1" style="width:90px">
     </div>
     <div><button id="load">Load model</button></div>
   </div>
-  <p class="hint" id="threads-note">
-    Threads set xn's worker count. On this page that changes nothing: xn's threading
-    lives in its CPU backend and the WebGPU backend makes no rayon call, and this wasm
-    build has no <code>atomics</code>, so it is single-threaded either way. Kept as a
-    control because it is one natively, where it matters a great deal.
-  </p>
   <div class="bar"><div id="prog"></div></div>
   <p class="hint">
-    f16 needs the adapter to report WGSL <code>shader-f16</code>. The q8_0 dtypes do not work in a
-    browser yet: xn quantizes weights by reading them back to the host
-    (<code>Q8Tensor::quantize</code>), and a browser cannot block on a readback. They are listed
-    because the same build runs them natively.
+    f16 needs the adapter to report WGSL <code>shader-f16</code>. The q8_0 dtypes load
+    <code>model.q8.gguf</code>, whose blocks are already quantized: 136 MB instead of 317 MB, and no
+    host round trip. f32 and f16 load the dense safetensors.
   </p>
   <div id="status">Pick a source and load. Weights are a few hundred MB and the browser caches them.</div>
 </div>
@@ -298,6 +288,18 @@ function renderHistory() {
 // ---- worker wiring -----------------------------------------------------
 const VOICES = ['alba', 'marius', 'javert', 'fantine', 'cosette', 'eponine', 'azelma'];
 
+// The dtype dictates the container: q8 reads pre-quantized blocks, so it needs the
+// gguf; f32/f16 need dense weights, so they need the safetensors. HuggingFace keeps
+// the two in separate repos.
+function weightsUrl(base, dtype) {
+  const q8 = dtype.startsWith('q8');
+  if (base === '/model') return q8 ? '/model/model.q8.gguf' : '/model/model.safetensors';
+  if (q8) {
+    return 'https://huggingface.co/lmz/pocket-tts-without-voice-cloning-q8/resolve/main/tts_b6369a24.gguf';
+  }
+  return `${base}/model.safetensors`;
+}
+
 function voiceList(base) {
   // The local dir keeps voices next to the model; the HF repo keeps them under
   // embeddings_v2/, which is also where its own demo reads them from.
@@ -313,7 +315,16 @@ $('load').onclick = () => {
   $('load').disabled = true;
   runs = []; renderHistory();
   worker = new Worker('./worker.js', { type: 'module' });
-  worker.onerror = e => { setStatus('worker failed: ' + e.message, true); $('load').disabled = false; };
+  // A module worker that fails to load reports an ErrorEvent with an empty
+  // message, so the location is the only useful part.
+  worker.onerror = e => {
+    const where = e.filename ? ` at ${e.filename}:${e.lineno}:${e.colno}` : '';
+    const msg = `worker failed: ${e.message || '(no message)'}${where}`;
+    setStatus(msg, true);
+    $('load').disabled = false;
+    if (typeof reportFailure === 'function') reportFailure(msg);
+  };
+  worker.onmessageerror = e => setStatus('worker message error: ' + JSON.stringify(e.data), true);
   worker.onmessage = ev => {
     const m = ev.data;
     switch (m.type) {
@@ -327,11 +338,11 @@ $('load').onclick = () => {
         break;
       }
       case 'threads':
-        $('threads-note').innerHTML =
-          `xn reports <code>${m.threads}</code> thread(s) over <code>${m.cpus}</code> visible cpu(s). ` +
-          'That number changes nothing here: xn\'s threading lives in its CPU backend and the ' +
-          'WebGPU backend makes no rayon call, and this wasm build has no <code>atomics</code>, ' +
-          'so it is single-threaded either way. Kept as a control because it is one natively.';
+        // Not a setting: this build has no `atomics`, so it is one thread, and the
+        // WebGPU backend has no rayon call that would read a count anyway.
+        $('threads-note').textContent =
+          `${m.threads} thread · ${m.cpus} cpu · all compute on the GPU`;
+        $('threads-note').hidden = false;
         break;
       case 'device':
         $('dev-badge').textContent = m.device + (m.f16 ? ' · shader-f16' : ' · no shader-f16');
@@ -347,7 +358,8 @@ $('load').onclick = () => {
       case 'ready':
         info = m.info;
         $('prog').style.width = '100%';
-        setStatus(`ready — ${info.device}, ${info.dtype}, ${info.sample_rate} Hz, loaded in ${fmt(info.load_ms)} ms`);
+        setStatus(`ready — ${info.device}, ${info.dtype} from ${info.container}, ` +
+          `${info.sample_rate} Hz, loaded in ${fmt(info.load_ms)} ms`);
         $('go').disabled = false;
         break;
       case 'gen_start':
@@ -390,7 +402,7 @@ $('load').onclick = () => {
   };
   worker.postMessage({
     type: 'setup', base, dtype, temperature: 0.4,
-    threads: Math.max(1, parseInt($('threads').value, 10) || 1),
+    weightsUrl: weightsUrl(base, dtype),
     configUrl: base === '/model' ? '/model/config.json' : null,
     voices: voiceList(base),
   });
@@ -444,7 +456,6 @@ if (q.get('auto')) {
   if (q.get('dtype')) $('dtype').value = q.get('dtype');
   if (q.get('base')) $('base').value = q.get('base');
   if (q.get('text')) $('text').value = q.get('text');
-  if (q.get('threads')) $('threads').value = q.get('threads');
   $('play').value = 'off';
 
   // A failure anywhere must still produce a report, or a headless run just hangs.
@@ -511,7 +522,7 @@ if (q.get('auto')) {
         clearTimeout(guard);
         report({
           ok: true, device: $('dev-badge').textContent, info, runs,
-          audio: audioOf(), threadsNote: $('threads-note').textContent.trim().slice(0, 120),
+          audio: audioOf(), threadsNote: $('threads-note').textContent.trim().slice(0, 140),
           // Non-zero entries here mean the waveform was drawn mid-run.
           inkDuringRun: inkSeries.filter(v => v > 0).length,
           inkSamples: inkSeries.length, inkSeries: inkSeries.slice(0, 12),

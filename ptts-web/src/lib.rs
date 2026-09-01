@@ -188,16 +188,23 @@ pub async fn load_model(
         )));
     }
 
-    // GGUF is deliberately not accepted: the WebGPU q8_0 path quantizes from f32
-    // weights on load, so it wants the safetensors even for a q8 run.
-    if model_bytes.len() >= 4 && &model_bytes[..4] == b"GGUF" {
+    let is_gguf = model_bytes.len() >= 4 && &model_bytes[..4] == b"GGUF";
+    // A q8 run in a browser needs the blocks already quantized in the file. Given
+    // dense weights, xn would have to read every weight back off the device to
+    // quantize it, and a browser cannot block on a readback.
+    if dtype.starts_with("q8") && !is_gguf {
         return Err(err(
-            "gguf weights are not supported here; the webgpu q8_0 path quantizes from the f32 safetensors",
+            "a q8 dtype needs gguf weights in a browser: quantizing from safetensors reads every \
+             weight back to the host, which deadlocks here. Load model.q8.gguf instead.",
         ));
     }
 
-    let vb =
-        VB::from_bytes_with_key_map(vec![model_bytes], device.clone(), remap_key).map_err(err)?;
+    let vb = if is_gguf {
+        VB::load_gguf_with_key_map(std::io::Cursor::new(model_bytes), device.clone(), remap_key)
+            .map_err(err)?
+    } else {
+        VB::from_bytes_with_key_map(vec![model_bytes], device.clone(), remap_key).map_err(err)?
+    };
     let root = vb.root();
 
     macro_rules! build {
@@ -225,6 +232,7 @@ pub async fn load_model(
         "f16": device.supports_f16(),
         "sample_rate": sample_rate,
         "frame_size": frame_size,
+        "container": if is_gguf { "gguf" } else { "safetensors" },
         "load_ms": now_ms() - t0,
     });
     LOADED.with(|c| {
@@ -274,30 +282,22 @@ pub fn max_frames_for_tokens(num_tokens: usize) -> usize {
     max_frames_for(num_tokens)
 }
 
-/// xn's worker count, which on this path controls nothing.
+/// This build is single-threaded, and there is nothing to configure.
 ///
-/// Threading in xn lives entirely in the CPU backend; the WebGPU backend does no
-/// rayon work, and this wasm build has no `atomics`/shared memory, so it is
-/// single-threaded regardless. Exposed so the page can *report* the value rather
-/// than imply a knob that does nothing -- see `threads_effective`.
-#[wasm_bindgen]
-pub fn set_threads(n: usize) {
-    if n > 0 {
-        xn::set_num_threads(n);
-    }
-}
-
-/// What xn now reports, and how many cpus it can see.
+/// Threading in xn lives entirely in its CPU backend: the WebGPU backend contains
+/// no rayon call, so nothing here would read a worker count anyway. On top of
+/// that the wasm32 rustflags carry no `+atomics`, so `std::thread` cannot spawn
+/// and `num_cpus` reports one core. Reported rather than set, so the number is
+/// derived from the build instead of asserted over it.
+///
+/// Deliberately no setter: `xn::set_num_threads` writes `RAYON_NUM_THREADS`, and
+/// `std::env::set_var` is unsupported on `wasm32-unknown-unknown` -- calling it
+/// traps the module.
 #[wasm_bindgen]
 pub fn threads_info() -> JsValue {
     let info = serde_json::json!({
         "threads": xn::get_num_threads(),
         "cpus": xn::get_num_cpus(),
-        // True for every build this page can produce: no `+atomics` in the
-        // wasm32 rustflags means `std::thread` cannot spawn.
-        "wasm_single_threaded": true,
-        // The WebGPU backend contains no rayon call at all.
-        "affects_gpu_compute": false,
     });
     JsValue::from_str(&info.to_string())
 }
