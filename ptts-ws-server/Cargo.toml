@@ -19,14 +19,12 @@ futures-util = { workspace = true }
 half = { workspace = true }
 hf-hub = { workspace = true }
 kaudio = { workspace = true }
-ptts = { workspace = true }
+ptts = { workspace = true, features = ["hf"] }
 rand = { workspace = true, features = ["std_rng"] }
 rand_distr = { workspace = true }
 rubato = { workspace = true }
-sentencepiece = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokenizers = { workspace = true }
 tokio = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }

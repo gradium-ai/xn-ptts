@@ -20,7 +20,7 @@ From the `ptts-wasm/` directory:
 make build
 ```
 
-This runs `wasm-pack build` and copies `index.html` into `pkg/`.
+This runs `wasm-pack build` and copies `www/` into `pkg/`.
 
 ## Run
 

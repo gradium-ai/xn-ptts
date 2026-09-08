@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Cargo workspace (resolver "3", edition 2024) with three members:
 
-- `ptts/` — core TTS library. Pure Rust, depends on the `xn` tensor/nn crate. Examples live under `ptts/examples/`: `pocket_tts` (end-to-end CLI) and `bench` (benchmark harness) both require the `sp` feature for SentencePiece; `quantize` (safetensors → GGUF converter that selectively quantizes `flow_lm.transformer.layers.*` weights) and `create_voice` (voice embeddings from audio samples) do not. `audio_helpers.rs` and `model_helpers.rs` are not examples — they are shared modules each example pulls in with `#[path = "..."] mod`, so `autoexamples = false` and every example is listed explicitly in `Cargo.toml`.
+- `ptts/` — core TTS library. Pure Rust, depends on the `xn` tensor/nn crate. Examples live under `ptts/examples/`: `pocket_tts` (end-to-end CLI) and `bench` (benchmark harness) both require the `hf` feature for the tokenizer; `quantize` (safetensors → GGUF converter that selectively quantizes `flow_lm.transformer.layers.*` weights) and `create_voice` (voice embeddings from audio samples) do not. `audio_helpers.rs` and `model_helpers.rs` are not examples — they are shared modules each example pulls in with `#[path = "..."] mod`, so `autoexamples = false` and every example is listed explicitly in `Cargo.toml`.
 - `ptts-pyo3/` — PyO3 bindings exposing `TTSModel` to Python. Built with maturin; the cdylib is named `ptts`. Has its own `pyproject.toml` and `uv.lock`.
 - `ptts-wasm/` — browser build via `wasm-bindgen` / `wasm-pack`. Ships a demo in `ptts-wasm/www/` (`index.html` + `worker.js`).
 
@@ -27,21 +27,23 @@ CI deletes `.cargo/config.toml` before building because it pins `target-cpu=nati
 
 Cargo features that gate optional functionality:
 
-- `ptts`: `sp` (SentencePiece tokenizer, required by the `pocket_tts` and `bench` examples), `cuda`, `accelerate`.
+- `ptts`: `hf` (Hugging Face `tokenizers`, i.e. `ptts::tok`, required by the `pocket_tts` and `bench` examples), `cuda`, `accelerate`.
 - `ptts-pyo3`: `cuda`, `accelerate` (each forwards to both `xn/*` and `ptts/*`).
 
 Run the CLI example:
 
 ```
-cargo run --release --example pocket_tts --features sp -- "hello world" -o out.wav
+cargo run --release --example pocket_tts --features hf -- "hello world" -o out.wav \
+  --tokenizer path/to/tokenizer.json
 ```
 
-It downloads weights from the `kyutai/pocket-tts` HuggingFace repo on first run. Built-in voice IDs: `alba`, `marius`, `javert`, `jean`, `fantine`, `cosette`, `eponine`, `azelma`. `--voice` also accepts a path to a 10s audio file or a precomputed voice safetensors.
+It downloads weights from the `kyutai/pocket-tts` HuggingFace repo on first run, along with that
+repo's `tokenizer.json` once it hosts one — until then `--tokenizer` supplies it. Built-in voice IDs: `alba`, `marius`, `javert`, `jean`, `fantine`, `cosette`, `eponine`, `azelma`. `--voice` also accepts a path to a 10s audio file or a precomputed voice safetensors.
 
 Benchmark a local model:
 
 ```
-cargo run --release --features sp,accelerate --example bench -- \
+cargo run --release --features hf,accelerate --example bench -- \
   --model model/model.q8.gguf --config model/config.json --quant q8 \
   --voice voices/freya.safetensors --threads 8 --iters 20
 ```
@@ -76,9 +78,10 @@ The library implements Pocket TTS: text → tokens → flow-matching language mo
 
 `ptts/src/lib.rs` exposes a single `Tokenizer` trait (`encode` / `decode`) so each binding plugs in its own implementation:
 
-- `pocket_tts` example: `SpTokenizer` wrapping `sentencepiece::SentencePieceProcessor`.
-- `ptts-pyo3`: tokenizer is built from `tokenizer.model` shipped in the HF repo.
-- `ptts-wasm`: `PresetTokenizer` — JS tokenizes in the browser and pushes IDs into the Rust state before each step.
+- `pocket_tts` and `bench` examples, `ptts-pyo3` and `ptts-ws-server`: `ptts::tok::Tok` (the `hf` feature), a Hugging Face `tokenizers` wrapper.
+- `ptts-wasm`: the same `ptts::tok::Tok`, built from the `tokenizer.json` the demo fetches and handed to `Model::new`; the browser passes text, not token ids.
+
+Every frontend loads a `tokenizer.json` and nothing else, and none is bundled or defaulted to: each checkpoint has its own vocabulary, and loading the wrong one yields plausible audio from the wrong ids, so `Tok::open` refuses to guess. `pocket_tts --tokenizer <path>` and `bench --tokenizer <path>` override where the examples look; otherwise they, `ptts-pyo3` and `ptts-ws-server` all expect `tokenizer.json` in the HF repo or beside the config. A checkpoint that carries only a `tokenizer.model` needs converting once with `scripts/convert-tokenizer.py`, which writes the equivalent json.
 
 Top-level orchestrator is `tts_model::TTSModel<Q>`, generic over a backend-quantization parameter `Q: BackendQ` from `xn`. It owns:
 

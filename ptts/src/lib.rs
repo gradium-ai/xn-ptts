@@ -9,6 +9,8 @@ pub mod preprocess;
 pub mod resample;
 pub mod rope;
 pub mod seanet;
+#[cfg(feature = "hf")]
+pub mod tok;
 pub mod transformer;
 pub mod tts_model;
 pub mod utils;

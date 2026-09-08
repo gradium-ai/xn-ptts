@@ -5,7 +5,8 @@ mod model_helpers;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use model_helpers::{SpTokenizer, max_frames_for};
+use model_helpers::max_frames_for;
+use ptts::tok::Tok;
 use ptts::tts_model::{
     MimiEnc, TTSConfig, TTSModel, prepare_text_prompt, split_into_best_sentences,
 };
@@ -50,6 +51,11 @@ struct Args {
     #[arg(long)]
     quant: Option<String>,
 
+    /// Path to a `tokenizer.json`, as produced by `scripts/convert-tokenizer.py`. Defaults to the
+    /// one shipped next to the weights.
+    #[arg(long)]
+    tokenizer: Option<std::path::PathBuf>,
+
     #[arg(long)]
     chrome_tracing: bool,
 
@@ -77,7 +83,7 @@ enum Voice {
     Audio(String),
 }
 
-fn download_files(voice: &str) -> Result<(std::path::PathBuf, std::path::PathBuf, Voice)> {
+fn download_files(voice: &str) -> Result<(std::path::PathBuf, Option<std::path::PathBuf>, Voice)> {
     use hf_hub::{Repo, RepoType, api::sync::Api};
     let repo_id = "kyutai/pocket-tts";
     tracing::info!(?repo_id, "downloading weights...");
@@ -87,7 +93,9 @@ fn download_files(voice: &str) -> Result<(std::path::PathBuf, std::path::PathBuf
     let model_path = repo.get("tts_b6369a24.safetensors").context("model weights not found")?;
     tracing::info!(?model_path, "model weights downloaded");
 
-    let tokenizer_path = repo.get("tokenizer.model").context("tokenizer not found")?;
+    // The repo ships a SentencePiece `tokenizer.model`, which needs converting once, so a
+    // `tokenizer.json` is not there to be had yet; `--tokenizer` points at the converted one.
+    let tokenizer_path = repo.get("tokenizer.json").ok();
     tracing::info!(?tokenizer_path, "tokenizer downloaded");
 
     let voice = if VOICES.contains(&voice) {
@@ -222,19 +230,28 @@ fn main() -> Result<()> {
         run_cpu(args)?;
     }
 
-    tracing::info!("peak RSS: {:.2} MB", peak_rss_mb());
+    match peak_rss_mb() {
+        Some(mb) => tracing::info!("peak RSS: {mb:.2} MB"),
+        None => tracing::info!("peak RSS: unavailable on this platform"),
+    }
 
     Ok(())
 }
 
-fn peak_rss_mb() -> f64 {
+#[cfg(unix)]
+fn peak_rss_mb() -> Option<f64> {
     let mut usage = std::mem::MaybeUninit::uninit();
     let maxrss = unsafe {
         libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr());
         usage.assume_init().ru_maxrss as f64
     };
     // ru_maxrss is in bytes on macOS but kilobytes on Linux.
-    if cfg!(target_os = "macos") { maxrss / (1024.0 * 1024.0) } else { maxrss / 1024.0 }
+    Some(if cfg!(target_os = "macos") { maxrss / (1024.0 * 1024.0) } else { maxrss / 1024.0 })
+}
+
+#[cfg(not(unix))]
+fn peak_rss_mb() -> Option<f64> {
+    None
 }
 
 enum Rng {
@@ -302,7 +319,7 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
                 None => parent.join("model.safetensors"),
                 Some(p) => std::path::PathBuf::from_str(p)?,
             };
-            let tokenizer_path = parent.join("tokenizer.model");
+            let tokenizer_path = Some(parent.join("tokenizer.json"));
             tracing::info!(?config, "using local config");
             let config: ptts::tts_model::TTSConfig =
                 serde_json::from_str(&std::fs::read_to_string(config)?)?;
@@ -333,7 +350,11 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
         }
     };
 
-    let tokenizer = SpTokenizer::open(&tokenizer_path)?;
+    let tokenizer_path = args.tokenizer.as_deref().or(tokenizer_path.as_deref()).context(
+        "no tokenizer.json alongside the weights: convert the checkpoint's tokenizer.model with \
+         `uv run scripts/convert-tokenizer.py` and pass the result with --tokenizer",
+    )?;
+    let tokenizer = Tok::open(tokenizer_path)?;
     let text = match args.lang.as_deref() {
         None => std::borrow::Cow::Borrowed(args.text.as_str()),
         Some(lang) => {

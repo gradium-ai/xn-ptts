@@ -94,25 +94,3 @@ pub fn load_voice_emb<Q: BackendQ>(
 pub fn max_frames_for(num_tokens: usize) -> usize {
     ((num_tokens as f64 / 3.0 + 2.0) * 12.5).ceil() as usize
 }
-
-#[cfg(feature = "sp")]
-pub struct SpTokenizer(pub sentencepiece::SentencePieceProcessor);
-
-#[cfg(feature = "sp")]
-impl SpTokenizer {
-    pub fn open(path: &std::path::Path) -> Result<Self> {
-        let path = path.to_str().context("invalid tokenizer path")?;
-        Ok(Self(sentencepiece::SentencePieceProcessor::open(path)?))
-    }
-}
-
-#[cfg(feature = "sp")]
-impl ptts::Tokenizer for SpTokenizer {
-    fn encode(&self, text: &str) -> xn::Result<Vec<u32>> {
-        Ok(self.0.encode(text).map_err(xn::Error::wrap)?.into_iter().map(|v| v.id).collect())
-    }
-
-    fn decode(&self, tokens: &[u32]) -> xn::Result<String> {
-        self.0.decode_piece_ids(tokens).map_err(xn::Error::wrap)
-    }
-}

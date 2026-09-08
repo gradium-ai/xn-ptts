@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use model_helpers::{SpTokenizer, max_frames_for};
+use model_helpers::max_frames_for;
+use ptts::tok::Tok;
 use ptts::tts_model::{TTSConfig, TTSModel, TTSState};
 use xn::{BackendQ, Tensor};
 
@@ -30,7 +31,7 @@ struct Args {
     #[arg(long)]
     config: std::path::PathBuf,
 
-    /// SentencePiece tokenizer. Defaults to `tokenizer.model` next to the config.
+    /// Tokenizer json. Defaults to `tokenizer.json` next to the config.
     #[arg(long)]
     tokenizer: Option<std::path::PathBuf>,
 
@@ -232,12 +233,12 @@ impl Bench<'_> {
         let tokenizer_path = match args.tokenizer.clone() {
             Some(path) => path,
             None => {
-                args.config.parent().context("config path has no parent")?.join("tokenizer.model")
+                args.config.parent().context("config path has no parent")?.join("tokenizer.json")
             }
         };
 
         let t_load = Instant::now();
-        let tokenizer = SpTokenizer::open(&tokenizer_path)?;
+        let tokenizer = Tok::open(&tokenizer_path)?;
         let vb = model_helpers::load_weights::<Q>(&args.model, &dev)?;
         let model: TTSModel<Q> = TTSModel::load(&vb, Box::new(tokenizer), &cfg)?;
         vb.check_all_used_with_ignore(model_helpers::is_unused_by_tts_model)?;

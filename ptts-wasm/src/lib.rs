@@ -1,4 +1,3 @@
-use std::sync::Mutex;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -13,49 +12,12 @@ macro_rules! console_log {
 
 use ptts::flow_lm::{self, FlowLMState};
 use ptts::mimi::MimiDecoderState;
+use ptts::tok::Tok;
 use ptts::transformer::{LayerAttentionState, StreamingMHAState, StreamingTransformerState};
 use ptts::tts_model::{TTSConfig, TTSModel, TTSState, prepare_text_prompt};
 use xn::nn::VB;
 use xn::quantized::Q80F32;
 use xn::{BackendQ, CPU, CpuDevice, Tensor, TypedTensor, Unquantized};
-
-/// Tokenizer that returns pre-set token IDs (set from JS before each generation).
-struct PresetTokenizer {
-    tokens: Mutex<Vec<u32>>,
-}
-
-impl PresetTokenizer {
-    fn new() -> Self {
-        Self { tokens: Mutex::new(Vec::new()) }
-    }
-
-    fn set_tokens(&self, tokens: Vec<u32>) {
-        *self.tokens.lock().unwrap() = tokens;
-    }
-}
-
-impl ptts::Tokenizer for PresetTokenizer {
-    fn encode(&self, _text: &str) -> xn::Result<Vec<u32>> {
-        Ok(self.tokens.lock().unwrap().clone())
-    }
-
-    fn decode(&self, _tokens: &[u32]) -> xn::Result<String> {
-        Ok(String::new())
-    }
-}
-
-/// Wrapper to allow sharing a PresetTokenizer via Arc while implementing the Tokenizer trait.
-struct SharedTokenizer(std::sync::Arc<PresetTokenizer>);
-
-impl ptts::Tokenizer for SharedTokenizer {
-    fn encode(&self, text: &str) -> xn::Result<Vec<u32>> {
-        self.0.encode(text)
-    }
-
-    fn decode(&self, tokens: &[u32]) -> xn::Result<String> {
-        self.0.decode(tokens)
-    }
-}
 
 struct WasmRng {
     inner: Box<rand::rngs::StdRng>,
@@ -199,14 +161,13 @@ struct GenState {
 #[wasm_bindgen]
 pub struct Model {
     inner: ModelInner,
-    tokenizer: std::sync::Arc<PresetTokenizer>,
     cfg: TTSConfig,
     gen_state: Option<GenState>,
     voice_states: Vec<RawState>,
 }
 
 impl Model {
-    pub fn new_(model_weights: &[u8], quant: &str) -> xn::Result<Model> {
+    pub fn new_(model_weights: &[u8], tokenizer_json: &[u8], quant: &str) -> xn::Result<Model> {
         let quant = Quant::parse(quant)?;
         console_log!("[new] loading model with quant={quant:?}");
         let cfg = TTSConfig::v202601(0.7);
@@ -221,9 +182,8 @@ impl Model {
             VB::from_bytes_with_key_map(vec![model_weights.to_vec()], CPU, remap_key)?
         };
         let root = vb.root();
-        let tokenizer = std::sync::Arc::new(PresetTokenizer::new());
         let tokenizer_box: Box<dyn ptts::Tokenizer + Send + Sync> =
-            Box::new(SharedTokenizer(std::sync::Arc::clone(&tokenizer)));
+            Box::new(Tok::from_bytes(tokenizer_json)?);
 
         let inner = match quant {
             Quant::F32 => ModelInner::F32(TTSModel::<Unquantized<f32, CpuDevice>>::load(
@@ -234,7 +194,7 @@ impl Model {
             Quant::Q8 => ModelInner::Q8(TTSModel::<Q80F32>::load(&root, tokenizer_box, &cfg)?),
         };
 
-        Ok(Model { inner, tokenizer, cfg, gen_state: None, voice_states: Vec::new() })
+        Ok(Model { inner, cfg, gen_state: None, voice_states: Vec::new() })
     }
 
     /// Load a pre-computed KV cache state from a safetensors buffer.
@@ -284,10 +244,14 @@ impl Model {
     pub fn start_generation_(
         &mut self,
         voice_index: usize,
-        token_ids: &[u32],
-        frames_after_eos: usize,
+        text: &str,
         temperature: f32,
-    ) -> xn::Result<()> {
+    ) -> xn::Result<usize> {
+        let (text, frames_after_eos) = prepare_text_prompt(text);
+        let token_ids = match &self.inner {
+            ModelInner::F32(m) => m.flow_lm.conditioner.tokenize(&text)?,
+            ModelInner::Q8(m) => m.flow_lm.conditioner.tokenize(&text)?,
+        };
         console_log!(
             "[start_generation] voice_index={} num_tokens={} frames_after_eos={} temperature={}",
             voice_index,
@@ -295,7 +259,6 @@ impl Model {
             frames_after_eos,
             temperature
         );
-        self.tokenizer.set_tokens(token_ids.to_vec());
 
         let num_tokens = token_ids.len();
         let max_frames = ((num_tokens as f64 / 3.0 + 2.0) * 12.5).ceil() as usize;
@@ -315,7 +278,7 @@ impl Model {
 
         console_log!("[start_generation] running prompt_text...");
         let mimi_state = dispatch!(&self.inner, &mut tts_state, |m, s| {
-            m.prompt_text(s, token_ids)?;
+            m.prompt_text(s, &token_ids)?;
             m.init_mimi_state(1, 250)?
         });
         console_log!("[start_generation] prompt_text done, starting generation loop");
@@ -336,7 +299,7 @@ impl Model {
             eos_countdown: None,
             step: 0,
         });
-        Ok(())
+        Ok(num_tokens)
     }
 
     pub fn generation_step_(&mut self) -> xn::Result<Option<js_sys::Float32Array>> {
@@ -389,33 +352,24 @@ impl Model {
 
 #[wasm_bindgen]
 impl Model {
+    /// `tokenizer_json` is the contents of a `tokenizer.json` for this checkpoint's vocabulary.
     #[wasm_bindgen(constructor)]
-    pub fn new(model_weights: &[u8], quant: &str) -> Result<Model, JsError> {
-        Self::new_(model_weights, quant).map_err(|e| JsError::new(&e.to_string()))
+    pub fn new(model_weights: &[u8], tokenizer_json: &[u8], quant: &str) -> Result<Model, JsError> {
+        Self::new_(model_weights, tokenizer_json, quant).map_err(|e| JsError::new(&e.to_string()))
     }
 
     pub fn add_voice(&mut self, voice_weights: &[u8]) -> Result<usize, JsError> {
         self.add_voice_(voice_weights).map_err(|e| JsError::new(&e.to_string()))
     }
 
-    /// Prepare text for generation: capitalize, add punctuation, pad short text.
-    /// Returns [processed_text, frames_after_eos] as a JS array.
-    pub fn prepare_text(&self, text: &str) -> js_sys::Array {
-        let (processed, frames_after_eos) = prepare_text_prompt(text);
-        let arr = js_sys::Array::new();
-        arr.push(&JsValue::from_str(&processed));
-        arr.push(&JsValue::from_f64(frames_after_eos as f64));
-        arr
-    }
-
+    /// Prepares and tokenizes `text`, then runs the prompt step. Returns the token count.
     pub fn start_generation(
         &mut self,
         voice_index: usize,
-        token_ids: &[u32],
-        frames_after_eos: usize,
+        text: &str,
         temperature: f32,
-    ) -> Result<(), JsError> {
-        self.start_generation_(voice_index, token_ids, frames_after_eos, temperature)
+    ) -> Result<usize, JsError> {
+        self.start_generation_(voice_index, text, temperature)
             .map_err(|e| JsError::new(&e.to_string()))
     }
 

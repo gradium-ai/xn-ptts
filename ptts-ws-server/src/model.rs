@@ -1,4 +1,5 @@
 use anyhow::{Context as _, Result};
+use ptts::tok::Tok;
 use ptts::tts_model::{TTSConfig, TTSModel, TTSState};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,43 +30,6 @@ impl ptts::flow_lm::Rng for StdRng {
     fn sample(&mut self) -> f32 {
         use rand::Rng;
         self.inner.sample(self.distr)
-    }
-}
-
-pub enum Tok {
-    Sp(std::sync::Arc<sentencepiece::SentencePieceProcessor>),
-    Hf(Box<tokenizers::Tokenizer>),
-}
-
-impl From<sentencepiece::SentencePieceProcessor> for Tok {
-    fn from(sp: sentencepiece::SentencePieceProcessor) -> Self {
-        Tok::Sp(std::sync::Arc::new(sp))
-    }
-}
-
-impl From<tokenizers::Tokenizer> for Tok {
-    fn from(tok: tokenizers::Tokenizer) -> Self {
-        Tok::Hf(Box::new(tok))
-    }
-}
-
-impl ptts::Tokenizer for Tok {
-    fn encode(&self, text: &str) -> xn::Result<Vec<u32>> {
-        let tokens = match self {
-            Tok::Sp(sp) => {
-                sp.encode(text).map_err(xn::Error::wrap)?.into_iter().map(|v| v.id).collect()
-            }
-            Tok::Hf(tok) => tok.encode(text, false).map_err(xn::Error::wrap)?.get_ids().to_vec(),
-        };
-        Ok(tokens)
-    }
-
-    fn decode(&self, ids: &[u32]) -> xn::Result<String> {
-        let decoded = match self {
-            Tok::Sp(sp) => sp.decode_piece_ids(ids).map_err(xn::Error::wrap)?,
-            Tok::Hf(tok) => tok.decode(ids, true).map_err(xn::Error::wrap)?,
-        };
-        Ok(decoded)
     }
 }
 
@@ -158,7 +122,7 @@ impl<Q: BackendQ> LoadedModel<Q> {
 
         let model_path = repo.get("model.q8.gguf")?;
         tracing::info!(?model_path, "model weights ready");
-        let tokenizer_path = repo.get("tokenizer.model")?;
+        let tokenizer_path = repo.get("tokenizer.json")?;
 
         let mut voices: HashMap<String, Tensor<Q::T, Q::B>> = HashMap::new();
         let default_voice = load_voice_embedding(&repo.get("default-voice.safetensors")?, dev)
@@ -176,7 +140,7 @@ impl<Q: BackendQ> LoadedModel<Q> {
         let repo = crate::utils::HfRepo::model(DEFAULT_REPO_ID)?;
         let model_path = repo.get(DEFAULT_MODEL_FILE)?;
         tracing::info!(?model_path, "model weights ready");
-        let tokenizer_path = repo.get("tokenizer.model")?;
+        let tokenizer_path = repo.get("tokenizer.json")?;
 
         let mut voices: HashMap<String, Tensor<Q::T, Q::B>> = HashMap::new();
         for &voice in VOICES {
@@ -218,7 +182,7 @@ impl<Q: BackendQ> LoadedModel<Q> {
                 "model file not found in directory {parent_dir:?}; expected model.safetensors or model.gguf"
             );
         };
-        let tokenizer_path = parent_dir.join("tokenizer.model");
+        let tokenizer_path = parent_dir.join("tokenizer.json");
         let mut voices: HashMap<String, Tensor<Q::T, Q::B>> = HashMap::new();
         for voice in parent_dir.join("voices").read_dir()? {
             let voice = match voice {
@@ -317,18 +281,7 @@ pub fn load_ptts<Q: BackendQ>(
         load_voices_from_dir::<Q>(voice_dir, &dev, &mut m.voices);
         tracing::info!(num_voices = m.voices.len(), "voice embeddings loaded (incl. voice-dir)");
     }
-    let tokenizer_path = m.tokenizer_path.to_str().context("invalid tokenizer path")?;
-    let tokenizer = if tokenizer_path.ends_with(".model") {
-        tracing::info!("loading SentencePiece tokenizer");
-        let sp = sentencepiece::SentencePieceProcessor::open(tokenizer_path)
-            .with_context(|| format!("failed to open tokenizer at {tokenizer_path}"))?;
-        Tok::Sp(sp.into())
-    } else {
-        tracing::info!("loading Hugging Face tokenizer");
-        let tok = tokenizers::Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| anyhow::format_err!("failed to load tokenizer: {e}"))?;
-        Tok::Hf(Box::new(tok))
-    };
+    let tokenizer = Tok::open(&m.tokenizer_path)?;
 
     let vb = if m.model_path.extension().and_then(|v| v.to_str()) == Some("gguf") {
         let reader = std::fs::File::open(&m.model_path)?;

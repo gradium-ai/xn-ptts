@@ -17,7 +17,7 @@ rand_distr = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-sentencepiece = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
@@ -26,10 +26,12 @@ half = { workspace = true }
 hf-hub = { workspace = true }
 safetensors = { workspace = true }
 rubato = { workspace = true }
-libc = { workspace = true }
 serde_json = { workspace = true }
 symphonia = { workspace = true }
 tracing-chrome = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
 
 [features]
 default = []
@@ -38,15 +40,16 @@ vulkan = ["xn/vulkan"]
 metal = ["xn/metal"]
 webgpu = ["xn/webgpu"]
 accelerate = ["xn/accelerate"]
-sp = ["dep:sentencepiece"]
+# Hugging Face `tokenizers` support, i.e. the `ptts::tok` module.
+hf = ["dep:tokenizers"]
 
 [[example]]
 name = "pocket_tts"
-required-features = ["sp"]
+required-features = ["hf"]
 
 [[example]]
 name = "bench"
-required-features = ["sp"]
+required-features = ["hf"]
 
 [[example]]
 name = "quantize"
