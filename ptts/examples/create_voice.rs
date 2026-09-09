@@ -73,10 +73,15 @@ fn run(args: Args) -> Result<()> {
         pcm
     };
     tracing::info!("loaded audio with {} samples", pcm.len());
-    // Trim it to 10s max.
-    let pcm = if pcm.len() > speaker_sr * 10 {
-        tracing::info!("trimming audio to 10 seconds");
-        pcm[..speaker_sr * 10].to_vec()
+    let max_len = (speaker_sr as f32 * cfg.audio_prompt_max_duration).round() as usize;
+    let pcm = if pcm.len() > max_len {
+        let cut = audio_helpers::quiet_cut_point(&pcm, max_len, speaker_sr);
+        tracing::info!(
+            max_duration = cfg.audio_prompt_max_duration,
+            cut_s = cut as f32 / speaker_sr as f32,
+            "trimming audio"
+        );
+        pcm[..cut].to_vec()
     } else {
         pcm
     };

@@ -439,7 +439,8 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
                         max_duration = cfg.audio_prompt_max_duration,
                         "trimming audio to max duration"
                     );
-                    pcm[..max_len].to_vec()
+                    let cut = audio_helpers::quiet_cut_point(&pcm, max_len, speaker_sr);
+                    pcm[..cut].to_vec()
                 } else {
                     pcm
                 };

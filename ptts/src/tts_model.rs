@@ -37,7 +37,7 @@ fn default_audio_prompt_min_duration() -> f32 {
 }
 
 fn default_audio_prompt_max_duration() -> f32 {
-    10.0
+    30.0
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -141,7 +141,7 @@ impl TTSConfig {
             },
             model_id: None,
             audio_prompt_min_duration: 10.0,
-            audio_prompt_max_duration: 10.0,
+            audio_prompt_max_duration: 30.0,
             cfg_null_audio_empty: false,
             speaker_mimi: None,
         }

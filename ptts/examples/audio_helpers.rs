@@ -81,3 +81,20 @@ pub fn resample(pcm_in: &[f32], sr_in: usize, sr_out: usize) -> Result<Vec<f32>>
 
     Ok(pcm_out)
 }
+
+/// Where to cut a prompt that exceeds `max_len` samples: the start of the quietest 20 ms frame in the
+/// last second before `max_len`, so the prompt does not end in the middle of a word.
+pub fn quiet_cut_point(pcm: &[f32], max_len: usize, sr: usize) -> usize {
+    let frame = sr / 50;
+    let search_from = max_len.saturating_sub(sr).max(frame);
+    let mut best = (f32::INFINITY, max_len);
+    let mut start = search_from;
+    while start + frame <= max_len {
+        let e: f32 = pcm[start..start + frame].iter().map(|v| v * v).sum();
+        if e < best.0 {
+            best = (e, start);
+        }
+        start += frame / 2;
+    }
+    best.1
+}
