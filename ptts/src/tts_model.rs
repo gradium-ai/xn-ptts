@@ -1,5 +1,6 @@
 use crate::flow_lm::{FlowLM, FlowLMConfig, FlowLMState};
 use crate::mimi::{MimiConfig, MimiDecoder, MimiDecoderState, MimiEncoder};
+use crate::transformer::LayerAttentionState;
 use xn::nn::{Linear, var_builder::Path};
 use xn::{BackendQ, Result, Tensor, Unquantized};
 
@@ -181,6 +182,105 @@ pub struct TTSState<Q: BackendQ> {
     pub flow_lm_state: FlowLMState<Q>,
 }
 
+/// The KV entries a voice embedding leaves in the flow LM's attention cache.
+///
+/// [`TTSModel::prompt_audio`] runs the backbone over the voice embedding and discards the
+/// output -- the only thing it produces is these cache entries, occupying positions `0..len` of
+/// every layer. Attention is causal and the voice is always the prefix of the sequence, so
+/// nothing appended afterwards (text, generated latents) can change them. They are therefore a
+/// pure function of the model and the voice, and conditioning per request repeats identical
+/// work.
+///
+/// Held compactly, at `len` positions rather than a whole request's budget, so seeding a state
+/// of any capacity from one is a pair of `slice_set`s per layer.
+/// One layer's `[batch, len, heads, head_dim]` keys and values.
+type LayerKv<Q> = (
+    Tensor<<Q as BackendQ>::T, <Q as BackendQ>::B>,
+    Tensor<<Q as BackendQ>::T, <Q as BackendQ>::B>,
+);
+
+#[derive(Clone, Debug)]
+pub struct VoicePrefix<Q: BackendQ> {
+    kv: Vec<LayerKv<Q>>,
+    len: usize,
+}
+
+impl<Q: BackendQ> VoicePrefix<Q> {
+    /// Keep the cache entries `state` has accumulated so far.
+    ///
+    /// Meaningful only while `state` holds nothing but voice conditioning: text and generated
+    /// latents belong to one request and must not be shared with the next.
+    pub fn from_state(state: &TTSState<Q>) -> Result<Self> {
+        let layers = &state.flow_lm_state.transformer_state.layer_states;
+        let mut kv = Vec::with_capacity(layers.len());
+        let mut len = None;
+        for layer in layers {
+            let s = match layer {
+                LayerAttentionState::FlowLm(s) => s,
+                LayerAttentionState::Mimi(_) => {
+                    xn::bail!("flow LM transformer produced a mimi attention state")
+                }
+            };
+            match len {
+                None => len = Some(s.current_end),
+                // One forward pass drives every layer, so a disagreement means the state was
+                // assembled by hand and is not safe to snapshot.
+                Some(len) if len != s.current_end => xn::bail!(
+                    "layers disagree on how much of the cache is filled: {len} vs {}",
+                    s.current_end
+                ),
+                Some(_) => {}
+            }
+            let end = s.current_end;
+            kv.push((
+                s.k_cache.narrow(1, 0..end)?.contiguous()?,
+                s.v_cache.narrow(1, 0..end)?.contiguous()?,
+            ));
+        }
+        Ok(Self { kv, len: len.unwrap_or(0) })
+    }
+
+    /// Positions this prefix occupies at the head of every layer's cache.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Seed a freshly initialized `state` with this prefix, as if `prompt_audio` had run on it.
+    ///
+    /// `state` must have been built by [`TTSModel::init_flow_lm_state`] with a sequence length
+    /// of at least [`Self::len`] and never advanced; seeding a state that already holds
+    /// anything would overwrite it.
+    pub fn apply(&self, state: &mut TTSState<Q>) -> Result<()> {
+        let layers = &mut state.flow_lm_state.transformer_state.layer_states;
+        if layers.len() != self.kv.len() {
+            xn::bail!("voice prefix has {} layers, state has {}", self.kv.len(), layers.len())
+        }
+        for (layer, (k, v)) in layers.iter_mut().zip(self.kv.iter()) {
+            let s = match layer {
+                LayerAttentionState::FlowLm(s) => s,
+                LayerAttentionState::Mimi(_) => {
+                    xn::bail!("flow LM transformer produced a mimi attention state")
+                }
+            };
+            let capacity = s.k_cache.dim(1usize)?;
+            if capacity < self.len {
+                xn::bail!(
+                    "state holds {capacity} positions, too few for a {}-position voice prefix",
+                    self.len
+                )
+            }
+            s.k_cache.slice_set(k, 1usize, 0)?;
+            s.v_cache.slice_set(v, 1usize, 0)?;
+            s.current_end = self.len;
+        }
+        Ok(())
+    }
+}
+
 impl<Q: BackendQ> TTSModel<Q> {
     pub fn load(
         vb: &Path<Q::B>,
@@ -214,6 +314,31 @@ impl<Q: BackendQ> TTSModel<Q> {
         sequence_length: usize,
     ) -> Result<TTSState<Q>> {
         Ok(TTSState { flow_lm_state: self.flow_lm.init_state(batch_size, sequence_length)? })
+    }
+
+    /// Condition on `voice_emb` once and keep only the cache entries it leaves behind.
+    ///
+    /// The result is independent of what any request goes on to say, so a caller serving many
+    /// requests in one voice should build this once and seed each request's state from it with
+    /// [`Self::init_flow_lm_state_with_prefix`] instead of calling [`Self::prompt_audio`] again.
+    pub fn build_voice_prefix(&self, voice_emb: &Tensor<Q::T, Q::B>) -> Result<VoicePrefix<Q>> {
+        let batch_size = voice_emb.dim(0usize)?;
+        let len = voice_emb.dim(1usize)?;
+        let mut state = self.init_flow_lm_state(batch_size, len)?;
+        self.prompt_audio(&mut state, voice_emb)?;
+        VoicePrefix::from_state(&state)
+    }
+
+    /// A state sized for `sequence_length`, seeded as if [`Self::prompt_audio`] had run.
+    pub fn init_flow_lm_state_with_prefix(
+        &self,
+        batch_size: usize,
+        sequence_length: usize,
+        prefix: &VoicePrefix<Q>,
+    ) -> Result<TTSState<Q>> {
+        let mut state = self.init_flow_lm_state(batch_size, sequence_length)?;
+        prefix.apply(&mut state)?;
+        Ok(state)
     }
 
     /// Run flow LM step with text tokens. Increments state.
@@ -403,6 +528,37 @@ impl<Q: BackendQ> MimiEnc<Q> {
 }
 
 pub const MAX_TOKENS_PER_CHUNK: usize = 50;
+
+/// Spare KV positions on top of what a chunk is calculated to need.
+pub const SEQ_BUDGET_SLACK: usize = 16;
+
+/// Upper bound on the flow LM's KV capacity, so a pathological input cannot ask for an
+/// arbitrarily large cache.
+pub const MAX_SEQ_BUDGET: usize = 4096;
+
+/// Frames a chunk of `num_tokens` tokens is allowed to generate before it is cut off.
+///
+/// Assumes the 12.5 Hz frame rate every shipped config uses.
+pub fn max_frames_for(num_tokens: usize) -> usize {
+    ((num_tokens as f64 / 3.0 + 2.0) * 12.5).ceil() as usize
+}
+
+/// KV positions to allocate for chunks of the given token counts, spoken in a voice occupying
+/// `voice_len` positions.
+///
+/// A chunk occupies the voice prefix, its own tokens, and one position per frame it may
+/// generate; the budget is the largest of those plus [`SEQ_BUDGET_SLACK`], capped at
+/// [`MAX_SEQ_BUDGET`]. Sizing to this rather than to a fixed maximum is the difference between
+/// a cache of hundreds of megabytes and one of tens -- and the cache is cloned per chunk.
+pub fn seq_budget_for(voice_len: usize, token_counts: impl IntoIterator<Item = usize>) -> usize {
+    token_counts
+        .into_iter()
+        .map(|n| voice_len + n + max_frames_for(n))
+        .max()
+        .unwrap_or(voice_len)
+        .saturating_add(SEQ_BUDGET_SLACK)
+        .min(MAX_SEQ_BUDGET)
+}
 
 /// Split text into sentence-aligned chunks that fit within a token budget.
 ///

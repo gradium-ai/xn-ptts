@@ -90,11 +90,6 @@ pub fn load_voice_emb<Q: BackendQ>(
     Ok(emb.to::<Q::T>()?)
 }
 
-/// Frames an utterance of `num_tokens` tokens is allowed to generate before it is cut off.
-pub fn max_frames_for(num_tokens: usize) -> usize {
-    ((num_tokens as f64 / 3.0 + 2.0) * 12.5).ceil() as usize
-}
-
 #[cfg(feature = "sp")]
 pub struct SpTokenizer(pub sentencepiece::SentencePieceProcessor);
 

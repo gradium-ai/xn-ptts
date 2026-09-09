@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use model_helpers::{SpTokenizer, max_frames_for};
-use ptts::tts_model::{TTSConfig, TTSModel, TTSState};
+use model_helpers::SpTokenizer;
+use ptts::tts_model::{TTSConfig, TTSModel, TTSState, max_frames_for, seq_budget_for};
 use xn::{BackendQ, Tensor};
 
 /// Frames of Mimi decoder context, matching `pocket_tts`.
@@ -268,18 +268,14 @@ impl Bench<'_> {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // Condition on the voice once. Every iteration clones the resulting state, which is
-        // what a server does per request, so the measurement is of generation rather than of
-        // repeated voice conditioning.
-        let voice_len = voice_emb.dim(1usize)?;
-        let seq_budget = chunks
-            .iter()
-            .map(|(tokens, _)| voice_len + tokens.len() + max_frames_for(tokens.len()))
-            .max()
-            .unwrap_or(voice_len);
+        // Condition on the voice once and keep the cache entries it leaves, then size a state to
+        // this utterance and seed it from them. That is what a server does per request, so the
+        // measurement is of generation rather than of repeated voice conditioning.
+        let seq_budget =
+            seq_budget_for(voice_emb.dim(1usize)?, chunks.iter().map(|(t, _)| t.len()));
         let t_voice = Instant::now();
-        let mut base_state = model.init_flow_lm_state(1, seq_budget)?;
-        model.prompt_audio(&mut base_state, &voice_emb)?;
+        let prefix = model.build_voice_prefix(&voice_emb)?;
+        let base_state = model.init_flow_lm_state_with_prefix(1, seq_budget, &prefix)?;
         let voice_ms = ms(t_voice.elapsed());
 
         for _ in 0..args.warmup {

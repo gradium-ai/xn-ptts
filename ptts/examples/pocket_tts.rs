@@ -5,7 +5,8 @@ mod model_helpers;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use model_helpers::{SpTokenizer, max_frames_for};
+use model_helpers::SpTokenizer;
+use ptts::tts_model::max_frames_for;
 use ptts::tts_model::{
     MimiEnc, TTSConfig, TTSModel, prepare_text_prompt, split_into_best_sentences,
 };

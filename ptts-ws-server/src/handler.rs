@@ -4,7 +4,7 @@ use crate::protocol::{TtsReply, TtsRequest, error_codes};
 use anyhow::Result;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use ptts::tts_model::TTSState;
+use ptts::tts_model::{VoicePrefix, seq_budget_for};
 use std::sync::Arc;
 
 pub async fn ws_handler(
@@ -63,7 +63,7 @@ async fn serve_q<Q: xn::BackendQ>(socket: WebSocket, app: Arc<AppStateB<Q>>) -> 
 
 enum SessionState<Q: xn::BackendQ> {
     Awaiting,
-    Ready { base_state: TTSState<Q>, text_buffer: String, stream_id: u32, encoder: Box<Encoder> },
+    Ready { voice: Arc<VoicePrefix<Q>>, text_buffer: String, stream_id: u32, encoder: Box<Encoder> },
 }
 
 async fn run_session<Q: xn::BackendQ>(
@@ -124,17 +124,17 @@ async fn run_session<Q: xn::BackendQ>(
                 text_buffer.push_str(&text);
             }
             (
-                SessionState::Ready { base_state, text_buffer, stream_id, encoder },
+                SessionState::Ready { voice, text_buffer, stream_id, encoder },
                 TtsRequest::Flush { flush_id },
             ) => {
-                flush_buffer(&app, base_state, text_buffer, stream_id, encoder, reply_tx).await?;
+                flush_buffer(&app, voice, text_buffer, stream_id, encoder, reply_tx).await?;
                 let _ = reply_tx.send(TtsReply::Flushed { flush_id });
             }
             (
-                SessionState::Ready { base_state, text_buffer, stream_id, encoder },
+                SessionState::Ready { voice, text_buffer, stream_id, encoder },
                 TtsRequest::EndOfStream,
             ) => {
-                flush_buffer(&app, base_state, text_buffer, stream_id, encoder, reply_tx).await?;
+                flush_buffer(&app, voice, text_buffer, stream_id, encoder, reply_tx).await?;
                 let _ = reply_tx.send(TtsReply::EndOfStream);
                 tracing::info!("websocket stream closed by client (end of stream)");
                 return Ok(());
@@ -147,7 +147,7 @@ async fn run_session<Q: xn::BackendQ>(
 
 async fn flush_buffer<Q: xn::BackendQ>(
     app: &Arc<AppStateB<Q>>,
-    base_state: &TTSState<Q>,
+    voice: &Arc<VoicePrefix<Q>>,
     text_buffer: &mut String,
     stream_id: &mut u32,
     encoder: &mut Encoder,
@@ -159,7 +159,7 @@ async fn flush_buffer<Q: xn::BackendQ>(
     let stream_id_now = *stream_id;
     *stream_id = stream_id.saturating_add(1);
     let text = std::mem::take(text_buffer);
-    if let Err(e) = generate_one(app, base_state, &text, stream_id_now, encoder, reply_tx).await {
+    if let Err(e) = generate_one(app, voice, &text, stream_id_now, encoder, reply_tx).await {
         tracing::warn!(error = %e, stream_id = stream_id_now, "generation failed");
         send_error(reply_tx, error_codes::INTERNAL, format!("generation failed: {e}"))?;
     }
@@ -208,26 +208,20 @@ async fn handle_setup<Q: xn::BackendQ>(
         .unwrap_or(&app.default_voice);
     let voice_name =
         if voice_name == "default" { &app.default_voice } else { voice_name }.to_string();
-    let voice_emb_t = match app.voices.get(&voice_name) {
-        Some(v) => v,
-        None => {
-            send_error(reply_tx, error_codes::NOT_FOUND, format!("unknown voice '{voice_name}'"))?;
-            return Ok(None);
-        }
-    };
-    let mut base_state = match app.model.init_flow_lm_state(1, app.max_seq_len) {
-        Ok(s) => s,
-        Err(e) => {
-            send_error(reply_tx, error_codes::INTERNAL, format!("init_flow_lm_state failed: {e}"))?;
-            return Ok(None);
-        }
-    };
-    tracing::info!(?voice_name, "starting new TTS session");
-    if let Err(e) = app.model.prompt_audio(&mut base_state, voice_emb_t) {
-        send_error(reply_tx, error_codes::INTERNAL, format!("prompt_audio failed: {e}"))?;
+    if !app.voices.contains_key(&voice_name) {
+        send_error(reply_tx, error_codes::NOT_FOUND, format!("unknown voice '{voice_name}'"))?;
         return Ok(None);
     }
-    tracing::info!(?voice_name, "prompted voice embedding");
+    tracing::info!(?voice_name, "starting new TTS session");
+    // Shared across sessions and built on the voice's first use, so only the first session in
+    // a given voice pays for conditioning.
+    let voice = match app.voice_prefix(&voice_name) {
+        Ok(prefix) => prefix,
+        Err(e) => {
+            send_error(reply_tx, error_codes::INTERNAL, format!("voice conditioning failed: {e}"))?;
+            return Ok(None);
+        }
+    };
     let request_id = uuid::Uuid::new_v4().to_string();
     let model_name =
         if model_name.is_empty() { "kyutai/pocket-tts".to_string() } else { model_name };
@@ -251,7 +245,7 @@ async fn handle_setup<Q: xn::BackendQ>(
         }
     }
     Ok(Some(SessionState::Ready {
-        base_state,
+        voice,
         text_buffer: String::new(),
         stream_id: 0,
         encoder: Box::new(encoder),
@@ -260,7 +254,7 @@ async fn handle_setup<Q: xn::BackendQ>(
 
 async fn generate_one<Q: xn::BackendQ>(
     app: &Arc<AppStateB<Q>>,
-    base_state: &TTSState<Q>,
+    voice: &Arc<VoicePrefix<Q>>,
     text: &str,
     stream_id: u32,
     encoder: &mut Encoder,
@@ -270,7 +264,11 @@ async fn generate_one<Q: xn::BackendQ>(
 
     let (prepared, frames_after_eos) = ptts::tts_model::prepare_text_prompt(text);
     let tokens = app.model.flow_lm.conditioner.tokenize(&prepared)?;
-    let state = base_state.clone();
+    // Size the cache to this request rather than to `--max-seq-len`, which stays as the
+    // operator's ceiling. Seeding from the prefix costs a pair of `slice_set`s per layer, where
+    // conditioning would be a whole backbone pass.
+    let seq_budget = seq_budget_for(voice.len(), [tokens.len()]).min(app.max_seq_len);
+    let state = app.model.init_flow_lm_state_with_prefix(1, seq_budget, voice)?;
     let model = Arc::clone(&app.model);
     let temperature = app.temperature;
     let seed = app.seed_base ^ (stream_id as u64).wrapping_mul(0x9E3779B97F4A7C15);

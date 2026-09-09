@@ -1,5 +1,5 @@
 use anyhow::{Context as _, Result};
-use ptts::tts_model::{TTSConfig, TTSModel, TTSState};
+use ptts::tts_model::{TTSConfig, TTSModel, TTSState, VoicePrefix, max_frames_for};
 use std::collections::HashMap;
 use std::sync::Arc;
 use xn::nn::VB;
@@ -111,6 +111,10 @@ fn load_voice_embedding<B: xn::Backend>(
 pub struct AppStateB<Q: BackendQ> {
     pub model: Arc<TTSModel<Q>>,
     pub voices: HashMap<String, Tensor<Q::T, Q::B>>,
+    /// Cache entries each voice leaves in the flow LM, filled on that voice's first use. Keyed
+    /// by the same names as `voices`, so a missing key means an unknown voice rather than an
+    /// unconditioned one.
+    pub voice_prefixes: HashMap<String, std::sync::OnceLock<Arc<VoicePrefix<Q>>>>,
     pub default_voice: String,
     pub max_seq_len: usize,
     pub temperature: f32,
@@ -138,6 +142,27 @@ pub enum AppState {
     Vulkan(Arc<AppStateB<xn::Unquantized<f32, xn::VulkanDevice>>>),
     #[cfg(feature = "metal")]
     Metal(Arc<AppStateB<xn::Unquantized<f32, xn::MetalDevice>>>),
+}
+
+impl<Q: BackendQ> AppStateB<Q> {
+    /// The voice's conditioned KV prefix, running the backbone over the embedding only the
+    /// first time it is asked for.
+    ///
+    /// Conditioning is a full backbone pass over the voice embedding and does not depend on
+    /// what a session goes on to say, so paying it per session was pure repetition.
+    pub fn voice_prefix(&self, name: &str) -> Result<Arc<VoicePrefix<Q>>> {
+        let cell =
+            self.voice_prefixes.get(name).with_context(|| format!("unknown voice '{name}'"))?;
+        if let Some(prefix) = cell.get() {
+            return Ok(Arc::clone(prefix));
+        }
+        let emb = self.voices.get(name).with_context(|| format!("unknown voice '{name}'"))?;
+        tracing::info!(voice = name, "conditioning voice");
+        let prefix = Arc::new(self.model.build_voice_prefix(emb)?);
+        // A concurrent caller may have won the race; either value is equivalent.
+        let _ = cell.set(Arc::clone(&prefix));
+        Ok(prefix)
+    }
 }
 
 struct LoadedModel<Q: BackendQ> {
@@ -353,8 +378,11 @@ pub fn load_ptts<Q: BackendQ>(
         Some(name) => name.clone(),
         None => anyhow::bail!("no voice embeddings found in model"),
     };
+    let voice_prefixes =
+        m.voices.keys().map(|name| (name.clone(), std::sync::OnceLock::new())).collect();
     Ok(AppStateB {
         model: Arc::new(model),
+        voice_prefixes,
         voices: m.voices,
         default_voice,
         max_seq_len,
@@ -378,7 +406,7 @@ pub fn generate_chunks<Q: BackendQ>(
 ) -> Result<(), xn::Error> {
     let device = model.device();
     let num_tokens = tokens.len();
-    let max_frames = ((num_tokens as f64 / 3.0 + 2.0) * 12.5).ceil() as usize;
+    let max_frames = max_frames_for(num_tokens);
     let mut rng = StdRng::new(temperature, seed);
     let mut mimi_state = model.init_mimi_state(1, 250)?;
 
