@@ -33,7 +33,7 @@ pub struct ConditionerConfig {
 }
 
 fn default_audio_prompt_min_duration() -> f32 {
-    10.0
+    1.0
 }
 
 fn default_audio_prompt_max_duration() -> f32 {
@@ -140,7 +140,7 @@ impl TTSConfig {
                 cross: vec![],
             },
             model_id: None,
-            audio_prompt_min_duration: 10.0,
+            audio_prompt_min_duration: 1.0,
             audio_prompt_max_duration: 30.0,
             cfg_null_audio_empty: false,
             speaker_mimi: None,
