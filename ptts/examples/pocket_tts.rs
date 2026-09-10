@@ -5,7 +5,7 @@ mod model_helpers;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ptts::flow_lm::NormalRng;
+use ptts::flow_lm::{NormalRng, ReplayRng};
 use ptts::plan::{EosPolicy, frame_budget, seq_budget};
 use ptts::tok::Tok;
 use ptts::tts_model::{
@@ -260,41 +260,6 @@ fn peak_rss_mb() -> Option<f64> {
     None
 }
 
-/// Either the library's seeded sampler, or a canned list of values replayed from a file, which
-/// is how a run is made to match a reference trace exactly.
-enum Rng {
-    Normal(Box<NormalRng>),
-    FromFile { values: Vec<f32>, index: usize },
-}
-
-impl Rng {
-    pub fn std_rng(temperature: f32, seed: u64) -> Result<Self> {
-        Ok(Self::Normal(Box::new(NormalRng::new(temperature, seed)?)))
-    }
-
-    pub fn from_file(path: &str) -> Result<Self> {
-        let file = std::fs::read_to_string(path)?;
-        let values = serde_json::from_str::<Vec<f32>>(&file)?;
-        Ok(Self::FromFile { values, index: 0 })
-    }
-}
-
-impl ptts::flow_lm::Rng for Rng {
-    fn sample(&mut self) -> f32 {
-        match self {
-            Self::Normal(rng) => rng.sample(),
-            Self::FromFile { values, index } => {
-                if *index >= values.len() {
-                    *index = 0;
-                }
-                let val = values[*index];
-                *index += 1;
-                val
-            }
-        }
-    }
-}
-
 fn spawn<F, R>(f: F) -> std::thread::JoinHandle<R>
 where
     F: FnOnce() -> Result<R>,
@@ -363,9 +328,12 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
     };
     let chunks = split_into_best_sentences(&tokenizer, &text, None)?;
 
-    let mut rng = match args.rng_values {
-        Some(path) => Rng::from_file(&path)?,
-        None => Rng::std_rng(args.temperature, args.seed)?,
+    let mut rng: Box<dyn ptts::flow_lm::Rng + Send> = match args.rng_values {
+        Some(path) => {
+            let values: Vec<f32> = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+            Box::new(ReplayRng::new(values)?)
+        }
+        None => Box::new(NormalRng::new(args.temperature, args.seed)?),
     };
 
     tracing::info!(
