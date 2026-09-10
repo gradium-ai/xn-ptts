@@ -15,12 +15,16 @@ ebur128 = { workspace = true }
 rand = { workspace = true, features = ["std_rng"] }
 rand_distr = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+safetensors = { workspace = true }
+serde_json = { workspace = true }
+# Optional: `hf-hub` for `ModelSource::Hub` (pulls in ureq, so it must stay out
+# of the wasm build), and one of `sentencepiece` / `tokenizers` for reading a
+# tokenizer out of a checkpoint.
+hf-hub = { workspace = true, optional = true }
 sentencepiece = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
-safetensors = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
@@ -44,6 +48,8 @@ accelerate = ["xn/accelerate"]
 sp = ["dep:sentencepiece"]
 # Hugging Face `tokenizers` support in `ptts::tok`.
 hf = ["dep:tokenizers"]
+# Download checkpoints from the Hugging Face Hub (`ModelSource::Hub`).
+hub = ["dep:hf-hub"]
 
 [[example]]
 name = "pocket_tts"
