@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use model_helpers::max_frames_for;
 use ptts::flow_lm::NormalRng;
+use ptts::plan::{EosPolicy, frame_budget};
 use ptts::tok::Tok;
 use ptts::tts_model::{TTSConfig, TTSModel, TTSState};
 use xn::{BackendQ, Tensor};
@@ -97,6 +97,7 @@ fn one<Q: BackendQ>(
     base_state: &TTSState<Q>,
     chunks: &[(Vec<u32>, usize)],
     args: &Args,
+    frame_rate: f64,
 ) -> Result<Run> {
     let dev = model.device();
     let ldim = model.flow_lm.ldim;
@@ -116,9 +117,9 @@ fn one<Q: BackendQ>(
         // BOS marker: an all-NaN latent.
         let nan: Tensor<f32, Q::B> = Tensor::from_vec(vec![f32::NAN; ldim], (1, 1, ldim), dev)?;
         let mut prev_latent = nan.to::<Q::T>()?;
-        let mut eos_countdown: Option<usize> = None;
+        let mut eos = EosPolicy::new(*frames_after_eos);
 
-        for _ in 0..max_frames_for(tokens.len()) {
+        for _ in 0..frame_budget(tokens.len(), frame_rate) {
             let frame_start = Instant::now();
             let (next_latent, is_eos) = model.generate_step(&mut state, &prev_latent, &mut rng)?;
             let sampled = Instant::now();
@@ -134,14 +135,8 @@ fn one<Q: BackendQ>(
                 samples += pcm.len();
             }
 
-            if is_eos && eos_countdown.is_none() {
-                eos_countdown = Some(*frames_after_eos);
-            }
-            if let Some(countdown) = eos_countdown.as_mut() {
-                if *countdown == 0 {
-                    break;
-                }
-                *countdown -= 1;
+            if eos.should_stop(is_eos) {
+                break;
             }
             prev_latent = next_latent;
         }
@@ -250,7 +245,9 @@ impl Bench<'_> {
         let voice_len = voice_emb.dim(1usize)?;
         let seq_budget = chunks
             .iter()
-            .map(|(tokens, _)| voice_len + tokens.len() + max_frames_for(tokens.len()))
+            .map(|(tokens, _)| {
+                voice_len + tokens.len() + frame_budget(tokens.len(), cfg.mimi.frame_rate)
+            })
             .max()
             .unwrap_or(voice_len);
         let t_voice = Instant::now();
@@ -259,11 +256,11 @@ impl Bench<'_> {
         let voice_ms = ms(t_voice.elapsed());
 
         for _ in 0..args.warmup {
-            one(&model, &base_state, &chunks, args)?;
+            one(&model, &base_state, &chunks, args, cfg.mimi.frame_rate)?;
         }
         let mut runs = Vec::with_capacity(args.iters);
         for i in 0..args.iters {
-            let r = one(&model, &base_state, &chunks, args)?;
+            let r = one(&model, &base_state, &chunks, args, cfg.mimi.frame_rate)?;
             if args.per_iter {
                 println!(
                     "iter {i:>3}: total {:>8.2}ms  ttfa {:>7.2}ms  frames {:>4}",
