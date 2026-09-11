@@ -1,16 +1,16 @@
-//! Exercises everything about `SynthOf` that does not need model weights.
+//! Exercises everything about `Synth` that does not need model weights.
 //!
 //! The generation path itself needs a checkpoint, so it is covered by the
 //! examples rather than here. What is testable without one is the surface most
 //! likely to break for a first-time user: argument parsing, feature gating, and
 //! the error messages on the paths they will hit by accident.
 
-use ptts::synth::{DeviceKind, Quant, SpeechOptions, SynthBuilder};
+use ptts::synth::{DeviceKind, Quant, SpeechOptions, Synth, SynthBuilder};
 
 /// A builder over `weights`, with the shipped config: every test here fails
 /// before the weights are read, so the config's contents do not matter.
 fn builder(weights: impl Into<std::path::PathBuf>) -> SynthBuilder {
-    SynthBuilder::new(ptts::tts_model::TTSConfig::v202601(0.7), weights)
+    Synth::builder(ptts::tts_model::TTSConfig::v202601(0.7), weights)
 }
 
 #[test]
@@ -112,6 +112,18 @@ fn a_load_without_a_tokenizer_says_how_to_supply_one() {
         .to_string();
     assert!(err.contains("SynthBuilder::tokenizer"), "{err}");
     std::fs::remove_file(&weights).ok();
+}
+
+#[test]
+fn quantization_on_a_gpu_is_rejected_before_the_weights_are_touched() {
+    let err = builder("/definitely/not/a/model/weights.safetensors")
+        .device(DeviceKind::Cuda)
+        .quant(Quant::Q40)
+        .build()
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("CPU-only"), "{err}");
+    assert!(err.contains("q4_0"), "the error should name the format: {err}");
 }
 
 #[test]
