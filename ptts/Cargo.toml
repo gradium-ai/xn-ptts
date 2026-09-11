@@ -46,6 +46,10 @@ sp = ["dep:sentencepiece"]
 hf = ["dep:tokenizers"]
 
 [[example]]
+name = "say"
+required-features = ["sp"]
+
+[[example]]
 name = "pocket_tts"
 required-features = ["sp"]
 
