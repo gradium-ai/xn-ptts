@@ -137,6 +137,23 @@ impl Quant {
         }
     }
 
+    /// Error if this weight format cannot run on `device`.
+    ///
+    /// [`SynthBuilder::build`] checks this too, but a caller that downloads a
+    /// checkpoint before building should check first, so an impossible
+    /// combination fails in milliseconds rather than after a few hundred
+    /// megabytes.
+    pub fn check_device(self, device: DeviceKind) -> Result<()> {
+        let device = device.resolve();
+        if device != DeviceKind::Cpu && self != Self::F32 {
+            xn::bail!(
+                "quantization ({}) is CPU-only, but the selected device is {device:?}",
+                self.as_str()
+            )
+        }
+        Ok(())
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::F32 => "f32",
@@ -557,6 +574,14 @@ impl<Q: BackendQ> SessionOf<Q> {
         self.stream_chunks(chunks, rng)
     }
 
+    /// Tokenize `text` the way [`Self::stream`] would.
+    ///
+    /// Paired with [`Self::stream_tokens`] for callers that want one utterance
+    /// per request with no sentence splitting.
+    pub fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+        self.model.flow_lm.conditioner.tokenize(text)
+    }
+
     /// Synthesize from tokens produced elsewhere, as one chunk.
     ///
     /// `frames_after_eos` is the tail [`prepare_text_prompt`] would have
@@ -910,12 +935,7 @@ impl SynthBuilder {
     /// [`Self::device`] and [`Self::quant`].
     pub fn build(self) -> Result<Synth> {
         let device = self.device.resolve();
-        if device != DeviceKind::Cpu && self.quant != Quant::F32 {
-            xn::bail!(
-                "quantization ({}) is CPU-only, but the selected device is {device:?}",
-                self.quant.as_str()
-            );
-        }
+        self.quant.check_device(device)?;
         match device {
             DeviceKind::Cpu => self.build_cpu(),
             DeviceKind::Cuda => self.build_cuda(),
@@ -1181,6 +1201,11 @@ impl Session {
     /// As [`Self::stream`], with an explicit seed for this request.
     pub fn stream_seeded(&self, text: &str, seed: u64) -> Result<SpeechStream> {
         dispatch_session!(&self.0, |s| s.stream_seeded(text, seed))
+    }
+
+    /// Tokenize `text` the way [`Self::stream`] would.
+    pub fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+        dispatch_session!(&self.0, |s| s.tokenize(text))
     }
 
     /// Synthesize from tokens produced elsewhere, as one chunk.
