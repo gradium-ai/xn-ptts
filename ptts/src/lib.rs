@@ -6,6 +6,7 @@ pub mod layer_scale;
 pub mod loader;
 pub mod mimi;
 pub mod mlp;
+pub mod plan;
 pub mod preprocess;
 pub mod resample;
 pub mod rope;

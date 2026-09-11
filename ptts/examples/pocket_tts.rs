@@ -5,8 +5,8 @@ mod model_helpers;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use model_helpers::max_frames_for;
 use ptts::flow_lm::NormalRng;
+use ptts::plan::{EosPolicy, frame_budget, seq_budget};
 use ptts::tok::Tok;
 use ptts::tts_model::{
     MimiEnc, TTSConfig, TTSModel, prepare_text_prompt, split_into_best_sentences,
@@ -390,9 +390,8 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
         let tokens = model.flow_lm.conditioner.tokenize(&text)?;
         let num_tokens = tokens.len();
         tracing::info!(?text, ?num_tokens, "processing text");
-        let max_frames = max_frames_for(num_tokens);
-        let seq_budget = num_tokens + 512 + max_frames;
-        max_seq_budget = max_seq_budget.max(seq_budget);
+        let max_frames = frame_budget(num_tokens, cfg.mimi.frame_rate);
+        max_seq_budget = max_seq_budget.max(seq_budget(num_tokens, max_frames));
         all_tokens.push((tokens, max_frames, frames_after_eos));
     }
     // Init states
@@ -504,7 +503,7 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
         let mut prev_latent: Tensor<Q::T, Q::B> =
             Tensor::from_vec(nan_data, (1, 1, ldim), &dev)?.to::<Q::T>()?;
 
-        let mut eos_countdown: Option<usize> = None;
+        let mut eos = EosPolicy::new(frames_after_eos);
 
         let (latent_tx, latent_rx) = std::sync::mpsc::channel::<Tensor<Q::T, _>>();
         let is_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -560,16 +559,9 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
             backbone_step_timings_ms.push(step_start.elapsed().as_secs_f64() * 1000.0);
             latent_tx.send(next_latent.clone())?;
 
-            if is_eos && eos_countdown.is_none() {
-                eos_countdown = Some(frames_after_eos);
-            }
-
-            if let Some(ref mut countdown) = eos_countdown {
-                if *countdown == 0 {
-                    tracing::info!(?step, "reached eos");
-                    break;
-                }
-                *countdown -= 1;
+            if eos.should_stop(is_eos) {
+                tracing::info!(?step, "reached eos");
+                break;
             }
 
             prev_latent = next_latent;
