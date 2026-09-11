@@ -54,3 +54,20 @@ pub fn write_pcm_as_wav<W: Write, S: Sample>(
     }
     Ok(())
 }
+
+/// Write mono PCM to a WAV file at `path`.
+///
+/// A convenience over [`write_pcm_as_wav`] for the common case of saving a
+/// finished generation: open the file, wrap it in a `BufWriter`, write, flush.
+pub fn write_wav_file<P: AsRef<std::path::Path>>(
+    path: P,
+    pcm: &[f32],
+    sample_rate: u32,
+) -> xn::Result<()> {
+    let file = std::fs::File::create(path.as_ref())
+        .map_err(|e| xn::Error::msg(format!("cannot create {}: {e}", path.as_ref().display())))?;
+    let mut writer = std::io::BufWriter::new(file);
+    write_pcm_as_wav(&mut writer, pcm, sample_rate, 1).map_err(xn::Error::wrap)?;
+    writer.flush().map_err(xn::Error::wrap)?;
+    Ok(())
+}

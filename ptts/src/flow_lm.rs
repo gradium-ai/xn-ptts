@@ -33,6 +33,41 @@ impl Rng for NormalRng {
     }
 }
 
+/// Lets a boxed noise source be passed where an `impl Rng` is expected, so a
+/// caller can choose one at runtime.
+impl Rng for Box<dyn Rng + Send> {
+    fn sample(&mut self) -> f32 {
+        (**self).sample()
+    }
+}
+
+/// Replays a fixed sequence of values, cycling when exhausted.
+///
+/// The sampler's only source of randomness is [`Rng`], so feeding it a recorded
+/// sequence makes a generation reproducible across implementations — which is
+/// how this crate is compared against the reference one step for step.
+pub struct ReplayRng {
+    values: Vec<f32>,
+    index: usize,
+}
+
+impl ReplayRng {
+    pub fn new(values: Vec<f32>) -> Result<Self> {
+        if values.is_empty() {
+            xn::bail!("ReplayRng needs at least one value")
+        }
+        Ok(Self { values, index: 0 })
+    }
+}
+
+impl Rng for ReplayRng {
+    fn sample(&mut self) -> f32 {
+        let value = self.values[self.index % self.values.len()];
+        self.index += 1;
+        value
+    }
+}
+
 /// Lagrangian Self Distillation decode.
 /// Rebuilds the data sample from starting point x_0.
 fn lsd_decode<T: WithDTypeF, B: Backend>(
@@ -279,5 +314,50 @@ impl<Q: BackendQ> FlowLM<Q> {
             }
         }
         Tensor::from_vec(out_data, sequence.shape().clone(), sequence.device())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normal_rng_is_reproducible_from_its_seed() {
+        let mut a = NormalRng::new(0.7, 42).unwrap();
+        let mut b = NormalRng::new(0.7, 42).unwrap();
+        for _ in 0..16 {
+            assert_eq!(a.sample(), b.sample());
+        }
+    }
+
+    #[test]
+    fn normal_rng_differs_between_seeds() {
+        let mut a = NormalRng::new(0.7, 1).unwrap();
+        let mut b = NormalRng::new(0.7, 2).unwrap();
+        let xs: Vec<f32> = (0..8).map(|_| a.sample()).collect();
+        let ys: Vec<f32> = (0..8).map(|_| b.sample()).collect();
+        assert_ne!(xs, ys);
+    }
+
+    #[test]
+    fn zero_temperature_removes_the_noise() {
+        // std = sqrt(0) = 0, so the sampler becomes deterministic rather than erroring.
+        let mut rng = NormalRng::new(0.0, 7).unwrap();
+        for _ in 0..8 {
+            assert_eq!(rng.sample(), 0.0);
+        }
+    }
+
+    #[test]
+    fn replay_rng_cycles_and_rejects_empty() {
+        let mut rng = ReplayRng::new(vec![1.0, 2.0]).unwrap();
+        assert_eq!([rng.sample(), rng.sample(), rng.sample()], [1.0, 2.0, 1.0]);
+        assert!(ReplayRng::new(vec![]).is_err());
+    }
+
+    #[test]
+    fn a_boxed_rng_forwards_to_its_inner_source() {
+        let mut boxed: Box<dyn Rng + Send> = Box::new(ReplayRng::new(vec![3.0, 4.0]).unwrap());
+        assert_eq!([boxed.sample(), boxed.sample()], [3.0, 4.0]);
     }
 }
