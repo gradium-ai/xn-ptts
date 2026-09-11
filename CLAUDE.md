@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Cargo workspace (resolver "3", edition 2024) with three members:
 
-- `ptts/` — core TTS library. Pure Rust, depends on the `xn` tensor/nn crate. Examples live under `ptts/examples/`: `pocket_tts` (end-to-end CLI) and `bench` (benchmark harness) both require the `sp` feature for SentencePiece; `quantize` (safetensors → GGUF converter that selectively quantizes `flow_lm.transformer.layers.*` weights) and `create_voice` (voice embeddings from audio samples) do not. `audio_helpers.rs` and `model_helpers.rs` are not examples — they are shared modules each example pulls in with `#[path = "..."] mod`, so `autoexamples = false` and every example is listed explicitly in `Cargo.toml`.
+- `ptts/` — core TTS library. Pure Rust, depends on the `xn` tensor/nn crate. Examples live under `ptts/examples/`: `say` (shortest end-to-end call), `pocket_tts` (full CLI) and `bench` (benchmark harness) require the `sp` feature for SentencePiece; `quantize` (safetensors → GGUF converter that selectively quantizes `flow_lm.transformer.layers.*` weights) and `create_voice` (voice embeddings from audio samples) do not. `audio_helpers.rs` and `model_helpers.rs` are not examples — they are shared modules each example pulls in with `#[path = "..."] mod`, so `autoexamples = false` and every example is listed explicitly in `Cargo.toml`.
 - `ptts-pyo3/` — PyO3 bindings exposing `TTSModel` to Python. Built with maturin; the cdylib is named `ptts`. Has its own `pyproject.toml` and `uv.lock`.
 - `ptts-wasm/` — browser build via `wasm-bindgen` / `wasm-pack`. Ships a demo in `ptts-wasm/www/` (`index.html` + `worker.js`).
 
@@ -27,7 +27,7 @@ CI deletes `.cargo/config.toml` before building because it pins `target-cpu=nati
 
 Cargo features that gate optional functionality:
 
-- `ptts`: `sp` (SentencePiece tokenizer, required by the `pocket_tts` and `bench` examples), `cuda`, `accelerate`.
+- `ptts`: `sp` (SentencePiece tokenizer, required by the `say`, `pocket_tts` and `bench` examples), `hf` (Hugging Face `tokenizers`), `cuda`, `accelerate`. The library never downloads anything, so there is no hub feature: `hf-hub` is a dev-dependency used by the examples.
 - `ptts-pyo3`: `cuda`, `accelerate` (each forwards to both `xn/*` and `ptts/*`).
 
 Run the CLI example:
@@ -36,7 +36,13 @@ Run the CLI example:
 cargo run --release --example pocket_tts --features sp -- "hello world" -o out.wav
 ```
 
-It downloads weights from the `kyutai/pocket-tts` HuggingFace repo on first run. Built-in voice IDs: `alba`, `marius`, `javert`, `jean`, `fantine`, `cosette`, `eponine`, `azelma`. `--voice` also accepts a path to a 10s audio file or a precomputed voice safetensors.
+It downloads weights from the `kyutai/pocket-tts` HuggingFace repo on first run. Which files that means — the repo id, the weight and tokenizer file names, the bundled voice list, the config to assume when a directory ships none — lives in `ptts/examples/model_helpers.rs`, not in the library: it changes with each published checkpoint, and `ptts` only reads the files it is handed. Built-in voice IDs: `alba`, `marius`, `javert`, `jean`, `fantine`, `cosette`, `eponine`, `azelma`. `--voice` also accepts a path to a 10s audio file or a precomputed voice safetensors. `--dir` loads a local checkpoint instead of downloading; `--device auto|cpu|cuda|vulkan|metal` picks the backend.
+
+`say` is the same thing in fifteen lines, for checking that the library works:
+
+```
+cargo run --release --example say --features sp -- "hello world"
+```
 
 Benchmark a local model:
 
@@ -76,7 +82,7 @@ The library implements Pocket TTS: text → tokens → flow-matching language mo
 
 `ptts/src/lib.rs` exposes a single `Tokenizer` trait (`encode` / `decode`) so each binding plugs in its own implementation:
 
-- `pocket_tts` example: `SpTokenizer` wrapping `sentencepiece::SentencePieceProcessor`.
+- `say` / `pocket_tts` examples: the tokenizer file found beside the weights, passed to `SynthBuilder::tokenizer_file` and read by `ptts::tok::Tok`, which picks SentencePiece or HF `tokenizers` by extension.
 - `ptts-pyo3`: tokenizer is built from `tokenizer.model` shipped in the HF repo.
 - `ptts-wasm`: `PresetTokenizer` — JS tokenizes in the browser and pushes IDs into the Rust state before each step.
 
@@ -84,6 +90,14 @@ Top-level orchestrator is `tts_model::TTSModel<Q>`, generic over a backend-quant
 
 - `flow_lm: FlowLM<Q>` — token-conditioned flow-matching transformer that emits Mimi latents (`flow_lm.rs`, `transformer.rs`, `rope.rs`, `mlp.rs`, `layer_scale.rs`, `conditioners.rs`).
 - `mimi: MimiDecoder<Unquantized<f32, Q::B>>` — neural audio codec decoder (`mimi.rs`, `seanet.rs`, `conv.rs`, `resample.rs`, `dummy_quantizer.rs`). The encoder side (`MimiEncoder` / `MimiEnc`) is used only for voice-prompt embedding from a 10s audio sample.
+
+`synth::Synth` sits on top of all of it: `synth::SynthBuilder::new(config, weights)` loads a
+checkpoint whose files the caller has already located and registers voices,
+`plan` supplies the frame/KV budgets and the EOS policy, and `Synth::say` / `Synth::stream`
+run the flow LM and the Mimi decoder on two threads. `Synth` erases the `Q` parameter behind
+an enum so a CLI flag can pick the weight format; `SynthBuilder::load::<Q>` skips that for
+callers who want it fixed at compile time. `ptts-pyo3`, `ptts-wasm` and `ptts-ws-server`
+still drive `TTSModel` directly.
 
 Generation is streaming and stateful: callers `init_flow_lm_state(batch, seq_len)`, then `prompt_text*` / `prompt_audio` to seed the state, then step-decode latents and feed them into `MimiDecoderState`. `lsd_decode_steps` controls flow-matching solver steps; `eos_threshold` controls termination. The default `TTSConfig::v202601` configuration is the canonical one consumed by all three frontends.
 
