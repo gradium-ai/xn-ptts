@@ -31,6 +31,7 @@ fn is_excluded(name: &str, no_mimi_encoder: bool) -> bool {
         if name.starts_with("mimi.encoder")
             || name == "mimi.downsample.conv.conv.weight"
             || name == "flow_lm.condition_provider.conditioners.speaker_wavs.output_proj.weight"
+            || name.starts_with("mimi_speaker.")
         {
             return true;
         }
