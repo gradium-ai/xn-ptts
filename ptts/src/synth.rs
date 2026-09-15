@@ -1,34 +1,35 @@
-//! Speech synthesis behind one call.
+//! One-call speech synthesis.
 //!
-//! [`SynthOf`] wraps everything between "I have some text" and "I have PCM":
-//! loading a checkpoint, registering voices, splitting text into sentence
-//! chunks, priming the transformer state, running the flow-matching solver, and
-//! streaming the latents through the Mimi decoder on a second thread.
+//! [`Synth`] wraps everything between "I have some text" and "I have PCM":
+//! locating and loading a checkpoint, choosing a device and weight format,
+//! registering voices, splitting text into sentence chunks, priming the
+//! transformer state, running the flow-matching solver, and streaming the
+//! latents through the Mimi decoder on a second thread.
 //!
 //! ```no_run
 //! # fn main() -> xn::Result<()> {
-//! use ptts::synth::SynthBuilder;
+//! use ptts::synth::Synth;
 //! use ptts::tts_model::TTSConfig;
 //!
-//! let tts = SynthBuilder::new(TTSConfig::v202601(0.7), "model/model.safetensors")
+//! let tts = Synth::builder(TTSConfig::v202601(0.7), "model/model.safetensors")
 //!     .tokenizer_file("model/tokenizer.model")
 //!     .add_voice("alba", "model/voices/alba.safetensors")
-//!     .load::<xn::Unquantized<f32, xn::CpuDevice>>(xn::CPU)?;
+//!     .build()?;
 //! let pcm = tts.say("Hello world")?;
 //! ptts::wav::write_wav_file("out.wav", &pcm, tts.sample_rate() as u32)?;
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! Audio arrives incrementally from [`SynthOf::stream`], which is the primitive
-//! [`SynthOf::say`] is built on:
+//! Audio arrives incrementally from [`Synth::stream`], which is the primitive
+//! [`Synth::say`] is built on:
 //!
 //! ```no_run
 //! # fn main() -> xn::Result<()> {
 //! # let cfg = ptts::tts_model::TTSConfig::v202601(0.7);
-//! # let tts = ptts::synth::SynthBuilder::new(cfg, "model/model.safetensors")
+//! # let tts = ptts::synth::Synth::builder(cfg, "model/model.safetensors")
 //! #     .tokenizer_file("model/tokenizer.model")
-//! #     .load::<xn::Unquantized<f32, xn::CpuDevice>>(xn::CPU)?;
+//! #     .build()?;
 //! for chunk in tts.stream("Hello world")? {
 //!     let pcm: Vec<f32> = chunk?;
 //!     // hand `pcm` to an audio sink
@@ -37,14 +38,10 @@
 //! # }
 //! ```
 //!
-//! The weight format is a type parameter, so a caller that picks one from a
-//! command-line flag has to be generic over `Q`. A following change adds a
-//! `Synth` that erases it.
-//!
-//! `SynthOf` is a composition of the [`crate::tts_model::TTSModel`] primitives,
-//! not a replacement for them: callers that need to drive generation themselves
-//! -- a browser build stepping from an event loop, a server interleaving
-//! requests -- should keep using those directly.
+//! Callers that want to name the weight format at compile time — `ptts-wasm`
+//! supports exactly two — can use [`SynthOf<Q>`] directly via
+//! [`SynthBuilder::load`], and skip the runtime dispatch in [`Synth`].
+
 use crate::flow_lm::NormalRng;
 use crate::loader;
 use crate::plan::{self, EosPolicy};
@@ -756,6 +753,85 @@ impl SynthBuilder {
         self
     }
 
+    /// Load the checkpoint, choosing the device and weight format from
+    /// [`Self::device`] and [`Self::quant`].
+    pub fn build(self) -> Result<Synth> {
+        let device = self.device.resolve();
+        if device != DeviceKind::Cpu && self.quant != Quant::F32 {
+            xn::bail!(
+                "quantization ({}) is CPU-only, but the selected device is {device:?}",
+                self.quant.as_str()
+            );
+        }
+        match device {
+            DeviceKind::Cpu => self.build_cpu(),
+            DeviceKind::Cuda => self.build_cuda(),
+            DeviceKind::Vulkan => self.build_vulkan(),
+            DeviceKind::Metal => self.build_metal(),
+            DeviceKind::Auto => unreachable!("resolved above"),
+        }
+    }
+
+    fn build_cpu(self) -> Result<Synth> {
+        macro_rules! cpu {
+            ($variant:ident, $q:ty) => {{
+                let synth = self.load::<$q>(xn::CPU)?;
+                Ok(Synth(SynthV::$variant(synth)))
+            }};
+        }
+        match self.quant {
+            Quant::F32 => cpu!(Cpu, xn::Unquantized<f32, xn::CpuDevice>),
+            Quant::Q80 => cpu!(Q80, xn::quantized::Q80F32),
+            Quant::Q81 => cpu!(Q81, xn::quantized::Q81F32),
+            Quant::Q8k => cpu!(Q8k, xn::quantized::Q8kF32),
+            Quant::Q6k => cpu!(Q6k, xn::quantized::Q6kF32),
+            Quant::Q50 => cpu!(Q50, xn::quantized::Q50F32),
+            Quant::Q51 => cpu!(Q51, xn::quantized::Q51F32),
+            Quant::Q5k => cpu!(Q5k, xn::quantized::Q5kF32),
+            Quant::Q40 => cpu!(Q40, xn::quantized::Q40F32),
+            Quant::Q41 => cpu!(Q41, xn::quantized::Q41F32),
+            Quant::Q4k => cpu!(Q4k, xn::quantized::Q4kF32),
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn build_cuda(self) -> Result<Synth> {
+        let dev = xn::cuda_backend::Device::new(0)?;
+        // Event tracking costs a few percent and this workload never queries events.
+        unsafe { dev.disable_event_tracking() };
+        let synth = self.load::<xn::Unquantized<half::bf16, _>>(dev)?;
+        Ok(Synth(SynthV::Cuda(synth)))
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn build_vulkan(self) -> Result<Synth> {
+        let dev = xn::vulkan_backend::Device::new(0)?;
+        let synth = self.load::<xn::Unquantized<f32, _>>(dev)?;
+        Ok(Synth(SynthV::Vulkan(synth)))
+    }
+
+    #[cfg(feature = "metal")]
+    fn build_metal(self) -> Result<Synth> {
+        let dev = xn::metal_backend::Device::new(0)?;
+        let synth = self.load::<xn::Unquantized<half::bf16, _>>(dev)?;
+        Ok(Synth(SynthV::Metal(synth)))
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    fn build_cuda(self) -> Result<Synth> {
+        xn::bail!("this build has no CUDA support; rebuild with the `cuda` feature")
+    }
+
+    #[cfg(not(feature = "vulkan"))]
+    fn build_vulkan(self) -> Result<Synth> {
+        xn::bail!("this build has no Vulkan support; rebuild with the `vulkan` feature")
+    }
+
+    #[cfg(not(feature = "metal"))]
+    fn build_metal(self) -> Result<Synth> {
+        xn::bail!("this build has no Metal support; rebuild with the `metal` feature")
+    }
+
     /// Load the weights and register the voices.
     pub fn load<Q: BackendQ>(mut self, device: Q::B) -> Result<SynthOf<Q>> {
         if !self.weights.is_file() {
@@ -826,5 +902,178 @@ impl SynthBuilder {
             "no tokenizer available: none was passed to SynthBuilder::tokenizer, the checkpoint \
              shipped none, and neither the `sp` nor the `hf` feature of `ptts` is enabled."
         )
+    }
+}
+
+/// Every weight format and device this build supports.
+///
+/// [`Synth`] exists so that a caller who picks a format from a command-line
+/// flag or a config file does not have to be generic over `Q`. The runtime
+/// dispatch happens once per method call and costs nothing next to a
+/// transformer step.
+enum SynthV {
+    Cpu(SynthOf<xn::Unquantized<f32, xn::CpuDevice>>),
+    Q80(SynthOf<xn::quantized::Q80F32>),
+    Q81(SynthOf<xn::quantized::Q81F32>),
+    Q8k(SynthOf<xn::quantized::Q8kF32>),
+    Q6k(SynthOf<xn::quantized::Q6kF32>),
+    Q50(SynthOf<xn::quantized::Q50F32>),
+    Q51(SynthOf<xn::quantized::Q51F32>),
+    Q5k(SynthOf<xn::quantized::Q5kF32>),
+    Q40(SynthOf<xn::quantized::Q40F32>),
+    Q41(SynthOf<xn::quantized::Q41F32>),
+    Q4k(SynthOf<xn::quantized::Q4kF32>),
+    #[cfg(feature = "cuda")]
+    Cuda(SynthOf<xn::Unquantized<half::bf16, xn::cuda_backend::Device>>),
+    #[cfg(feature = "vulkan")]
+    Vulkan(SynthOf<xn::Unquantized<f32, xn::vulkan_backend::Device>>),
+    #[cfg(feature = "metal")]
+    Metal(SynthOf<xn::Unquantized<half::bf16, xn::metal_backend::Device>>),
+}
+
+/// Forward a method to whichever [`SynthOf`] is inside, binding it to `$s`.
+macro_rules! dispatch {
+    ($synth:expr, |$s:ident| $body:expr) => {
+        match $synth {
+            SynthV::Cpu($s) => $body,
+            SynthV::Q80($s) => $body,
+            SynthV::Q81($s) => $body,
+            SynthV::Q8k($s) => $body,
+            SynthV::Q6k($s) => $body,
+            SynthV::Q50($s) => $body,
+            SynthV::Q51($s) => $body,
+            SynthV::Q5k($s) => $body,
+            SynthV::Q40($s) => $body,
+            SynthV::Q41($s) => $body,
+            SynthV::Q4k($s) => $body,
+            #[cfg(feature = "cuda")]
+            SynthV::Cuda($s) => $body,
+            #[cfg(feature = "vulkan")]
+            SynthV::Vulkan($s) => $body,
+            #[cfg(feature = "metal")]
+            SynthV::Metal($s) => $body,
+        }
+    };
+}
+
+/// A loaded Pocket TTS model, ready to synthesize speech.
+///
+/// See the [module docs](self) for the short version. The weight format and
+/// device are chosen at load time by [`SynthBuilder`] and erased here.
+pub struct Synth(SynthV);
+
+impl Synth {
+    /// A builder over a checkpoint's config and weights file.
+    ///
+    /// Finding those -- and the tokenizer and voices beside them -- is the
+    /// caller's job: see [`SynthBuilder`].
+    pub fn builder(config: TTSConfig, weights: impl Into<PathBuf>) -> SynthBuilder {
+        SynthBuilder::new(config, weights)
+    }
+
+    /// Synthesize `text` and return the whole waveform as mono `f32` at
+    /// [`Self::sample_rate`].
+    pub fn say(&self, text: &str) -> Result<Vec<f32>> {
+        dispatch!(&self.0, |s| s.say(text))
+    }
+
+    /// Synthesize `text` with per-request overrides.
+    pub fn say_with(&self, text: &str, opts: &SpeechOptions) -> Result<Vec<f32>> {
+        dispatch!(&self.0, |s| s.say_with(text, opts))
+    }
+
+    /// Start generating `text`, yielding PCM as the decoder produces it.
+    pub fn stream(&self, text: &str) -> Result<SpeechStream> {
+        dispatch!(&self.0, |s| s.stream(text))
+    }
+
+    /// Start generating `text` with per-request overrides.
+    pub fn stream_with(&self, text: &str, opts: &SpeechOptions) -> Result<SpeechStream> {
+        dispatch!(&self.0, |s| s.stream_with(text, opts))
+    }
+
+    /// As [`Self::stream_with`], but with an explicit noise source — see
+    /// [`SynthOf::stream_with_rng`].
+    pub fn stream_with_rng(
+        &self,
+        text: &str,
+        opts: &SpeechOptions,
+        rng: Box<dyn crate::flow_lm::Rng + Send>,
+    ) -> Result<SpeechStream> {
+        dispatch!(&self.0, |s| s.stream_with_rng(text, opts, rng))
+    }
+
+    pub fn sample_rate(&self) -> usize {
+        dispatch!(&self.0, |s| s.sample_rate())
+    }
+
+    pub fn config(&self) -> &TTSConfig {
+        dispatch!(&self.0, |s| s.config())
+    }
+
+    /// Name of the device the model is running on, e.g. `"cpu"` or `"cuda:0"`.
+    pub fn device_name(&self) -> String {
+        dispatch!(&self.0, |s| s.device_name())
+    }
+
+    /// Registered voice names, sorted.
+    pub fn voices(&self) -> Vec<String> {
+        dispatch!(&self.0, |s| s.voices())
+    }
+
+    /// True if this checkpoint carries a speaker encoder, which
+    /// [`Self::add_voice_from_pcm`] requires.
+    pub fn supports_voice_cloning(&self) -> bool {
+        dispatch!(&self.0, |s| s.supports_voice_cloning())
+    }
+
+    /// The sample rate [`Self::add_voice_from_pcm`] expects.
+    pub fn voice_prompt_sample_rate(&self) -> usize {
+        dispatch!(&self.0, |s| s.voice_prompt_sample_rate())
+    }
+
+    /// Register a precomputed voice embedding, replacing any voice of the same name.
+    pub fn add_voice_file(&mut self, name: &str, path: &FsPath) -> Result<()> {
+        dispatch!(&mut self.0, |s| s.add_voice_file(name, path))
+    }
+
+    /// Clone a voice from a mono audio prompt at
+    /// [`Self::voice_prompt_sample_rate`].
+    pub fn add_voice_from_pcm(&mut self, name: &str, pcm: &[f32]) -> Result<()> {
+        dispatch!(&mut self.0, |s| s.add_voice_from_pcm(name, pcm))
+    }
+
+    /// The weight format actually loaded. GPU backends are always unquantized.
+    pub fn quant(&self) -> Quant {
+        match &self.0 {
+            SynthV::Cpu(_) => Quant::F32,
+            SynthV::Q80(_) => Quant::Q80,
+            SynthV::Q81(_) => Quant::Q81,
+            SynthV::Q8k(_) => Quant::Q8k,
+            SynthV::Q6k(_) => Quant::Q6k,
+            SynthV::Q50(_) => Quant::Q50,
+            SynthV::Q51(_) => Quant::Q51,
+            SynthV::Q5k(_) => Quant::Q5k,
+            SynthV::Q40(_) => Quant::Q40,
+            SynthV::Q41(_) => Quant::Q41,
+            SynthV::Q4k(_) => Quant::Q4k,
+            #[cfg(feature = "cuda")]
+            SynthV::Cuda(_) => Quant::F32,
+            #[cfg(feature = "vulkan")]
+            SynthV::Vulkan(_) => Quant::F32,
+            #[cfg(feature = "metal")]
+            SynthV::Metal(_) => Quant::F32,
+        }
+    }
+}
+
+impl std::fmt::Debug for Synth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Synth")
+            .field("device", &self.device_name())
+            .field("weights", &self.quant().as_str())
+            .field("sample_rate", &self.sample_rate())
+            .field("voices", &self.voices())
+            .finish()
     }
 }
