@@ -45,6 +45,8 @@
 //! [`tts_model::TTSModel`] directly. `Synth` is a composition of those
 //! primitives, not a replacement for them.
 
+#[cfg(feature = "audio")]
+pub mod audio;
 pub mod conditioners;
 pub mod conv;
 pub mod dummy_quantizer;

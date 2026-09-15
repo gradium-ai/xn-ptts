@@ -9,8 +9,6 @@
 //! `model_helpers`), audio file decoding for `--voice <file>`, and the timing
 //! report.
 
-#[path = "audio_helpers.rs"]
-mod audio_helpers;
 #[path = "model_helpers.rs"]
 mod model_helpers;
 
@@ -232,12 +230,12 @@ impl VoiceArg {
 
 /// Decode an audio file to mono PCM at `sample_rate`, for voice cloning.
 fn load_voice_audio(path: &std::path::Path, sample_rate: usize) -> Result<Vec<f32>> {
-    let (pcm, file_rate) = audio_helpers::pcm_decode(path)?;
+    let (pcm, file_rate) = ptts::audio::decode_file(path)?;
     tracing::info!(?path, samples = pcm.len(), rate = file_rate, "decoded voice prompt");
     if file_rate as usize == sample_rate {
         Ok(pcm)
     } else {
-        Ok(audio_helpers::resample(&pcm, file_rate as usize, sample_rate)?)
+        Ok(ptts::audio::resample(&pcm, file_rate as usize, sample_rate)?)
     }
 }
 
