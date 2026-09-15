@@ -11,6 +11,7 @@ pub mod preprocess;
 pub mod resample;
 pub mod rope;
 pub mod seanet;
+pub mod synth;
 #[cfg(any(feature = "sp", feature = "hf"))]
 pub mod tok;
 pub mod transformer;
