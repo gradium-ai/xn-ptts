@@ -289,7 +289,8 @@ pub fn generate_chunks<Q: BackendQ>(
 
     let mut eos_countdown: Option<usize> = None;
     for _ in 0..max_frames {
-        let (next_latent, is_eos) = model.generate_step(&mut state, &prev_latent, &mut rng)?;
+        let (next_latent, is_eos, _eos_logit) =
+            model.generate_step(&mut state, &prev_latent, &mut rng)?;
         if latent_tx.send(next_latent.clone()).is_err() {
             break;
         }

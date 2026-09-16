@@ -174,6 +174,7 @@ pub struct TTSModel<Q: BackendQ> {
     pub mimi: MimiDecoder<Unquantized<f32, Q::B>>,
     lsd_decode_steps: usize,
     eos_threshold: f32,
+    cfg_on_eos: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -195,11 +196,20 @@ impl<Q: BackendQ> TTSModel<Q> {
             mimi,
             lsd_decode_steps: cfg.lsd_decode_steps,
             eos_threshold: cfg.eos_threshold,
+            cfg_on_eos: true,
         })
     }
 
     pub fn with_eos_threshold(mut self, eos_threshold: f32) -> Self {
         self.eos_threshold = eos_threshold;
+        self
+    }
+
+    /// Whether classifier-free guidance is applied to the EOS logit. Defaults to `true`
+    /// (the EOS head runs on the CFG-mixed output). Set to `false` to compute the stop
+    /// signal from the raw conditional output instead. Only affects the CFG generation path.
+    pub fn with_cfg_on_eos(mut self, cfg_on_eos: bool) -> Self {
+        self.cfg_on_eos = cfg_on_eos;
         self
     }
 
@@ -276,18 +286,19 @@ impl<Q: BackendQ> TTSModel<Q> {
     }
 
     /// Run one autoregressive generation step.
-    /// Returns (next_latent [B, 1, ldim], is_eos).
+    /// Returns (next_latent [B, 1, ldim], is_eos, eos_logit) where `eos_logit` is the raw
+    /// (pre-threshold) EOS logit for the first batch element.
     #[allow(clippy::type_complexity)]
     pub fn generate_step(
         &self,
         state: &mut TTSState<Q>,
         backbone_input: &Tensor<Q::T, Q::B>,
         rng: &mut impl crate::flow_lm::Rng,
-    ) -> Result<(Tensor<Q::T, Q::B>, bool)> {
+    ) -> Result<(Tensor<Q::T, Q::B>, bool, f32)> {
         let dev = backbone_input.device();
         let empty_text = Tensor::zeros((1, 0, self.flow_lm.conditioner.dim), dev)?;
 
-        let (latent, is_eos) = self.flow_lm.sample_next_latent(
+        let (latent, is_eos, eos_logit) = self.flow_lm.sample_next_latent(
             backbone_input,
             &empty_text,
             &mut state.flow_lm_state,
@@ -296,7 +307,7 @@ impl<Q: BackendQ> TTSModel<Q> {
             self.eos_threshold,
         )?;
 
-        Ok((latent, is_eos))
+        Ok((latent, is_eos, eos_logit))
     }
 
     #[allow(clippy::type_complexity)]
@@ -307,11 +318,11 @@ impl<Q: BackendQ> TTSModel<Q> {
         cfg_coef: f32,
         backbone_input: &Tensor<Q::T, Q::B>,
         rng: &mut impl crate::flow_lm::Rng,
-    ) -> Result<(Tensor<Q::T, Q::B>, bool)> {
+    ) -> Result<(Tensor<Q::T, Q::B>, bool, f32)> {
         let dev = backbone_input.device();
         let empty_text = Tensor::zeros((1, 0, self.flow_lm.conditioner.dim), dev)?;
 
-        let (latent, is_eos) = self.flow_lm.sample_next_latent_cfg(
+        let (latent, is_eos, eos_logit) = self.flow_lm.sample_next_latent_cfg(
             backbone_input,
             &empty_text,
             &mut state.flow_lm_state,
@@ -320,9 +331,10 @@ impl<Q: BackendQ> TTSModel<Q> {
             self.lsd_decode_steps,
             rng,
             self.eos_threshold,
+            self.cfg_on_eos,
         )?;
 
-        Ok((latent, is_eos))
+        Ok((latent, is_eos, eos_logit))
     }
 
     /// Decode latent to audio using mimi (streaming).

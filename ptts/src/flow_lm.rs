@@ -230,7 +230,8 @@ impl<Q: BackendQ> FlowLM<Q> {
     }
 
     /// Sample next latent using flow matching.
-    /// Returns (next_latent [B, 1, ldim], is_eos [B, 1]).
+    /// Returns (next_latent [B, 1, ldim], is_eos, eos_logit) where `eos_logit` is the raw
+    /// (pre-threshold) EOS logit for the first batch element.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn sample_next_latent(
         &self,
@@ -240,7 +241,7 @@ impl<Q: BackendQ> FlowLM<Q> {
         lsd_decode_steps: usize,
         rng: &mut impl Rng,
         eos_threshold: f32,
-    ) -> Result<(Tensor<Q::T, Q::B>, bool)> {
+    ) -> Result<(Tensor<Q::T, Q::B>, bool, f32)> {
         let (b, s, _) = sequence.dims3()?;
         let dev = sequence.device();
 
@@ -253,13 +254,14 @@ impl<Q: BackendQ> FlowLM<Q> {
 
         let eos_logit = self.out_eos.forward(&transformer_out)?;
         let eos_val = eos_logit.to_vec()?;
-        let is_eos = eos_val[0].to_f32() > eos_threshold;
+        let eos_logit = eos_val[0].to_f32();
+        let is_eos = eos_logit > eos_threshold;
         let noise_data: Vec<Q::T> =
             (0..b * self.ldim).map(|_| Q::T::from_f32(rng.sample())).collect();
         let noise = Tensor::from_vec(noise_data, (b, self.ldim), dev)?;
         let latent = lsd_decode(&self.flow_net, &transformer_out, &noise, lsd_decode_steps)?;
         let latent = latent.reshape((b, 1, self.ldim))?;
-        Ok((latent, is_eos))
+        Ok((latent, is_eos, eos_logit))
     }
 
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -273,30 +275,36 @@ impl<Q: BackendQ> FlowLM<Q> {
         lsd_decode_steps: usize,
         rng: &mut impl Rng,
         eos_threshold: f32,
-    ) -> Result<(Tensor<Q::T, Q::B>, bool)> {
+        cfg_on_eos: bool,
+    ) -> Result<(Tensor<Q::T, Q::B>, bool, f32)> {
         let (b, s, _) = sequence.dims3()?;
         let dev = sequence.device();
 
         let sequence = self.replace_nan_with_bos(sequence)?;
         let input = self.input_linear.forward(&sequence)?;
-        let t_out = self.backbone(&input, text_embeddings, s, state)?;
-        let t_len = t_out.dim(1usize)?;
-        let t_out = t_out.narrow(1, t_len - 1..t_len)?.contiguous()?;
-        let t_out = t_out.reshape((b, self.dim))?;
+        let cond_out = self.backbone(&input, text_embeddings, s, state)?;
+        let t_len = cond_out.dim(1usize)?;
+        let cond_out = cond_out.narrow(1, t_len - 1..t_len)?.contiguous()?;
+        let cond_out = cond_out.reshape((b, self.dim))?;
         let null_out = self.backbone(&input, text_embeddings, s, null_state)?;
         let null_out =
             null_out.narrow(1, t_len - 1..t_len)?.contiguous()?.reshape((b, self.dim))?;
         let s = Q::T::from_f32(cfg_coef);
-        let t_out = t_out.sub(&null_out)?.scale(s)?.add(&null_out)?;
-        let eos_logit = self.out_eos.forward(&t_out)?;
+        let t_out = cond_out.sub(&null_out)?.scale(s)?.add(&null_out)?;
+        // The EOS head can either run on the CFG-mixed output (default) or on the raw
+        // conditional output. Disabling CFG on the EOS logit avoids extrapolating the
+        // stop signal along with the latent, which can shift termination timing.
+        let eos_src = if cfg_on_eos { &t_out } else { &cond_out };
+        let eos_logit = self.out_eos.forward(eos_src)?;
         let eos_val = eos_logit.to_vec()?;
-        let is_eos = eos_val[0].to_f32() > eos_threshold;
+        let eos_logit = eos_val[0].to_f32();
+        let is_eos = eos_logit > eos_threshold;
         let noise_data: Vec<Q::T> =
             (0..b * self.ldim).map(|_| Q::T::from_f32(rng.sample())).collect();
         let noise = Tensor::from_vec(noise_data, (b, self.ldim), dev)?;
         let latent = lsd_decode(&self.flow_net, &t_out, &noise, lsd_decode_steps)?;
         let latent = latent.reshape((b, 1, self.ldim))?;
-        Ok((latent, is_eos))
+        Ok((latent, is_eos, eos_logit))
     }
 
     /// Replace NaN values in sequence with bos_emb.
