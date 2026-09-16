@@ -59,6 +59,11 @@ struct Args {
     #[arg(long)]
     cfg_coef: Option<f32>,
 
+    /// Whether guidance also applies to the EOS logit (default true). With false, the
+    /// stop signal comes from the conditional branch alone. Only matters with --cfg-coef.
+    #[arg(long)]
+    cfg_on_eos: Option<bool>,
+
     /// Replay noise from a JSON array of floats instead of sampling it, so a
     /// run can be compared against the reference implementation step for step.
     #[arg(long)]
@@ -105,6 +110,9 @@ fn main() -> Result<()> {
     }
     if let Some(cfg_coef) = args.cfg_coef {
         builder = builder.cfg_coef(cfg_coef);
+    }
+    if let Some(cfg_on_eos) = args.cfg_on_eos {
+        builder = builder.cfg_on_eos(cfg_on_eos);
     }
     // An embedding file can be registered before the model loads; an audio file
     // has to wait until the speaker codec's sample rate is known.

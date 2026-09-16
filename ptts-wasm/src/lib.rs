@@ -327,7 +327,7 @@ impl Model {
 
         let (next_latent, audio_chunk, is_eos) =
             dispatch!(&self.inner, &mut state.tts_state, |m, s| {
-                let (next_latent, is_eos) =
+                let (next_latent, is_eos, _eos_logit) =
                     m.generate_step(s, &state.prev_latent, &mut state.rng)?;
                 let audio_chunk = m.decode_latent(&next_latent, &mut state.mimi_state)?;
                 (next_latent, audio_chunk, is_eos)

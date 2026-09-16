@@ -561,17 +561,20 @@ fn run_backbone<Q: BackendQ>(
         let mut prev: Tensor<Q::T, Q::B> =
             Tensor::from_vec(nan, (1, 1, ldim), &device)?.to::<Q::T>()?;
         let mut eos = EosPolicy::new(chunk.frames_after_eos);
+        let mut eos_logits: Vec<f32> = Vec::with_capacity(chunk.frame_budget);
 
         for _ in 0..chunk.frame_budget {
-            let (next, is_eos) = match cfg_state.as_mut() {
+            let (next, is_eos, eos_logit) = match cfg_state.as_mut() {
                 Some((coef, null_state)) => {
                     model.generate_step_cfg(&mut state, null_state, *coef, &prev, &mut rng)?
                 }
                 None => model.generate_step(&mut state, &prev, &mut rng)?,
             };
+            eos_logits.push(eos_logit);
             // A closed channel means the consumer went away; stop quietly and
             // let the decoder thread report any error of its own.
             if latent_tx.send(Frame::Latent(next.clone())).is_err() {
+                tracing::debug!(?eos_logits, "eos logits for truncated chunk");
                 return Ok(());
             }
             if eos.should_stop(is_eos) {
@@ -579,6 +582,8 @@ fn run_backbone<Q: BackendQ>(
             }
             prev = next;
         }
+        // The raw EOS logit per frame, for tuning `eos_threshold` and `cfg_on_eos`.
+        tracing::debug!(?eos_logits, "eos logits for chunk");
         if latent_tx.send(Frame::ChunkEnd).is_err() {
             return Ok(());
         }
@@ -655,6 +660,7 @@ pub struct SynthBuilder {
     seed: u64,
     cfg_coef: Option<f32>,
     eos_threshold: Option<f32>,
+    cfg_on_eos: Option<bool>,
     voice: Option<String>,
     max_tokens_per_chunk: usize,
     voices: Vec<(String, PathBuf)>,
@@ -674,6 +680,7 @@ impl SynthBuilder {
             seed: 4242424242424242,
             cfg_coef: None,
             eos_threshold: None,
+            cfg_on_eos: None,
             voice: None,
             max_tokens_per_chunk: MAX_TOKENS_PER_CHUNK,
             voices: vec![],
@@ -727,6 +734,15 @@ impl SynthBuilder {
     /// the model run longer before it decides an utterance is finished.
     pub fn eos_threshold(mut self, eos_threshold: f32) -> Self {
         self.eos_threshold = Some(eos_threshold);
+        self
+    }
+
+    /// Whether classifier-free guidance is applied to the EOS logit as well as
+    /// to the latent. Defaults to `true`; `false` reads the stop signal from the
+    /// raw conditional output, so guidance does not shift termination timing.
+    /// Only matters when [`Self::cfg_coef`] is set.
+    pub fn cfg_on_eos(mut self, cfg_on_eos: bool) -> Self {
+        self.cfg_on_eos = Some(cfg_on_eos);
         self
     }
 
@@ -844,6 +860,10 @@ impl SynthBuilder {
         let model = TTSModel::<Q>::load(&vb, tokenizer, &config)?;
         let model = match self.eos_threshold {
             Some(threshold) => model.with_eos_threshold(threshold),
+            None => model,
+        };
+        let model = match self.cfg_on_eos {
+            Some(cfg_on_eos) => model.with_cfg_on_eos(cfg_on_eos),
             None => model,
         };
         // A dedicated speaker codec ships its encoder under its own prefix, so

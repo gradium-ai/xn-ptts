@@ -121,7 +121,8 @@ fn one<Q: BackendQ>(
 
         for _ in 0..frame_budget(tokens.len(), frame_rate) {
             let frame_start = Instant::now();
-            let (next_latent, is_eos) = model.generate_step(&mut state, &prev_latent, &mut rng)?;
+            let (next_latent, is_eos, _eos_logit) =
+                model.generate_step(&mut state, &prev_latent, &mut rng)?;
             let sampled = Instant::now();
             // Decoding on this thread rather than overlapped, so the measurement attributes
             // sampling and decoding to the frame that caused them.
