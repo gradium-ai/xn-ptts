@@ -574,6 +574,7 @@ fn run_backbone<Q: BackendQ>(
             // A closed channel means the consumer went away; stop quietly and
             // let the decoder thread report any error of its own.
             if latent_tx.send(Frame::Latent(next.clone())).is_err() {
+                tracing::debug!(?eos_logits, "eos logits for truncated chunk");
                 return Ok(());
             }
             if eos.should_stop(is_eos) {

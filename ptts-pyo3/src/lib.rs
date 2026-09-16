@@ -768,7 +768,8 @@ impl<Q: BackendQ> ModelStateB<Q> {
 }
 
 /// Build the Python return value for a generation call: the PCM array on its own, or a
-/// `(pcm, eos_logits)` tuple when `return_eos_logits` is set.
+/// `(pcm, eos_logits)` tuple when `return_eos_logits` is set. The streaming `generate_bt`
+/// path yields PCM chunks over a channel and does not expose the logits.
 fn pcm_result(
     py: Python<'_>,
     pcm: Vec<f32>,
@@ -973,7 +974,7 @@ fn load_model_<Q: BackendQ>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (temperature=0.5, repo_id="kyutai/pocket-tts", model_file="tts_b6369a24.safetensors", config=None, eos_threshold=None, cfg_on_eos=None, device=None, quant=None))]
+#[pyo3(signature = (temperature=0.5, repo_id="kyutai/pocket-tts", model_file="tts_b6369a24.safetensors", config=None, eos_threshold=None, device=None, quant=None, cfg_on_eos=None))]
 #[allow(clippy::too_many_arguments)]
 fn load_model(
     py: Python<'_>,
@@ -982,9 +983,9 @@ fn load_model(
     model_file: &str,
     config: Option<&str>,
     eos_threshold: Option<f32>,
-    cfg_on_eos: Option<bool>,
     device: Option<&str>,
     quant: Option<&str>,
+    cfg_on_eos: Option<bool>,
 ) -> PyResult<Model> {
     let repo_id = repo_id.to_string();
     let model_file = model_file.to_string();
