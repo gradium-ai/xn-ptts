@@ -62,3 +62,6 @@ name = "quantize"
 
 [[example]]
 name = "create_voice"
+
+[[example]]
+name = "mimi_bench"
