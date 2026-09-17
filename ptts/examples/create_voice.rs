@@ -1,5 +1,3 @@
-#[path = "audio_helpers.rs"]
-mod audio_helpers;
 #[path = "model_helpers.rs"]
 mod model_helpers;
 
@@ -64,11 +62,11 @@ fn run(args: Args) -> Result<()> {
     tracing::info!("loading voice from audio file {}", args.input);
 
     let speaker_sr = cfg.speaker_mimi_cfg().sample_rate;
-    let (mut pcm, sample_rate) = audio_helpers::pcm_decode(&args.input)?;
+    let (mut pcm, sample_rate) = ptts::audio::decode_file(std::path::Path::new(&args.input))?;
     ptts::utils::normalize_loudness(&mut pcm, sample_rate)?;
     let sample_rate = sample_rate as usize;
     let pcm = if sample_rate != speaker_sr {
-        audio_helpers::resample(&pcm, sample_rate, speaker_sr)?
+        ptts::audio::resample(&pcm, sample_rate, speaker_sr)?
     } else {
         pcm
     };
