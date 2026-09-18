@@ -56,17 +56,34 @@ pub struct Checkpoint {
     pub voices: Vec<(String, PathBuf)>,
 }
 
+/// Where a checkpoint's files come from.
+#[derive(Clone, Copy, Debug)]
+pub enum Source<'a> {
+    /// A local directory, see [`Checkpoint::from_dir`].
+    Dir(&'a Path),
+    /// A Hugging Face model repo, see [`Checkpoint::from_hub`].
+    Hub(&'a str),
+}
+
 impl Checkpoint {
-    /// A local model directory, or the published repo on the Hub when `dir` is `None`.
-    pub fn locate(dir: Option<&Path>) -> Result<Self> {
-        match dir {
-            Some(dir) => Self::from_dir(dir),
-            None => Self::from_hub(REPO_ID),
+    /// Locate a checkpoint in `source`.
+    ///
+    /// `weights` names the weights file inside the source, e.g. `model.q8.gguf`, for a
+    /// checkpoint that ships several. When `None`, the first of [`WEIGHT_CANDIDATES`] that
+    /// exists is used.
+    pub fn locate(source: Source<'_>, weights: Option<&str>) -> Result<Self> {
+        match source {
+            Source::Dir(dir) => Self::from_dir(dir, weights),
+            Source::Hub(repo_id) => Self::from_hub(repo_id, weights),
         }
     }
 
-    /// Download from a Hugging Face model repo laid out like [`REPO_ID`].
-    pub fn from_hub(repo_id: &str) -> Result<Self> {
+    /// Download from a Hugging Face model repo laid out like [`REPO_ID`]: an optional
+    /// `config.json`, a weights file, a tokenizer, voices under `embeddings/` and an optional
+    /// `default-voice.safetensors`. Only the files that are used get downloaded, so naming the
+    /// weights file with `weights` avoids fetching the f32 weights of a repo that also ships a
+    /// quantized GGUF.
+    pub fn from_hub(repo_id: &str, weights: Option<&str>) -> Result<Self> {
         let repo = HubRepo::open(repo_id)?;
         tracing::info!(?repo_id, "resolving checkpoint on the Hugging Face Hub");
 
@@ -74,12 +91,15 @@ impl Checkpoint {
             Some(path) => read_config(&path)?,
             None => shipped_config(),
         };
-        let weights = match WEIGHT_CANDIDATES.iter().find_map(|name| repo.get_optional(name)) {
-            Some(path) => path,
-            None => anyhow::bail!(
-                "no weights file in `{repo_id}`; expected one of {}",
-                WEIGHT_CANDIDATES.join(", ")
-            ),
+        let weights = match weights {
+            Some(name) => repo.get(name)?,
+            None => match WEIGHT_CANDIDATES.iter().find_map(|name| repo.get_optional(name)) {
+                Some(path) => path,
+                None => anyhow::bail!(
+                    "no weights file in `{repo_id}`; expected one of {}",
+                    WEIGHT_CANDIDATES.join(", ")
+                ),
+            },
         };
         let tokenizer = TOKENIZER_CANDIDATES.iter().find_map(|name| repo.get_optional(name));
 
@@ -98,8 +118,9 @@ impl Checkpoint {
     }
 
     /// A local directory holding `config.json`, a weights file, a tokenizer and an optional
-    /// `voices/` or `embeddings/` subdirectory -- both layouts are in circulation.
-    pub fn from_dir(dir: &Path) -> Result<Self> {
+    /// `voices/` or `embeddings/` subdirectory -- both layouts are in circulation. `weights`
+    /// is as for [`Self::locate`].
+    pub fn from_dir(dir: &Path, weights: Option<&str>) -> Result<Self> {
         if !dir.is_dir() {
             anyhow::bail!("not a directory: {}", dir.display())
         }
@@ -107,17 +128,26 @@ impl Checkpoint {
         let config =
             if config_path.is_file() { read_config(&config_path)? } else { shipped_config() };
 
-        let weights = WEIGHT_CANDIDATES
-            .iter()
-            .map(|name| dir.join(name))
-            .find(|path| path.is_file())
-            .with_context(|| {
-                format!(
-                    "no weights file in {}; expected one of {}",
-                    dir.display(),
-                    WEIGHT_CANDIDATES.join(", ")
-                )
-            })?;
+        let weights = match weights {
+            Some(name) => {
+                let path = dir.join(name);
+                if !path.is_file() {
+                    anyhow::bail!("no weights file `{name}` in {}", dir.display())
+                }
+                path
+            }
+            None => WEIGHT_CANDIDATES
+                .iter()
+                .map(|name| dir.join(name))
+                .find(|path| path.is_file())
+                .with_context(|| {
+                    format!(
+                        "no weights file in {}; expected one of {}",
+                        dir.display(),
+                        WEIGHT_CANDIDATES.join(", ")
+                    )
+                })?,
+        };
         let tokenizer =
             TOKENIZER_CANDIDATES.iter().map(|name| dir.join(name)).find(|path| path.is_file());
 

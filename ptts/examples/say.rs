@@ -12,7 +12,7 @@ fn main() -> anyhow::Result<()> {
 
     // `ptts` reads the files it is handed; finding them is the frontend's job,
     // and for the examples `model_helpers` is where that knowledge lives.
-    let checkpoint = model_helpers::Checkpoint::from_hub(model_helpers::REPO_ID)?;
+    let checkpoint = model_helpers::Checkpoint::from_hub(model_helpers::REPO_ID, None)?;
     let mut tts = checkpoint.builder().build()?;
     checkpoint.register_voices(&mut tts);
 
