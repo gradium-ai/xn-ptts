@@ -58,7 +58,13 @@ struct Args {
 }
 
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // `info` for everything but the Hub download stack: `hf_hub` transfers through the Xet
+    // backend, which reports every retry policy and range probe at `info`.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(
+            "info,xet=warn,xet_client=warn,xet_data=warn,xet_runtime=warn,xet_core_structures=warn",
+        )
+    });
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::Layer::new().with_target(false))
         .with(filter)

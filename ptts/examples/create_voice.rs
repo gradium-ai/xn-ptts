@@ -27,7 +27,9 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(model_helpers::LOG_DIRECTIVES));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
     let args = Args::parse();
     run(args)?;
     Ok(())
@@ -49,12 +51,13 @@ fn run(args: Args) -> Result<()> {
         };
         (cfg, model_path)
     } else {
-        let api = hf_hub::api::sync::Api::new()?;
-        let repo = api.model(args.config);
-        let cfg = repo.get("config.json")?;
+        let api = hf_hub::HFClientSync::new()?;
+        let (owner, name) = hf_hub::split_id(&args.config);
+        let repo = api.model(owner, name);
+        let cfg = repo.download_file().filename("config.json").send()?;
         let cfg: ptts::tts_model::TTSConfig = serde_json::from_str(&std::fs::read_to_string(cfg)?)?;
         let model_path = match args.weights.as_ref() {
-            None => repo.get("model.safetensors")?,
+            None => repo.download_file().filename("model.safetensors").send()?,
             Some(p) => std::path::PathBuf::from_str(p)?,
         };
         (cfg, model_path)
