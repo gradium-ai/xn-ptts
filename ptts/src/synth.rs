@@ -1226,7 +1226,6 @@ impl Synth {
     ///
     /// See [`SynthOf::session`]. `max_seq_len` is the KV budget allocated up
     /// front; text needing more is rejected rather than silently re-primed.
-
     pub fn session(&self, opts: &SpeechOptions, max_seq_len: usize) -> Result<Session> {
         Ok(Session(match &self.0 {
             SynthV::Cpu(s) => SessionV::Cpu(s.session(opts, max_seq_len)?),
