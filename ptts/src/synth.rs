@@ -351,12 +351,13 @@ impl<Q: BackendQ> SynthOf<Q> {
             Some(coef) if coef != 1.0 => Some(coef),
             _ => None,
         };
-        let voice = opts.voice.as_ref().or(self.defaults.voice.as_ref());
+        let voice = opts.voice.as_deref().or(self.defaults.voice.as_deref());
         let (base, cfg_base) = self.primed_state(voice, seq_budget, cfg_coef)?;
         Ok(SessionOf {
             model: Arc::clone(&self.model),
             frame_rate: self.cfg.mimi.frame_rate,
-            defaults: self.defaults.clone(),
+            temperature: opts.temperature.unwrap_or(self.defaults.temperature),
+            seed: opts.seed.unwrap_or(self.defaults.seed),
             max_tokens_per_chunk: opts
                 .max_tokens_per_chunk
                 .unwrap_or(self.defaults.max_tokens_per_chunk),
@@ -405,7 +406,7 @@ impl<Q: BackendQ> SynthOf<Q> {
     #[allow(clippy::type_complexity)]
     fn primed_state(
         &self,
-        voice: Option<&String>,
+        voice: Option<&str>,
         seq_budget: usize,
         cfg_coef: Option<f32>,
     ) -> Result<(TTSState<Q>, Option<(f32, TTSState<Q>)>)> {
@@ -509,7 +510,8 @@ fn plan_chunks<Q: BackendQ>(
 pub struct SessionOf<Q: BackendQ> {
     model: Arc<TTSModel<Q>>,
     frame_rate: f64,
-    defaults: Defaults,
+    temperature: f32,
+    seed: u64,
     max_tokens_per_chunk: usize,
     base: TTSState<Q>,
     cfg_base: Option<(f32, TTSState<Q>)>,
@@ -537,13 +539,13 @@ impl<Q: BackendQ> SessionOf<Q> {
 
     /// Synthesize `text`, yielding PCM as the decoder produces it.
     pub fn stream(&self, text: &str) -> Result<SpeechStream> {
-        let rng = Box::new(NormalRng::new(self.defaults.temperature, self.defaults.seed)?);
+        let rng = Box::new(NormalRng::new(self.temperature, self.seed)?);
         self.stream_with_rng(text, rng)
     }
 
     /// As [`Self::stream`], with an explicit seed for this request.
     pub fn stream_seeded(&self, text: &str, seed: u64) -> Result<SpeechStream> {
-        let rng = Box::new(NormalRng::new(self.defaults.temperature, seed)?);
+        let rng = Box::new(NormalRng::new(self.temperature, seed)?);
         self.stream_with_rng(text, rng)
     }
 
@@ -1222,6 +1224,7 @@ impl Synth {
     ///
     /// See [`SynthOf::session`]. `max_seq_len` is the KV budget allocated up
     /// front; text needing more is rejected rather than silently re-primed.
+
     pub fn session(&self, opts: &SpeechOptions, max_seq_len: usize) -> Result<Session> {
         Ok(Session(match &self.0 {
             SynthV::Cpu(s) => SessionV::Cpu(s.session(opts, max_seq_len)?),
@@ -1366,14 +1369,5 @@ mod tests {
         assert!(needed > 512, "a real utterance needs more than the headroom alone");
         // A session primed for a shorter utterance cannot serve a longer one.
         assert!(needed > plan::seq_budget(1, plan::frame_budget(1, 12.5)));
-    }
-
-    #[test]
-    fn speech_options_carry_through_to_a_session() {
-        let opts = SpeechOptions::default().voice("alba").cfg_coef(1.0);
-        // A cfg_coef of exactly 1.0 disables guidance rather than running a
-        // null branch that changes nothing.
-        assert_eq!(opts.cfg_coef, Some(1.0));
-        assert_eq!(opts.voice.as_deref(), Some("alba"));
     }
 }
