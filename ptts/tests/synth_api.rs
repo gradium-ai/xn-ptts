@@ -149,3 +149,20 @@ fn speech_options_default_to_the_builders_settings() {
     assert!(opts.seed.is_none());
     assert!(opts.cfg_coef.is_none());
 }
+
+/// A session is the fix for re-priming the voice on every call, so the type has
+/// to be nameable and its budget visible without a model in hand.
+#[test]
+fn session_is_part_of_the_public_api() {
+    fn _accepts(_: &ptts::synth::Session) {}
+    fn _budget(s: &ptts::synth::Session) -> usize {
+        s.seq_budget()
+    }
+}
+
+#[test]
+fn a_generic_session_is_nameable_too() {
+    // `ptts-wasm` and anything else that fixes its weight format at compile
+    // time uses `SessionOf<Q>` rather than the erased `Session`.
+    fn _accepts<Q: xn::BackendQ>(_: &ptts::synth::SessionOf<Q>) {}
+}
