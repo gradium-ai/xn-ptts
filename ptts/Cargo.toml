@@ -21,7 +21,6 @@ tracing-subscriber = { workspace = true }
 sentencepiece = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
 safetensors = { workspace = true }
-# `synth.rs` names `half::bf16` for the CUDA and Metal backends.
 half = { workspace = true, optional = true }
 
 [dev-dependencies]
