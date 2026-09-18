@@ -30,7 +30,8 @@ struct Args {
     output: std::path::PathBuf,
 
     /// Voice: a bundled voice id, a path to a voice `.safetensors`, or a path to
-    /// a ~10s audio file to clone. Defaults to the first bundled voice.
+    /// a ~10s audio file to clone. Defaults to the checkpoint's `default` voice,
+    /// or its first bundled voice by name.
     #[arg(short, long)]
     voice: Option<String>,
 
@@ -42,10 +43,22 @@ struct Args {
     #[arg(short, long, default_value_t = 4242424242424242)]
     seed: u64,
 
+    /// Hugging Face model repo to download the checkpoint from: config.json,
+    /// weights, tokenizer and voices.
+    #[arg(long, default_value = model_helpers::REPO_ID, conflicts_with = "dir")]
+    repo: String,
+
     /// Load from a local directory holding config.json, weights, tokenizer and
     /// voices/ instead of downloading from the Hugging Face Hub.
     #[arg(long)]
     dir: Option<std::path::PathBuf>,
+
+    /// Weights file to load from the repo or directory, e.g. `model.q8.gguf` for
+    /// a checkpoint that ships both f32 and quantized weights. Defaults to the
+    /// first of model.safetensors, model.q8.gguf or tts_b6369a24.safetensors
+    /// that exists.
+    #[arg(long)]
+    weights: Option<String>,
 
     /// Device to run on: auto, cpu, cuda, vulkan or metal.
     #[arg(long, default_value = "auto")]
@@ -94,7 +107,11 @@ fn main() -> Result<()> {
 
     // Which files the checkpoint ships, and what they are called, is this
     // example's business rather than the library's.
-    let checkpoint = model_helpers::Checkpoint::locate(args.dir.as_deref())?;
+    let source = match args.dir.as_deref() {
+        Some(dir) => model_helpers::Source::Dir(dir),
+        None => model_helpers::Source::Hub(&args.repo),
+    };
+    let checkpoint = model_helpers::Checkpoint::locate(source, args.weights.as_deref())?;
     let mut builder = checkpoint
         .builder()
         .device(DeviceKind::parse(&args.device)?)
@@ -121,10 +138,13 @@ fn main() -> Result<()> {
     let mut opts = SpeechOptions::default();
     match &voice {
         // The bundled voices are registered after the load, so the builder's
-        // own "first voice by name" default never saw them; pick it here.
+        // own "first voice by name" default never saw them; pick it here. A
+        // checkpoint that ships a `default-voice.safetensors` gets that one.
         VoiceArg::Default => {
-            if let Some(first) = tts.voices().first() {
-                opts = opts.voice(first.clone());
+            let voices = tts.voices();
+            let pick = voices.iter().find(|v| v.as_str() == "default").or(voices.first());
+            if let Some(name) = pick {
+                opts = opts.voice(name.clone());
             }
         }
         VoiceArg::Bundled(name) => opts = opts.voice(name.clone()),
