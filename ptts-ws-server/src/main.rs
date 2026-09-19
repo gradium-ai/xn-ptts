@@ -59,7 +59,8 @@ struct Args {
 
 fn init_tracing() {
     // `info` for everything but the Hub download stack: `hf_hub` transfers through the Xet
-    // backend, which reports every retry policy and range probe at `info`.
+    // backend, which reports every retry policy and range probe at `info`. Keep in sync with
+    // `LOG_DIRECTIVES` in `ptts/examples/model_helpers.rs`.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(
             "info,xet=warn,xet_client=warn,xet_data=warn,xet_runtime=warn,xet_core_structures=warn",
@@ -71,13 +72,21 @@ fn init_tracing() {
         .init();
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     init_tracing();
     let args = Args::parse();
 
+    // Loading the model happens before the runtime exists: it downloads the
+    // checkpoint through hf-hub's blocking client and then spends seconds in
+    // CPU-bound weight loading, neither of which belongs on a runtime thread.
+    // hf-hub 1.0 drives a tokio runtime of its own for the download; it keeps
+    // that runtime on a dedicated thread so a nested `block_on` does not panic,
+    // but this ordering does not have to rely on that.
     let app_state = build_app_state(&args)?;
+    tokio::runtime::Runtime::new()?.block_on(serve(args, app_state))
+}
 
+async fn serve(args: Args, app_state: model::AppState) -> Result<()> {
     let app = Router::new()
         .route("/speech/tts", any(handler::ws_handler))
         .with_state(app_state)
