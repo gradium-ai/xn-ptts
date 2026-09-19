@@ -394,9 +394,15 @@ impl<Q: BackendQ> MimiEnc<Q> {
     pub fn encode_audio(&self, audio: &Tensor<Q::T, Q::B>) -> Result<Tensor<Q::T, Q::B>> {
         let f32_audio = audio.to::<f32>()?;
         let encoded = self.mimi.encode_to_latent(&f32_audio)?;
-        // [B, C, T] -> [B, T, C]
-        let latents = encoded.transpose(1, 2)?.contiguous()?;
-        let latents = latents.to::<Q::T>()?;
+        self.embed_latents(&encoded)
+    }
+
+    /// Turn speaker-Mimi latents, `[B, C, T]` as `encode_to_latent` lays them out, into the
+    /// voice embedding the flow LM is conditioned on, `[B, T, dim]`. This is the second half
+    /// of [`Self::encode_audio`], for callers that already hold the latents -- a
+    /// `speaker_wavs` tensor stored by the training pipeline, say -- rather than the audio.
+    pub fn embed_latents(&self, latents: &Tensor<f32, Q::B>) -> Result<Tensor<Q::T, Q::B>> {
+        let latents = latents.transpose(1, 2)?.contiguous()?.to::<Q::T>()?;
         match self.speaker_proj.as_ref() {
             Some(p) => p.forward(&latents),
             None => Ok(latents),
