@@ -244,7 +244,8 @@ fn load_voice_audio(path: &std::path::Path, sample_rate: usize) -> Result<Vec<f3
 fn init_tracing(chrome_tracing: bool) -> Option<tracing_chrome::FlushGuard> {
     use tracing_subscriber::{EnvFilter, prelude::*};
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(model_helpers::LOG_DIRECTIVES));
     let fmt = tracing_subscriber::fmt::Layer::new().with_target(false);
     if chrome_tracing {
         let (chrome_layer, guard) = tracing_chrome::ChromeLayerBuilder::new().build();

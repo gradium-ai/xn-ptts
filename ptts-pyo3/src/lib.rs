@@ -827,6 +827,24 @@ impl ModelState {
     }
 }
 
+/// A model repo on the Hugging Face Hub. The client reads `HF_TOKEN` and the
+/// cache location from the environment.
+fn hub_model(repo_id: &str) -> xn::Result<HubRepo> {
+    let client = hf_hub::HFClientSync::new().map_err(xn::Error::msg)?;
+    let (owner, name) = hf_hub::split_id(repo_id);
+    Ok(client.model(owner, name))
+}
+
+type HubRepo = hf_hub::HFRepositorySync<hf_hub::repository::RepoTypeModel>;
+
+/// Download `filename` from `repo`, or find it in the local cache.
+fn hub_get(repo: &HubRepo, filename: &str) -> xn::Result<std::path::PathBuf> {
+    repo.download_file()
+        .filename(filename)
+        .send()
+        .map_err(|e| xn::Error::msg(e).with_path(filename))
+}
+
 fn load_model_<Q: BackendQ>(
     temperature: f32,
     repo_id: String,
@@ -859,37 +877,30 @@ fn load_model_<Q: BackendQ>(
         // A HuggingFace repo id: download `config.json`, the quantized
         // `model.q8.gguf`, the tokenizer and the `default-voice` embedding.
         Some(repo_id) => {
-            use hf_hub::{Repo, RepoType, api::sync::Api};
+            let repo = hub_model(&repo_id)?;
 
-            let api = Api::new().map_err(xn::Error::msg)?;
-            let repo = api.repo(Repo::new(repo_id, RepoType::Model));
-
-            let config_path = repo.get("config.json").map_err(xn::Error::msg)?;
+            let config_path = hub_get(&repo, "config.json")?;
             let config_str = std::fs::read_to_string(&config_path)
                 .map_err(|e| xn::Error::msg(e).with_path(&config_path))?;
             let mut cfg: TTSConfig = serde_json::from_str(&config_str)
                 .map_err(|e| xn::Error::msg(e).with_path(&config_path))?;
             cfg.temp = temperature;
 
-            let model_path = repo.get("model.q8.gguf").map_err(xn::Error::msg)?;
-            let tokenizer_path = repo.get("tokenizer.model").map_err(xn::Error::msg)?;
+            let model_path = hub_get(&repo, "model.q8.gguf")?;
+            let tokenizer_path = hub_get(&repo, "tokenizer.model")?;
 
             (model_path, tokenizer_path, cfg, std::collections::HashMap::new())
         }
         None => {
-            use hf_hub::{Repo, RepoType, api::sync::Api};
+            let repo = hub_model(&repo_id)?;
 
-            let api = Api::new().map_err(xn::Error::msg)?;
-            let repo = api.repo(Repo::new(repo_id, RepoType::Model));
-
-            let model_path =
-                repo.get(&model_file).map_err(|e| xn::Error::msg(e).with_path(&model_file))?;
-            let tokenizer_path = repo.get("tokenizer.model").map_err(xn::Error::msg)?;
+            let model_path = hub_get(&repo, &model_file)?;
+            let tokenizer_path = hub_get(&repo, "tokenizer.model")?;
 
             let mut voices = std::collections::HashMap::new();
             for &voice in POCKET_TTS_VOICES {
                 let voice_file = format!("embeddings/{voice}.safetensors");
-                if let Ok(voice_path) = repo.get(&voice_file)
+                if let Ok(voice_path) = hub_get(&repo, &voice_file)
                     && let Ok(voice_emb) = load_voice_emb(&voice_path, None, &dev)
                     && let Ok(voice_emb) = voice_emb.to::<Q::T>()
                 {

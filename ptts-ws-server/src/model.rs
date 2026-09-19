@@ -53,20 +53,21 @@ struct LoadedModel<Q: BackendQ> {
 }
 
 impl<Q: BackendQ> LoadedModel<Q> {
-    fn load_from_hf(repo_id: &str, temperature: f32, dev: &Q::B) -> Result<Self> {
+    async fn load_from_hf(repo_id: &str, temperature: f32, dev: &Q::B) -> Result<Self> {
         tracing::info!("downloading model artifacts");
         let repo = crate::utils::HfRepo::model(repo_id)?;
-        let config_path = repo.get("config.json")?;
+        let config_path = repo.get("config.json").await?;
         let mut cfg: TTSConfig = serde_json::from_str(&std::fs::read_to_string(config_path)?)
             .with_context(|| "failed to read config from file {config:?}")?;
         cfg.temp = temperature;
 
-        let model_path = repo.get("model.q8.gguf")?;
+        let model_path = repo.get("model.q8.gguf").await?;
         tracing::info!(?model_path, "model weights ready");
-        let tokenizer_path = repo.get("tokenizer.model")?;
+        let tokenizer_path = repo.get("tokenizer.model").await?;
 
         let mut voices: HashMap<String, Tensor<Q::T, Q::B>> = HashMap::new();
-        let default_voice = load_voice_emb(&repo.get("default-voice.safetensors")?, None, dev)
+        let default_voice_path = repo.get("default-voice.safetensors").await?;
+        let default_voice = load_voice_emb(&default_voice_path, None, dev)
             .with_context(|| "failed to load default voice embedding")?
             .to::<Q::T>()
             .with_context(|| "failed to convert default voice embedding")?;
@@ -76,17 +77,17 @@ impl<Q: BackendQ> LoadedModel<Q> {
         Ok(Self { cfg, voices, tokenizer_path, model_path })
     }
 
-    fn load_pocket_from_hf(temperature: f32, dev: &Q::B) -> Result<Self> {
+    async fn load_pocket_from_hf(temperature: f32, dev: &Q::B) -> Result<Self> {
         tracing::info!("downloading model artifacts");
         let repo = crate::utils::HfRepo::model(DEFAULT_REPO_ID)?;
-        let model_path = repo.get(DEFAULT_MODEL_FILE)?;
+        let model_path = repo.get(DEFAULT_MODEL_FILE).await?;
         tracing::info!(?model_path, "model weights ready");
-        let tokenizer_path = repo.get("tokenizer.model")?;
+        let tokenizer_path = repo.get("tokenizer.model").await?;
 
         let mut voices: HashMap<String, Tensor<Q::T, Q::B>> = HashMap::new();
         for &voice in VOICES {
             let voice_file = format!("embeddings/{voice}.safetensors");
-            match repo.get(&voice_file) {
+            match repo.get(&voice_file).await {
                 Ok(voice_path) => match load_voice_emb(&voice_path, None, dev) {
                     Ok(emb) => match emb.to::<Q::T>() {
                         Ok(emb) => {
@@ -200,7 +201,7 @@ fn load_voices_from_dir<Q: BackendQ>(
     }
 }
 
-pub fn load_ptts<Q: BackendQ>(
+pub async fn load_ptts<Q: BackendQ>(
     config: Option<&std::path::PathBuf>,
     voice_dir: Option<&std::path::PathBuf>,
     temperature: f32,
@@ -214,9 +215,9 @@ pub fn load_ptts<Q: BackendQ>(
         }
         Some(repo_id) => {
             let repo_id = repo_id.to_str().context("invalid repo ID path")?;
-            LoadedModel::<Q>::load_from_hf(repo_id, temperature, &dev)?
+            LoadedModel::<Q>::load_from_hf(repo_id, temperature, &dev).await?
         }
-        None => LoadedModel::<Q>::load_pocket_from_hf(temperature, &dev)?,
+        None => LoadedModel::<Q>::load_pocket_from_hf(temperature, &dev).await?,
     };
     if let Some(voice_dir) = voice_dir {
         load_voices_from_dir::<Q>(voice_dir, &dev, &mut m.voices);

@@ -25,6 +25,13 @@ use ptts::tts_model::TTSConfig;
 /// Hugging Face repo holding the published checkpoint.
 pub const REPO_ID: &str = "kyutai/pocket-tts";
 
+/// Default `tracing` directives for the examples: `info` for everything but the Hub download
+/// stack. `hf_hub` transfers through the Xet backend, which reports every retry policy and
+/// range probe at `info` -- a dozen lines per file that say nothing to a user waiting for a
+/// download. `RUST_LOG` overrides this.
+pub const LOG_DIRECTIVES: &str =
+    "info,xet=warn,xet_client=warn,xet_data=warn,xet_runtime=warn,xet_core_structures=warn";
+
 /// Voices the published checkpoint bundles, under `embeddings/`.
 pub const VOICES: &[&str] =
     &["alba", "marius", "javert", "jean", "fantine", "cosette", "eponine", "azelma"];
@@ -218,27 +225,29 @@ fn collect_voice_dir(dir: &Path, voices: &mut Vec<(String, PathBuf)>) {
     }
 }
 
-/// A Hugging Face model repo, wrapped so a download failure names the repo, the file and the
-/// URL -- `hf_hub`'s own errors mention none of the three, which makes a gated repo or a
-/// renamed file hard to diagnose.
+/// A Hugging Face model repo, wrapped so a download failure names the repo and the file --
+/// `hf_hub` does so for a missing file but not for an HTTP or authentication failure, which
+/// makes a gated repo hard to diagnose -- and so the callers need not spell out the download
+/// builder.
 struct HubRepo {
-    repo: hf_hub::api::sync::ApiRepo,
+    repo: hf_hub::HFRepositorySync<hf_hub::repository::RepoTypeModel>,
     repo_id: String,
 }
 
 impl HubRepo {
+    /// The client reads `HF_TOKEN`, `HF_ENDPOINT` and the cache location from the environment,
+    /// falling back to the token `huggingface-cli login` stores.
     fn open(repo_id: &str) -> Result<Self> {
-        use hf_hub::{Repo, RepoType, api::sync::Api};
-        let api = Api::new().context("cannot reach the Hugging Face Hub")?;
-        let repo = api.repo(Repo::new(repo_id.to_string(), RepoType::Model));
-        Ok(Self { repo, repo_id: repo_id.to_string() })
+        let client = hf_hub::HFClientSync::new().context("cannot reach the Hugging Face Hub")?;
+        let (owner, name) = hf_hub::split_id(repo_id);
+        Ok(Self { repo: client.model(owner, name), repo_id: repo_id.to_string() })
     }
 
+    /// Download `filename`, or find it in the local cache.
     fn get(&self, filename: &str) -> Result<PathBuf> {
-        self.repo.get(filename).map_err(|e| {
-            let url = self.repo.url(filename);
+        self.repo.download_file().filename(filename).send().map_err(|e| {
             anyhow::anyhow!(
-                "failed to fetch `{filename}` from `{}` ({url}): {e}\n\
+                "failed to fetch `{filename}` from `{}`: {e}\n\
                  If the repo is gated, accept its terms on huggingface.co and run \
                  `huggingface-cli login` (or set HF_TOKEN).",
                 self.repo_id
@@ -249,6 +258,6 @@ impl HubRepo {
     /// Like [`Self::get`] but maps any failure to `None`, for files that may legitimately be
     /// absent from a given repo layout.
     fn get_optional(&self, filename: &str) -> Option<PathBuf> {
-        self.repo.get(filename).ok()
+        self.repo.download_file().filename(filename).send().ok()
     }
 }
