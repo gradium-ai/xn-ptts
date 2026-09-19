@@ -185,7 +185,7 @@ impl Model {
     pub fn new_(model_weights: &[u8], quant: &str) -> xn::Result<Model> {
         let quant = Quant::parse(quant)?;
         console_log!("[new] loading model with quant={quant:?}");
-        let cfg = TTSConfig::v202601(0.7);
+        let cfg = TTSConfig::v202601(0.5);
 
         let is_gguf = model_weights.len() >= 4 && &model_weights[..4] == b"GGUF";
         let vb = if is_gguf {

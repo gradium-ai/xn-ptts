@@ -13,7 +13,7 @@
 //! use ptts::synth::Synth;
 //! use ptts::tts_model::TTSConfig;
 //!
-//! let tts = Synth::builder(TTSConfig::v202601(0.7), "model/model.safetensors")
+//! let tts = Synth::builder(TTSConfig::v202601(0.5), "model/model.safetensors")
 //!     .tokenizer_file("model/tokenizer.model")
 //!     .add_voice("alba", "model/voices/alba.safetensors")
 //!     .build()?;

@@ -11,7 +11,7 @@
 //! use ptts::synth::Synth;
 //! use ptts::tts_model::TTSConfig;
 //!
-//! let tts = Synth::builder(TTSConfig::v202601(0.7), "model/model.safetensors")
+//! let tts = Synth::builder(TTSConfig::v202601(0.5), "model/model.safetensors")
 //!     .tokenizer_file("model/tokenizer.model")
 //!     .add_voice("alba", "model/voices/alba.safetensors")
 //!     .build()?;
@@ -26,7 +26,7 @@
 //!
 //! ```no_run
 //! # fn main() -> xn::Result<()> {
-//! # let cfg = ptts::tts_model::TTSConfig::v202601(0.7);
+//! # let cfg = ptts::tts_model::TTSConfig::v202601(0.5);
 //! # let tts = ptts::synth::Synth::builder(cfg, "model/model.safetensors")
 //! #     .tokenizer_file("model/tokenizer.model")
 //! #     .build()?;
@@ -670,7 +670,7 @@ impl SynthBuilder {
             device: DeviceKind::Auto,
             quant: Quant::F32,
             tokenizer: None,
-            temperature: 0.7,
+            temperature: 0.5,
             seed: 4242424242424242,
             cfg_coef: None,
             eos_threshold: None,
