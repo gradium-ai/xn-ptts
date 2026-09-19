@@ -72,21 +72,16 @@ fn init_tracing() {
         .init();
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     init_tracing();
     let args = Args::parse();
 
-    // Loading the model happens before the runtime exists: it downloads the
-    // checkpoint through hf-hub's blocking client and then spends seconds in
-    // CPU-bound weight loading, neither of which belongs on a runtime thread.
-    // hf-hub 1.0 drives a tokio runtime of its own for the download; it keeps
-    // that runtime on a dedicated thread so a nested `block_on` does not panic,
-    // but this ordering does not have to rely on that.
-    let app_state = build_app_state(&args)?;
-    tokio::runtime::Runtime::new()?.block_on(serve(args, app_state))
-}
+    // The checkpoint is downloaded with hf-hub's async client on this runtime.
+    // The weight loading that follows is CPU-bound and blocks the runtime
+    // thread, which is fine here: nothing is served until it is done.
+    let app_state = build_app_state(&args).await?;
 
-async fn serve(args: Args, app_state: model::AppState) -> Result<()> {
     let app = Router::new()
         .route("/speech/tts", any(handler::ws_handler))
         .with_state(app_state)
@@ -103,7 +98,7 @@ async fn serve(args: Args, app_state: model::AppState) -> Result<()> {
     Ok(())
 }
 
-fn build_app_state(args: &Args) -> Result<model::AppState> {
+async fn build_app_state(args: &Args) -> Result<model::AppState> {
     if args.cuda as u8 + args.vulkan as u8 + args.metal as u8 > 1 {
         anyhow::bail!("at most one of --cuda, --vulkan, and --metal can be used");
     }
@@ -124,7 +119,8 @@ fn build_app_state(args: &Args) -> Result<model::AppState> {
                 args.seed,
                 args.max_seq_len,
                 dev,
-            )?;
+            )
+            .await?;
             return Ok(model::AppState::Cuda(Arc::new(s)));
         }
         #[cfg(not(feature = "cuda"))]
@@ -141,7 +137,8 @@ fn build_app_state(args: &Args) -> Result<model::AppState> {
                 args.seed,
                 args.max_seq_len,
                 dev,
-            )?;
+            )
+            .await?;
             return Ok(model::AppState::Vulkan(Arc::new(s)));
         }
         #[cfg(not(feature = "vulkan"))]
@@ -158,16 +155,17 @@ fn build_app_state(args: &Args) -> Result<model::AppState> {
                 args.seed,
                 args.max_seq_len,
                 dev,
-            )?;
+            )
+            .await?;
             return Ok(model::AppState::Metal(Arc::new(s)));
         }
         #[cfg(not(feature = "metal"))]
         anyhow::bail!("--metal requested but binary was not built with --features metal");
     }
-    build_cpu_state(args)
+    build_cpu_state(args).await
 }
 
-fn build_cpu_state(args: &Args) -> Result<model::AppState> {
+async fn build_cpu_state(args: &Args) -> Result<model::AppState> {
     use model::AppState;
     let temp = args.temperature;
     let seed = args.seed;
@@ -177,124 +175,157 @@ fn build_cpu_state(args: &Args) -> Result<model::AppState> {
     let state = match args.quant.as_deref() {
         None => {
             tracing::info!("using cpu backend (unquantized f32)");
-            AppState::Cpu(Arc::new(model::load_ptts::<xn::Unquantized<f32, _>>(
-                config,
-                voice_dir,
-                temp,
-                seed,
-                mlen,
-                xn::CPU,
-            )?))
+            AppState::Cpu(Arc::new(
+                model::load_ptts::<xn::Unquantized<f32, _>>(
+                    config,
+                    voice_dir,
+                    temp,
+                    seed,
+                    mlen,
+                    xn::CPU,
+                )
+                .await?,
+            ))
         }
         Some("q8" | "q8_0") => {
             tracing::info!("using cpu q8_0 backend");
-            AppState::Q80(Arc::new(model::load_ptts::<xn::quantized::Q80F32>(
-                config,
-                voice_dir,
-                temp,
-                seed,
-                mlen,
-                xn::CPU,
-            )?))
+            AppState::Q80(Arc::new(
+                model::load_ptts::<xn::quantized::Q80F32>(
+                    config,
+                    voice_dir,
+                    temp,
+                    seed,
+                    mlen,
+                    xn::CPU,
+                )
+                .await?,
+            ))
         }
         Some("q8_1") => {
             tracing::info!("using cpu q8_1 backend");
-            AppState::Q81(Arc::new(model::load_ptts::<xn::quantized::Q81F32>(
-                config,
-                voice_dir,
-                temp,
-                seed,
-                mlen,
-                xn::CPU,
-            )?))
+            AppState::Q81(Arc::new(
+                model::load_ptts::<xn::quantized::Q81F32>(
+                    config,
+                    voice_dir,
+                    temp,
+                    seed,
+                    mlen,
+                    xn::CPU,
+                )
+                .await?,
+            ))
         }
         Some("q8k") => {
             tracing::info!("using cpu q8k backend");
-            AppState::Q8k(Arc::new(model::load_ptts::<xn::quantized::Q8kF32>(
-                config,
-                voice_dir,
-                temp,
-                seed,
-                mlen,
-                xn::CPU,
-            )?))
+            AppState::Q8k(Arc::new(
+                model::load_ptts::<xn::quantized::Q8kF32>(
+                    config,
+                    voice_dir,
+                    temp,
+                    seed,
+                    mlen,
+                    xn::CPU,
+                )
+                .await?,
+            ))
         }
         Some("q6k") => {
             tracing::info!("using cpu q6k backend");
-            AppState::Q6k(Arc::new(model::load_ptts::<xn::quantized::Q6kF32>(
-                config,
-                voice_dir,
-                temp,
-                seed,
-                mlen,
-                xn::CPU,
-            )?))
+            AppState::Q6k(Arc::new(
+                model::load_ptts::<xn::quantized::Q6kF32>(
+                    config,
+                    voice_dir,
+                    temp,
+                    seed,
+                    mlen,
+                    xn::CPU,
+                )
+                .await?,
+            ))
         }
         Some("q5" | "q5_0") => {
             tracing::info!("using cpu q5_0 backend");
-            AppState::Q50(Arc::new(model::load_ptts::<xn::quantized::Q50F32>(
-                config,
-                voice_dir,
-                temp,
-                seed,
-                mlen,
-                xn::CPU,
-            )?))
+            AppState::Q50(Arc::new(
+                model::load_ptts::<xn::quantized::Q50F32>(
+                    config,
+                    voice_dir,
+                    temp,
+                    seed,
+                    mlen,
+                    xn::CPU,
+                )
+                .await?,
+            ))
         }
         Some("q5_1") => {
             tracing::info!("using cpu q5_1 backend");
-            AppState::Q51(Arc::new(model::load_ptts::<xn::quantized::Q51F32>(
-                config,
-                voice_dir,
-                temp,
-                seed,
-                mlen,
-                xn::CPU,
-            )?))
+            AppState::Q51(Arc::new(
+                model::load_ptts::<xn::quantized::Q51F32>(
+                    config,
+                    voice_dir,
+                    temp,
+                    seed,
+                    mlen,
+                    xn::CPU,
+                )
+                .await?,
+            ))
         }
         Some("q5k") => {
             tracing::info!("using cpu q5k backend");
-            AppState::Q5k(Arc::new(model::load_ptts::<xn::quantized::Q5kF32>(
-                config,
-                voice_dir,
-                temp,
-                seed,
-                mlen,
-                xn::CPU,
-            )?))
+            AppState::Q5k(Arc::new(
+                model::load_ptts::<xn::quantized::Q5kF32>(
+                    config,
+                    voice_dir,
+                    temp,
+                    seed,
+                    mlen,
+                    xn::CPU,
+                )
+                .await?,
+            ))
         }
         Some("q4" | "q4_0") => {
             tracing::info!("using cpu q4_0 backend");
-            AppState::Q40(Arc::new(model::load_ptts::<xn::quantized::Q40F32>(
-                config,
-                voice_dir,
-                temp,
-                seed,
-                mlen,
-                xn::CPU,
-            )?))
+            AppState::Q40(Arc::new(
+                model::load_ptts::<xn::quantized::Q40F32>(
+                    config,
+                    voice_dir,
+                    temp,
+                    seed,
+                    mlen,
+                    xn::CPU,
+                )
+                .await?,
+            ))
         }
         Some("q4_1") => {
             tracing::info!("using cpu q4_1 backend");
-            AppState::Q41(Arc::new(model::load_ptts::<xn::quantized::Q41F32>(
-                config,
-                voice_dir,
-                temp,
-                seed,
-                mlen,
-                xn::CPU,
-            )?))
+            AppState::Q41(Arc::new(
+                model::load_ptts::<xn::quantized::Q41F32>(
+                    config,
+                    voice_dir,
+                    temp,
+                    seed,
+                    mlen,
+                    xn::CPU,
+                )
+                .await?,
+            ))
         }
         Some("q4k") => {
             tracing::info!("using cpu q4k backend");
-            AppState::Q4k(Arc::new(model::load_ptts::<xn::quantized::Q4kF32>(
-                config,
-                voice_dir,
-                temp,
-                seed,
-                mlen,
-                xn::CPU,
-            )?))
+            AppState::Q4k(Arc::new(
+                model::load_ptts::<xn::quantized::Q4kF32>(
+                    config,
+                    voice_dir,
+                    temp,
+                    seed,
+                    mlen,
+                    xn::CPU,
+                )
+                .await?,
+            ))
         }
         Some(other) => anyhow::bail!("unsupported --quant value '{other}'"),
     };
