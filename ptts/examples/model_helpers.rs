@@ -201,7 +201,7 @@ impl Checkpoint {
 /// `config.json`. `temp` is not read by the runtime -- sampling temperature reaches the model
 /// through `SynthBuilder::temperature` -- so any value does.
 fn shipped_config() -> TTSConfig {
-    TTSConfig::v202601(0.7)
+    TTSConfig::v202601(0.5)
 }
 
 fn read_config(path: &Path) -> Result<TTSConfig> {

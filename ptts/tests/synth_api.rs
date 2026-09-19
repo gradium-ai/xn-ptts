@@ -10,7 +10,7 @@ use ptts::synth::{DeviceKind, Quant, SpeechOptions, Synth, SynthBuilder};
 /// A builder over `weights`, with the shipped config: every test here fails
 /// before the weights are read, so the config's contents do not matter.
 fn builder(weights: impl Into<std::path::PathBuf>) -> SynthBuilder {
-    Synth::builder(ptts::tts_model::TTSConfig::v202601(0.7), weights)
+    Synth::builder(ptts::tts_model::TTSConfig::v202601(0.5), weights)
 }
 
 #[test]
