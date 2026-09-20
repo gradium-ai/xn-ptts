@@ -70,16 +70,18 @@ fn run(args: Args) -> Result<()> {
 
     tracing::info!(?model_path, "loading model");
     let vb = model_helpers::load_weights::<xn::Unquantized<f32, xn::CpuDevice>>(&model_path, &dev)?;
-    let mimi_enc: MimiEnc<xn::Unquantized<f32, xn::CpuDevice>> = MimiEnc::load(&vb, &cfg)?;
 
     let emb = if args.input.ends_with(".safetensors") {
         // Stored `speaker_wavs` latents or an already computed `emb`: the loader tells them
-        // apart and puts the former through the checkpoint's speaker projection.
+        // apart and puts the former through the checkpoint's speaker projection. Only that
+        // projection is read, so a GGUF written with `quantize --no-mimi-encoder` works here.
         tracing::info!("loading voice from safetensors file {}", args.input);
         let speaker_proj = ptts::loader::load_speaker_proj(&vb, &cfg)?;
         let path = std::path::Path::new(&args.input);
         model_helpers::load_voice_emb(path, None, speaker_proj.as_ref(), &dev)?
     } else {
+        // Audio needs the speaker encoder, which only the full checkpoint carries.
+        let mimi_enc: MimiEnc<xn::Unquantized<f32, xn::CpuDevice>> = MimiEnc::load(&vb, &cfg)?;
         tracing::info!("loading voice from audio file {}", args.input);
         let pcm_tensor = load_voice_audio(&args.input, &cfg, &dev)?;
         tracing::info!("encoding audio to latent");
