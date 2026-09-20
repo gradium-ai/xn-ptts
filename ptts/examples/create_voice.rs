@@ -21,10 +21,10 @@ struct Args {
     #[arg(long)]
     output: std::path::PathBuf,
 
-    /// Voice to use: an audio file of ~10s, or a `.safetensors` file holding a
-    /// `speaker_wavs` tensor of speaker-Mimi latents, `[1, C, T]`, as stored by
-    /// the training pipeline. The latter skips the audio encoding and only
-    /// applies the model's speaker projection.
+    /// Voice to use: an audio file of ~10s, or a `.safetensors` file holding
+    /// either a `speaker_wavs` tensor of speaker-Mimi latents, `[1, C, T]`, as
+    /// stored by the training pipeline, or an `emb` tensor. The former skips
+    /// the audio encoding and only applies the model's speaker projection.
     #[arg(long)]
     input: String,
 }
@@ -70,14 +70,18 @@ fn run(args: Args) -> Result<()> {
 
     tracing::info!(?model_path, "loading model");
     let vb = model_helpers::load_weights::<xn::Unquantized<f32, xn::CpuDevice>>(&model_path, &dev)?;
-    let mimi_enc: MimiEnc<xn::Unquantized<f32, xn::CpuDevice>> = MimiEnc::load(&vb, &cfg)?;
 
     let emb = if args.input.ends_with(".safetensors") {
-        tracing::info!("loading speaker latents from {}", args.input);
-        let latents = load_speaker_latents(&args.input, &cfg, &dev)?;
-        tracing::info!(?latents, "loaded speaker latents");
-        mimi_enc.embed_latents(&latents)?
+        // Stored `speaker_wavs` latents or an already computed `emb`: the loader tells them
+        // apart and puts the former through the checkpoint's speaker projection. Only that
+        // projection is read, so a GGUF written with `quantize --no-mimi-encoder` works here.
+        tracing::info!("loading voice from safetensors file {}", args.input);
+        let speaker_proj = ptts::loader::load_speaker_proj(&vb, &cfg)?;
+        let path = std::path::Path::new(&args.input);
+        model_helpers::load_voice_emb(path, None, speaker_proj.as_ref(), &dev)?
     } else {
+        // Audio needs the speaker encoder, which only the full checkpoint carries.
+        let mimi_enc: MimiEnc<xn::Unquantized<f32, xn::CpuDevice>> = MimiEnc::load(&vb, &cfg)?;
         tracing::info!("loading voice from audio file {}", args.input);
         let pcm_tensor = load_voice_audio(&args.input, &cfg, &dev)?;
         tracing::info!("encoding audio to latent");
@@ -118,33 +122,4 @@ fn load_voice_audio(
         pcm
     };
     Ok(Tensor::from_vec(pcm, (1, 1, ()), dev)?)
-}
-
-/// The `speaker_wavs` tensor of a safetensors file: speaker-Mimi latents as `[1, C, T]`, with
-/// `C` the speaker encoder's dimension. A `[C, T]` tensor gets its batch dimension added.
-fn load_speaker_latents(
-    path: &str,
-    cfg: &ptts::tts_model::TTSConfig,
-    dev: &xn::CpuDevice,
-) -> Result<Tensor<f32, xn::CpuDevice>> {
-    const NAME: &str = "speaker_wavs";
-    let vb = xn::nn::VB::load(&[path], *dev)?;
-    let shape = vb
-        .shape(NAME)
-        .with_context(|| format!("no `{NAME}` tensor in {path}; found {:?}", vb.tensor_names()))?;
-    let dims = shape.dims().to_vec();
-    let latents: Tensor<f32, _> = vb.tensor(NAME, shape)?;
-    let latents = match dims.as_slice() {
-        [c, t] => latents.reshape((1, *c, *t))?,
-        [_, _, _] => latents,
-        _ => anyhow::bail!("`{NAME}` in {path} has shape {dims:?}, expected [1, C, T]"),
-    };
-    let dim = cfg.speaker_mimi_cfg().dimension;
-    if latents.dims()[1] != dim {
-        anyhow::bail!(
-            "`{NAME}` in {path} has {} channels but the speaker encoder has dimension {dim}",
-            latents.dims()[1]
-        )
-    }
-    Ok(latents)
 }

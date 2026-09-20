@@ -45,15 +45,19 @@ pub enum AppState {
     Metal(Arc<AppStateB<xn::Unquantized<f32, xn::MetalDevice>>>),
 }
 
+/// A checkpoint whose files are located. The voices are loaded once the model is, since a
+/// file of stored speaker latents goes through the checkpoint's speaker projection.
 struct LoadedModel<Q: BackendQ> {
     cfg: TTSConfig,
-    voices: HashMap<String, Tensor<Q::T, Q::B>>,
+    /// Voice name to embedding file.
+    voice_files: Vec<(String, std::path::PathBuf)>,
     tokenizer_path: std::path::PathBuf,
     model_path: std::path::PathBuf,
+    _q: std::marker::PhantomData<Q>,
 }
 
 impl<Q: BackendQ> LoadedModel<Q> {
-    async fn load_from_hf(repo_id: &str, temperature: f32, dev: &Q::B) -> Result<Self> {
+    async fn load_from_hf(repo_id: &str, temperature: f32) -> Result<Self> {
         tracing::info!("downloading model artifacts");
         let repo = crate::utils::HfRepo::model(repo_id)?;
         let config_path = repo.get("config.json").await?;
@@ -65,50 +69,33 @@ impl<Q: BackendQ> LoadedModel<Q> {
         tracing::info!(?model_path, "model weights ready");
         let tokenizer_path = repo.get("tokenizer.model").await?;
 
-        let mut voices: HashMap<String, Tensor<Q::T, Q::B>> = HashMap::new();
         let default_voice_path = repo.get("default-voice.safetensors").await?;
-        let default_voice = load_voice_emb(&default_voice_path, None, dev)
-            .with_context(|| "failed to load default voice embedding")?
-            .to::<Q::T>()
-            .with_context(|| "failed to convert default voice embedding")?;
-        voices.insert("default".to_string(), default_voice);
-        tracing::info!(num_voices = voices.len(), "voice embeddings loaded");
+        let voice_files = vec![("default".to_string(), default_voice_path)];
 
-        Ok(Self { cfg, voices, tokenizer_path, model_path })
+        Ok(Self { cfg, voice_files, tokenizer_path, model_path, _q: std::marker::PhantomData })
     }
 
-    async fn load_pocket_from_hf(temperature: f32, dev: &Q::B) -> Result<Self> {
+    async fn load_pocket_from_hf(temperature: f32) -> Result<Self> {
         tracing::info!("downloading model artifacts");
         let repo = crate::utils::HfRepo::model(DEFAULT_REPO_ID)?;
         let model_path = repo.get(DEFAULT_MODEL_FILE).await?;
         tracing::info!(?model_path, "model weights ready");
         let tokenizer_path = repo.get("tokenizer.model").await?;
 
-        let mut voices: HashMap<String, Tensor<Q::T, Q::B>> = HashMap::new();
+        let mut voice_files = Vec::new();
         for &voice in VOICES {
             let voice_file = format!("embeddings/{voice}.safetensors");
             match repo.get(&voice_file).await {
-                Ok(voice_path) => match load_voice_emb(&voice_path, None, dev) {
-                    Ok(emb) => match emb.to::<Q::T>() {
-                        Ok(emb) => {
-                            voices.insert(voice.to_string(), emb);
-                        }
-                        Err(e) => {
-                            tracing::warn!(?voice, error = %e, "failed to convert voice embedding")
-                        }
-                    },
-                    Err(e) => tracing::warn!(?voice, error = %e, "failed to load voice embedding"),
-                },
+                Ok(voice_path) => voice_files.push((voice.to_string(), voice_path)),
                 Err(e) => tracing::warn!(?voice, error = %e, "failed to download voice embedding"),
             }
         }
-        tracing::info!(num_voices = voices.len(), "voice embeddings loaded");
 
         let cfg = TTSConfig::v202601(temperature);
-        Ok(Self { cfg, voices, tokenizer_path, model_path })
+        Ok(Self { cfg, voice_files, tokenizer_path, model_path, _q: std::marker::PhantomData })
     }
 
-    fn load_from_path(config: &std::path::PathBuf, temperature: f32, dev: &Q::B) -> Result<Self> {
+    fn load_from_path(config: &std::path::PathBuf, temperature: f32) -> Result<Self> {
         let parent_dir = config
             .parent()
             .with_context(|| format!("failed to get parent directory of config path {config:?}"))?;
@@ -125,43 +112,15 @@ impl<Q: BackendQ> LoadedModel<Q> {
             );
         };
         let tokenizer_path = parent_dir.join("tokenizer.model");
-        let mut voices: HashMap<String, Tensor<Q::T, Q::B>> = HashMap::new();
-        for voice in parent_dir.join("voices").read_dir()? {
-            let voice = match voice {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let voice = voice.path();
-            if voice.extension().and_then(|e| e.to_str()) != Some("safetensors") {
-                continue;
-            }
-            let voice_name =
-                voice.file_stem().and_then(|s| s.to_str()).context("invalid voice file name")?;
-            match load_voice_emb(&voice, None, dev) {
-                Ok(emb) => match emb.to::<Q::T>() {
-                    Ok(emb) => {
-                        voices.insert(voice_name.to_string(), emb);
-                    }
-                    Err(e) => {
-                        tracing::warn!(?voice_name, error = %e, "failed to convert voice embedding")
-                    }
-                },
-                Err(e) => tracing::warn!(?voice_name, error = %e, "failed to load voice embedding"),
-            }
-        }
-        tracing::info!(num_voices = voices.len(), "voice embeddings loaded");
-        Ok(Self { cfg, voices, tokenizer_path, model_path })
+        let mut voice_files = Vec::new();
+        collect_voice_files(&parent_dir.join("voices"), &mut voice_files);
+        Ok(Self { cfg, voice_files, tokenizer_path, model_path, _q: std::marker::PhantomData })
     }
 }
 
-/// Load every `*.safetensors` file in `dir` as a voice embedding, keyed by file
-/// stem. Errors (unreadable directory, bad file, conversion failure) are logged
-/// and skipped rather than propagated.
-fn load_voices_from_dir<Q: BackendQ>(
-    dir: &std::path::Path,
-    dev: &Q::B,
-    voices: &mut HashMap<String, Tensor<Q::T, Q::B>>,
-) {
+/// Every `*.safetensors` file in `dir`, keyed by file stem, appended to `files`. An unreadable
+/// directory or entry is logged and skipped rather than propagated.
+fn collect_voice_files(dir: &std::path::Path, files: &mut Vec<(String, std::path::PathBuf)>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
@@ -180,25 +139,35 @@ fn load_voices_from_dir<Q: BackendQ>(
         if path.extension().and_then(|e| e.to_str()) != Some("safetensors") {
             continue;
         }
-        let voice_name = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(name) => name.to_string(),
-            None => {
-                tracing::warn!(?path, "invalid voice file name");
-                continue;
-            }
-        };
-        match load_voice_emb(&path, None, dev) {
-            Ok(emb) => match emb.to::<Q::T>() {
-                Ok(emb) => {
-                    voices.insert(voice_name, emb);
-                }
-                Err(e) => {
-                    tracing::warn!(?voice_name, error = %e, "failed to convert voice embedding")
-                }
-            },
-            Err(e) => tracing::warn!(?voice_name, error = %e, "failed to load voice embedding"),
+        match path.file_stem().and_then(|s| s.to_str()) {
+            Some(name) => files.push((name.to_string(), path)),
+            None => tracing::warn!(?path, "invalid voice file name"),
         }
     }
+}
+
+/// Load the voice files against `model`, whose speaker projection a file of stored speaker
+/// latents goes through. A voice that fails to load is logged and skipped: one bad file should
+/// not take the server down.
+fn load_voice_files<Q: BackendQ>(
+    model: &TTSModel<Q>,
+    files: &[(String, std::path::PathBuf)],
+) -> HashMap<String, Tensor<Q::T, Q::B>> {
+    let mut voices = HashMap::new();
+    for (name, path) in files {
+        match load_voice_emb(path, None, model.speaker_proj(), model.device()) {
+            Ok(emb) => match emb.to::<Q::T>() {
+                Ok(emb) => {
+                    voices.insert(name.clone(), emb);
+                }
+                Err(e) => {
+                    tracing::warn!(voice = %name, error = %e, "failed to convert voice embedding")
+                }
+            },
+            Err(e) => tracing::warn!(voice = %name, error = %e, "failed to load voice embedding"),
+        }
+    }
+    voices
 }
 
 pub async fn load_ptts<Q: BackendQ>(
@@ -211,17 +180,16 @@ pub async fn load_ptts<Q: BackendQ>(
 ) -> Result<AppStateB<Q>> {
     let mut m = match config {
         Some(config) if config.is_file() || config.extension().is_some_and(|v| v == "json") => {
-            LoadedModel::<Q>::load_from_path(config, temperature, &dev)?
+            LoadedModel::<Q>::load_from_path(config, temperature)?
         }
         Some(repo_id) => {
             let repo_id = repo_id.to_str().context("invalid repo ID path")?;
-            LoadedModel::<Q>::load_from_hf(repo_id, temperature, &dev).await?
+            LoadedModel::<Q>::load_from_hf(repo_id, temperature).await?
         }
-        None => LoadedModel::<Q>::load_pocket_from_hf(temperature, &dev).await?,
+        None => LoadedModel::<Q>::load_pocket_from_hf(temperature).await?,
     };
     if let Some(voice_dir) = voice_dir {
-        load_voices_from_dir::<Q>(voice_dir, &dev, &mut m.voices);
-        tracing::info!(num_voices = m.voices.len(), "voice embeddings loaded (incl. voice-dir)");
+        collect_voice_files(voice_dir, &mut m.voice_files);
     }
     let tokenizer = Tok::open(&m.tokenizer_path)
         .with_context(|| format!("failed to open tokenizer at {}", m.tokenizer_path.display()))?;
@@ -230,15 +198,18 @@ pub async fn load_ptts<Q: BackendQ>(
     let model: TTSModel<Q> = TTSModel::load(&vb, Box::new(tokenizer), &m.cfg)?;
     vb.check_all_used_with_ignore(is_unused_by_tts_model)?;
 
+    let voices = load_voice_files(&model, &m.voice_files);
+    tracing::info!(num_voices = voices.len(), "voice embeddings loaded");
+
     let sample_rate = model.sample_rate() as u32;
     let frame_size = (sample_rate as f64 / m.cfg.mimi.frame_rate).round() as u32;
-    let default_voice = match m.voices.keys().min() {
+    let default_voice = match voices.keys().min() {
         Some(name) => name.clone(),
         None => anyhow::bail!("no voice embeddings found in model"),
     };
     Ok(AppStateB {
         model: Arc::new(model),
-        voices: m.voices,
+        voices,
         default_voice,
         max_seq_len,
         temperature,

@@ -172,6 +172,7 @@ impl TTSConfig {
 pub struct TTSModel<Q: BackendQ> {
     pub flow_lm: FlowLM<Q>,
     pub mimi: MimiDecoder<Unquantized<f32, Q::B>>,
+    speaker_proj: Option<Linear<f32, Q::B>>,
     lsd_decode_steps: usize,
     eos_threshold: f32,
 }
@@ -189,10 +190,12 @@ impl<Q: BackendQ> TTSModel<Q> {
     ) -> Result<Self> {
         let flow_lm = FlowLM::load(&vb.pp("flow_lm"), tokenizer, &cfg.flow_lm)?;
         let mimi = MimiDecoder::load(&vb.pp("mimi"), &cfg.mimi)?;
+        let speaker_proj = crate::loader::load_speaker_proj(vb, cfg)?;
 
         Ok(Self {
             flow_lm,
             mimi,
+            speaker_proj,
             lsd_decode_steps: cfg.lsd_decode_steps,
             eos_threshold: cfg.eos_threshold,
         })
@@ -205,6 +208,12 @@ impl<Q: BackendQ> TTSModel<Q> {
 
     pub fn sample_rate(&self) -> usize {
         self.mimi.sample_rate
+    }
+
+    /// The checkpoint's speaker projection, when it has one. Voice files holding stored
+    /// speaker latents go through it in [`crate::loader::load_voice_emb`].
+    pub fn speaker_proj(&self) -> Option<&Linear<f32, Q::B>> {
+        self.speaker_proj.as_ref()
     }
 
     /// Initialize flow LM state with the given sequence length budget.
@@ -371,42 +380,43 @@ impl<Q: BackendQ> TTSModel<Q> {
     }
 }
 
+/// The speaker encoder: speaker-Mimi latents from audio, projected to the flow LM's width.
 pub struct MimiEnc<Q: BackendQ> {
-    speaker_proj: Option<Linear<Q::T, Q::B>>,
+    speaker_proj: Linear<Q::T, Q::B>,
     mimi: MimiEncoder<Unquantized<f32, Q::B>>,
 }
 
 impl<Q: BackendQ> MimiEnc<Q> {
+    /// Fails when the checkpoint has no speaker projection: the encoder's latents are not a
+    /// voice embedding on their own, and conditioning on them makes the model babble or stop
+    /// at once with no other symptom, so a missing weight is better caught here.
     pub fn load(vb: &Path<Q::B>, cfg: &TTSConfig) -> Result<Self> {
         let mimi_cfg = cfg.speaker_mimi_cfg();
         let mimi = MimiEncoder::load(&vb.pp(cfg.speaker_mimi_prefix()), mimi_cfg)?;
-        let speaker_proj = if vb.contains("flow_lm.speaker_proj_weight") {
-            let weights = vb
-                .tensor("flow_lm.speaker_proj_weight", (cfg.flow_lm.d_model, mimi_cfg.dimension))?;
-            Some(Linear::new(weights))
-        } else {
-            None
-        };
-        Ok(Self { speaker_proj, mimi })
+        if !vb.contains(crate::loader::SPEAKER_PROJ_WEIGHT) {
+            xn::bail!(
+                "checkpoint has a speaker encoder under `{}` but no speaker projection \
+                 (`{}`), which voice cloning needs. A GGUF written by an older `quantize \
+                 --no-mimi-encoder` dropped it: regenerate the GGUF from the safetensors \
+                 checkpoint.",
+                cfg.speaker_mimi_prefix(),
+                crate::loader::SPEAKER_PROJ_WEIGHT
+            )
+        }
+        let weights = vb.tensor(
+            crate::loader::SPEAKER_PROJ_WEIGHT,
+            (cfg.flow_lm.d_model, mimi_cfg.dimension),
+        )?;
+        Ok(Self { speaker_proj: Linear::new(weights), mimi })
     }
 
     /// Encode audio for voice conditioning. Returns [1, T', dim].
     pub fn encode_audio(&self, audio: &Tensor<Q::T, Q::B>) -> Result<Tensor<Q::T, Q::B>> {
         let f32_audio = audio.to::<f32>()?;
         let encoded = self.mimi.encode_to_latent(&f32_audio)?;
-        self.embed_latents(&encoded)
-    }
-
-    /// Turn speaker-Mimi latents, `[B, C, T]` as `encode_to_latent` lays them out, into the
-    /// voice embedding the flow LM is conditioned on, `[B, T, dim]`. This is the second half
-    /// of [`Self::encode_audio`], for callers that already hold the latents -- a
-    /// `speaker_wavs` tensor stored by the training pipeline, say -- rather than the audio.
-    pub fn embed_latents(&self, latents: &Tensor<f32, Q::B>) -> Result<Tensor<Q::T, Q::B>> {
-        let latents = latents.transpose(1, 2)?.contiguous()?.to::<Q::T>()?;
-        match self.speaker_proj.as_ref() {
-            Some(p) => p.forward(&latents),
-            None => Ok(latents),
-        }
+        // [B, C, T] -> [B, T, C]
+        let latents = encoded.transpose(1, 2)?.contiguous()?.to::<Q::T>()?;
+        self.speaker_proj.forward(&latents)
     }
 }
 

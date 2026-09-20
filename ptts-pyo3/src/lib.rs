@@ -167,7 +167,8 @@ impl<Q: BackendQ> ModelB<Q> {
     /// `name`, overwriting any existing voice with the same name.
     fn add_voice(&mut self, name: &str, voice_path: &std::path::Path) -> xn::Result<()> {
         let dev = self.inner.device().clone();
-        let voice_emb = load_voice_emb(voice_path, None, &dev)?.to::<Q::T>()?;
+        let voice_emb =
+            load_voice_emb(voice_path, None, self.inner.speaker_proj(), &dev)?.to::<Q::T>()?;
         self.voices.insert(name.to_string(), voice_emb);
         Ok(())
     }
@@ -853,7 +854,7 @@ fn load_model_<Q: BackendQ>(
     eos_threshold: Option<f32>,
     dev: Q::B,
 ) -> xn::Result<ModelB<Q>> {
-    let (model_path, tokenizer_path, cfg, voices) = match config {
+    let (model_path, tokenizer_path, cfg, voice_files) = match config {
         // A local config path: load the weights sitting next to it.
         Some(config_path)
             if std::path::Path::new(&config_path).is_file() || config_path.ends_with(".json") =>
@@ -872,7 +873,7 @@ fn load_model_<Q: BackendQ>(
                 .map_err(|e| xn::Error::msg(e).with_path(&config_path))?;
             let cfg: TTSConfig = serde_json::from_str(&config_str)
                 .map_err(|e| xn::Error::msg(e).with_path(&config_path))?;
-            (model_path, tokenizer_path, cfg, std::collections::HashMap::new())
+            (model_path, tokenizer_path, cfg, Vec::new())
         }
         // A HuggingFace repo id: download `config.json`, the quantized
         // `model.q8.gguf`, the tokenizer and the `default-voice` embedding.
@@ -889,7 +890,7 @@ fn load_model_<Q: BackendQ>(
             let model_path = hub_get(&repo, "model.q8.gguf")?;
             let tokenizer_path = hub_get(&repo, "tokenizer.model")?;
 
-            (model_path, tokenizer_path, cfg, std::collections::HashMap::new())
+            (model_path, tokenizer_path, cfg, Vec::new())
         }
         None => {
             let repo = hub_model(&repo_id)?;
@@ -897,19 +898,16 @@ fn load_model_<Q: BackendQ>(
             let model_path = hub_get(&repo, &model_file)?;
             let tokenizer_path = hub_get(&repo, "tokenizer.model")?;
 
-            let mut voices = std::collections::HashMap::new();
+            let mut voice_files = Vec::new();
             for &voice in POCKET_TTS_VOICES {
                 let voice_file = format!("embeddings/{voice}.safetensors");
-                if let Ok(voice_path) = hub_get(&repo, &voice_file)
-                    && let Ok(voice_emb) = load_voice_emb(&voice_path, None, &dev)
-                    && let Ok(voice_emb) = voice_emb.to::<Q::T>()
-                {
-                    voices.insert(voice.to_string(), voice_emb);
+                if let Ok(voice_path) = hub_get(&repo, &voice_file) {
+                    voice_files.push((voice.to_string(), voice_path));
                 }
             }
 
             let cfg = TTSConfig::v202601(temperature);
-            (model_path, tokenizer_path, cfg, voices)
+            (model_path, tokenizer_path, cfg, voice_files)
         }
     };
 
@@ -933,6 +931,17 @@ fn load_model_<Q: BackendQ>(
     } else {
         model
     };
+    // Voices load after the model: a file of stored speaker latents goes
+    // through the checkpoint's speaker projection. A voice that fails to load
+    // is skipped rather than failing the model, as before.
+    let mut voices = std::collections::HashMap::new();
+    for (name, path) in voice_files {
+        if let Ok(emb) = load_voice_emb(&path, None, model.speaker_proj(), model.device())
+            && let Ok(emb) = emb.to::<Q::T>()
+        {
+            voices.insert(name, emb);
+        }
+    }
     // Probe under the speaker prefix: a dedicated speaker codec ships its
     // encoder as `<speaker_mimi.prefix>.encoder.*` with no `mimi.encoder.*`.
     let enc_probe = format!("{}.encoder.model.0.conv.weight", cfg.speaker_mimi_prefix());
