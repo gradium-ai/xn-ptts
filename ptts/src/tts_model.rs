@@ -172,6 +172,7 @@ impl TTSConfig {
 pub struct TTSModel<Q: BackendQ> {
     pub flow_lm: FlowLM<Q>,
     pub mimi: MimiDecoder<Unquantized<f32, Q::B>>,
+    speaker_proj: Option<Linear<f32, Q::B>>,
     lsd_decode_steps: usize,
     eos_threshold: f32,
 }
@@ -189,10 +190,12 @@ impl<Q: BackendQ> TTSModel<Q> {
     ) -> Result<Self> {
         let flow_lm = FlowLM::load(&vb.pp("flow_lm"), tokenizer, &cfg.flow_lm)?;
         let mimi = MimiDecoder::load(&vb.pp("mimi"), &cfg.mimi)?;
+        let speaker_proj = crate::loader::load_speaker_proj(vb, cfg)?;
 
         Ok(Self {
             flow_lm,
             mimi,
+            speaker_proj,
             lsd_decode_steps: cfg.lsd_decode_steps,
             eos_threshold: cfg.eos_threshold,
         })
@@ -205,6 +208,12 @@ impl<Q: BackendQ> TTSModel<Q> {
 
     pub fn sample_rate(&self) -> usize {
         self.mimi.sample_rate
+    }
+
+    /// The checkpoint's speaker projection, when it has one. Voice files holding stored
+    /// speaker latents go through it in [`crate::loader::load_voice_emb`].
+    pub fn speaker_proj(&self) -> Option<&Linear<f32, Q::B>> {
+        self.speaker_proj.as_ref()
     }
 
     /// Initialize flow LM state with the given sequence length budget.

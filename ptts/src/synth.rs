@@ -255,7 +255,9 @@ impl<Q: BackendQ> SynthOf<Q> {
     pub fn add_voice_file(&mut self, name: &str, path: &FsPath) -> Result<()> {
         let dev = self.model.device().clone();
         let model_ext = self.cfg.model_ext();
-        let emb = loader::load_voice_emb(path, model_ext.as_deref(), &dev)?.to::<Q::T>()?;
+        let emb =
+            loader::load_voice_emb(path, model_ext.as_deref(), self.model.speaker_proj(), &dev)?
+                .to::<Q::T>()?;
         self.voices.insert(name.to_string(), Voice { emb, null_emb: None });
         Ok(())
     }

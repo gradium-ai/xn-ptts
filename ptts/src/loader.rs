@@ -4,7 +4,8 @@
 //! rename the same checkpoint keys, skip the same unused tensors and unpack voice files the same
 //! way. Keeping that here means a checkpoint layout change is one edit rather than four.
 
-use xn::nn::{Path, VB};
+use crate::tts_model::TTSConfig;
+use xn::nn::{Linear, Path, VB};
 use xn::{Backend, BackendQ, Result, Tensor};
 
 /// Maps upstream checkpoint names onto the names this crate's modules expect, dropping the
@@ -46,7 +47,6 @@ pub fn is_unused_by_tts_model(name: &str) -> bool {
         || name.starts_with("mimi.quantizer")
         || name.starts_with("mimi.encoder")
         || name.starts_with("speaker_mimi")
-        || name == "flow_lm.speaker_proj_weight"
         // A prefix, not the single `conv.conv.weight` the examples used to name: the ws-server
         // already matched it this way, and taking the union keeps every caller as permissive as
         // it was.
@@ -64,28 +64,106 @@ pub fn load_weights<Q: BackendQ>(path: &std::path::Path, dev: &Q::B) -> Result<P
     Ok(vb.root())
 }
 
-/// Loads a precomputed voice embedding as `[1, T, dim]`.
+/// Name of the speaker projection weight, as [`remap_key`] spells it.
+pub const SPEAKER_PROJ_WEIGHT: &str = "flow_lm.speaker_proj_weight";
+
+/// Tensor name of a precomputed voice embedding, as `create_voice` writes it.
+pub const EMB_TENSOR: &str = "emb";
+/// Tensor name of stored speaker-Mimi latents, as the training pipeline writes them.
+pub const SPEAKER_WAVS_TENSOR: &str = "speaker_wavs";
+
+/// The checkpoint's speaker projection, when it has one: the linear map from speaker-Mimi
+/// latents (`speaker_mimi_cfg().dimension` wide) to the flow LM's `d_model`. It turns stored
+/// `speaker_wavs` latents into the voice embedding the flow LM is conditioned on, see
+/// [`load_voice_emb`]. Kept in f32 like the embeddings it produces.
+pub fn load_speaker_proj<B: Backend>(
+    vb: &Path<B>,
+    cfg: &TTSConfig,
+) -> Result<Option<Linear<f32, B>>> {
+    if !vb.contains(SPEAKER_PROJ_WEIGHT) {
+        return Ok(None);
+    }
+    let shape = (cfg.flow_lm.d_model, cfg.speaker_mimi_cfg().dimension);
+    let weight = vb.tensor(SPEAKER_PROJ_WEIGHT, shape)?;
+    Ok(Some(Linear::new(weight)))
+}
+
+/// What a voice file holds, told apart by tensor name.
+enum VoiceTensor {
+    /// A voice embedding, `[T, dim]` or `[1, T, dim]`.
+    Emb,
+    /// Speaker-Mimi latents, `[C, T]` or `[1, C, T]`.
+    Latents,
+}
+
+/// Loads a voice embedding as `[1, T, dim]`.
 ///
-/// Voice files hold either `[T, dim]` or an already batched `[1, T, dim]`. When `model_ext` is
-/// given and the file records one of its own, the two must agree -- a voice conditioned on a
-/// different checkpoint produces confident nonsense rather than an error, so it is worth
-/// catching here. Pass `None` to skip the check.
+/// Two kinds of file are understood:
+///
+/// - An `emb` tensor, `[T, dim]` or `[1, T, dim]`: a precomputed embedding, as `create_voice`
+///   writes it. A file whose single tensor goes by another name -- the published voices call
+///   theirs `audio_prompt` -- is read the same way.
+/// - A `speaker_wavs` tensor, `[C, T]` or `[1, C, T]`: speaker-Mimi latents as the training
+///   pipeline stores them. They are transposed to `[1, T, C]` and, when `speaker_proj` is given,
+///   projected to the flow LM's width; see [`load_speaker_proj`]. A checkpoint without a
+///   projection conditions on the latents directly, so `None` returns them as they are.
+///
+/// When `model_ext` is given and the file records one of its own, the two must agree -- a voice
+/// conditioned on a different checkpoint produces confident nonsense rather than an error, so it
+/// is worth catching here. Pass `None` to skip the check.
 ///
 /// The result is f32 regardless of the backend's quantization; convert with `to::<Q::T>()`.
 pub fn load_voice_emb<B: Backend>(
     path: &std::path::Path,
     model_ext: Option<&str>,
+    speaker_proj: Option<&Linear<f32, B>>,
     dev: &B,
 ) -> Result<Tensor<f32, B>> {
     use xn::error::Context;
 
     let vb = VB::load(&[path], dev.clone())?;
     let names = vb.tensor_names();
-    let key = names.first().context("no tensors found in voice embedding file")?;
-    let shape = vb.shape(key).context("voice tensor not found")?;
+    let (name, kind) = if names.contains(&EMB_TENSOR) {
+        (EMB_TENSOR, VoiceTensor::Emb)
+    } else if names.contains(&SPEAKER_WAVS_TENSOR) {
+        (SPEAKER_WAVS_TENSOR, VoiceTensor::Latents)
+    } else {
+        let first = names.first().context("no tensors found in voice embedding file")?;
+        (*first, VoiceTensor::Emb)
+    };
+    let shape = vb.shape(name).context("voice tensor not found")?;
     let dims = shape.dims().to_vec();
-    let emb: Tensor<f32, B> = vb.tensor(key, shape)?;
-    let emb = if dims.len() == 2 { emb.reshape((1, dims[0], dims[1]))? } else { emb };
+    let tensor: Tensor<f32, B> = vb.tensor(name, shape)?;
+    let tensor = match dims.as_slice() {
+        [a, b] => tensor.reshape((1, *a, *b))?,
+        [_, _, _] => tensor,
+        _ => xn::bail!(
+            "voice tensor `{name}` in {} has shape {dims:?}, expected two or three dimensions",
+            path.display()
+        ),
+    };
+    let emb = match kind {
+        VoiceTensor::Emb => tensor,
+        VoiceTensor::Latents => {
+            // [1, C, T] -> [1, T, C]
+            let latents = tensor.transpose(1, 2)?.contiguous()?;
+            match speaker_proj {
+                None => latents,
+                Some(proj) => {
+                    let channels = latents.dim(2usize)?;
+                    let in_dim = proj.weight().dims()[1];
+                    if channels != in_dim {
+                        xn::bail!(
+                            "`{SPEAKER_WAVS_TENSOR}` in {} has {channels} channels but the speaker \
+                             projection takes {in_dim}",
+                            path.display()
+                        )
+                    }
+                    proj.forward(&latents)?
+                }
+            }
+        }
+    };
     if let Some(model_ext) = model_ext {
         check_model_ext(path, model_ext)?;
     }
@@ -220,7 +298,6 @@ mod tests {
             "mimi.quantizer.output_proj.weight",
             "mimi.encoder.layers.0.weight",
             "speaker_mimi.encoder.weight",
-            "flow_lm.speaker_proj_weight",
             "mimi.downsample.conv.conv.weight",
             "mimi.downsample.something_else",
         ] {
@@ -228,5 +305,59 @@ mod tests {
         }
         assert!(!is_unused_by_tts_model("flow_lm.transformer.layers.0.linear1.weight"));
         assert!(!is_unused_by_tts_model("mimi.decoder.layers.0.weight"));
+        // Read by `TTSModel::load` for `load_voice_emb`, so no longer ignorable.
+        assert!(!is_unused_by_tts_model(SPEAKER_PROJ_WEIGHT));
+    }
+
+    fn save_voice(name: &str, file: &str, t: Tensor<f32, xn::CpuDevice>) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(file);
+        let tensors =
+            std::collections::HashMap::from([(name.to_string(), xn::TypedTensor::F32(t))]);
+        xn::safetensors::save_with_data_info(&tensors, None, &path).unwrap();
+        path
+    }
+
+    fn values(t: &Tensor<f32, xn::CpuDevice>) -> Vec<f32> {
+        t.flatten_all().unwrap().to_vec1().unwrap()
+    }
+
+    #[test]
+    fn voice_emb_is_batched_whatever_its_name() {
+        let dev = xn::CpuDevice;
+        let data: Vec<f32> = (0..6).map(|v| v as f32).collect();
+        for (name, file) in [
+            ("emb", "ptts-loader-voice-emb.safetensors"),
+            ("audio_prompt", "ptts-loader-voice-legacy.safetensors"),
+        ] {
+            let t = Tensor::from_vec(data.clone(), (3, 2), &dev).unwrap();
+            let path = save_voice(name, file, t);
+            let emb = load_voice_emb(&path, None, None, &dev).unwrap();
+            assert_eq!(emb.dims(), &[1, 3, 2], "{name}");
+            assert_eq!(values(&emb), data, "{name}");
+        }
+    }
+
+    #[test]
+    fn speaker_wavs_are_transposed_and_projected() {
+        let dev = xn::CpuDevice;
+        // C = 2 channels, T = 3 frames, latents[c][t] = 10 * c + t.
+        let latents = Tensor::from_vec(vec![0., 1., 2., 10., 11., 12.], (2, 3), &dev).unwrap();
+        let path = save_voice("speaker_wavs", "ptts-loader-voice-latents.safetensors", latents);
+
+        // No projection: the transposed latents are the embedding.
+        let emb = load_voice_emb(&path, None, None, &dev).unwrap();
+        assert_eq!(emb.dims(), &[1, 3, 2]);
+        assert_eq!(values(&emb), vec![0., 10., 1., 11., 2., 12.]);
+
+        // W = [[1, 0], [0, 2]] maps [x0, x1] to [x0, 2 * x1].
+        let w = Tensor::from_vec(vec![1., 0., 0., 2.], (2, 2), &dev).unwrap();
+        let emb = load_voice_emb(&path, None, Some(&Linear::new(w)), &dev).unwrap();
+        assert_eq!(emb.dims(), &[1, 3, 2]);
+        assert_eq!(values(&emb), vec![0., 20., 1., 22., 2., 24.]);
+
+        // A projection expecting three channels rejects two-channel latents.
+        let w = Tensor::from_vec(vec![0.; 6], (2, 3), &dev).unwrap();
+        let err = load_voice_emb(&path, None, Some(&Linear::new(w)), &dev).unwrap_err().to_string();
+        assert!(err.contains("2 channels") && err.contains("takes 3"), "{err}");
     }
 }

@@ -20,7 +20,9 @@ struct Args {
     #[arg(long)]
     force_bf16: bool,
 
-    /// Also exclude mimi.encoder* weights from the output
+    /// Also exclude the speaker encoder (mimi.encoder*, mimi_speaker.*) from the output,
+    /// for a model that will only be used with precomputed voices. The speaker projection
+    /// is kept: voice files of stored `speaker_wavs` latents still go through it.
     #[arg(long)]
     no_mimi_encoder: bool,
 }
@@ -28,9 +30,11 @@ struct Args {
 fn is_excluded(name: &str, no_mimi_encoder: bool) -> bool {
     #[allow(clippy::collapsible_if)]
     if no_mimi_encoder {
+        // The speaker projection (`...speaker_wavs.output_proj.weight`) is deliberately not
+        // in this list: `load_voice_emb` applies it to stored latents, encoder or not, and a
+        // GGUF without it conditions such voices on unprojected latents.
         if name.starts_with("mimi.encoder")
             || name == "mimi.downsample.conv.conv.weight"
-            || name == "flow_lm.condition_provider.conditioners.speaker_wavs.output_proj.weight"
             || name.starts_with("mimi_speaker.")
         {
             return true;

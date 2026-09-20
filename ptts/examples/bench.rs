@@ -211,9 +211,13 @@ impl Bench<'_> {
         let vb = model_helpers::load_weights::<Q>(&args.model, &dev)?;
         let model: TTSModel<Q> = TTSModel::load(&vb, Box::new(tokenizer), &cfg)?;
         vb.check_all_used_with_ignore(model_helpers::is_unused_by_tts_model)?;
-        let voice_emb =
-            model_helpers::load_voice_emb(&args.voice, cfg.model_ext().as_deref(), &dev)?
-                .to::<Q::T>()?;
+        let voice_emb = model_helpers::load_voice_emb(
+            &args.voice,
+            cfg.model_ext().as_deref(),
+            model.speaker_proj(),
+            &dev,
+        )?
+        .to::<Q::T>()?;
         let load_ms = ms(t_load.elapsed());
 
         // Tokenize up front: the loop needs the tokens anyway, and the KV cache is sized from
