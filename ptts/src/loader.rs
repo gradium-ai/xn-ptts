@@ -104,9 +104,10 @@ enum VoiceTensor {
 ///   writes it. A file whose single tensor goes by another name -- the published voices call
 ///   theirs `audio_prompt` -- is read the same way.
 /// - A `speaker_wavs` tensor, `[C, T]` or `[1, C, T]`: speaker-Mimi latents as the training
-///   pipeline stores them. They are transposed to `[1, T, C]` and, when `speaker_proj` is given,
-///   projected to the flow LM's width; see [`load_speaker_proj`]. A checkpoint without a
-///   projection conditions on the latents directly, so `None` returns them as they are.
+///   pipeline stores them. They are transposed to `[1, T, C]` and projected to the flow LM's
+///   width by `speaker_proj`, see [`load_speaker_proj`]. Such a file cannot be used without the
+///   projection -- unprojected latents make the model babble or stop at once, with no other
+///   symptom -- so `None` is an error for this kind of file and is ignored for the other.
 ///
 /// When `model_ext` is given and the file records one of its own, the two must agree -- a voice
 /// conditioned on a different checkpoint produces confident nonsense rather than an error, so it
@@ -147,21 +148,26 @@ pub fn load_voice_emb<B: Backend>(
         VoiceTensor::Latents => {
             // [1, C, T] -> [1, T, C]
             let latents = tensor.transpose(1, 2)?.contiguous()?;
-            match speaker_proj {
-                None => latents,
-                Some(proj) => {
-                    let channels = latents.dim(2usize)?;
-                    let in_dim = proj.weight().dims()[1];
-                    if channels != in_dim {
-                        xn::bail!(
-                            "`{SPEAKER_WAVS_TENSOR}` in {} has {channels} channels but the speaker \
-                             projection takes {in_dim}",
-                            path.display()
-                        )
-                    }
-                    proj.forward(&latents)?
-                }
+            let Some(proj) = speaker_proj else {
+                xn::bail!(
+                    "{} holds `{SPEAKER_WAVS_TENSOR}` latents, but this checkpoint has no speaker \
+                     projection (`{SPEAKER_PROJ_WEIGHT}`) to turn them into a voice embedding. A \
+                     GGUF written by an older `quantize --no-mimi-encoder` dropped it: regenerate \
+                     the GGUF from the safetensors checkpoint, or use a precomputed `{EMB_TENSOR}` \
+                     voice.",
+                    path.display()
+                )
+            };
+            let channels = latents.dim(2usize)?;
+            let in_dim = proj.weight().dims()[1];
+            if channels != in_dim {
+                xn::bail!(
+                    "`{SPEAKER_WAVS_TENSOR}` in {} has {channels} channels but the speaker \
+                     projection takes {in_dim}",
+                    path.display()
+                )
             }
+            proj.forward(&latents)?
         }
     };
     if let Some(model_ext) = model_ext {
@@ -344,10 +350,9 @@ mod tests {
         let latents = Tensor::from_vec(vec![0., 1., 2., 10., 11., 12.], (2, 3), &dev).unwrap();
         let path = save_voice("speaker_wavs", "ptts-loader-voice-latents.safetensors", latents);
 
-        // No projection: the transposed latents are the embedding.
-        let emb = load_voice_emb(&path, None, None, &dev).unwrap();
-        assert_eq!(emb.dims(), &[1, 3, 2]);
-        assert_eq!(values(&emb), vec![0., 10., 1., 11., 2., 12.]);
+        // Latents are unusable without the projection.
+        let err = load_voice_emb(&path, None, None, &dev).unwrap_err().to_string();
+        assert!(err.contains("no speaker projection"), "{err}");
 
         // W = [[1, 0], [0, 2]] maps [x0, x1] to [x0, 2 * x1].
         let w = Tensor::from_vec(vec![1., 0., 0., 2.], (2, 2), &dev).unwrap();
