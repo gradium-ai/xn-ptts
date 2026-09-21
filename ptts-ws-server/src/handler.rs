@@ -1,44 +1,24 @@
 use crate::encoder::{Encoder, Format};
-use crate::model::{AppState, AppStateB, generate_chunks};
+use crate::model::AppState;
 use crate::protocol::{TtsReply, TtsRequest, error_codes};
 use anyhow::Result;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use ptts::tts_model::TTSState;
-use std::sync::Arc;
+use ptts::synth::{Session, SpeechOptions};
 
 pub async fn ws_handler(
     State(app): State<AppState>,
     ws: WebSocketUpgrade,
 ) -> axum::response::Response {
     async fn handle_socket(socket: WebSocket, app: AppState) {
-        let result = match app {
-            AppState::Cpu(s) => serve_q(socket, s).await,
-            AppState::Q80(s) => serve_q(socket, s).await,
-            AppState::Q81(s) => serve_q(socket, s).await,
-            AppState::Q8k(s) => serve_q(socket, s).await,
-            AppState::Q6k(s) => serve_q(socket, s).await,
-            AppState::Q50(s) => serve_q(socket, s).await,
-            AppState::Q51(s) => serve_q(socket, s).await,
-            AppState::Q5k(s) => serve_q(socket, s).await,
-            AppState::Q40(s) => serve_q(socket, s).await,
-            AppState::Q41(s) => serve_q(socket, s).await,
-            AppState::Q4k(s) => serve_q(socket, s).await,
-            #[cfg(feature = "cuda")]
-            AppState::Cuda(s) => serve_q(socket, s).await,
-            #[cfg(feature = "vulkan")]
-            AppState::Vulkan(s) => serve_q(socket, s).await,
-            #[cfg(feature = "metal")]
-            AppState::Metal(s) => serve_q(socket, s).await,
-        };
-        if let Err(e) = result {
+        if let Err(e) = serve(socket, app).await {
             tracing::error!(error = %e, "ws session terminated");
         }
     }
     ws.on_upgrade(move |socket| handle_socket(socket, app))
 }
 
-async fn serve_q<Q: xn::BackendQ>(socket: WebSocket, app: Arc<AppStateB<Q>>) -> Result<()> {
+async fn serve(socket: WebSocket, app: AppState) -> Result<()> {
     use futures_util::{SinkExt, StreamExt};
     let (mut tx, mut rx) = socket.split();
     let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -61,18 +41,18 @@ async fn serve_q<Q: xn::BackendQ>(socket: WebSocket, app: Arc<AppStateB<Q>>) -> 
     outcome
 }
 
-enum SessionState<Q: xn::BackendQ> {
+enum SessionState {
     Awaiting,
-    Ready { base_state: TTSState<Q>, text_buffer: String, stream_id: u32, encoder: Box<Encoder> },
+    Ready { session: Session, text_buffer: String, stream_id: u32, encoder: Box<Encoder> },
 }
 
-async fn run_session<Q: xn::BackendQ>(
-    app: Arc<AppStateB<Q>>,
+async fn run_session(
+    app: AppState,
     stream: &mut futures_util::stream::SplitStream<WebSocket>,
     reply_tx: &tokio::sync::mpsc::UnboundedSender<TtsReply>,
 ) -> Result<()> {
     use futures_util::StreamExt;
-    let mut sess: SessionState<Q> = SessionState::Awaiting;
+    let mut sess: SessionState = SessionState::Awaiting;
 
     while let Some(msg) = stream.next().await {
         let msg = msg?;
@@ -124,17 +104,17 @@ async fn run_session<Q: xn::BackendQ>(
                 text_buffer.push_str(&text);
             }
             (
-                SessionState::Ready { base_state, text_buffer, stream_id, encoder },
+                SessionState::Ready { session, text_buffer, stream_id, encoder },
                 TtsRequest::Flush { flush_id },
             ) => {
-                flush_buffer(&app, base_state, text_buffer, stream_id, encoder, reply_tx).await?;
+                flush_buffer(&app, session, text_buffer, stream_id, encoder, reply_tx).await?;
                 let _ = reply_tx.send(TtsReply::Flushed { flush_id });
             }
             (
-                SessionState::Ready { base_state, text_buffer, stream_id, encoder },
+                SessionState::Ready { session, text_buffer, stream_id, encoder },
                 TtsRequest::EndOfStream,
             ) => {
-                flush_buffer(&app, base_state, text_buffer, stream_id, encoder, reply_tx).await?;
+                flush_buffer(&app, session, text_buffer, stream_id, encoder, reply_tx).await?;
                 let _ = reply_tx.send(TtsReply::EndOfStream);
                 tracing::info!("websocket stream closed by client (end of stream)");
                 return Ok(());
@@ -145,9 +125,9 @@ async fn run_session<Q: xn::BackendQ>(
     Ok(())
 }
 
-async fn flush_buffer<Q: xn::BackendQ>(
-    app: &Arc<AppStateB<Q>>,
-    base_state: &TTSState<Q>,
+async fn flush_buffer(
+    app: &AppState,
+    session: &Session,
     text_buffer: &mut String,
     stream_id: &mut u32,
     encoder: &mut Encoder,
@@ -159,22 +139,22 @@ async fn flush_buffer<Q: xn::BackendQ>(
     let stream_id_now = *stream_id;
     *stream_id = stream_id.saturating_add(1);
     let text = std::mem::take(text_buffer);
-    if let Err(e) = generate_one(app, base_state, &text, stream_id_now, encoder, reply_tx).await {
+    if let Err(e) = generate_one(app, session, &text, stream_id_now, encoder, reply_tx).await {
         tracing::warn!(error = %e, stream_id = stream_id_now, "generation failed");
         send_error(reply_tx, error_codes::INTERNAL, format!("generation failed: {e}"))?;
     }
     Ok(())
 }
 
-async fn handle_setup<Q: xn::BackendQ>(
-    app: &Arc<AppStateB<Q>>,
+async fn handle_setup(
+    app: &AppState,
     model_name: String,
     output_format: String,
     voice: Option<String>,
     voice_id: Option<String>,
     voice_emb: Option<String>,
     reply_tx: &tokio::sync::mpsc::UnboundedSender<TtsReply>,
-) -> Result<Option<SessionState<Q>>> {
+) -> Result<Option<SessionState>> {
     if voice_emb.as_deref().is_some_and(|s| !s.is_empty()) {
         send_error(
             reply_tx,
@@ -208,25 +188,21 @@ async fn handle_setup<Q: xn::BackendQ>(
         .unwrap_or(&app.default_voice);
     let voice_name =
         if voice_name == "default" { &app.default_voice } else { voice_name }.to_string();
-    let voice_emb_t = match app.voices.get(&voice_name) {
-        Some(v) => v,
-        None => {
-            send_error(reply_tx, error_codes::NOT_FOUND, format!("unknown voice '{voice_name}'"))?;
-            return Ok(None);
-        }
-    };
-    let mut base_state = match app.model.init_flow_lm_state(1, app.max_seq_len) {
-        Ok(s) => s,
-        Err(e) => {
-            send_error(reply_tx, error_codes::INTERNAL, format!("init_flow_lm_state failed: {e}"))?;
-            return Ok(None);
-        }
-    };
-    tracing::info!(?voice_name, "starting new TTS session");
-    if let Err(e) = app.model.prompt_audio(&mut base_state, voice_emb_t) {
-        send_error(reply_tx, error_codes::INTERNAL, format!("prompt_audio failed: {e}"))?;
+    if !app.voices.contains(&voice_name) {
+        send_error(reply_tx, error_codes::NOT_FOUND, format!("unknown voice '{voice_name}'"))?;
         return Ok(None);
     }
+    tracing::info!(?voice_name, "starting new TTS session");
+    // Conditioning on the voice happens once here, not per request: every
+    // generation below clones this primed state.
+    let opts = SpeechOptions::default().voice(voice_name.clone());
+    let session = match app.synth.session(&opts, app.max_seq_len) {
+        Ok(session) => session,
+        Err(e) => {
+            send_error(reply_tx, error_codes::INTERNAL, format!("failed to prime voice: {e}"))?;
+            return Ok(None);
+        }
+    };
     tracing::info!(?voice_name, "prompted voice embedding");
     let request_id = uuid::Uuid::new_v4().to_string();
     let model_name =
@@ -251,16 +227,16 @@ async fn handle_setup<Q: xn::BackendQ>(
         }
     }
     Ok(Some(SessionState::Ready {
-        base_state,
+        session,
         text_buffer: String::new(),
         stream_id: 0,
         encoder: Box::new(encoder),
     }))
 }
 
-async fn generate_one<Q: xn::BackendQ>(
-    app: &Arc<AppStateB<Q>>,
-    base_state: &TTSState<Q>,
+async fn generate_one(
+    app: &AppState,
+    session: &Session,
     text: &str,
     stream_id: u32,
     encoder: &mut Encoder,
@@ -268,31 +244,50 @@ async fn generate_one<Q: xn::BackendQ>(
 ) -> Result<()> {
     use base64::Engine;
 
+    // One request is one utterance: prepare and tokenize it here rather than
+    // letting `Session::stream` split it on sentence boundaries, which is what
+    // this server did before and what its stream ids assume.
     let (prepared, frames_after_eos) = ptts::tts_model::prepare_text_prompt(text);
-    let tokens = app.model.flow_lm.conditioner.tokenize(&prepared)?;
-    let state = base_state.clone();
-    let model = Arc::clone(&app.model);
-    let temperature = app.temperature;
+    let tokens = session.tokenize(&prepared)?;
     let seed = app.seed_base ^ (stream_id as u64).wrapping_mul(0x9E3779B97F4A7C15);
+    let rng = Box::new(ptts::flow_lm::NormalRng::new(app.temperature, seed)?);
 
     let (audio_tx, mut audio_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f32>>();
-    let join = tokio::task::spawn_blocking(move || {
-        generate_chunks(model, state, tokens, temperature, seed, frames_after_eos, audio_tx)
+    let stream = session.stream_tokens(tokens, frames_after_eos, rng)?;
+    // The generation threads are `Synth`'s; this one just moves chunks onto the
+    // tokio channel so the socket writer stays async.
+    let join = tokio::task::spawn_blocking(move || -> Result<()> {
+        for chunk in stream {
+            // A send failure means the client went away; dropping `stream`
+            // stops the workers.
+            if audio_tx.send(chunk?).is_err() {
+                break;
+            }
+        }
+        Ok(())
     });
 
-    while let Some(pcm) = audio_rx.recv().await {
-        let encoded = encoder.encode(&pcm)?;
-        let audio = base64::engine::general_purpose::STANDARD.encode(&encoded.data);
-        if reply_tx
-            .send(TtsReply::Audio {
-                audio,
-                start_s: encoded.start_s,
-                stop_s: encoded.stop_s,
-                stream_id,
-            })
-            .is_err()
-        {
-            break;
+    // `SpeechStream` decodes every queued latent in one call, so a chunk can
+    // carry several Mimi frames. The resampled formats build their
+    // `FftFixedInOut` for exactly one `frame_size`, so feed it a frame at a
+    // time rather than whatever the batch happened to be.
+    let frame = app.frame_size as usize;
+    'send: while let Some(pcm) = audio_rx.recv().await {
+        for pcm in pcm.chunks(frame) {
+            let encoded = encoder.encode(pcm)?;
+            let audio = base64::engine::general_purpose::STANDARD.encode(&encoded.data);
+            if reply_tx
+                .send(TtsReply::Audio {
+                    audio,
+                    start_s: encoded.start_s,
+                    stop_s: encoded.stop_s,
+                    stream_id,
+                })
+                .is_err()
+            {
+                // The client is gone; stop draining entirely, not just this batch.
+                break 'send;
+            }
         }
     }
     drop(audio_rx);
