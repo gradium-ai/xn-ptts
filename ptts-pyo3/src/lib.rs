@@ -199,8 +199,21 @@ impl Tts {
             None => Quant::F32,
             Some(name) => Quant::parse(name).py()?,
         };
-        // Reject an impossible combination before resolve() downloads anything.
+        // Both checks happen before resolve() downloads anything; `SynthBuilder`
+        // would catch them, but only once the checkpoint is on disk.
         quant.check_device(device).py()?;
+        let unavailable = match device {
+            DeviceKind::Cuda if !cfg!(feature = "cuda") => Some("cuda"),
+            DeviceKind::Vulkan if !cfg!(feature = "vulkan") => Some("vulkan"),
+            DeviceKind::Metal if !cfg!(feature = "metal") => Some("metal"),
+            _ => None,
+        };
+        if let Some(name) = unavailable {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "device '{name}' is not available in this build; available: {:?}",
+                available_devices()
+            )));
+        }
         // Loading reads hundreds of megabytes and runs no Python.
         py.detach(move || {
             let artifacts = resolve(config.as_deref(), temperature).py()?;
@@ -210,9 +223,6 @@ impl Tts {
                 .quant(quant)
                 .temperature(temperature)
                 .seed(seed);
-            for (name, path) in artifacts.voices.iter() {
-                builder = builder.add_voice(name, path);
-            }
             if let Some(voice) = voice {
                 builder = builder.voice(voice);
             }
@@ -222,7 +232,16 @@ impl Tts {
             if let Some(eos_threshold) = eos_threshold {
                 builder = builder.eos_threshold(eos_threshold);
             }
-            Ok(Self { inner: Arc::new(Mutex::new(builder.build().py()?)) })
+            let mut synth = builder.build().py()?;
+            // Registered after the build, not through it: the builder
+            // propagates a bad voice file, and a checkpoint shipping one
+            // unreadable voice should not stop the model from loading.
+            for (name, path) in artifacts.voices.iter() {
+                // Skipped rather than propagated, as before: `TTS.voices` shows
+                // which ones made it.
+                let _ = synth.add_voice_file(name, path);
+            }
+            Ok(Self { inner: Arc::new(Mutex::new(synth)) })
         })
     }
 
