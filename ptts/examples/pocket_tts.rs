@@ -1,7 +1,7 @@
 //! Generate speech from text on the command line.
 //!
 //! ```text
-//! cargo run --release --example pocket_tts --features sp -- "hello world" -o out.wav
+//! cargo run --release --example pocket_tts --features sp,audio -- "hello world" -o out.wav
 //! ```
 //!
 //! Everything between the text and the WAV file is [`ptts::synth::Synth`]; what

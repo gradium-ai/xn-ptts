@@ -38,6 +38,11 @@ pub fn decode_file(path: &std::path::Path) -> Result<(Vec<f32>, u32)> {
         .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
         .ok_or_else(|| xn::Error::msg(format!("no audio track in {}", path.display())))?;
     let track_id = track.id;
+    if format.tracks().len() > 1 {
+        let others: Vec<_> =
+            format.tracks().iter().map(|t| t.id).filter(|id| *id != track_id).collect();
+        tracing::info!(?path, chosen = track_id, ignored = ?others, "file has several tracks");
+    }
     let sample_rate = track
         .codec_params
         .sample_rate
@@ -47,9 +52,19 @@ pub fn decode_file(path: &std::path::Path) -> Result<(Vec<f32>, u32)> {
         .map_err(|e| xn::Error::msg(format!("unsupported codec in {}: {e}", path.display())))?;
 
     let mut pcm = Vec::new();
-    // `next_packet` returning Err is how symphonia signals end of stream, so a
-    // clean finish and a truncated file look the same here.
-    while let Ok(packet) = format.next_packet() {
+    loop {
+        // Symphonia signals a clean end with an UnexpectedEof io error. Every
+        // other failure -- a container corrupt halfway through, a read error on
+        // a network mount -- would otherwise return Ok with a truncated prompt.
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(symphonia::core::errors::Error::IoError(e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(e) => xn::bail!("cannot read {}: {e}", path.display()),
+        };
         while !format.metadata().is_latest() {
             format.metadata().pop();
         }
@@ -88,12 +103,16 @@ where
     pcm.extend(buf.chan(0).iter().map(|v| f32::from_sample(*v)))
 }
 
-/// Resample mono `f32` from `sr_in` to `sr_out`. A no-op when they match.
-pub fn resample(pcm: &[f32], sr_in: usize, sr_out: usize) -> Result<Vec<f32>> {
+/// Resample mono `f32` from `sr_in` to `sr_out`.
+///
+/// Takes the buffer by value so that matching rates — the common case for a
+/// voice file already at the speaker codec's rate — hand it straight back
+/// rather than copying it.
+pub fn resample(pcm: Vec<f32>, sr_in: usize, sr_out: usize) -> Result<Vec<f32>> {
     use rubato::Resampler;
 
     if sr_in == sr_out {
-        return Ok(pcm.to_vec());
+        return Ok(pcm);
     }
     let mut out =
         Vec::with_capacity((pcm.len() as f64 * sr_out as f64 / sr_in as f64) as usize + 1024);
@@ -134,7 +153,7 @@ pub fn resample(pcm: &[f32], sr_in: usize, sr_out: usize) -> Result<Vec<f32>> {
 pub fn load_mono_at(path: &std::path::Path, sample_rate: usize) -> Result<Vec<f32>> {
     let (pcm, file_rate) = decode_file(path)?;
     tracing::info!(?path, samples = pcm.len(), rate = file_rate, "decoded audio");
-    resample(&pcm, file_rate as usize, sample_rate)
+    resample(pcm, file_rate as usize, sample_rate)
 }
 
 #[cfg(test)]
@@ -144,7 +163,7 @@ mod tests {
     #[test]
     fn resampling_to_the_same_rate_is_a_copy() {
         let pcm = vec![0.1, -0.2, 0.3];
-        assert_eq!(resample(&pcm, 24000, 24000).unwrap(), pcm);
+        assert_eq!(resample(pcm.clone(), 24000, 24000).unwrap(), pcm);
     }
 
     #[test]
@@ -152,7 +171,7 @@ mod tests {
         // 2s at 16kHz to 24kHz should land near 2s again; the FFT resampler
         // works in blocks, so allow a block of slack.
         let pcm = vec![0f32; 32_000];
-        let out = resample(&pcm, 16_000, 24_000).unwrap();
+        let out = resample(pcm, 16_000, 24_000).unwrap();
         assert!(
             (out.len() as f64 - 48_000.0).abs() < 2048.0,
             "expected ~48000 samples, got {}",

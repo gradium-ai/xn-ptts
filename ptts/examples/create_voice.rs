@@ -105,12 +105,9 @@ fn load_voice_audio(
     let speaker_sr = cfg.speaker_mimi_cfg().sample_rate;
     let (mut pcm, sample_rate) = ptts::audio::decode_file(std::path::Path::new(path))?;
     ptts::utils::normalize_loudness(&mut pcm, sample_rate)?;
-    let sample_rate = sample_rate as usize;
-    let pcm = if sample_rate != speaker_sr {
-        ptts::audio::resample(&pcm, sample_rate, speaker_sr)?
-    } else {
-        pcm
-    };
+    // Unconditional: `resample` hands the buffer back untouched when the rates
+    // already match.
+    let pcm = ptts::audio::resample(pcm, sample_rate as usize, speaker_sr)?;
     tracing::info!("loaded audio with {} samples", pcm.len());
     // Trim it to 10s max.
     let pcm = if pcm.len() > speaker_sr * 10 {
