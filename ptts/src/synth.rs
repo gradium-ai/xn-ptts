@@ -358,17 +358,19 @@ impl<Q: BackendQ> SynthOf<Q> {
     ///
     /// `max_seq_len` is the KV budget, allocated up front and held until the
     /// session is dropped. At 12.5 Hz a full [`MAX_TOKENS_PER_CHUNK`]-token
-    /// chunk needs 796, so 1024 covers any single
+    /// chunk needs 796, so 1024 covers any
+    /// single chunk; longer text is split into chunks of that size rather than
+    /// needing more.
     pub fn session(&self, opts: &SpeechOptions, max_seq_len: usize) -> Result<SessionOf<Q>> {
-        self.session_at(opts, max_seq_len)
+        self.session_at(&resolve(&self.defaults, opts), max_seq_len)
     }
 
     /// Build a session, sized to `seq_budget`.
-    fn session_at(&self, opts: &SpeechOptions, seq_budget: usize) -> Result<SessionOf<Q>> {
-        let settings = resolve(&self.defaults, opts);
+    fn session_at(&self, settings: &Defaults, seq_budget: usize) -> Result<SessionOf<Q>> {
         let (base, cfg_base) =
             self.primed_state(settings.voice.as_deref(), seq_budget, settings.cfg_coef)?;
         Ok(SessionOf {
+            prompt_len: primed_len(&base),
             model: Arc::clone(&self.model),
             frame_rate: self.cfg.mimi.frame_rate,
             temperature: settings.temperature,
@@ -413,7 +415,7 @@ impl<Q: BackendQ> SynthOf<Q> {
         // A one-shot call primes a session sized to this text and drops it
         // afterwards, so there is one generation path rather than two.
         let seq_budget = chunks.iter().map(|c| c.seq_budget).max().unwrap_or(0);
-        self.session_at(opts, seq_budget)?.stream_chunks(chunks, rng)
+        self.session_at(&settings, seq_budget)?.stream_chunks(chunks, rng)
     }
 
     /// Build the state every chunk starts from: allocated, then conditioned on
@@ -440,6 +442,15 @@ impl<Q: BackendQ> SynthOf<Q> {
             },
         };
 
+        if let Some(voice) = voice {
+            let frames = voice.emb.dim(1usize)?;
+            if frames >= seq_budget {
+                xn::bail!(
+                    "the voice prompt is {frames} frames but the KV budget is {seq_budget}; \
+                     build the session with a larger max_seq_len"
+                )
+            }
+        }
         let mut state = self.model.init_flow_lm_state(1, seq_budget)?;
         if let Some(voice) = voice {
             self.model.prompt_audio(&mut state, &voice.emb)?;
@@ -515,6 +526,22 @@ fn plan_chunks<Q: BackendQ>(
 
 /// A voice primed once, ready to generate repeatedly.
 ///
+/// # One generation at a time
+///
+/// A session must not have two generations in flight at once. Starting one
+/// clones the primed state, and cloning an `xn` tensor shares its storage
+/// rather than copying it, so both would write into the same KV buffers and
+/// each would attend over the other's keys — wrong audio from both, with no
+/// error. Sequential use is safe: each generation overwrites the rows the last
+/// one left before reading them.
+///
+/// This is not enforced by the type. `!Sync` would express it, but an async
+/// caller holding a `&Session` across an await needs `Sync` for its future to
+/// be `Send`, which is exactly how `ptts-ws-server` is written; and forking the
+/// state deeply costs a full copy of the cache — about 48 MB at a 1024-slot
+/// budget — on every generation, which is what the session exists to avoid.
+/// A server wanting concurrency should build one session per connection.
+///
 /// Built by [`SynthOf::session`]. Every generation clones the primed state
 /// rather than re-running `prompt_audio` over the voice prompt. A one-shot
 /// caller should just use [`SynthOf::say`].
@@ -529,6 +556,9 @@ pub struct SessionOf<Q: BackendQ> {
     base: TTSState<Q>,
     cfg_base: Option<(f32, TTSState<Q>)>,
     seq_budget: usize,
+    /// Slots the voice prompt already occupies, so the budget check can use it
+    /// instead of [`plan::PROMPT_SEQ_HEADROOM`]'s fixed reserve.
+    prompt_len: usize,
 }
 
 impl<Q: BackendQ> SessionOf<Q> {
@@ -560,6 +590,15 @@ impl<Q: BackendQ> SessionOf<Q> {
     pub fn stream_seeded(&self, text: &str, seed: u64) -> Result<SpeechStream> {
         let rng = Box::new(NormalRng::new(self.temperature, seed)?);
         self.stream_with_rng(text, rng)
+    }
+
+    /// As [`Self::say`], with an explicit seed for this request.
+    pub fn say_seeded(&self, text: &str, seed: u64) -> Result<Vec<f32>> {
+        let mut pcm = Vec::new();
+        for chunk in self.stream_seeded(text, seed)? {
+            pcm.extend_from_slice(&chunk?);
+        }
+        Ok(pcm)
     }
 
     /// As [`Self::stream`], with an explicit noise source.
@@ -600,7 +639,14 @@ impl<Q: BackendQ> SessionOf<Q> {
         chunks: Vec<ChunkPlan>,
         rng: Box<dyn crate::flow_lm::Rng + Send>,
     ) -> Result<SpeechStream> {
-        let needed = chunks.iter().map(|c| c.seq_budget).max().unwrap_or(0);
+        // `c.seq_budget` reserves PROMPT_SEQ_HEADROOM for a voice prompt whose
+        // real length this session knows, so it over-states what is needed for
+        // a short prompt and under-states it for a long one.
+        let needed = chunks
+            .iter()
+            .map(|c| self.prompt_len + c.tokens.len() + c.frame_budget)
+            .max()
+            .unwrap_or(0);
         if needed > self.seq_budget {
             xn::bail!(
                 "this text needs a KV budget of {needed} but the session was primed with \
@@ -689,6 +735,23 @@ impl<Q: BackendQ> SessionOf<Q> {
             workers: Some([backbone_handle, decode_handle]),
         })
     }
+}
+
+/// Slots the primed state already occupies — the voice prompt's frames.
+///
+/// Read off the first flow-LM layer: every layer advances together, and a Mimi
+/// layer has no such position.
+fn primed_len<Q: BackendQ>(state: &TTSState<Q>) -> usize {
+    state
+        .flow_lm_state
+        .transformer_state
+        .layer_states
+        .iter()
+        .find_map(|layer| match layer {
+            crate::transformer::LayerAttentionState::FlowLm(mha) => Some(mha.current_end),
+            _ => None,
+        })
+        .unwrap_or(0)
 }
 
 /// What one text chunk will need.
@@ -1191,6 +1254,12 @@ impl Session {
     /// Synthesize `text`, yielding PCM as the decoder produces it.
     pub fn stream(&self, text: &str) -> Result<SpeechStream> {
         dispatch_session!(&self.0, |s| s.stream(text))
+    }
+
+    /// As [`Self::say`], with an explicit seed for this request. Every call on a
+    /// session otherwise draws the same noise, since the seed is the session's.
+    pub fn say_seeded(&self, text: &str, seed: u64) -> Result<Vec<f32>> {
+        dispatch_session!(&self.0, |s| s.say_seeded(text, seed))
     }
 
     /// As [`Self::stream`], with an explicit seed for this request.
