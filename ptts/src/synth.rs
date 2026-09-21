@@ -371,6 +371,7 @@ impl<Q: BackendQ> SynthOf<Q> {
             self.primed_state(settings.voice.as_deref(), seq_budget, settings.cfg_coef)?;
         Ok(SessionOf {
             prompt_len: primed_len(&base),
+            in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model: Arc::clone(&self.model),
             frame_rate: self.cfg.mimi.frame_rate,
             temperature: settings.temperature,
@@ -528,19 +529,20 @@ fn plan_chunks<Q: BackendQ>(
 ///
 /// # One generation at a time
 ///
-/// A session must not have two generations in flight at once. Starting one
-/// clones the primed state, and cloning an `xn` tensor shares its storage
-/// rather than copying it, so both would write into the same KV buffers and
-/// each would attend over the other's keys — wrong audio from both, with no
-/// error. Sequential use is safe: each generation overwrites the rows the last
-/// one left before reading them.
+/// A session runs one generation at a time, and says so: starting a second
+/// while the first is still running is an error, not silent corruption.
 ///
-/// This is not enforced by the type. `!Sync` would express it, but an async
-/// caller holding a `&Session` across an await needs `Sync` for its future to
-/// be `Send`, which is exactly how `ptts-ws-server` is written; and forking the
-/// state deeply costs a full copy of the cache — about 48 MB at a 1024-slot
-/// budget — on every generation, which is what the session exists to avoid.
-/// A server wanting concurrency should build one session per connection.
+/// Starting one clones the primed state, and cloning an `xn` tensor shares its
+/// storage rather than copying it, so two overlapping generations would write
+/// into the same KV buffers and each would attend over the other's keys. The
+/// hazard outlives the call — [`SpeechStream`] is `'static` and its workers
+/// keep writing after `stream` returns — so a flag held for the life of those
+/// workers is what actually enforces it; `!Sync` or `&mut self` cannot see it.
+/// Dropping a stream joins its workers, so finishing or dropping one and
+/// starting the next always works.
+///
+/// A server wanting genuine concurrency builds one session per connection,
+/// which is what `ptts-ws-server` does.
 ///
 /// Built by [`SynthOf::session`]. Every generation clones the primed state
 /// rather than re-running `prompt_audio` over the voice prompt. A one-shot
@@ -559,6 +561,8 @@ pub struct SessionOf<Q: BackendQ> {
     /// Slots the voice prompt already occupies, so the budget check can use it
     /// instead of [`plan::PROMPT_SEQ_HEADROOM`]'s fixed reserve.
     prompt_len: usize,
+    /// Set while a generation is running. See the note on this type.
+    in_flight: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<Q: BackendQ> SessionOf<Q> {
@@ -654,6 +658,25 @@ impl<Q: BackendQ> SessionOf<Q> {
                 self.seq_budget
             )
         }
+        // Claimed before anything is cloned: the state clone shares its KV
+        // storage, so a second generation would write into the same buffers.
+        if self
+            .in_flight
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::Acquire,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            xn::bail!(
+                "a generation is already in flight on this session; finish or drop that \
+                 SpeechStream first, or build a second session"
+            )
+        }
+        let in_flight = InFlight(Arc::clone(&self.in_flight));
+
         // Each request starts from the primed state rather than re-conditioning
         // on the voice.
         let base_state = self.base.clone();
@@ -722,6 +745,8 @@ impl<Q: BackendQ> SessionOf<Q> {
         // Flow-LM: text in, latents out.
         let model = Arc::clone(&self.model);
         let backbone_handle = std::thread::spawn(move || {
+            // Dropped when this thread ends, which is after its last write.
+            let _in_flight = in_flight;
             let result = run_backbone(&model, chunks, base_state, cfg_base, rng, ldim, &latent_tx);
             if let Err(e) = result {
                 let _ = pcm_tx.send(Err(e));
@@ -729,7 +754,7 @@ impl<Q: BackendQ> SessionOf<Q> {
         });
 
         Ok(SpeechStream {
-            rx: pcm_rx,
+            rx: Some(pcm_rx),
             sample_rate: self.sample_rate(),
             failed: false,
             workers: Some([backbone_handle, decode_handle]),
@@ -752,6 +777,19 @@ fn primed_len<Q: BackendQ>(state: &TTSState<Q>) -> usize {
             _ => None,
         })
         .unwrap_or(0)
+}
+
+/// Clears a session's in-flight flag when the generation that set it ends.
+///
+/// Moved into the flow-LM thread's closure, so the flag clears exactly when the
+/// last write to the shared KV buffers happens — including the early-drop case,
+/// where the thread runs one more step before it notices the closed channel.
+struct InFlight(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// What one text chunk will need.
@@ -824,7 +862,10 @@ fn run_backbone<Q: BackendQ>(
 /// and decodes them together. The iterator ends when generation finishes; an
 /// `Err` item is terminal.
 pub struct SpeechStream {
-    rx: std::sync::mpsc::Receiver<Result<Vec<f32>>>,
+    /// `Option` so [`Drop`] can release it *before* joining: the channel is
+    /// unbounded, so a worker only notices it should stop once the receiver is
+    /// gone, and fields drop after `Drop::drop` has run.
+    rx: Option<std::sync::mpsc::Receiver<Result<Vec<f32>>>>,
     sample_rate: usize,
     failed: bool,
     /// The flow-LM and decoder threads, joined once the channel closes so that
@@ -838,6 +879,23 @@ impl SpeechStream {
     }
 }
 
+/// Joining on drop is what makes a session's in-flight flag exact: dropping the
+/// receiver closes the channels, the workers stop, and only once they have
+/// stopped writing does the flag clear. Without it, "drop the stream, start the
+/// next one" could still be refused.
+impl Drop for SpeechStream {
+    fn drop(&mut self) {
+        // Releasing the receiver first is what stops the workers; joining
+        // before that would wait for the whole generation.
+        self.rx.take();
+        if let Some(workers) = self.workers.take() {
+            for worker in workers {
+                let _ = worker.join();
+            }
+        }
+    }
+}
+
 impl Iterator for SpeechStream {
     type Item = Result<Vec<f32>>;
 
@@ -845,7 +903,7 @@ impl Iterator for SpeechStream {
         if self.failed {
             return None;
         }
-        match self.rx.recv() {
+        match self.rx.as_ref()?.recv() {
             Ok(Err(e)) => {
                 self.failed = true;
                 self.workers.take();
@@ -1233,7 +1291,11 @@ macro_rules! dispatch_session {
     };
 }
 
-/// A voice primed once, ready to generate repeatedly. See [`SessionOf`].
+/// A voice primed once, ready to generate repeatedly.
+///
+/// Runs one generation at a time: starting a second while the first is still
+/// running is an error. See [`SessionOf`] for why, and for the concurrency
+/// story.
 pub struct Session(SessionV);
 
 impl Session {
@@ -1479,6 +1541,31 @@ mod tests {
         assert_eq!(one.seed, 99);
         assert_eq!(one.temperature, 0.5);
         assert_eq!(one.voice.as_deref(), Some("alba"));
+    }
+
+    /// The in-flight flag is what makes "one generation at a time" an error
+    /// rather than silent corruption, and the guard is what clears it.
+    #[test]
+    fn the_in_flight_guard_clears_on_drop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(
+            flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok(),
+            "an idle session must be claimable"
+        );
+        assert!(
+            flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err(),
+            "a claimed session must refuse a second generation"
+        );
+
+        let guard = InFlight(Arc::clone(&flag));
+        drop(guard);
+        assert!(!flag.load(Ordering::Acquire), "the guard must release the session");
+        assert!(
+            flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok(),
+            "and the next generation must be able to claim it"
+        );
     }
 
     #[test]
