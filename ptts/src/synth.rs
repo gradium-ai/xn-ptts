@@ -345,11 +345,6 @@ impl<Q: BackendQ> SynthOf<Q> {
 
     /// Prime a voice once and keep it, for callers that generate repeatedly.
     ///
-    /// [`Self::stream_with`] conditions the transformer on the voice prompt
-    /// every time it is called — around 125 frames of `prompt_audio` per
-    /// request. A server answering many requests on one connection should pay
-    /// that once:
-    ///
     /// ```no_run
     /// # fn main() -> xn::Result<()> {
     /// # let tts: ptts::synth::Synth = todo!();
@@ -362,11 +357,8 @@ impl<Q: BackendQ> SynthOf<Q> {
     /// ```
     ///
     /// `max_seq_len` is the KV budget, allocated up front and held until the
-    /// session is dropped — so it is memory per concurrent connection, not a
-    /// ceiling to round up. At 12.5 Hz a 40-token sentence needs 744 and a full
-    /// [`MAX_TOKENS_PER_CHUNK`]-token chunk needs 796, so 1024 covers any single
-    /// chunk; longer text is split rather than needing more. Text over the
-    /// budget is rejected, naming both numbers. See [`plan::seq_budget`].
+    /// session is dropped. At 12.5 Hz a full [`MAX_TOKENS_PER_CHUNK`]-token
+    /// chunk needs 796, so 1024 covers any single
     pub fn session(&self, opts: &SpeechOptions, max_seq_len: usize) -> Result<SessionOf<Q>> {
         self.session_at(opts, max_seq_len)
     }
@@ -524,12 +516,10 @@ fn plan_chunks<Q: BackendQ>(
 /// A voice primed once, ready to generate repeatedly.
 ///
 /// Built by [`SynthOf::session`]. Every generation clones the primed state
-/// rather than re-running `prompt_audio` over the voice prompt, which is what
-/// makes this worth having for a server; a one-shot caller should just use
-/// [`SynthOf::say`].
+/// rather than re-running `prompt_audio` over the voice prompt. A one-shot
+/// caller should just use [`SynthOf::say`].
 ///
-/// The KV budget is fixed at construction. Text that needs more is an error
-/// rather than a silent re-prime, so a session's cost per request stays flat.
+/// The KV budget is fixed at construction.
 pub struct SessionOf<Q: BackendQ> {
     model: Arc<TTSModel<Q>>,
     frame_rate: f64,
