@@ -148,7 +148,7 @@ fn main() -> Result<()> {
         VoiceArg::Bundled(name) => opts = opts.voice(name.clone()),
         VoiceArg::Embedding(_) => opts = opts.voice(VoiceArg::REGISTERED),
         VoiceArg::Audio(path) => {
-            let pcm = load_voice_audio(path, tts.voice_prompt_sample_rate())?;
+            let pcm = ptts::audio::load_mono_at(path, tts.voice_prompt_sample_rate())?;
             tts.add_voice_from_pcm(VoiceArg::REGISTERED, &pcm)?;
             opts = opts.voice(VoiceArg::REGISTERED);
         }
@@ -225,17 +225,6 @@ impl VoiceArg {
             Some(arg) if std::path::Path::new(arg).is_file() => Self::Audio(arg.into()),
             Some(arg) => Self::Bundled(arg.to_string()),
         }
-    }
-}
-
-/// Decode an audio file to mono PCM at `sample_rate`, for voice cloning.
-fn load_voice_audio(path: &std::path::Path, sample_rate: usize) -> Result<Vec<f32>> {
-    let (pcm, file_rate) = ptts::audio::decode_file(path)?;
-    tracing::info!(?path, samples = pcm.len(), rate = file_rate, "decoded voice prompt");
-    if file_rate as usize == sample_rate {
-        Ok(pcm)
-    } else {
-        Ok(ptts::audio::resample(&pcm, file_rate as usize, sample_rate)?)
     }
 }
 
