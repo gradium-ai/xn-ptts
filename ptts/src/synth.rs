@@ -341,6 +341,42 @@ impl<Q: BackendQ> SynthOf<Q> {
         Ok(())
     }
 
+    /// Register a voice from a conditioning embedding already in memory, laid
+    /// out as `frames` rows of `dim`.
+    ///
+    /// This is the mimi encoder's output -- what [`Self::add_voice_from_pcm`]
+    /// computes internally. Callers that compute or cache embeddings themselves
+    /// (`ptts-pyo3` hands one over from numpy) use this.
+    ///
+    /// `null_emb`, when given, is the encoding of equal-length silence, which
+    /// CFG needs on models where `cfg_null_audio_empty` is false.
+    pub fn add_voice_from_embedding(
+        &mut self,
+        name: &str,
+        emb: &[f32],
+        frames: usize,
+        dim: usize,
+        null_emb: Option<&[f32]>,
+    ) -> Result<()> {
+        if emb.len() != frames * dim {
+            xn::bail!("embedding has {} values, expected {frames} x {dim}", emb.len());
+        }
+        let dev = self.model.device().clone();
+        let to_tensor = |data: &[f32]| -> Result<Tensor<Q::T, Q::B>> {
+            Tensor::from_vec(data.to_vec(), (1, frames, dim), &dev)?.to::<Q::T>()
+        };
+        let emb = to_tensor(emb)?;
+        let null_emb = match null_emb {
+            None => None,
+            Some(null) if null.len() != frames * dim => {
+                xn::bail!("null embedding has {} values, expected {frames} x {dim}", null.len())
+            }
+            Some(null) => Some(to_tensor(null)?),
+        };
+        self.voices.insert(name.to_string(), Voice { emb, null_emb });
+        Ok(())
+    }
+
     /// Synthesize `text` and return the whole waveform.
     pub fn say(&self, text: &str) -> Result<Vec<f32>> {
         self.say_with(text, &SpeechOptions::default())
@@ -1486,6 +1522,19 @@ impl Synth {
     /// [`Self::voice_prompt_sample_rate`].
     pub fn add_voice_from_pcm(&mut self, name: &str, pcm: &[f32]) -> Result<()> {
         dispatch!(&mut self.0, |s| s.add_voice_from_pcm(name, pcm))
+    }
+
+    /// Register a voice from a conditioning embedding already in memory -- see
+    /// [`SynthOf::add_voice_from_embedding`].
+    pub fn add_voice_from_embedding(
+        &mut self,
+        name: &str,
+        emb: &[f32],
+        frames: usize,
+        dim: usize,
+        null_emb: Option<&[f32]>,
+    ) -> Result<()> {
+        dispatch!(&mut self.0, |s| s.add_voice_from_embedding(name, emb, frames, dim, null_emb))
     }
 
     /// The weight format actually loaded. GPU backends are always unquantized.
