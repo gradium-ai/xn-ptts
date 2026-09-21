@@ -115,9 +115,18 @@ async fn build_app_state(args: &Args) -> Result<model::AppState> {
         None => Quant::F32,
         Some(name) => Quant::parse(name)?,
     };
-    // Reject an impossible combination before `load_ptts` downloads anything;
-    // `SynthBuilder` also rejects a backend the binary was not built with.
+    // Both checks happen before `load_ptts` downloads anything: `SynthBuilder`
+    // would catch them, but only after the checkpoint is on disk.
     quant.check_device(device)?;
+    let unavailable = match device {
+        DeviceKind::Cuda if !cfg!(feature = "cuda") => Some("cuda"),
+        DeviceKind::Vulkan if !cfg!(feature = "vulkan") => Some("vulkan"),
+        DeviceKind::Metal if !cfg!(feature = "metal") => Some("metal"),
+        _ => None,
+    };
+    if let Some(flag) = unavailable {
+        anyhow::bail!("--{flag} requested but binary was not built with --features {flag}");
+    }
     model::load_ptts(
         args.config.as_ref(),
         args.voice_dir.as_ref(),

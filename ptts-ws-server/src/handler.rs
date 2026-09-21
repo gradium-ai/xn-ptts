@@ -267,19 +267,27 @@ async fn generate_one(
         Ok(())
     });
 
-    while let Some(pcm) = audio_rx.recv().await {
-        let encoded = encoder.encode(&pcm)?;
-        let audio = base64::engine::general_purpose::STANDARD.encode(&encoded.data);
-        if reply_tx
-            .send(TtsReply::Audio {
-                audio,
-                start_s: encoded.start_s,
-                stop_s: encoded.stop_s,
-                stream_id,
-            })
-            .is_err()
-        {
-            break;
+    // `SpeechStream` decodes every queued latent in one call, so a chunk can
+    // carry several Mimi frames. The resampled formats build their
+    // `FftFixedInOut` for exactly one `frame_size`, so feed it a frame at a
+    // time rather than whatever the batch happened to be.
+    let frame = app.frame_size as usize;
+    'send: while let Some(pcm) = audio_rx.recv().await {
+        for pcm in pcm.chunks(frame) {
+            let encoded = encoder.encode(pcm)?;
+            let audio = base64::engine::general_purpose::STANDARD.encode(&encoded.data);
+            if reply_tx
+                .send(TtsReply::Audio {
+                    audio,
+                    start_s: encoded.start_s,
+                    stop_s: encoded.stop_s,
+                    stream_id,
+                })
+                .is_err()
+            {
+                // The client is gone; stop draining entirely, not just this batch.
+                break 'send;
+            }
         }
     }
     drop(audio_rx);

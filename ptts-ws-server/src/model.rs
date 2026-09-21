@@ -165,21 +165,21 @@ pub async fn load_ptts(
     if let Some(voice_dir) = voice_dir {
         collect_voice_files(voice_dir, &mut m.voice_files);
     }
-    m.voice_files.sort();
-    m.voice_files.dedup_by(|a, b| a.0 == b.0);
-
     let frame_rate = m.cfg.mimi.frame_rate;
-    let mut builder = SynthBuilder::new(m.cfg, &m.model_path)
+    let mut synth = SynthBuilder::new(m.cfg, &m.model_path)
         .tokenizer_file(&m.tokenizer_path)
         .device(device)
         .quant(quant)
-        .temperature(temperature);
-    // A voice that fails to load is skipped by the builder and logged there:
-    // one bad file should not take the server down.
+        .temperature(temperature)
+        .build()?;
+    // Registered after the build, not through it: the builder propagates a bad
+    // voice file and one should not take the server down. Order is preserved,
+    // so a --voice-dir entry still overrides a bundled voice of the same name.
     for (name, path) in m.voice_files.iter() {
-        builder = builder.add_voice(name, path);
+        if let Err(e) = synth.add_voice_file(name, path) {
+            tracing::warn!(voice = %name, error = %e, "failed to load voice embedding");
+        }
     }
-    let synth = builder.build()?;
 
     let voices = synth.voices();
     let default_voice = voices.first().context("no voice embeddings found in model")?.clone();

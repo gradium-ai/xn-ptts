@@ -632,10 +632,11 @@ impl<Q: BackendQ> SessionOf<Q> {
         self.stream_chunks(chunks, rng)
     }
 
-    /// Tokenize `text` the way [`Self::stream`] would.
+    /// Tokenize `text` as given, with none of the preparation [`Self::stream`]
+    /// does first — no [`prepare_text_prompt`], no sentence splitting.
     ///
     /// Paired with [`Self::stream_tokens`] for callers that want one utterance
-    /// per request with no sentence splitting.
+    /// per request and prepare the text themselves.
     pub fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
         self.model.flow_lm.conditioner.tokenize(text)
     }
@@ -1349,7 +1350,7 @@ impl Session {
         dispatch_session!(&self.0, |s| s.stream_seeded(text, seed))
     }
 
-    /// Tokenize `text` the way [`Self::stream`] would.
+    /// Tokenize `text` as given — see [`SessionOf::tokenize`].
     pub fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
         dispatch_session!(&self.0, |s| s.tokenize(text))
     }
