@@ -166,3 +166,19 @@ fn a_generic_session_is_nameable_too() {
     // time uses `SessionOf<Q>` rather than the erased `Session`.
     fn _accepts<Q: xn::BackendQ>(_: &ptts::synth::SessionOf<Q>) {}
 }
+
+/// `ptts-ws-server` holds a `Session` in its axum state and generates from it on
+/// a `spawn_blocking` worker, so an `Rc` anywhere in the primed state would
+/// break it — silently, at the call site rather than here. `SpeechStream` is
+/// `Send` but deliberately not `Sync`: it owns an mpsc receiver, which is why
+/// `ptts-pyo3` wraps it in a mutex.
+#[test]
+fn the_types_the_frontends_move_between_threads_still_can() {
+    fn send_sync<T: Send + Sync>() {}
+    fn send<T: Send>() {}
+    send_sync::<ptts::synth::Synth>();
+    send_sync::<ptts::synth::Session>();
+    send_sync::<ptts::synth::SynthOf<xn::Unquantized<f32, xn::CpuDevice>>>();
+    send_sync::<ptts::synth::SessionOf<xn::Unquantized<f32, xn::CpuDevice>>>();
+    send::<ptts::synth::SpeechStream>();
+}

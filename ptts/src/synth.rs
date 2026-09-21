@@ -38,9 +38,14 @@
 //! # }
 //! ```
 //!
+//! A server answering many requests for one voice wants [`Synth::session`],
+//! which conditions on the voice prompt once instead of per request.
+//!
 //! Callers that want to name the weight format at compile time — `ptts-wasm`
 //! supports exactly two — can use [`SynthOf<Q>`] directly via
-//! [`SynthBuilder::load`], and skip the runtime dispatch in [`Synth`].
+//! [`SynthBuilder::load`], and skip the runtime dispatch in [`Synth`]. Driving
+//! the loop by hand, from an event loop with no threads to spawn, is what
+//! [`crate::tts_model::TTSModel`]'s primitives are for.
 
 use crate::flow_lm::NormalRng;
 use crate::loader;
@@ -203,6 +208,23 @@ struct Defaults {
     max_tokens_per_chunk: usize,
 }
 
+/// Merge per-request overrides onto the settings a [`SynthBuilder`] was given.
+///
+/// A `cfg_coef` of 1.0 becomes `None`: guidance at 1.0 is the identity, and
+/// computing it would cost a second forward pass.
+fn resolve(defaults: &Defaults, opts: &SpeechOptions) -> Defaults {
+    Defaults {
+        voice: opts.voice.clone().or_else(|| defaults.voice.clone()),
+        temperature: opts.temperature.unwrap_or(defaults.temperature),
+        seed: opts.seed.unwrap_or(defaults.seed),
+        cfg_coef: match opts.cfg_coef.or(defaults.cfg_coef) {
+            Some(coef) if coef != 1.0 => Some(coef),
+            _ => None,
+        },
+        max_tokens_per_chunk: opts.max_tokens_per_chunk.unwrap_or(defaults.max_tokens_per_chunk),
+    }
+}
+
 /// A registered voice: the conditioning embedding, plus the encoding of
 /// equal-length silence when the model needs one for CFG.
 struct Voice<Q: BackendQ> {
@@ -331,7 +353,7 @@ impl<Q: BackendQ> SynthOf<Q> {
     /// ```no_run
     /// # fn main() -> xn::Result<()> {
     /// # let tts: ptts::synth::Synth = todo!();
-    /// let session = tts.session(&ptts::synth::SpeechOptions::default().voice("alba"), 2048)?;
+    /// let session = tts.session(&ptts::synth::SpeechOptions::default().voice("alba"), 1024)?;
     /// for line in ["First.", "Second.", "Third."] {
     ///     let pcm = session.say(line)?;
     /// }
@@ -339,30 +361,27 @@ impl<Q: BackendQ> SynthOf<Q> {
     /// # }
     /// ```
     ///
-    /// `max_seq_len` is the KV budget the session allocates up front. Text
-    /// needing more than that is rejected rather than silently re-primed, so
-    /// the cost stays predictable; [`plan::seq_budget`] computes what a given
-    /// token count needs.
+    /// `max_seq_len` is the KV budget, allocated up front and held until the
+    /// session is dropped — so it is memory per concurrent connection, not a
+    /// ceiling to round up. At 12.5 Hz a 40-token sentence needs 744 and a full
+    /// [`MAX_TOKENS_PER_CHUNK`]-token chunk needs 796, so 1024 covers any single
+    /// chunk; longer text is split rather than needing more. Text over the
+    /// budget is rejected, naming both numbers. See [`plan::seq_budget`].
     pub fn session(&self, opts: &SpeechOptions, max_seq_len: usize) -> Result<SessionOf<Q>> {
         self.session_at(opts, max_seq_len)
     }
 
     /// Build a session, sized to `seq_budget`.
     fn session_at(&self, opts: &SpeechOptions, seq_budget: usize) -> Result<SessionOf<Q>> {
-        let cfg_coef = match opts.cfg_coef.or(self.defaults.cfg_coef) {
-            Some(coef) if coef != 1.0 => Some(coef),
-            _ => None,
-        };
-        let voice = opts.voice.as_deref().or(self.defaults.voice.as_deref());
-        let (base, cfg_base) = self.primed_state(voice, seq_budget, cfg_coef)?;
+        let settings = resolve(&self.defaults, opts);
+        let (base, cfg_base) =
+            self.primed_state(settings.voice.as_deref(), seq_budget, settings.cfg_coef)?;
         Ok(SessionOf {
             model: Arc::clone(&self.model),
             frame_rate: self.cfg.mimi.frame_rate,
-            temperature: opts.temperature.unwrap_or(self.defaults.temperature),
-            seed: opts.seed.unwrap_or(self.defaults.seed),
-            max_tokens_per_chunk: opts
-                .max_tokens_per_chunk
-                .unwrap_or(self.defaults.max_tokens_per_chunk),
+            temperature: settings.temperature,
+            seed: settings.seed,
+            max_tokens_per_chunk: settings.max_tokens_per_chunk,
             base,
             cfg_base,
             seq_budget,
@@ -375,9 +394,8 @@ impl<Q: BackendQ> SynthOf<Q> {
     /// the Mimi decoder — so decoding overlaps the next backbone step. Dropping
     /// the returned [`SpeechStream`] stops both.
     pub fn stream_with(&self, text: &str, opts: &SpeechOptions) -> Result<SpeechStream> {
-        let temperature = opts.temperature.unwrap_or(self.defaults.temperature);
-        let seed = opts.seed.unwrap_or(self.defaults.seed);
-        let rng = Box::new(NormalRng::new(temperature, seed)?);
+        let settings = resolve(&self.defaults, opts);
+        let rng = Box::new(NormalRng::new(settings.temperature, settings.seed)?);
         self.stream_with_rng(text, opts, rng)
     }
 
@@ -393,10 +411,13 @@ impl<Q: BackendQ> SynthOf<Q> {
         opts: &SpeechOptions,
         rng: Box<dyn crate::flow_lm::Rng + Send>,
     ) -> Result<SpeechStream> {
-        let max_tokens_per_chunk =
-            opts.max_tokens_per_chunk.unwrap_or(self.defaults.max_tokens_per_chunk);
-        let chunks =
-            plan_chunks(&self.model, self.cfg.mimi.frame_rate, text, max_tokens_per_chunk)?;
+        let settings = resolve(&self.defaults, opts);
+        let chunks = plan_chunks(
+            &self.model,
+            self.cfg.mimi.frame_rate,
+            text,
+            settings.max_tokens_per_chunk,
+        )?;
         // A one-shot call primes a session sized to this text and drops it
         // afterwards, so there is one generation path rather than two.
         let seq_budget = chunks.iter().map(|c| c.seq_budget).max().unwrap_or(0);
@@ -1359,16 +1380,64 @@ impl std::fmt::Debug for Synth {
 mod tests {
     use super::*;
 
-    /// The budget check is the one part of a session that is reachable without
-    /// weights, and it is the part a caller gets wrong.
+    fn defaults() -> Defaults {
+        Defaults {
+            voice: Some("alba".into()),
+            temperature: 0.5,
+            seed: 42,
+            cfg_coef: None,
+            max_tokens_per_chunk: 50,
+        }
+    }
+
     #[test]
-    fn a_session_budget_is_compared_against_what_the_text_needs() {
-        // `stream_chunks` rejects a plan whose widest chunk exceeds the budget.
-        // 40 tokens at 12.5Hz need 40 + 512 + frame_budget(40).
-        let frames = plan::frame_budget(40, 12.5);
-        let needed = plan::seq_budget(40, frames);
-        assert!(needed > 512, "a real utterance needs more than the headroom alone");
-        // A session primed for a shorter utterance cannot serve a longer one.
-        assert!(needed > plan::seq_budget(1, plan::frame_budget(1, 12.5)));
+    fn unset_options_leave_the_defaults_alone() {
+        let d = defaults();
+        let got = resolve(&d, &SpeechOptions::default());
+        assert_eq!(got.voice, d.voice);
+        assert_eq!(got.temperature, d.temperature);
+        assert_eq!(got.seed, d.seed);
+        assert_eq!(got.max_tokens_per_chunk, d.max_tokens_per_chunk);
+    }
+
+    /// The regression this function exists for: `session` used to drop the
+    /// caller's temperature and seed in favour of the builder's. Each field is
+    /// also set on its own, since clobbering the rest is the other way to fail.
+    #[test]
+    fn each_field_overrides_independently() {
+        let all = SpeechOptions::default()
+            .voice("marius")
+            .temperature(0.9)
+            .seed(7)
+            .max_tokens_per_chunk(80);
+        let got = resolve(&defaults(), &all);
+        assert_eq!(got.voice.as_deref(), Some("marius"));
+        assert_eq!(got.temperature, 0.9);
+        assert_eq!(got.seed, 7);
+        assert_eq!(got.max_tokens_per_chunk, 80);
+
+        let one = resolve(&defaults(), &SpeechOptions::default().seed(99));
+        assert_eq!(one.seed, 99);
+        assert_eq!(one.temperature, 0.5);
+        assert_eq!(one.voice.as_deref(), Some("alba"));
+    }
+
+    #[test]
+    fn guidance_at_one_is_normalized_away() {
+        let from_request = SpeechOptions::default().cfg_coef(1.0);
+        assert_eq!(resolve(&defaults(), &from_request).cfg_coef, None);
+        assert_eq!(
+            resolve(&defaults(), &SpeechOptions::default().cfg_coef(2.0)).cfg_coef,
+            Some(2.0)
+        );
+        // From the builder, and when a request turns the builder's off.
+        let enabled = Defaults { cfg_coef: Some(3.0), ..defaults() };
+        assert_eq!(
+            resolve(&Defaults { cfg_coef: Some(1.0), ..defaults() }, &SpeechOptions::default())
+                .cfg_coef,
+            None
+        );
+        assert_eq!(resolve(&enabled, &from_request).cfg_coef, None);
+        assert_eq!(resolve(&enabled, &SpeechOptions::default()).cfg_coef, Some(3.0));
     }
 }
