@@ -10,6 +10,10 @@
 //! The pipeline is `ptts::synth::Synth`, so this file is a translation layer:
 //! locating a checkpoint, numpy in and out, releasing the GIL around the slow
 //! parts, and letting Ctrl-C through between audio chunks.
+//!
+//! One invariant throughout: **never hold a lock across a GIL reacquisition**.
+//! A thread parked in `py.detach` with a guard alive deadlocks against any
+//! other Python thread wanting the same lock, and Ctrl-C reaches neither.
 
 use numpy::{PyArray1, PyReadonlyArrayDyn, PyUntypedArrayMethods};
 use ptts::synth::{DeviceKind, Quant, SpeechOptions, SpeechStream, Synth, SynthBuilder};
@@ -241,8 +245,15 @@ impl Tts {
                 // which ones made it.
                 let _ = synth.add_voice_file(name, path);
             }
-            let default_voice = voice.or_else(|| synth.voices().first().cloned());
-            Ok(Self { inner: Arc::new(Mutex::new(synth)), default_voice })
+            if let Some(name) = voice.as_deref()
+                && !synth.voices().iter().any(|v| v == name)
+            {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown voice '{name}'; available voices are {:?}",
+                    synth.voices()
+                )));
+            }
+            Ok(Self { inner: Arc::new(Mutex::new(synth)), default_voice: voice })
         })
     }
 
@@ -418,7 +429,17 @@ impl Tts {
     /// against any other Python thread calling in.
     fn start(&self, py: Python<'_>, text: &str, opts: &SpeechOptions) -> PyResult<SpeechStream> {
         let inner = Arc::clone(&self.inner);
-        py.detach(|| inner.lock().map_err(|_| poisoned())?.stream_with(text, opts).py())
+        let mut opts = opts.clone();
+        py.detach(move || {
+            let synth = inner.lock().map_err(|_| poisoned())?;
+            // Resolved here rather than at construction so a voice registered
+            // afterwards -- `clone_voice` on a repo that ships none -- is used
+            // without having to name it on every call.
+            if opts.voice.is_none() {
+                opts.voice = synth.voices().first().cloned();
+            }
+            synth.stream_with(text, &opts).py()
+        })
     }
 }
 
@@ -478,9 +499,12 @@ impl AudioStream {
         slf: PyRef<'py, Self>,
         py: Python<'py>,
     ) -> PyResult<Option<Bound<'py, PyArray1<f32>>>> {
-        let mut guard = slf.inner.lock().map_err(|_| poisoned())?;
-        let Some(stream) = guard.as_mut() else { return Ok(None) };
-        match py.detach(|| stream.next()) {
+        let inner = &slf.inner;
+        let next = py.detach(|| -> PyResult<Option<Result<Vec<f32>, xn::Error>>> {
+            let mut guard = inner.lock().map_err(|_| poisoned())?;
+            Ok(guard.as_mut().and_then(|stream| stream.next()))
+        })?;
+        match next {
             None => Ok(None),
             Some(chunk) => Ok(Some(PyArray1::from_vec(py, chunk.py()?))),
         }
