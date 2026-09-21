@@ -1,7 +1,7 @@
 //! Generate speech from text on the command line.
 //!
 //! ```text
-//! cargo run --release --example pocket_tts --features sp -- "hello world" -o out.wav
+//! cargo run --release --example pocket_tts --features sp,audio -- "hello world" -o out.wav
 //! ```
 //!
 //! Everything between the text and the WAV file is [`ptts::synth::Synth`]; what
@@ -9,8 +9,6 @@
 //! `model_helpers`), audio file decoding for `--voice <file>`, and the timing
 //! report.
 
-#[path = "audio_helpers.rs"]
-mod audio_helpers;
 #[path = "model_helpers.rs"]
 mod model_helpers;
 
@@ -150,7 +148,7 @@ fn main() -> Result<()> {
         VoiceArg::Bundled(name) => opts = opts.voice(name.clone()),
         VoiceArg::Embedding(_) => opts = opts.voice(VoiceArg::REGISTERED),
         VoiceArg::Audio(path) => {
-            let pcm = load_voice_audio(path, tts.voice_prompt_sample_rate())?;
+            let pcm = ptts::audio::load_mono_at(path, tts.voice_prompt_sample_rate())?;
             tts.add_voice_from_pcm(VoiceArg::REGISTERED, &pcm)?;
             opts = opts.voice(VoiceArg::REGISTERED);
         }
@@ -227,17 +225,6 @@ impl VoiceArg {
             Some(arg) if std::path::Path::new(arg).is_file() => Self::Audio(arg.into()),
             Some(arg) => Self::Bundled(arg.to_string()),
         }
-    }
-}
-
-/// Decode an audio file to mono PCM at `sample_rate`, for voice cloning.
-fn load_voice_audio(path: &std::path::Path, sample_rate: usize) -> Result<Vec<f32>> {
-    let (pcm, file_rate) = audio_helpers::pcm_decode(path)?;
-    tracing::info!(?path, samples = pcm.len(), rate = file_rate, "decoded voice prompt");
-    if file_rate as usize == sample_rate {
-        Ok(pcm)
-    } else {
-        Ok(audio_helpers::resample(&pcm, file_rate as usize, sample_rate)?)
     }
 }
 

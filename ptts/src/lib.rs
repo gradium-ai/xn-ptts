@@ -32,6 +32,7 @@
 //! | [`plan`] | Frame and KV budgets, the end-of-speech policy. |
 //! | [`preprocess`] | Per-language text normalization, applied before tokenizing. |
 //! | [`tok`] | Tokenizers, behind the `sp` / `hf` features. |
+//! | [`audio`] | Decoding and resampling audio files for voice cloning, behind `audio`. |
 //! | [`tts_model`] | [`tts_model::TTSModel`], the streaming primitives `synth` drives. |
 //! | [`flow_lm`], [`transformer`] | The token-conditioned flow-matching LM. |
 //! | [`mimi`], [`seanet`] | The neural audio codec. |
@@ -45,6 +46,8 @@
 //! [`tts_model::TTSModel`] directly. `Synth` is a composition of those
 //! primitives, not a replacement for them.
 
+#[cfg(feature = "audio")]
+pub mod audio;
 pub mod conditioners;
 pub mod conv;
 pub mod dummy_quantizer;

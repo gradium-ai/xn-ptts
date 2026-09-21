@@ -1,5 +1,3 @@
-#[path = "audio_helpers.rs"]
-mod audio_helpers;
 #[path = "model_helpers.rs"]
 mod model_helpers;
 
@@ -105,14 +103,11 @@ fn load_voice_audio(
     dev: &xn::CpuDevice,
 ) -> Result<Tensor<f32, xn::CpuDevice>> {
     let speaker_sr = cfg.speaker_mimi_cfg().sample_rate;
-    let (mut pcm, sample_rate) = audio_helpers::pcm_decode(path)?;
+    let (mut pcm, sample_rate) = ptts::audio::decode_file(std::path::Path::new(path))?;
     ptts::utils::normalize_loudness(&mut pcm, sample_rate)?;
-    let sample_rate = sample_rate as usize;
-    let pcm = if sample_rate != speaker_sr {
-        audio_helpers::resample(&pcm, sample_rate, speaker_sr)?
-    } else {
-        pcm
-    };
+    // Unconditional: `resample` hands the buffer back untouched when the rates
+    // already match.
+    let pcm = ptts::audio::resample(pcm, sample_rate as usize, speaker_sr)?;
     tracing::info!("loaded audio with {} samples", pcm.len());
     // Trim it to 10s max.
     let pcm = if pcm.len() > speaker_sr * 10 {

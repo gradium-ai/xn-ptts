@@ -18,7 +18,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+rubato = { workspace = true, optional = true }
 sentencepiece = { workspace = true, optional = true }
+symphonia = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
 safetensors = { workspace = true }
 
@@ -27,8 +29,6 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 half = { workspace = true }
 hf-hub = { workspace = true }
-rubato = { workspace = true }
-symphonia = { workspace = true }
 tracing-chrome = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
@@ -44,6 +44,8 @@ accelerate = ["xn/accelerate"]
 sp = ["dep:sentencepiece"]
 # Hugging Face `tokenizers` support in `ptts::tok`.
 hf = ["dep:tokenizers"]
+# Decoding and resampling audio files (`ptts::audio`), for voice cloning.
+audio = ["dep:symphonia", "dep:rubato"]
 
 [[example]]
 name = "say"
@@ -51,7 +53,7 @@ required-features = ["sp"]
 
 [[example]]
 name = "pocket_tts"
-required-features = ["sp"]
+required-features = ["sp", "audio"]
 
 [[example]]
 name = "bench"
@@ -62,3 +64,4 @@ name = "quantize"
 
 [[example]]
 name = "create_voice"
+required-features = ["audio"]
