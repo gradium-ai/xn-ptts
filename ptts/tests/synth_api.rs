@@ -149,3 +149,36 @@ fn speech_options_default_to_the_builders_settings() {
     assert!(opts.seed.is_none());
     assert!(opts.cfg_coef.is_none());
 }
+
+/// A session is the fix for re-priming the voice on every call, so the type has
+/// to be nameable and its budget visible without a model in hand.
+#[test]
+fn session_is_part_of_the_public_api() {
+    fn _accepts(_: &ptts::synth::Session) {}
+    fn _budget(s: &ptts::synth::Session) -> usize {
+        s.seq_budget()
+    }
+}
+
+#[test]
+fn a_generic_session_is_nameable_too() {
+    // `ptts-wasm` and anything else that fixes its weight format at compile
+    // time uses `SessionOf<Q>` rather than the erased `Session`.
+    fn _accepts<Q: xn::BackendQ>(_: &ptts::synth::SessionOf<Q>) {}
+}
+
+/// `Session` needs `Sync` as well as `Send`: `ptts-ws-server` holds a
+/// `&Session` across an await, and tokio requires that future to be `Send`.
+/// That does **not** make concurrent generation from one session safe — see the
+/// note on `SessionOf`, which the type cannot enforce. `SpeechStream` is `Send`
+/// only: it owns an mpsc receiver, which is why `ptts-pyo3` wraps it in a mutex.
+#[test]
+fn the_types_the_frontends_move_between_threads_still_can() {
+    fn send_sync<T: Send + Sync>() {}
+    fn send<T: Send>() {}
+    send_sync::<ptts::synth::Synth>();
+    send_sync::<ptts::synth::SynthOf<xn::Unquantized<f32, xn::CpuDevice>>>();
+    send_sync::<ptts::synth::Session>();
+    send_sync::<ptts::synth::SessionOf<xn::Unquantized<f32, xn::CpuDevice>>>();
+    send::<ptts::synth::SpeechStream>();
+}

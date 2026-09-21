@@ -38,9 +38,14 @@
 //! # }
 //! ```
 //!
+//! A server answering many requests for one voice wants [`Synth::session`],
+//! which conditions on the voice prompt once instead of per request.
+//!
 //! Callers that want to name the weight format at compile time — `ptts-wasm`
 //! supports exactly two — can use [`SynthOf<Q>`] directly via
-//! [`SynthBuilder::load`], and skip the runtime dispatch in [`Synth`].
+//! [`SynthBuilder::load`], and skip the runtime dispatch in [`Synth`]. Driving
+//! the loop by hand, from an event loop with no threads to spawn, is what
+//! [`crate::tts_model::TTSModel`]'s primitives are for.
 
 use crate::flow_lm::NormalRng;
 use crate::loader;
@@ -203,6 +208,23 @@ struct Defaults {
     max_tokens_per_chunk: usize,
 }
 
+/// Merge per-request overrides onto the settings a [`SynthBuilder`] was given.
+///
+/// A `cfg_coef` of 1.0 becomes `None`: guidance at 1.0 is the identity, and
+/// computing it would cost a second forward pass.
+fn resolve(defaults: &Defaults, opts: &SpeechOptions) -> Defaults {
+    Defaults {
+        voice: opts.voice.clone().or_else(|| defaults.voice.clone()),
+        temperature: opts.temperature.unwrap_or(defaults.temperature),
+        seed: opts.seed.unwrap_or(defaults.seed),
+        cfg_coef: match opts.cfg_coef.or(defaults.cfg_coef) {
+            Some(coef) if coef != 1.0 => Some(coef),
+            _ => None,
+        },
+        max_tokens_per_chunk: opts.max_tokens_per_chunk.unwrap_or(defaults.max_tokens_per_chunk),
+    }
+}
+
 /// A registered voice: the conditioning embedding, plus the encoding of
 /// equal-length silence when the model needs one for CFG.
 struct Voice<Q: BackendQ> {
@@ -321,15 +343,54 @@ impl<Q: BackendQ> SynthOf<Q> {
         self.stream_with(text, &SpeechOptions::default())
     }
 
+    /// Prime a voice once and keep it, for callers that generate repeatedly.
+    ///
+    /// ```no_run
+    /// # fn main() -> xn::Result<()> {
+    /// # let tts: ptts::synth::Synth = todo!();
+    /// let session = tts.session(&ptts::synth::SpeechOptions::default().voice("alba"), 1024)?;
+    /// for line in ["First.", "Second.", "Third."] {
+    ///     let pcm = session.say(line)?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// `max_seq_len` is the KV budget, allocated up front and held until the
+    /// session is dropped. At 12.5 Hz a full [`MAX_TOKENS_PER_CHUNK`]-token
+    /// chunk needs 796, so 1024 covers any
+    /// single chunk; longer text is split into chunks of that size rather than
+    /// needing more.
+    pub fn session(&self, opts: &SpeechOptions, max_seq_len: usize) -> Result<SessionOf<Q>> {
+        self.session_at(&resolve(&self.defaults, opts), max_seq_len)
+    }
+
+    /// Build a session, sized to `seq_budget`.
+    fn session_at(&self, settings: &Defaults, seq_budget: usize) -> Result<SessionOf<Q>> {
+        let (base, cfg_base) =
+            self.primed_state(settings.voice.as_deref(), seq_budget, settings.cfg_coef)?;
+        Ok(SessionOf {
+            prompt_len: primed_len(&base),
+            in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            model: Arc::clone(&self.model),
+            frame_rate: self.cfg.mimi.frame_rate,
+            temperature: settings.temperature,
+            seed: settings.seed,
+            max_tokens_per_chunk: settings.max_tokens_per_chunk,
+            base,
+            cfg_base,
+            seq_budget,
+        })
+    }
+
     /// Start generating `text` with per-request overrides.
     ///
     /// Generation runs on two background threads — one for the flow-LM, one for
     /// the Mimi decoder — so decoding overlaps the next backbone step. Dropping
     /// the returned [`SpeechStream`] stops both.
     pub fn stream_with(&self, text: &str, opts: &SpeechOptions) -> Result<SpeechStream> {
-        let temperature = opts.temperature.unwrap_or(self.defaults.temperature);
-        let seed = opts.seed.unwrap_or(self.defaults.seed);
-        let rng = Box::new(NormalRng::new(temperature, seed)?);
+        let settings = resolve(&self.defaults, opts);
+        let rng = Box::new(NormalRng::new(settings.temperature, settings.seed)?);
         self.stream_with_rng(text, opts, rng)
     }
 
@@ -345,19 +406,281 @@ impl<Q: BackendQ> SynthOf<Q> {
         opts: &SpeechOptions,
         rng: Box<dyn crate::flow_lm::Rng + Send>,
     ) -> Result<SpeechStream> {
-        let max_tokens_per_chunk =
-            opts.max_tokens_per_chunk.unwrap_or(self.defaults.max_tokens_per_chunk);
-        let cfg_coef = match opts.cfg_coef.or(self.defaults.cfg_coef) {
-            Some(coef) if coef != 1.0 => Some(coef),
-            _ => None,
+        let settings = resolve(&self.defaults, opts);
+        let chunks = plan_chunks(
+            &self.model,
+            self.cfg.mimi.frame_rate,
+            text,
+            settings.max_tokens_per_chunk,
+        )?;
+        // A one-shot call primes a session sized to this text and drops it
+        // afterwards, so there is one generation path rather than two.
+        let seq_budget = chunks.iter().map(|c| c.seq_budget).max().unwrap_or(0);
+        self.session_at(&settings, seq_budget)?.stream_chunks(chunks, rng)
+    }
+
+    /// Build the state every chunk starts from: allocated, then conditioned on
+    /// the voice. Cloning it per chunk is much cheaper than re-priming.
+    #[allow(clippy::type_complexity)]
+    fn primed_state(
+        &self,
+        voice: Option<&str>,
+        seq_budget: usize,
+        cfg_coef: Option<f32>,
+    ) -> Result<(TTSState<Q>, Option<(f32, TTSState<Q>)>)> {
+        let voice = match voice {
+            None if self.voices.is_empty() => None,
+            None => xn::bail!(
+                "no voice selected; this model has {}",
+                self.voices.keys().cloned().collect::<Vec<_>>().join(", ")
+            ),
+            Some(name) => match self.voices.get(name) {
+                Some(voice) => Some(voice),
+                None => xn::bail!(
+                    "unknown voice '{name}'; available voices are {}",
+                    self.voices.keys().cloned().collect::<Vec<_>>().join(", ")
+                ),
+            },
         };
 
-        let chunks = self.plan_chunks(text, max_tokens_per_chunk)?;
-        let seq_budget = chunks.iter().map(|c| c.seq_budget).max().unwrap_or(0);
+        if let Some(voice) = voice {
+            let frames = voice.emb.dim(1usize)?;
+            if frames >= seq_budget {
+                xn::bail!(
+                    "the voice prompt is {frames} frames but the KV budget is {seq_budget}; \
+                     build the session with a larger max_seq_len"
+                )
+            }
+        }
+        let mut state = self.model.init_flow_lm_state(1, seq_budget)?;
+        if let Some(voice) = voice {
+            self.model.prompt_audio(&mut state, &voice.emb)?;
+        }
 
-        let voice_name = opts.voice.as_ref().or(self.defaults.voice.as_ref());
-        let (base_state, cfg_base) = self.primed_state(voice_name, seq_budget, cfg_coef)?;
+        let cfg_state = match cfg_coef {
+            None => None,
+            Some(coef) => {
+                let mut null_state = self.model.init_flow_lm_state(1, seq_budget)?;
+                if !self.cfg.cfg_null_audio_empty
+                    && let Some(voice) = voice
+                {
+                    match voice.null_emb.as_ref() {
+                        Some(null_emb) => self.model.prompt_audio(&mut null_state, null_emb)?,
+                        None => xn::bail!(
+                            "this model conditions its CFG null branch on silence \
+                             (cfg_null_audio_empty=false), which needs the voice's source audio. \
+                             Register the voice with add_voice_from_pcm instead of a precomputed \
+                             embedding, or disable CFG."
+                        ),
+                    }
+                }
+                Some((coef, null_state))
+            }
+        };
+        Ok((state, cfg_state))
+    }
+}
 
+impl<Q: BackendQ> std::fmt::Debug for SynthOf<Q> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SynthOf")
+            .field("device", &self.device_name())
+            .field("sample_rate", &self.sample_rate())
+            .field("voices", &self.voices())
+            .finish()
+    }
+}
+
+/// Split `text` into chunks and work out the budgets for each.
+///
+/// Free rather than a method because both [`SynthOf`] and [`SessionOf`] need
+/// it, and it depends only on the tokenizer inside the model and the codec's
+/// frame rate.
+fn plan_chunks<Q: BackendQ>(
+    model: &TTSModel<Q>,
+    frame_rate: f64,
+    text: &str,
+    max_tokens_per_chunk: usize,
+) -> Result<Vec<ChunkPlan>> {
+    let tokenizer = match model.flow_lm.conditioner.tokenizer.as_ref() {
+        Some(tokenizer) => tokenizer.as_ref(),
+        None => xn::bail!(
+            "this model was loaded without a tokenizer; pass one to \
+                 SynthBuilder::tokenizer, or use the lower-level TTSModel API with \
+                 pre-tokenized input"
+        ),
+    };
+    let texts = split_into_best_sentences(tokenizer, text, Some(max_tokens_per_chunk))?;
+    let mut chunks = Vec::with_capacity(texts.len());
+    for text in texts {
+        let (prepared, frames_after_eos) = prepare_text_prompt(&text);
+        let tokens = model.flow_lm.conditioner.tokenize(&prepared)?;
+        let frame_budget = plan::frame_budget(tokens.len(), frame_rate);
+        let seq_budget = plan::seq_budget(tokens.len(), frame_budget);
+        chunks.push(ChunkPlan { tokens, frame_budget, frames_after_eos, seq_budget });
+    }
+    if chunks.is_empty() {
+        xn::bail!("nothing to synthesize: the text is empty");
+    }
+    Ok(chunks)
+}
+
+/// A voice primed once, ready to generate repeatedly.
+///
+/// # One generation at a time
+///
+/// A session runs one generation at a time, and says so: starting a second
+/// while the first is still running is an error, not silent corruption.
+///
+/// Starting one clones the primed state, and cloning an `xn` tensor shares its
+/// storage rather than copying it, so two overlapping generations would write
+/// into the same KV buffers and each would attend over the other's keys. The
+/// hazard outlives the call — [`SpeechStream`] is `'static` and its workers
+/// keep writing after `stream` returns — so a flag held for the life of those
+/// workers is what actually enforces it; `!Sync` or `&mut self` cannot see it.
+/// Dropping a stream joins its workers, so finishing or dropping one and
+/// starting the next always works.
+///
+/// A server wanting genuine concurrency builds one session per connection,
+/// which is what `ptts-ws-server` does.
+///
+/// Built by [`SynthOf::session`]. Every generation clones the primed state
+/// rather than re-running `prompt_audio` over the voice prompt. A one-shot
+/// caller should just use [`SynthOf::say`].
+///
+/// The KV budget is fixed at construction.
+pub struct SessionOf<Q: BackendQ> {
+    model: Arc<TTSModel<Q>>,
+    frame_rate: f64,
+    temperature: f32,
+    seed: u64,
+    max_tokens_per_chunk: usize,
+    base: TTSState<Q>,
+    cfg_base: Option<(f32, TTSState<Q>)>,
+    seq_budget: usize,
+    /// Slots the voice prompt already occupies, so the budget check can use it
+    /// instead of [`plan::PROMPT_SEQ_HEADROOM`]'s fixed reserve.
+    prompt_len: usize,
+    /// Set while a generation is running. See the note on this type.
+    in_flight: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<Q: BackendQ> SessionOf<Q> {
+    /// The KV budget this session was primed with.
+    pub fn seq_budget(&self) -> usize {
+        self.seq_budget
+    }
+
+    pub fn sample_rate(&self) -> usize {
+        self.model.sample_rate()
+    }
+
+    /// Synthesize `text`, returning the whole waveform.
+    pub fn say(&self, text: &str) -> Result<Vec<f32>> {
+        let mut pcm = Vec::new();
+        for chunk in self.stream(text)? {
+            pcm.extend_from_slice(&chunk?);
+        }
+        Ok(pcm)
+    }
+
+    /// Synthesize `text`, yielding PCM as the decoder produces it.
+    pub fn stream(&self, text: &str) -> Result<SpeechStream> {
+        let rng = Box::new(NormalRng::new(self.temperature, self.seed)?);
+        self.stream_with_rng(text, rng)
+    }
+
+    /// As [`Self::stream`], with an explicit seed for this request.
+    pub fn stream_seeded(&self, text: &str, seed: u64) -> Result<SpeechStream> {
+        let rng = Box::new(NormalRng::new(self.temperature, seed)?);
+        self.stream_with_rng(text, rng)
+    }
+
+    /// As [`Self::say`], with an explicit seed for this request.
+    pub fn say_seeded(&self, text: &str, seed: u64) -> Result<Vec<f32>> {
+        let mut pcm = Vec::new();
+        for chunk in self.stream_seeded(text, seed)? {
+            pcm.extend_from_slice(&chunk?);
+        }
+        Ok(pcm)
+    }
+
+    /// As [`Self::stream`], with an explicit noise source.
+    pub fn stream_with_rng(
+        &self,
+        text: &str,
+        rng: Box<dyn crate::flow_lm::Rng + Send>,
+    ) -> Result<SpeechStream> {
+        let chunks = plan_chunks(&self.model, self.frame_rate, text, self.max_tokens_per_chunk)?;
+        self.stream_chunks(chunks, rng)
+    }
+
+    /// Synthesize from tokens produced elsewhere, as one chunk.
+    ///
+    /// `frames_after_eos` is the tail [`prepare_text_prompt`] would have
+    /// chosen: 3 for a very short prompt, 1 otherwise.
+    pub fn stream_tokens(
+        &self,
+        tokens: Vec<u32>,
+        frames_after_eos: usize,
+        rng: Box<dyn crate::flow_lm::Rng + Send>,
+    ) -> Result<SpeechStream> {
+        if tokens.is_empty() {
+            xn::bail!("nothing to synthesize: no tokens");
+        }
+        let frame_budget = plan::frame_budget(tokens.len(), self.frame_rate);
+        let seq_budget = plan::seq_budget(tokens.len(), frame_budget);
+        let chunk = ChunkPlan { tokens, frame_budget, frames_after_eos, seq_budget };
+        self.stream_chunks(vec![chunk], rng)
+    }
+
+    /// Start the two worker threads for an already-planned set of chunks.
+    ///
+    /// The single place generation is driven from: [`SynthOf::stream_with_rng`]
+    /// reaches it through an ephemeral session.
+    fn stream_chunks(
+        &self,
+        chunks: Vec<ChunkPlan>,
+        rng: Box<dyn crate::flow_lm::Rng + Send>,
+    ) -> Result<SpeechStream> {
+        // `c.seq_budget` reserves PROMPT_SEQ_HEADROOM for a voice prompt whose
+        // real length this session knows, so it over-states what is needed for
+        // a short prompt and under-states it for a long one.
+        let needed = chunks
+            .iter()
+            .map(|c| self.prompt_len + c.tokens.len() + c.frame_budget)
+            .max()
+            .unwrap_or(0);
+        if needed > self.seq_budget {
+            xn::bail!(
+                "this text needs a KV budget of {needed} but the session was primed with \
+                 {}; build the session with a larger max_seq_len, or split the text",
+                self.seq_budget
+            )
+        }
+        // Claimed before anything is cloned: the state clone shares its KV
+        // storage, so a second generation would write into the same buffers.
+        if self
+            .in_flight
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::Acquire,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            xn::bail!(
+                "a generation is already in flight on this session; finish or drop that \
+                 SpeechStream first, or build a second session"
+            )
+        }
+        let in_flight = InFlight(Arc::clone(&self.in_flight));
+
+        // Each request starts from the primed state rather than re-conditioning
+        // on the voice.
+        let base_state = self.base.clone();
+        let cfg_base = self.cfg_base.clone();
         let mimi_init = self.model.init_mimi_state(1)?;
         let ldim = self.model.flow_lm.ldim;
 
@@ -422,6 +745,8 @@ impl<Q: BackendQ> SynthOf<Q> {
         // Flow-LM: text in, latents out.
         let model = Arc::clone(&self.model);
         let backbone_handle = std::thread::spawn(move || {
+            // Dropped when this thread ends, which is after its last write.
+            let _in_flight = in_flight;
             let result = run_backbone(&model, chunks, base_state, cfg_base, rng, ldim, &latent_tx);
             if let Err(e) = result {
                 let _ = pcm_tx.send(Err(e));
@@ -429,99 +754,41 @@ impl<Q: BackendQ> SynthOf<Q> {
         });
 
         Ok(SpeechStream {
-            rx: pcm_rx,
+            rx: Some(pcm_rx),
             sample_rate: self.sample_rate(),
             failed: false,
             workers: Some([backbone_handle, decode_handle]),
         })
     }
-
-    /// Split `text` into chunks and work out the budgets for each.
-    fn plan_chunks(&self, text: &str, max_tokens_per_chunk: usize) -> Result<Vec<ChunkPlan>> {
-        let tokenizer = match self.model.flow_lm.conditioner.tokenizer.as_ref() {
-            Some(tokenizer) => tokenizer.as_ref(),
-            None => xn::bail!(
-                "this model was loaded without a tokenizer; pass one to \
-                 SynthBuilder::tokenizer, or use the lower-level TTSModel API with \
-                 pre-tokenized input"
-            ),
-        };
-        let texts = split_into_best_sentences(tokenizer, text, Some(max_tokens_per_chunk))?;
-        let frame_rate = self.cfg.mimi.frame_rate;
-        let mut chunks = Vec::with_capacity(texts.len());
-        for text in texts {
-            let (prepared, frames_after_eos) = prepare_text_prompt(&text);
-            let tokens = self.model.flow_lm.conditioner.tokenize(&prepared)?;
-            let frame_budget = plan::frame_budget(tokens.len(), frame_rate);
-            let seq_budget = plan::seq_budget(tokens.len(), frame_budget);
-            chunks.push(ChunkPlan { tokens, frame_budget, frames_after_eos, seq_budget });
-        }
-        if chunks.is_empty() {
-            xn::bail!("nothing to synthesize: the text is empty");
-        }
-        Ok(chunks)
-    }
-
-    /// Build the state every chunk starts from: allocated, then conditioned on
-    /// the voice. Cloning it per chunk is much cheaper than re-priming.
-    #[allow(clippy::type_complexity)]
-    fn primed_state(
-        &self,
-        voice: Option<&String>,
-        seq_budget: usize,
-        cfg_coef: Option<f32>,
-    ) -> Result<(TTSState<Q>, Option<(f32, TTSState<Q>)>)> {
-        let voice = match voice {
-            None if self.voices.is_empty() => None,
-            None => xn::bail!(
-                "no voice selected; this model has {}",
-                self.voices.keys().cloned().collect::<Vec<_>>().join(", ")
-            ),
-            Some(name) => match self.voices.get(name) {
-                Some(voice) => Some(voice),
-                None => xn::bail!(
-                    "unknown voice '{name}'; available voices are {}",
-                    self.voices.keys().cloned().collect::<Vec<_>>().join(", ")
-                ),
-            },
-        };
-
-        let mut state = self.model.init_flow_lm_state(1, seq_budget)?;
-        if let Some(voice) = voice {
-            self.model.prompt_audio(&mut state, &voice.emb)?;
-        }
-
-        let cfg_state = match cfg_coef {
-            None => None,
-            Some(coef) => {
-                let mut null_state = self.model.init_flow_lm_state(1, seq_budget)?;
-                if !self.cfg.cfg_null_audio_empty
-                    && let Some(voice) = voice
-                {
-                    match voice.null_emb.as_ref() {
-                        Some(null_emb) => self.model.prompt_audio(&mut null_state, null_emb)?,
-                        None => xn::bail!(
-                            "this model conditions its CFG null branch on silence \
-                             (cfg_null_audio_empty=false), which needs the voice's source audio. \
-                             Register the voice with add_voice_from_pcm instead of a precomputed \
-                             embedding, or disable CFG."
-                        ),
-                    }
-                }
-                Some((coef, null_state))
-            }
-        };
-        Ok((state, cfg_state))
-    }
 }
 
-impl<Q: BackendQ> std::fmt::Debug for SynthOf<Q> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SynthOf")
-            .field("device", &self.device_name())
-            .field("sample_rate", &self.sample_rate())
-            .field("voices", &self.voices())
-            .finish()
+/// Slots the primed state already occupies — the voice prompt's frames.
+///
+/// Read off the first flow-LM layer: every layer advances together, and a Mimi
+/// layer has no such position.
+fn primed_len<Q: BackendQ>(state: &TTSState<Q>) -> usize {
+    state
+        .flow_lm_state
+        .transformer_state
+        .layer_states
+        .iter()
+        .find_map(|layer| match layer {
+            crate::transformer::LayerAttentionState::FlowLm(mha) => Some(mha.current_end),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+/// Clears a session's in-flight flag when the generation that set it ends.
+///
+/// Moved into the flow-LM thread's closure, so the flag clears exactly when the
+/// last write to the shared KV buffers happens — including the early-drop case,
+/// where the thread runs one more step before it notices the closed channel.
+struct InFlight(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -595,7 +862,10 @@ fn run_backbone<Q: BackendQ>(
 /// and decodes them together. The iterator ends when generation finishes; an
 /// `Err` item is terminal.
 pub struct SpeechStream {
-    rx: std::sync::mpsc::Receiver<Result<Vec<f32>>>,
+    /// `Option` so [`Drop`] can release it *before* joining: the channel is
+    /// unbounded, so a worker only notices it should stop once the receiver is
+    /// gone, and fields drop after `Drop::drop` has run.
+    rx: Option<std::sync::mpsc::Receiver<Result<Vec<f32>>>>,
     sample_rate: usize,
     failed: bool,
     /// The flow-LM and decoder threads, joined once the channel closes so that
@@ -609,6 +879,23 @@ impl SpeechStream {
     }
 }
 
+/// Joining on drop is what makes a session's in-flight flag exact: dropping the
+/// receiver closes the channels, the workers stop, and only once they have
+/// stopped writing does the flag clear. Without it, "drop the stream, start the
+/// next one" could still be refused.
+impl Drop for SpeechStream {
+    fn drop(&mut self) {
+        // Releasing the receiver first is what stops the workers; joining
+        // before that would wait for the whole generation.
+        self.rx.take();
+        if let Some(workers) = self.workers.take() {
+            for worker in workers {
+                let _ = worker.join();
+            }
+        }
+    }
+}
+
 impl Iterator for SpeechStream {
     type Item = Result<Vec<f32>>;
 
@@ -616,7 +903,7 @@ impl Iterator for SpeechStream {
         if self.failed {
             return None;
         }
-        match self.rx.recv() {
+        match self.rx.as_ref()?.recv() {
             Ok(Err(e)) => {
                 self.failed = true;
                 self.workers.take();
@@ -958,6 +1245,110 @@ macro_rules! dispatch {
     };
 }
 
+/// The erased counterpart of [`SessionOf`], for callers that chose their weight
+/// format at runtime.
+enum SessionV {
+    Cpu(SessionOf<xn::Unquantized<f32, xn::CpuDevice>>),
+    Q80(SessionOf<xn::quantized::Q80F32>),
+    Q81(SessionOf<xn::quantized::Q81F32>),
+    Q8k(SessionOf<xn::quantized::Q8kF32>),
+    Q6k(SessionOf<xn::quantized::Q6kF32>),
+    Q50(SessionOf<xn::quantized::Q50F32>),
+    Q51(SessionOf<xn::quantized::Q51F32>),
+    Q5k(SessionOf<xn::quantized::Q5kF32>),
+    Q40(SessionOf<xn::quantized::Q40F32>),
+    Q41(SessionOf<xn::quantized::Q41F32>),
+    Q4k(SessionOf<xn::quantized::Q4kF32>),
+    #[cfg(feature = "cuda")]
+    Cuda(SessionOf<xn::Unquantized<half::bf16, xn::cuda_backend::Device>>),
+    #[cfg(feature = "vulkan")]
+    Vulkan(SessionOf<xn::Unquantized<f32, xn::vulkan_backend::Device>>),
+    #[cfg(feature = "metal")]
+    Metal(SessionOf<xn::Unquantized<half::bf16, xn::metal_backend::Device>>),
+}
+
+macro_rules! dispatch_session {
+    ($session:expr, |$s:ident| $body:expr) => {
+        match $session {
+            SessionV::Cpu($s) => $body,
+            SessionV::Q80($s) => $body,
+            SessionV::Q81($s) => $body,
+            SessionV::Q8k($s) => $body,
+            SessionV::Q6k($s) => $body,
+            SessionV::Q50($s) => $body,
+            SessionV::Q51($s) => $body,
+            SessionV::Q5k($s) => $body,
+            SessionV::Q40($s) => $body,
+            SessionV::Q41($s) => $body,
+            SessionV::Q4k($s) => $body,
+            #[cfg(feature = "cuda")]
+            SessionV::Cuda($s) => $body,
+            #[cfg(feature = "vulkan")]
+            SessionV::Vulkan($s) => $body,
+            #[cfg(feature = "metal")]
+            SessionV::Metal($s) => $body,
+        }
+    };
+}
+
+/// A voice primed once, ready to generate repeatedly.
+///
+/// Runs one generation at a time: starting a second while the first is still
+/// running is an error. See [`SessionOf`] for why, and for the concurrency
+/// story.
+pub struct Session(SessionV);
+
+impl Session {
+    /// The KV budget this session was primed with.
+    pub fn seq_budget(&self) -> usize {
+        dispatch_session!(&self.0, |s| s.seq_budget())
+    }
+
+    pub fn sample_rate(&self) -> usize {
+        dispatch_session!(&self.0, |s| s.sample_rate())
+    }
+
+    /// Synthesize `text`, returning the whole waveform.
+    pub fn say(&self, text: &str) -> Result<Vec<f32>> {
+        dispatch_session!(&self.0, |s| s.say(text))
+    }
+
+    /// Synthesize `text`, yielding PCM as the decoder produces it.
+    pub fn stream(&self, text: &str) -> Result<SpeechStream> {
+        dispatch_session!(&self.0, |s| s.stream(text))
+    }
+
+    /// As [`Self::say`], with an explicit seed for this request. Every call on a
+    /// session otherwise draws the same noise, since the seed is the session's.
+    pub fn say_seeded(&self, text: &str, seed: u64) -> Result<Vec<f32>> {
+        dispatch_session!(&self.0, |s| s.say_seeded(text, seed))
+    }
+
+    /// As [`Self::stream`], with an explicit seed for this request.
+    pub fn stream_seeded(&self, text: &str, seed: u64) -> Result<SpeechStream> {
+        dispatch_session!(&self.0, |s| s.stream_seeded(text, seed))
+    }
+
+    /// Synthesize from tokens produced elsewhere, as one chunk.
+    pub fn stream_tokens(
+        &self,
+        tokens: Vec<u32>,
+        frames_after_eos: usize,
+        rng: Box<dyn crate::flow_lm::Rng + Send>,
+    ) -> Result<SpeechStream> {
+        dispatch_session!(&self.0, |s| s.stream_tokens(tokens, frames_after_eos, rng))
+    }
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("sample_rate", &self.sample_rate())
+            .field("seq_budget", &self.seq_budget())
+            .finish()
+    }
+}
+
 /// A loaded Pocket TTS model, ready to synthesize speech.
 ///
 /// See the [module docs](self) for the short version. The weight format and
@@ -971,6 +1362,32 @@ impl Synth {
     /// caller's job: see [`SynthBuilder`].
     pub fn builder(config: TTSConfig, weights: impl Into<PathBuf>) -> SynthBuilder {
         SynthBuilder::new(config, weights)
+    }
+
+    /// Prime a voice once and keep it, for callers that generate repeatedly.
+    ///
+    /// See [`SynthOf::session`]. `max_seq_len` is the KV budget allocated up
+    /// front; text needing more is rejected rather than silently re-primed.
+    pub fn session(&self, opts: &SpeechOptions, max_seq_len: usize) -> Result<Session> {
+        Ok(Session(match &self.0 {
+            SynthV::Cpu(s) => SessionV::Cpu(s.session(opts, max_seq_len)?),
+            SynthV::Q80(s) => SessionV::Q80(s.session(opts, max_seq_len)?),
+            SynthV::Q81(s) => SessionV::Q81(s.session(opts, max_seq_len)?),
+            SynthV::Q8k(s) => SessionV::Q8k(s.session(opts, max_seq_len)?),
+            SynthV::Q6k(s) => SessionV::Q6k(s.session(opts, max_seq_len)?),
+            SynthV::Q50(s) => SessionV::Q50(s.session(opts, max_seq_len)?),
+            SynthV::Q51(s) => SessionV::Q51(s.session(opts, max_seq_len)?),
+            SynthV::Q5k(s) => SessionV::Q5k(s.session(opts, max_seq_len)?),
+            SynthV::Q40(s) => SessionV::Q40(s.session(opts, max_seq_len)?),
+            SynthV::Q41(s) => SessionV::Q41(s.session(opts, max_seq_len)?),
+            SynthV::Q4k(s) => SessionV::Q4k(s.session(opts, max_seq_len)?),
+            #[cfg(feature = "cuda")]
+            SynthV::Cuda(s) => SessionV::Cuda(s.session(opts, max_seq_len)?),
+            #[cfg(feature = "vulkan")]
+            SynthV::Vulkan(s) => SessionV::Vulkan(s.session(opts, max_seq_len)?),
+            #[cfg(feature = "metal")]
+            SynthV::Metal(s) => SessionV::Metal(s.session(opts, max_seq_len)?),
+        }))
     }
 
     /// Synthesize `text` and return the whole waveform as mono `f32` at
@@ -1077,5 +1494,96 @@ impl std::fmt::Debug for Synth {
             .field("sample_rate", &self.sample_rate())
             .field("voices", &self.voices())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn defaults() -> Defaults {
+        Defaults {
+            voice: Some("alba".into()),
+            temperature: 0.5,
+            seed: 42,
+            cfg_coef: None,
+            max_tokens_per_chunk: 50,
+        }
+    }
+
+    #[test]
+    fn unset_options_leave_the_defaults_alone() {
+        let d = defaults();
+        let got = resolve(&d, &SpeechOptions::default());
+        assert_eq!(got.voice, d.voice);
+        assert_eq!(got.temperature, d.temperature);
+        assert_eq!(got.seed, d.seed);
+        assert_eq!(got.max_tokens_per_chunk, d.max_tokens_per_chunk);
+    }
+
+    /// The regression this function exists for: `session` used to drop the
+    /// caller's temperature and seed in favour of the builder's. Each field is
+    /// also set on its own, since clobbering the rest is the other way to fail.
+    #[test]
+    fn each_field_overrides_independently() {
+        let all = SpeechOptions::default()
+            .voice("marius")
+            .temperature(0.9)
+            .seed(7)
+            .max_tokens_per_chunk(80);
+        let got = resolve(&defaults(), &all);
+        assert_eq!(got.voice.as_deref(), Some("marius"));
+        assert_eq!(got.temperature, 0.9);
+        assert_eq!(got.seed, 7);
+        assert_eq!(got.max_tokens_per_chunk, 80);
+
+        let one = resolve(&defaults(), &SpeechOptions::default().seed(99));
+        assert_eq!(one.seed, 99);
+        assert_eq!(one.temperature, 0.5);
+        assert_eq!(one.voice.as_deref(), Some("alba"));
+    }
+
+    /// The in-flight flag is what makes "one generation at a time" an error
+    /// rather than silent corruption, and the guard is what clears it.
+    #[test]
+    fn the_in_flight_guard_clears_on_drop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(
+            flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok(),
+            "an idle session must be claimable"
+        );
+        assert!(
+            flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err(),
+            "a claimed session must refuse a second generation"
+        );
+
+        let guard = InFlight(Arc::clone(&flag));
+        drop(guard);
+        assert!(!flag.load(Ordering::Acquire), "the guard must release the session");
+        assert!(
+            flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok(),
+            "and the next generation must be able to claim it"
+        );
+    }
+
+    #[test]
+    fn guidance_at_one_is_normalized_away() {
+        let from_request = SpeechOptions::default().cfg_coef(1.0);
+        assert_eq!(resolve(&defaults(), &from_request).cfg_coef, None);
+        assert_eq!(
+            resolve(&defaults(), &SpeechOptions::default().cfg_coef(2.0)).cfg_coef,
+            Some(2.0)
+        );
+        // From the builder, and when a request turns the builder's off.
+        let enabled = Defaults { cfg_coef: Some(3.0), ..defaults() };
+        assert_eq!(
+            resolve(&Defaults { cfg_coef: Some(1.0), ..defaults() }, &SpeechOptions::default())
+                .cfg_coef,
+            None
+        );
+        assert_eq!(resolve(&enabled, &from_request).cfg_coef, None);
+        assert_eq!(resolve(&enabled, &SpeechOptions::default()).cfg_coef, Some(3.0));
     }
 }

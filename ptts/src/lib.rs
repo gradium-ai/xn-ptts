@@ -41,8 +41,12 @@
 //! know: `ptts` reads the config, weights, tokenizer and voice files it is
 //! handed, and never guesses at names or downloads anything itself.
 //!
-//! Callers that need to drive generation themselves — a browser build stepping
-//! from an event loop, a server interleaving requests — should use
+//! A server answering many requests for one voice wants
+//! [`synth::Synth::session`], which conditions on the voice prompt once
+//! instead of per request.
+//!
+//! Callers that need to drive the loop themselves — a browser build stepping
+//! from an event loop, with no threads to spawn — should use
 //! [`tts_model::TTSModel`] directly. `Synth` is a composition of those
 //! primitives, not a replacement for them.
 
