@@ -23,6 +23,7 @@ sentencepiece = { workspace = true, optional = true }
 symphonia = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
 safetensors = { workspace = true }
+half = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
@@ -36,9 +37,9 @@ libc = { workspace = true }
 
 [features]
 default = []
-cuda = ["xn/cuda"]
+cuda = ["xn/cuda", "dep:half"]
 vulkan = ["xn/vulkan"]
-metal = ["xn/metal"]
+metal = ["xn/metal", "dep:half"]
 webgpu = ["xn/webgpu"]
 accelerate = ["xn/accelerate"]
 sp = ["dep:sentencepiece"]
