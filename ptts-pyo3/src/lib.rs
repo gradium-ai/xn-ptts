@@ -163,11 +163,14 @@ fn embedding_dims(arr: &PyReadonlyArrayDyn<'_, f32>) -> PyResult<(Vec<f32>, usiz
 #[pyclass(name = "TTS", module = "ptts")]
 struct Tts {
     inner: Arc<Mutex<Synth>>,
+    /// Voice for calls that name none. `SynthBuilder` picks its own during
+    /// `build()`, which is before the voices below are registered.
+    default_voice: Option<String>,
 }
 
 #[pymethods]
 impl Tts {
-    /// `TTS(config=None, device=None, quant=None, voice=None, temperature=0.7, seed=..., cfg_coef=None, eos_threshold=None)`
+    /// `TTS(config=None, device=None, quant=None, voice=None, temperature=0.5, seed=..., cfg_coef=None, eos_threshold=None)`
     #[new]
     #[pyo3(signature = (
         config = None,
@@ -223,9 +226,6 @@ impl Tts {
                 .quant(quant)
                 .temperature(temperature)
                 .seed(seed);
-            if let Some(voice) = voice {
-                builder = builder.voice(voice);
-            }
             if let Some(cfg_coef) = cfg_coef {
                 builder = builder.cfg_coef(cfg_coef);
             }
@@ -241,7 +241,8 @@ impl Tts {
                 // which ones made it.
                 let _ = synth.add_voice_file(name, path);
             }
-            Ok(Self { inner: Arc::new(Mutex::new(synth)) })
+            let default_voice = voice.or_else(|| synth.voices().first().cloned());
+            Ok(Self { inner: Arc::new(Mutex::new(synth)), default_voice })
         })
     }
 
@@ -292,8 +293,8 @@ impl Tts {
         seed: Option<u64>,
         cfg_coef: Option<f32>,
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
-        let opts = options(voice, temperature, seed, cfg_coef);
-        let stream = self.lock()?.stream_with(text, &opts).py()?;
+        let opts = self.opts(voice, temperature, seed, cfg_coef);
+        let stream = self.start(py, text, &opts)?;
         let pcm = drain(py, stream)?;
         Ok(PyArray1::from_vec(py, pcm))
     }
@@ -312,13 +313,10 @@ impl Tts {
         seed: Option<u64>,
         cfg_coef: Option<f32>,
     ) -> PyResult<f64> {
-        let opts = options(voice, temperature, seed, cfg_coef);
-        let (pcm, sample_rate) = {
-            let synth = self.lock()?;
-            let stream = synth.stream_with(text, &opts).py()?;
-            let sample_rate = stream.sample_rate();
-            (drain(py, stream)?, sample_rate)
-        };
+        let opts = self.opts(voice, temperature, seed, cfg_coef);
+        let stream = self.start(py, text, &opts)?;
+        let sample_rate = stream.sample_rate();
+        let pcm = drain(py, stream)?;
         let seconds = pcm.len() as f64 / sample_rate as f64;
         py.detach(|| ptts::wav::write_wav_file(&path, &pcm, sample_rate as u32).py())?;
         Ok(seconds)
@@ -337,9 +335,8 @@ impl Tts {
         seed: Option<u64>,
         cfg_coef: Option<f32>,
     ) -> PyResult<AudioStream> {
-        let opts = options(voice, temperature, seed, cfg_coef);
-        let synth = self.lock()?;
-        let stream = py.detach(|| synth.stream_with(text, &opts).py())?;
+        let opts = self.opts(voice, temperature, seed, cfg_coef);
+        let stream = self.start(py, text, &opts)?;
         Ok(AudioStream { inner: Mutex::new(Some(stream)) })
     }
 
@@ -398,21 +395,37 @@ impl Tts {
     fn lock(&self) -> PyResult<std::sync::MutexGuard<'_, Synth>> {
         self.inner.lock().map_err(|_| poisoned())
     }
+
+    /// Per-call settings, with this model's default voice filled in.
+    fn opts(
+        &self,
+        voice: Option<String>,
+        temperature: Option<f32>,
+        seed: Option<u64>,
+        cfg_coef: Option<f32>,
+    ) -> SpeechOptions {
+        SpeechOptions {
+            voice: voice.or_else(|| self.default_voice.clone()),
+            temperature,
+            seed,
+            cfg_coef,
+            max_tokens_per_chunk: None,
+        }
+    }
+
+    /// Start a generation with the lock taken *inside* `py.detach`. Holding it
+    /// across a GIL reacquisition — which `drain` does per chunk — deadlocks
+    /// against any other Python thread calling in.
+    fn start(&self, py: Python<'_>, text: &str, opts: &SpeechOptions) -> PyResult<SpeechStream> {
+        let inner = Arc::clone(&self.inner);
+        py.detach(|| inner.lock().map_err(|_| poisoned())?.stream_with(text, opts).py())
+    }
 }
 
 /// A panic inside a `&mut self` method would leave the model half-updated, so a
 /// poisoned lock is reported rather than papered over.
 fn poisoned() -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err("the model is unusable: a previous call panicked")
-}
-
-fn options(
-    voice: Option<String>,
-    temperature: Option<f32>,
-    seed: Option<u64>,
-    cfg_coef: Option<f32>,
-) -> SpeechOptions {
-    SpeechOptions { voice, temperature, seed, cfg_coef, max_tokens_per_chunk: None }
 }
 
 /// Collect a whole stream, letting Ctrl-C through between chunks.
