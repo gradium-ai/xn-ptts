@@ -1031,9 +1031,8 @@ impl SynthBuilder {
         }
     }
 
-    /// The tokenizer file the checkpoint ships, read by [`crate::tok::Tok`],
-    /// which picks the family from the extension. Ignored when
-    /// [`Self::tokenizer`] supplies one directly.
+    /// The `tokenizer.json` the checkpoint ships, read by [`crate::tok::Tok`].
+    /// Ignored when [`Self::tokenizer`] supplies one directly.
     pub fn tokenizer_file(mut self, path: impl Into<PathBuf>) -> Self {
         self.tokenizer_file = Some(path.into());
         self
@@ -1249,8 +1248,8 @@ impl SynthBuilder {
                 path.display()
             ),
             None => xn::bail!(
-                "no tokenizer available: the checkpoint shipped none and none was passed to \
-                 SynthBuilder::tokenizer or SynthBuilder::tokenizer_file."
+                "no tokenizer available: no `tokenizer.json` was found beside the checkpoint, \
+                 and none was passed to SynthBuilder::tokenizer or SynthBuilder::tokenizer_file."
             ),
         }
     }

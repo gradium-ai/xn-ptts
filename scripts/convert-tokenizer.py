@@ -59,10 +59,11 @@ def convert(model_path: str, output_path: str) -> None:
                 [AddedToken(sp.id_to_piece(i), special=True)]
             )
 
-    tokenizer.save(output_path)
-    print(f"Saved tokenizer to {output_path}")
-
-    # Sanity check: compare SP and HF tokenization.
+    # Sanity check before writing anything: a tokenizer.json that disagrees with the
+    # .model yields plausible audio from the wrong ids, which is exactly what `ptts`
+    # refuses to do silently -- so a mismatch has to fail, not warn. A pipeline with
+    # nobody reading stderr would otherwise upload a broken tokenizer.
+    mismatches = 0
     for test in TEST_SENTENCES:
         sp_encoded = sp.encode(test, out_type=int)
         sp_decoded = sp.decode(sp_encoded)
@@ -71,7 +72,19 @@ def convert(model_path: str, output_path: str) -> None:
         print(f"SentencePiece: '{test}' -> {sp_encoded} -> '{sp_decoded}'")
         print(f"HuggingFace:   '{test}' -> {hf_encoded} -> '{hf_decoded}'")
         if sp_encoded != hf_encoded:
+            mismatches += 1
             print("WARNING: token ids differ!", file=sys.stderr)
+
+    if mismatches:
+        print(
+            f"Error: {mismatches}/{len(TEST_SENTENCES)} test sentences tokenize "
+            f"differently; not writing {output_path}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    tokenizer.save(output_path)
+    print(f"Saved tokenizer to {output_path}")
 
 
 def main() -> None:
