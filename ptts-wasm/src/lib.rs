@@ -10,9 +10,10 @@ macro_rules! console_log {
     ($($t:tt)*) => (log(&format!($($t)*)))
 }
 
-use ptts::flow_lm::{self, FlowLMState};
+use ptts::flow_lm::{FlowLMState, NormalRng};
 use ptts::loader::remap_key;
 use ptts::mimi::MimiDecoderState;
+use ptts::plan::{self, EosPolicy};
 use ptts::tok::Tok;
 use ptts::transformer::{LayerAttentionState, StreamingMHAState, StreamingTransformerState};
 use ptts::tts_model::{TTSConfig, TTSModel, TTSState, prepare_text_prompt};
@@ -20,27 +21,10 @@ use xn::nn::VB;
 use xn::quantized::Q80F32;
 use xn::{BackendQ, CPU, CpuDevice, Tensor, TypedTensor, Unquantized};
 
-struct WasmRng {
-    inner: Box<rand::rngs::StdRng>,
-    distr: rand_distr::Normal<f32>,
-}
-
-impl WasmRng {
-    fn new(temperature: f32) -> Self {
-        use rand::SeedableRng;
-        let std = temperature.sqrt();
-        let distr = rand_distr::Normal::new(0f32, std).unwrap();
-        let rng = rand::rngs::StdRng::seed_from_u64(42);
-        Self { inner: Box::new(rng), distr }
-    }
-}
-
-impl flow_lm::Rng for WasmRng {
-    fn sample(&mut self) -> f32 {
-        use rand::Rng;
-        self.inner.sample(self.distr)
-    }
-}
+/// Seed for the noise source. Fixed, as it was when this crate carried its own copy of the
+/// sampler: the browser has no way to pass one yet, and a fixed seed at least makes a
+/// generation reproducible across reloads.
+const SEED: u64 = 42;
 
 /// Underlying type-erased transformer state, shared across all supported quantizations
 /// (all of them use `T = f32, B = CpuDevice`).
@@ -127,10 +111,9 @@ struct GenState {
     tts_state: StateInner,
     mimi_state: MimiDecoderState<f32, CpuDevice>,
     prev_latent: Tensor<f32, CpuDevice>,
-    rng: WasmRng,
+    rng: NormalRng,
     max_frames: usize,
-    frames_after_eos: usize,
-    eos_countdown: Option<usize>,
+    eos: EosPolicy,
     step: usize,
 }
 
@@ -180,7 +163,7 @@ impl Model {
     pub fn add_voice_(&mut self, state_bytes: &[u8]) -> xn::Result<usize> {
         console_log!("[add_voice] loading safetensors, {} bytes", state_bytes.len());
         let tensors = xn::safetensors::load_from_buffer(state_bytes, &CPU)?;
-        let num_layers = 6;
+        let num_layers = self.cfg.flow_lm.num_layers;
         let mut layer_states = Vec::with_capacity(num_layers);
 
         for i in 0..num_layers {
@@ -223,6 +206,16 @@ impl Model {
         text: &str,
         temperature: f32,
     ) -> xn::Result<usize> {
+        // Dropped before anything else can fail. `generation_step_` only puts the state back
+        // while the utterance is unfinished, so an abandoned one is still here -- and every
+        // early return below would otherwise leave a caller that swallows the error polling
+        // `generation_step` and quietly resuming the *previous* utterance.
+        self.gen_state = None;
+        // Built here rather than after the prompt pass: a temperature that cannot produce a
+        // distribution should be refused before `resize_state` allocates the KV cache and
+        // `prompt_text` runs a forward pass, not after.
+        let rng = NormalRng::new(temperature, SEED)?;
+
         let (text, frames_after_eos) = prepare_text_prompt(text);
         let token_ids = match &self.inner {
             ModelInner::F32(m) => m.flow_lm.conditioner.tokenize(&text)?,
@@ -237,8 +230,8 @@ impl Model {
         );
 
         let num_tokens = token_ids.len();
-        let max_frames = ((num_tokens as f64 / 3.0 + 2.0) * 12.5).ceil() as usize;
-        let seq_budget = num_tokens + 512 + max_frames;
+        let max_frames = plan::frame_budget(num_tokens, self.cfg.mimi.frame_rate);
+        let seq_budget = plan::seq_budget(num_tokens, max_frames);
 
         // Resize the cached voice state (small budget) into a full-sized state.
         if voice_index >= self.voice_states.len() {
@@ -259,8 +252,6 @@ impl Model {
         });
         console_log!("[start_generation] prompt_text done, starting generation loop");
 
-        let rng = WasmRng::new(temperature);
-
         let ldim = self.cfg.flow_lm.ldim;
         let nan_data: Vec<f32> = vec![f32::NAN; ldim];
         let prev_latent = Tensor::from_vec(nan_data, (1, 1, ldim), &CPU)?;
@@ -271,8 +262,7 @@ impl Model {
             prev_latent,
             rng,
             max_frames,
-            frames_after_eos,
-            eos_countdown: None,
+            eos: EosPolicy::new(frames_after_eos),
             step: 0,
         });
         Ok(num_tokens)
@@ -296,20 +286,9 @@ impl Model {
                 (next_latent, audio_chunk, is_eos)
             });
 
-        if is_eos && state.eos_countdown.is_none() {
-            state.eos_countdown = Some(state.frames_after_eos);
-        }
-
-        let done = if let Some(ref mut countdown) = state.eos_countdown {
-            if *countdown == 0 {
-                true
-            } else {
-                *countdown -= 1;
-                false
-            }
-        } else {
-            false
-        };
+        // `should_stop` is called after the frame has gone to the decoder: the EOS frame
+        // itself is part of the output.
+        let done = state.eos.should_stop(is_eos);
 
         state.prev_latent = next_latent;
         state.step += 1;

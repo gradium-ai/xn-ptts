@@ -2821,8 +2821,6 @@ dependencies = [
  "getrandom 0.3.4",
  "js-sys",
  "ptts",
- "rand 0.9.4",
- "rand_distr",
  "wasm-bindgen",
  "xn",
 ]
