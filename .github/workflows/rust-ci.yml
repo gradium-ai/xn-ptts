@@ -46,8 +46,8 @@ jobs:
         with:
           components: clippy
           cache-key: clippy
-      # `--all-targets` so the examples are linted too. This subsumes the old `check` job,
-      # which compiled strictly less.
+      # `--all-targets` so the examples are linted too, and the whole workspace including
+      # `ptts-ws-server`, which used to be excluded from every job.
       - name: Workspace, default features
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: ptts, every optional feature on
@@ -77,8 +77,11 @@ jobs:
       - name: ptts, every optional feature on
         run: cargo test -p ptts --features sp,hf,audio --all-targets
         shell: bash
+      # `-p ptts` rather than `--workspace`: it is the only crate with doctests, and selecting
+      # the two `cdylib` crates only produces "doc tests are not supported for crate type(s)
+      # `cdylib`" warnings.
       - name: Doctests
-        run: cargo test --workspace --doc $WS_EXCLUDE && cargo test -p ptts --features sp,hf,audio --doc
+        run: cargo test -p ptts --doc && cargo test -p ptts --features sp,hf,audio --doc
         shell: bash
       # The two backends that only exist on this platform, so nowhere else can check them.
       - name: macOS-only backends compile
@@ -99,11 +102,9 @@ jobs:
         with:
           cache-key: features
           audio-deps: "false"
-      # Every optional feature of `ptts` alone and in combination. `sp` and `hf` did reach the
-      # compiler before, but only because `ptts-pyo3` asks for them and workspace feature
-      # unification turned them on for everyone -- `audio`, and any combination with `sp` or
-      # `hf` off, was never type-checked. `-p ptts --no-default-features` escapes unification,
-      # which is the only way to get at those.
+      # Every optional feature of `ptts` alone and in combination. Nothing but the default set
+      # was ever compiled in CI before, so a `#[cfg(feature = ...)]` that did not build was
+      # invisible until someone enabled it.
       - name: Each combination
         shell: bash
         run: |
@@ -113,7 +114,6 @@ jobs:
             cargo check -p ptts --no-default-features --features "$features" --all-targets
             echo "::endgroup::"
           done
-
       - name: Install glslc
         # `xn`'s build script compiles the Vulkan compute shaders with `glslc`, so the `vulkan`
         # feature cannot even be type-checked without it.
@@ -182,10 +182,22 @@ jobs:
       # compiles `ptts-wasm` for the host, which is not the target it runs on. The SIMD flags
       # are the ones `.cargo/config.toml` sets for real builds, repeated here because CI
       # deletes that file.
+      #
+      # That file also sets `--cfg getrandom_backend="wasm_js"`, which is deliberately *not*
+      # repeated. getrandom 0.3.4 reaches its wasm_js backend two ways: through that cfg, or
+      # through the target-based branch that needs only the `wasm_js` cargo feature, which
+      # `ptts-wasm` enables directly. Its `compile_error!` text still claims "the `wasm_js`
+      # feature flag alone is insufficient", but that arm only fires when the feature is
+      # absent. Keeping the cfg out means this job proves the feature alone carries the build.
       - name: Check the browser build
         env:
           RUSTFLAGS: -C target-feature=+simd128,+relaxed-simd
         run: cargo check -p ptts-wasm --target wasm32-unknown-unknown --all-targets
+      # `ptts-wasm`'s `webgpu` feature is deliberately not checked here: it does not compile for
+      # this target, and has not since before this workflow. `xn 0.2.4`'s webgpu backend wants
+      # `Send + Sync` storage, while `wgpu`'s browser backend holds a `RefCell` and so is
+      # `!Sync` on wasm32 -- 48 errors, all of them that. The feature builds fine for the host,
+      # which is why nothing had noticed. Add the check here once `xn` is fixed.
 
   # One job to require in branch protection, instead of every matrix leg by name.
   ci-ok:
