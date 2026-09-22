@@ -7,9 +7,12 @@ on:
   workflow_dispatch:
 
 # A PR that gets three pushes in a minute should not leave two runs burning runners. Pushes to
-# `main` are left alone: their caches are what every branch restores from.
+# `main` get a group of their own, keyed by run id, so they never queue behind each other:
+# GitHub keeps only one *pending* run per group, so merging three PRs in a row would otherwise
+# cancel the middle run before it started -- and those are the runs whose caches every branch
+# restores from.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
