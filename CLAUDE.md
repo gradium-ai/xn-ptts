@@ -4,26 +4,44 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Workspace layout
 
-Cargo workspace (resolver "3", edition 2024) with three members:
+Cargo workspace (resolver "3", edition 2024) with four members:
 
 - `ptts/` — core TTS library. Pure Rust, depends on the `xn` tensor/nn crate. Examples live under `ptts/examples/`: `say` (shortest end-to-end call) and `bench` (benchmark harness) require the `hf` feature for the tokenizer, `pocket_tts` (full CLI) requires `hf` and `audio`, `create_voice` (voice embeddings from audio samples) requires `audio`, and `quantize` (safetensors → GGUF converter that selectively quantizes `flow_lm.transformer.layers.*` weights) requires nothing. `model_helpers.rs` is not an example — it is a shared module each example pulls in with `#[path = "..."] mod`, so `autoexamples = false` and every example is listed explicitly in `Cargo.toml`.
 - `ptts-pyo3/` — PyO3 bindings exposing `TTSModel` to Python. Built with maturin; the cdylib is named `ptts`. Has its own `pyproject.toml` and `uv.lock`.
 - `ptts-wasm/` — browser build via `wasm-bindgen` / `wasm-pack`. Ships a demo in `ptts-wasm/www/` (`index.html` + `worker.js`).
+- `ptts-ws-server/` — WebSocket streaming server (`axum` + `kaudio`). Needs a system libopus through `kaudio` → `libopus_sys`, which is why CI installs it on Linux and macOS and skips this crate on Windows.
 
 Shared dependency versions (notably `xn`) and the workspace version live in the top-level `Cargo.toml`. Bumping the release version means editing `workspace.package.version` and the `ptts` workspace dep.
 
 ## Build / test / lint
 
-CI (`.github/workflows/rust-ci.yml`) runs on stable + nightly across Linux/macOS/Windows and is the source of truth:
+CI (`.github/workflows/rust-ci.yml`) is the source of truth. Seven jobs, gated behind one
+required check called `CI`:
 
-```
-cargo check
-cargo test
-cargo fmt --all -- --check        # rustfmt.toml: use_small_heuristics = "Max", edition 2024
-cargo clippy -- -D warnings
-```
+| Job | What it covers |
+|---|---|
+| `fmt` | `cargo fmt --all -- --check` (rustfmt.toml: `use_small_heuristics = "Max"`, edition 2024) |
+| `clippy` | whole workspace `--all-targets -D warnings`, then `ptts` with `sp,hf,audio` |
+| `test` | stable + nightly × Linux/macOS/Windows; default features, then `sp,hf,audio`, then doctests; `metal` and `accelerate` type-checked on the macOS leg |
+| `features` | every combination of `sp`/`hf`/`audio`, plus `vulkan` and `webgpu` |
+| `docs` | `cargo doc` on nightly with `--cfg docsrs` exactly as docs.rs builds it, then again on stable |
+| `wasm` | `ptts-wasm` for `wasm32-unknown-unknown` with the SIMD flags real builds use |
 
-CI deletes `.cargo/config.toml` before building because it pins `target-cpu=native`, which breaks portable dependency builds. If you reproduce CI failures locally, do the same (`rm -f .cargo/config.toml`) — otherwise keep the file in place for fast local builds.
+`.github/actions/setup-rust` is a composite action holding the parts every job shares: the
+toolchain, the cache, and the platform quirks below.
+
+Three things worth knowing before editing it:
+
+- **`--all-features` never works.** It turns on `cuda`, whose `cudarc` build script shells out to
+  `nvcc`. Feature sets are always named explicitly, including in `[package.metadata.docs.rs]`.
+- **`ptts-ws-server` needs a system libopus** (through `kaudio` → `libopus_sys`). CI installs it
+  on Linux and macOS; Windows has no one-line equivalent, so the crate is excluded there and only
+  there, through `$WS_EXCLUDE`. The `vulkan` feature likewise needs `glslc`, installed in the
+  `features` job.
+- **CI deletes `.cargo/config.toml`** because it pins `target-cpu=native`, which breaks portable
+  dependency builds. If you reproduce a CI failure locally, do the same (`rm -f
+  .cargo/config.toml`) — otherwise keep the file in place for fast local builds. The `wasm` job
+  re-sets that file's SIMD flags itself.
 
 Cargo features that gate optional functionality:
 

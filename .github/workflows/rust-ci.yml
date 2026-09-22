@@ -186,3 +186,23 @@ jobs:
         env:
           RUSTFLAGS: -C target-feature=+simd128,+relaxed-simd
         run: cargo check -p ptts-wasm --target wasm32-unknown-unknown --all-targets
+
+  # One job to require in branch protection, instead of every matrix leg by name.
+  ci-ok:
+    name: CI
+    if: always()
+    needs: [fmt, clippy, test, features, docs, wasm]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail if anything upstream did
+        shell: bash
+        run: |
+          results="${{ join(needs.*.result, ' ') }}"
+          echo "$results"
+          for result in $results; do
+            if [ "$result" != "success" ]; then
+              echo "::error::a required job reported '$result'"
+              exit 1
+            fi
+          done
