@@ -47,6 +47,7 @@
 //! |---|---|
 //! | [`synth`] | The one-call API: load, prime, generate, decode. Start here. |
 //! | [`loader`] | Locating a checkpoint, reading weights and voice files, and the key mapping. |
+//! | [`error`] | [`Error`] and [`ErrorKind`], what those two return. |
 //! | [`plan`] | Frame and KV budgets, the end-of-speech policy. |
 //! | [`preprocess`] | Per-language text normalization, applied before tokenizing. |
 //! | [`tok`] | Tokenizers, behind the `sp` / `hf` features. |
@@ -54,6 +55,14 @@
 //! | [`tts_model`] | [`tts_model::TTSModel`], the streaming primitives `synth` drives. |
 //! | [`flow_lm`], [`transformer`] | The token-conditioned flow-matching LM. |
 //! | [`mimi`], [`seanet`] | The neural audio codec. |
+//!
+//! # Errors
+//!
+//! [`synth`] and [`loader`] return [`Error`]; the model modules below them keep `xn::Result`,
+//! because a shape mismatch inside the codec is not something a caller acts on. `?` crosses the
+//! boundary in both directions, so a frontend whose own functions return `xn::Result` keeps
+//! compiling. [`Error::kind`] sorts a failure into one of eight [`ErrorKind`]s, which is what a
+//! binding maps onto its host language's exceptions.
 //!
 //! Downloading is opt-in. With the `hub` feature off -- the default -- `ptts`
 //! makes no network calls at all and reads only files the caller has already
@@ -75,6 +84,7 @@ pub mod audio;
 pub mod conditioners;
 pub mod conv;
 pub mod dummy_quantizer;
+pub mod error;
 pub mod flow_lm;
 pub mod layer_scale;
 pub mod loader;
@@ -92,6 +102,8 @@ pub mod transformer;
 pub mod tts_model;
 pub mod utils;
 pub mod wav;
+
+pub use error::{Error, ErrorKind, Result};
 
 pub trait Tokenizer {
     fn encode(&self, text: &str) -> xn::Result<Vec<u32>>;

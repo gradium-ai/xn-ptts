@@ -23,6 +23,7 @@ sentencepiece = { workspace = true, optional = true }
 symphonia = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
 safetensors = { workspace = true }
+thiserror = { workspace = true }
 half = { workspace = true, optional = true }
 hf-hub = { workspace = true, optional = true }
 

@@ -3,9 +3,13 @@
 //! The generation path itself needs a checkpoint, so it is covered by the
 //! examples rather than here. What is testable without one is the surface most
 //! likely to break for a first-time user: argument parsing, feature gating, and
-//! the error messages on the paths they will hit by accident.
+//! the errors on the paths they will hit by accident.
+//!
+//! Those errors are asserted on as *values* -- the variant and its fields -- rather than as
+//! prose. A message is allowed to be reworded; which failure it is, is the contract.
 
 use ptts::synth::{DeviceKind, Quant, SpeechOptions, Synth, SynthBuilder};
+use ptts::{Error, ErrorKind};
 
 /// A builder over `weights`, with the shipped config: every test here fails
 /// before the weights are read, so the config's contents do not matter.
@@ -57,10 +61,11 @@ fn quant_round_trips_through_its_canonical_name() {
 }
 
 #[test]
-fn unknown_quant_lists_the_valid_ones() {
-    let err = Quant::parse("q3k").unwrap_err().to_string();
-    assert!(err.contains("q3k"), "{err}");
-    assert!(err.contains("q4k"), "should list the supported formats: {err}");
+fn unknown_quant_names_what_was_passed_and_lists_the_valid_ones() {
+    let err = Quant::parse("q3k").unwrap_err();
+    assert!(matches!(&err, Error::UnknownQuant { name } if name == "q3k"), "{err:?}");
+    assert_eq!(err.kind(), ErrorKind::InvalidArgument);
+    assert!(err.to_string().contains("q4k"), "should list the supported formats: {err}");
 }
 
 #[test]
@@ -70,8 +75,9 @@ fn device_parses_and_rejects_unknown_names() {
     assert_eq!(DeviceKind::parse("cuda").unwrap(), DeviceKind::Cuda);
     assert_eq!(DeviceKind::parse("vulkan").unwrap(), DeviceKind::Vulkan);
     assert_eq!(DeviceKind::parse("metal").unwrap(), DeviceKind::Metal);
-    let err = DeviceKind::parse("tpu").unwrap_err().to_string();
-    assert!(err.contains("tpu"), "{err}");
+    let err = DeviceKind::parse("tpu").unwrap_err();
+    assert!(matches!(&err, Error::UnknownDevice { name } if name == "tpu"), "{err:?}");
+    assert_eq!(err.kind(), ErrorKind::InvalidArgument);
 }
 
 #[test]
@@ -92,12 +98,12 @@ fn explicit_device_survives_resolution() {
 }
 
 #[test]
-fn missing_weights_name_the_path() {
+fn missing_weights_are_a_not_found_naming_the_path() {
     let err = builder("/definitely/not/a/model/weights.safetensors")
         .load::<xn::Unquantized<f32, xn::CpuDevice>>(xn::CPU)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("/definitely/not/a/model/weights.safetensors"), "{err}");
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::NotFound);
+    assert!(err.to_string().contains("/definitely/not/a/model/weights.safetensors"), "{err}");
 }
 
 #[test]
@@ -106,11 +112,10 @@ fn a_load_without_a_tokenizer_says_how_to_supply_one() {
     // is not a checkpoint, but the tokenizer is resolved before it is read.
     let weights = std::env::temp_dir().join("ptts-synth-api-no-tokenizer.safetensors");
     std::fs::write(&weights, b"").unwrap();
-    let err = builder(&weights)
-        .load::<xn::Unquantized<f32, xn::CpuDevice>>(xn::CPU)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("SynthBuilder::tokenizer"), "{err}");
+    let err = builder(&weights).load::<xn::Unquantized<f32, xn::CpuDevice>>(xn::CPU).unwrap_err();
+    assert!(matches!(err, Error::NoTokenizer), "{err:?}");
+    assert_eq!(err.kind(), ErrorKind::Unsupported);
+    assert!(err.to_string().contains("SynthBuilder::tokenizer"), "{err}");
     std::fs::remove_file(&weights).ok();
 }
 
@@ -120,10 +125,17 @@ fn quantization_on_a_gpu_is_rejected_before_the_weights_are_touched() {
         .device(DeviceKind::Cuda)
         .quant(Quant::Q40)
         .build()
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("CPU-only"), "{err}");
-    assert!(err.contains("q4_0"), "the error should name the format: {err}");
+        .unwrap_err();
+    // Not `NotFound`: the check has to happen before the weights are opened, and the variant is
+    // what proves the order rather than which words came out.
+    assert!(
+        matches!(
+            err,
+            Error::QuantUnsupportedOnDevice { quant: Quant::Q40, device: DeviceKind::Cuda }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(err.kind(), ErrorKind::Unsupported);
 }
 
 #[test]
@@ -175,7 +187,7 @@ fn model_source_reaches_a_checkpoint_without_the_frontend_knowing_its_layout() {
 fn a_default_voice_can_be_chosen_after_the_model_is_loaded() {
     // Registering a checkpoint's voices happens after `build`, so the default has to be
     // settable then. Signature-only: choosing one needs weights.
-    fn _accepts(tts: &mut ptts::synth::Synth) -> xn::Result<()> {
+    fn _accepts(tts: &mut ptts::synth::Synth) -> ptts::Result<()> {
         let _: Option<&str> = tts.default_voice();
         tts.set_default_voice("alba")
     }
@@ -210,4 +222,26 @@ fn the_types_the_frontends_move_between_threads_still_can() {
     send_sync::<ptts::synth::Session>();
     send_sync::<ptts::synth::SessionOf<xn::Unquantized<f32, xn::CpuDevice>>>();
     send::<ptts::synth::SpeechStream>();
+}
+
+#[test]
+fn an_unknown_voice_hands_back_the_names_that_would_have_worked() {
+    // The reason `UnknownVoice` carries `known`: a caller can correct itself, or print a list,
+    // without re-deriving it from the message.
+    let err =
+        Error::UnknownVoice { name: "nobody".into(), known: vec!["alba".into(), "marius".into()] };
+    let Error::UnknownVoice { known, .. } = &err else { panic!("{err:?}") };
+    assert_eq!(known, &["alba", "marius"]);
+    assert_eq!(err.kind(), ErrorKind::NotFound);
+}
+
+#[test]
+fn a_frontend_on_xn_result_still_compiles() {
+    // The compatibility bridge: `?` on this crate inside a function returning `xn::Result` is
+    // what every existing frontend does, and it has to keep working.
+    fn _frontend() -> xn::Result<()> {
+        let _ = Quant::parse("q8_0")?;
+        let _ = DeviceKind::parse("cpu")?;
+        Ok(())
+    }
 }

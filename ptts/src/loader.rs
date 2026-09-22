@@ -5,8 +5,9 @@
 //! way. Keeping that here means a checkpoint layout change is one edit rather than four.
 
 use crate::tts_model::TTSConfig;
+use crate::{Error, Result};
 use xn::nn::{Linear, Path, VB};
-use xn::{Backend, BackendQ, Result, Tensor};
+use xn::{Backend, BackendQ, Tensor};
 
 /// Maps upstream checkpoint names onto the names this crate's modules expect, dropping the
 /// tensors the runtime has no use for.
@@ -138,10 +139,12 @@ pub fn load_voice_emb<B: Backend>(
     let tensor = match dims.as_slice() {
         [a, b] => tensor.reshape((1, *a, *b))?,
         [_, _, _] => tensor,
-        _ => xn::bail!(
-            "voice tensor `{name}` in {} has shape {dims:?}, expected two or three dimensions",
-            path.display()
-        ),
+        _ => {
+            return Err(Error::checkpoint(format!(
+                "voice tensor `{name}` in {} has shape {dims:?}, expected two or three dimensions",
+                path.display()
+            )));
+        }
     };
     let emb = match kind {
         VoiceTensor::Emb => tensor,
@@ -149,23 +152,23 @@ pub fn load_voice_emb<B: Backend>(
             // [1, C, T] -> [1, T, C]
             let latents = tensor.transpose(1, 2)?.contiguous()?;
             let Some(proj) = speaker_proj else {
-                xn::bail!(
+                return Err(Error::checkpoint(format!(
                     "{} holds `{SPEAKER_WAVS_TENSOR}` latents, but this checkpoint has no speaker \
                      projection (`{SPEAKER_PROJ_WEIGHT}`) to turn them into a voice embedding. A \
                      GGUF written by an older `quantize --no-mimi-encoder` dropped it: regenerate \
                      the GGUF from the safetensors checkpoint, or use a precomputed `{EMB_TENSOR}` \
                      voice.",
                     path.display()
-                )
+                )));
             };
             let channels = latents.dim(2usize)?;
             let in_dim = proj.weight().dims()[1];
             if channels != in_dim {
-                xn::bail!(
+                return Err(Error::checkpoint(format!(
                     "`{SPEAKER_WAVS_TENSOR}` in {} has {channels} channels but the speaker \
                      projection takes {in_dim}",
                     path.display()
-                )
+                )));
             }
             proj.forward(&latents)?
         }
@@ -183,16 +186,17 @@ fn check_model_ext(path: &std::path::Path, model_ext: &str) -> Result<()> {
     // Not `SafeTensors::read_metadata`: it validates that the buffer holds the
     // tensor data as well as the header, which is exactly what is not read here.
     let header: serde_json::Value = serde_json::from_slice(&header).map_err(|e| {
-        xn::Error::msg(format!("cannot parse safetensors header of {}: {e}", path.display()))
+        Error::checkpoint(format!("cannot parse safetensors header of {}: {e}", path.display()))
     })?;
     if let Some(voice_model_ext) = header.get("__metadata__").and_then(|m| m.get("model_ext"))
         && let Some(voice_model_ext) = voice_model_ext.as_str()
     {
         tracing::info!(?voice_model_ext, "voice embedding model_ext from metadata");
         if voice_model_ext != model_ext {
-            xn::bail!(
-                "voice embedding model_ext '{voice_model_ext}' does not match config model_ext '{model_ext}'"
-            )
+            return Err(Error::checkpoint(format!(
+                "voice embedding model_ext '{voice_model_ext}' does not match config model_ext \
+                 '{model_ext}'"
+            )));
         }
     }
     Ok(())
@@ -214,7 +218,10 @@ fn read_safetensors_header(path: &std::path::Path) -> Result<Vec<u8>> {
     // A file that is not safetensors can claim an absurd header length; refuse
     // to allocate on its word.
     if header_len > 100 * 1024 * 1024 {
-        xn::bail!("{} does not look like a safetensors file", path.display())
+        return Err(Error::checkpoint(format!(
+            "{} does not look like a safetensors file",
+            path.display()
+        )));
     }
     let mut buf = vec![0u8; header_len as usize];
     file.read_exact(&mut buf)?;
@@ -513,18 +520,18 @@ impl ModelSource {
 
     fn resolve_dir(&self, dir: &std::path::Path) -> Result<Checkpoint> {
         if !dir.is_dir() {
-            xn::bail!("not a directory: {}", dir.display())
+            return Err(Error::not_found(format!("not a directory: {}", dir.display())));
         }
         let root = match self.prefix() {
             Some(prefix) => dir.join(prefix),
             None => dir.to_path_buf(),
         };
         if !root.is_dir() {
-            xn::bail!(
+            return Err(Error::not_found(format!(
                 "no subdirectory `{}` in {}",
                 self.subdir.as_deref().unwrap_or(""),
                 dir.display()
-            )
+            )));
         }
 
         let config_path = root.join("config.json");
@@ -538,7 +545,10 @@ impl ModelSource {
             Some(name) => {
                 let path = root.join(name);
                 if !path.is_file() {
-                    xn::bail!("no weights file `{name}` in {}", root.display())
+                    return Err(Error::not_found(format!(
+                        "no weights file `{name}` in {}",
+                        root.display()
+                    )));
                 }
                 path
             }
@@ -547,7 +557,7 @@ impl ModelSource {
                 .map(|name| root.join(name))
                 .find(|path| path.is_file())
                 .ok_or_else(|| {
-                    xn::Error::msg(format!(
+                    Error::not_found(format!(
                         "no weights file in {}; expected one of {}",
                         root.display(),
                         WEIGHT_CANDIDATES.join(", ")
@@ -592,9 +602,9 @@ fn assumed_config() -> TTSConfig {
 
 fn read_config(path: &std::path::Path) -> Result<TTSConfig> {
     let text = std::fs::read_to_string(path)
-        .map_err(|e| xn::Error::msg(format!("cannot read config {}: {e}", path.display())))?;
+        .map_err(|e| Error::checkpoint(format!("cannot read config {}: {e}", path.display())))?;
     serde_json::from_str(&text)
-        .map_err(|e| xn::Error::msg(format!("cannot parse config {}: {e}", path.display())))
+        .map_err(|e| Error::checkpoint(format!("cannot parse config {}: {e}", path.display())))
 }
 
 /// A checkpoint whose files have been located and whose config is parsed.
@@ -662,11 +672,7 @@ impl Checkpoint {
 #[cfg(not(feature = "hub"))]
 impl ModelSource {
     fn resolve_hub(&self, repo_id: &str) -> Result<Checkpoint> {
-        xn::bail!(
-            "cannot load `{repo_id}`: reading from the Hugging Face Hub needs the `hub` feature \
-             of the `ptts` crate. Either enable it, or download the checkpoint yourself and use \
-             `ModelSource::dir`."
-        )
+        Err(Error::HubFeatureDisabled { repo_id: repo_id.to_string() })
     }
 }
 
@@ -686,13 +692,13 @@ impl ModelSource {
         let weights = match self.weights.as_deref() {
             Some(name) => {
                 if !has(name) {
-                    xn::bail!("{}", self.no_such_file(repo_id, name, &listing))
+                    return Err(Error::not_found(self.no_such_file(repo_id, name, &listing)));
                 }
                 name.to_string()
             }
             None => match WEIGHT_CANDIDATES.iter().find(|name| has(name)) {
                 Some(name) => name.to_string(),
-                None => xn::bail!("{}", self.no_weights(repo_id, &listing)),
+                None => return Err(Error::not_found(self.no_weights(repo_id, &listing))),
             },
         };
         // The first fetch, and the one that decides whether this user can read the repo at all.
@@ -788,8 +794,11 @@ impl HubRepo {
     /// The client reads `HF_TOKEN`, `HF_ENDPOINT` and the cache location from the environment,
     /// falling back to the token `huggingface-cli login` stores.
     fn open(repo_id: &str, revision: Option<String>) -> Result<Self> {
-        let client = hf_hub::HFClientSync::new()
-            .map_err(|e| xn::Error::msg(format!("cannot reach the Hugging Face Hub: {e}")))?;
+        let client = hf_hub::HFClientSync::new().map_err(|e| Error::Hub {
+            repo_id: repo_id.to_string(),
+            what: "the client".to_string(),
+            source: Box::new(e),
+        })?;
         let (owner, name) = hf_hub::split_id(repo_id);
         Ok(Self { repo: client.model(owner, name), repo_id: repo_id.to_string(), revision })
     }
@@ -801,7 +810,7 @@ impl HubRepo {
             .filename(filename)
             .maybe_revision(self.revision.clone())
             .send()
-            .map_err(|e| xn::Error::msg(self.explain(filename, &e)))
+            .map_err(|e| self.classify(filename, e))
     }
 
     /// Names of the entries directly inside `dir`, sorted, relative to `dir` itself. Pass `""`
@@ -817,7 +826,7 @@ impl HubRepo {
             .send()
             .map_err(|e| {
                 let what = if dir.is_empty() { "the file listing" } else { dir };
-                xn::Error::msg(self.explain(what, &e))
+                self.classify(what, e)
             })?;
         // The Hub returns repo-relative paths; callers want names within `dir`.
         let strip = |path: String| match dir.is_empty() {
@@ -836,33 +845,24 @@ impl HubRepo {
         Ok(names)
     }
 
-    /// Turn a Hub failure into something a reader can act on.
+    /// Classify a Hub failure.
     ///
-    /// Authentication is the one worth spelling out: the published checkpoint is gated, so a
+    /// Authentication is the one worth its own variant: the published checkpoint is gated, so a
     /// rejected fetch is the first thing a new user meets, and neither "Authentication required"
     /// nor a bare 401 says what to do about it. Matched on the typed variants rather than on the
     /// message, which is not ours and can be reworded.
-    fn explain(&self, what: &str, error: &hf_hub::HFError) -> String {
+    fn classify(&self, what: &str, error: hf_hub::HFError) -> Error {
         use hf_hub::HFError;
 
-        let repo_id = &self.repo_id;
-        let base = format!("failed to fetch {what} from `{repo_id}`: {error}");
-        match error {
-            HFError::AuthRequired { .. } | HFError::Forbidden { .. } => format!(
-                "{base}\n\
-                 This repo is gated. Accept its terms at https://huggingface.co/{repo_id}, then \
-                 authenticate with `huggingface-cli login` or by setting HF_TOKEN."
-            ),
-            HFError::RepoNotFound { .. } => format!(
-                "{base}\n\
-                 No such repo, or it is private and this token cannot see it."
-            ),
-            HFError::RevisionNotFound { .. } => format!(
-                "{base}\n\
-                 No such revision `{}` in `{repo_id}`.",
-                self.revision.as_deref().unwrap_or("main")
-            ),
-            _ => base,
+        match &error {
+            HFError::AuthRequired { .. } | HFError::Forbidden { .. } => {
+                Error::Gated { repo_id: self.repo_id.clone(), filename: what.to_string() }
+            }
+            _ => Error::Hub {
+                repo_id: self.repo_id.clone(),
+                what: what.to_string(),
+                source: Box::new(error),
+            },
         }
     }
 }

@@ -80,6 +80,8 @@ Release wheels are produced by `.github/workflows/maturin-pub.yml` (Linux x86_64
 
 The library implements Pocket TTS: text → tokens → flow-matching language model produces Mimi codec latents → Mimi decoder produces 24 kHz PCM audio.
 
+`synth` and `loader` return `ptts::Error` (`ptts/src/error.rs`); the model modules below them keep `xn::Result`, since a shape mismatch inside the codec is not something a caller acts on. `?` crosses the boundary both ways — `Error: From<xn::Error>` and `xn::Error: From<Error>` — so a frontend whose own functions return `xn::Result` keeps compiling. `Error::kind()` sorts a failure into one of eight `ErrorKind`s, which is what a binding maps onto its host language's exceptions rather than matching the twenty-odd variants; `ptts-pyo3` does exactly that, so a gated repo reaches Python as `PermissionError` and an unknown voice as `LookupError`.
+
 `ptts/src/lib.rs` exposes a single `Tokenizer` trait (`encode` / `decode`) so each binding plugs in its own implementation:
 
 - `say` / `pocket_tts` examples: the tokenizer file found beside the weights, passed to `SynthBuilder::tokenizer_file` and read by `ptts::tok::Tok`, which picks SentencePiece or HF `tokenizers` by extension.

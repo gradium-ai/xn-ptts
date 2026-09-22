@@ -40,6 +40,7 @@ sentencepiece = "0.13.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 symphonia = { version = "0.5.3", features = ["all"] }
+thiserror = "2"
 tokenizers = "0.23.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tower-http = { version = "0.6", features = ["trace"] }

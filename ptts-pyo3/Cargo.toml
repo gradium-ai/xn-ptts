@@ -14,8 +14,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 xn = { workspace = true }
-ptts = { workspace = true, features = ["sp", "hf"] }
-hf-hub = { workspace = true }
+ptts = { workspace = true, features = ["sp", "hf", "hub"] }
 numpy = "0.28"
 pyo3 = { version = "0.28", features = ["extension-module"] }
 serde_json = { workspace = true }

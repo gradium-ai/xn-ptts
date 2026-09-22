@@ -17,136 +17,72 @@
 
 use numpy::{PyArray1, PyReadonlyArrayDyn, PyUntypedArrayMethods};
 use ptts::synth::{DeviceKind, Quant, SpeechOptions, SpeechStream, Synth, SynthBuilder};
-use ptts::tts_model::TTSConfig;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::sync::{Arc, Mutex};
 
-/// Voices the published checkpoint ships, used to name the files to fetch.
-const POCKET_TTS_VOICES: &[&str] =
-    &["alba", "marius", "javert", "jean", "fantine", "cosette", "eponine", "azelma"];
-
+/// Hub repo loaded when the caller names none. Which voices and weight files it holds is
+/// `ptts::loader::ModelSource`'s to discover, not this file's to list.
 const DEFAULT_REPO_ID: &str = "kyutai/pocket-tts";
-const DEFAULT_MODEL_FILE: &str = "tts_b6369a24.safetensors";
 
-/// Map a `ptts` error onto a Python exception. `ValueError` throughout: every
-/// failure here is a bad argument, a missing file or a bad checkpoint.
+/// Map a `ptts` error onto the Python exception its class calls for.
+///
+/// `ptts::ErrorKind` exists so a binding does not have to match twenty-odd variants, or flatten
+/// them all onto one exception -- which is what this did before, and which made a gated
+/// checkpoint and a misspelt voice both `ValueError`.
+fn to_py_err(e: ptts::Error) -> PyErr {
+    use ptts::ErrorKind::*;
+    use pyo3::exceptions as exc;
+
+    let msg = e.to_string();
+    match e.kind() {
+        InvalidArgument => exc::PyValueError::new_err(msg),
+        // `LookupError` is the base of `KeyError`, and covers both "no such voice" and
+        // "no such checkpoint file" without claiming either is a dict lookup.
+        NotFound => exc::PyLookupError::new_err(msg),
+        Unsupported => exc::PyNotImplementedError::new_err(msg),
+        PermissionDenied => exc::PyPermissionError::new_err(msg),
+        Network => exc::PyConnectionError::new_err(msg),
+        // `Busy` is retryable and the others are not, but Python has no better shared base
+        // than `RuntimeError` for either.
+        InvalidData | Busy | Internal => exc::PyRuntimeError::new_err(msg),
+        // `ErrorKind` is `#[non_exhaustive]`: a kind added upstream should not silently pick
+        // one of the above.
+        _ => exc::PyRuntimeError::new_err(msg),
+    }
+}
+
 trait IntoPy<R> {
     fn py(self) -> PyResult<R>;
 }
 
-impl<R, E: Into<xn::Error>> IntoPy<R> for Result<R, E> {
+impl<R, E: Into<ptts::Error>> IntoPy<R> for Result<R, E> {
     fn py(self) -> PyResult<R> {
-        self.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.into().to_string()))
+        self.map_err(|e| to_py_err(e.into()))
     }
 }
 
-/// A checkpoint's files, located but not yet loaded.
-struct Artifacts {
-    cfg: TTSConfig,
-    model_path: std::path::PathBuf,
-    tokenizer_path: std::path::PathBuf,
-    voices: Vec<(String, std::path::PathBuf)>,
-}
+/// Resolve `config` -- a local `config.json` or model directory, a Hub repo id, or nothing for
+/// the published checkpoint -- into a located checkpoint.
+///
+/// `ptts::loader::ModelSource` does the searching; this only decides which of its two kinds the
+/// string is. Routing through it is also what makes the typed errors reach Python: a gated repo
+/// arrives as `PermissionError` rather than as a message inside a `RuntimeError`.
+fn resolve(config: Option<&str>) -> ptts::Result<ptts::loader::Checkpoint> {
+    use ptts::loader::ModelSource;
 
-/// Resolve `config` — a local `config.json`, a Hub repo id, or nothing for the
-/// published checkpoint — into the files needed to load it.
-fn resolve(config: Option<&str>, temperature: f32) -> xn::Result<Artifacts> {
-    use xn::error::Context;
-
-    match config {
-        // A local config path: load the weights sitting next to it.
-        Some(path) if std::path::Path::new(path).is_file() || path.ends_with(".json") => {
-            let config_path = std::fs::canonicalize(path)
-                .map_err(|e| xn::Error::msg(format!("cannot read config {path}: {e}")))?;
-            let parent = config_path.parent().context("config path has no parent")?;
-            // Prefer an unquantized safetensors checkpoint, falling back to a
-            // pre-quantized GGUF if that is what sits next to the config.
-            let model_path = if parent.join("model.safetensors").is_file() {
-                parent.join("model.safetensors")
-            } else {
-                parent.join("model.q8.gguf")
-            };
-            let text = std::fs::read_to_string(&config_path)
-                .map_err(|e| xn::Error::msg(e).with_path(&config_path))?;
-            let mut cfg: TTSConfig = serde_json::from_str(&text)
-                .map_err(|e| xn::Error::msg(e).with_path(&config_path))?;
-            cfg.temp = temperature;
-            let mut voices = vec![];
-            collect_voices(&parent.join("voices"), &mut voices);
-            Ok(Artifacts {
-                cfg,
-                model_path,
-                tokenizer_path: parent.join("tokenizer.model"),
-                voices,
-            })
+    let source = match config {
+        None => ModelSource::hub(DEFAULT_REPO_ID),
+        // A config file names its directory; a directory names itself.
+        Some(path) if path.ends_with(".json") => {
+            let config_path = std::path::Path::new(path);
+            let parent = config_path.parent().filter(|p| !p.as_os_str().is_empty());
+            ModelSource::dir(parent.unwrap_or(std::path::Path::new(".")))
         }
-        // A Hub repo laid out with config.json and a quantized checkpoint.
-        Some(repo_id) => {
-            let repo = hub(repo_id)?;
-            let config_path = hub_get(&repo, "config.json")?;
-            let text = std::fs::read_to_string(&config_path)
-                .map_err(|e| xn::Error::msg(e).with_path(&config_path))?;
-            let mut cfg: TTSConfig = serde_json::from_str(&text)
-                .map_err(|e| xn::Error::msg(e).with_path(&config_path))?;
-            cfg.temp = temperature;
-            Ok(Artifacts {
-                cfg,
-                model_path: hub_get(&repo, "model.q8.gguf")?,
-                tokenizer_path: hub_get(&repo, "tokenizer.model")?,
-                voices: vec![],
-            })
-        }
-        // The published pocket-tts repo, whose voices sit under `embeddings/`.
-        None => {
-            let repo = hub(DEFAULT_REPO_ID)?;
-            let model_path = hub_get(&repo, DEFAULT_MODEL_FILE)?;
-            let tokenizer_path = hub_get(&repo, "tokenizer.model")?;
-            let mut voices = vec![];
-            for &voice in POCKET_TTS_VOICES {
-                if let Ok(path) = hub_get(&repo, &format!("embeddings/{voice}.safetensors")) {
-                    voices.push((voice.to_string(), path));
-                }
-            }
-            Ok(Artifacts {
-                cfg: TTSConfig::v202601(temperature),
-                model_path,
-                tokenizer_path,
-                voices,
-            })
-        }
-    }
-}
-
-type HubRepo = hf_hub::HFRepositorySync<hf_hub::repository::RepoTypeModel>;
-
-fn hub(repo_id: &str) -> xn::Result<HubRepo> {
-    let client = hf_hub::HFClientSync::new().map_err(xn::Error::msg)?;
-    let (owner, name) = hf_hub::split_id(repo_id);
-    Ok(client.model(owner, name))
-}
-
-/// Download `filename` from `repo`, or find it in the local cache.
-fn hub_get(repo: &HubRepo, filename: &str) -> xn::Result<std::path::PathBuf> {
-    repo.download_file()
-        .filename(filename)
-        .send()
-        .map_err(|e| xn::Error::msg(e).with_path(filename))
-}
-
-/// Add every `*.safetensors` file in `dir` to `voices`, keyed by file stem.
-/// A missing directory is not an error: voices are optional.
-fn collect_voices(dir: &std::path::Path, voices: &mut Vec<(String, std::path::PathBuf)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("safetensors") {
-            continue;
-        }
-        if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-            voices.push((name.to_string(), path));
-        }
-    }
+        Some(path) if std::path::Path::new(path).is_dir() => ModelSource::dir(path),
+        Some(repo_id) => ModelSource::hub(repo_id),
+    };
+    source.resolve()
 }
 
 /// Flatten a conditioning embedding of shape `[T, dim]` or `[1, T, dim]`.
@@ -223,13 +159,17 @@ impl Tts {
         }
         // Loading reads hundreds of megabytes and runs no Python.
         py.detach(move || {
-            let artifacts = resolve(config.as_deref(), temperature).py()?;
-            let mut builder = SynthBuilder::new(artifacts.cfg, &artifacts.model_path)
-                .tokenizer_file(&artifacts.tokenizer_path)
+            let checkpoint = resolve(config.as_deref()).py()?;
+            let mut cfg = checkpoint.config.clone();
+            cfg.temp = temperature;
+            let mut builder = SynthBuilder::new(cfg, &checkpoint.weights)
                 .device(device)
                 .quant(quant)
                 .temperature(temperature)
                 .seed(seed);
+            if let Some(tokenizer) = checkpoint.tokenizer.as_ref() {
+                builder = builder.tokenizer_file(tokenizer);
+            }
             if let Some(cfg_coef) = cfg_coef {
                 builder = builder.cfg_coef(cfg_coef);
             }
@@ -240,7 +180,7 @@ impl Tts {
             // Registered after the build, not through it: the builder
             // propagates a bad voice file, and a checkpoint shipping one
             // unreadable voice should not stop the model from loading.
-            for (name, path) in artifacts.voices.iter() {
+            for (name, path) in checkpoint.voices.iter() {
                 // Skipped rather than propagated, as before: `TTS.voices` shows
                 // which ones made it.
                 let _ = synth.add_voice_file(name, path);
@@ -500,7 +440,7 @@ impl AudioStream {
         py: Python<'py>,
     ) -> PyResult<Option<Bound<'py, PyArray1<f32>>>> {
         let inner = &slf.inner;
-        let next = py.detach(|| -> PyResult<Option<Result<Vec<f32>, xn::Error>>> {
+        let next = py.detach(|| -> PyResult<Option<Result<Vec<f32>, ptts::Error>>> {
             let mut guard = inner.lock().map_err(|_| poisoned())?;
             Ok(guard.as_mut().and_then(|stream| stream.next()))
         })?;
