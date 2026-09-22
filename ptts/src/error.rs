@@ -171,7 +171,10 @@ mod tests {
         // The bridge exists so a frontend on `xn::Result` keeps compiling. A tensor error must
         // not pick up a layer of message wrapping on the way through.
         let there: xn::Error = Error::Tensor(xn::Error::msg("device out of memory")).into();
-        assert_eq!(there.to_string(), "device out of memory");
+        // `xn::Error::msg` captures a backtrace when `RUST_BACKTRACE` is set, and prints it
+        // below the message -- so compare the first line rather than the whole string. What
+        // this asserts is that nothing wrapped the message, not that xn kept it bare.
+        assert_eq!(there.to_string().lines().next(), Some("device out of memory"));
         assert!(matches!(Error::from(there), Error::Tensor(_)));
 
         let io = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
