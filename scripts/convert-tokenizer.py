@@ -20,6 +20,15 @@ from tokenizers.models import Unigram
 from tokenizers.normalizers import Prepend
 from tokenizers.pre_tokenizers import Metaspace
 
+# Control and unknown pieces are prefixed with this in the HF vocab. SentencePiece keeps
+# them out of the segmentation lattice; HF's Unigram has no such notion, and because this
+# vocabulary spells "<" and ">" as byte-fallback pieces there is no alternative path over
+# "<s>", so a prompt containing one would encode to the control id. A score penalty cannot
+# fix that (HF derives the fallback score from the vocab minimum), but a NUL prefix makes
+# the piece unmatchable while every id keeps its position. Nothing in ptts resolves a token
+# by name, and the pieces stay registered as special so the decoder still skips them.
+SENTINEL = "\u0000"
+
 # Includes inputs that exercise SentencePiece's add_dummy_prefix behavior
 # (leading whitespace, whitespace-only) to catch regressions in the prepend logic.
 TEST_SENTENCES = [
@@ -37,7 +46,11 @@ TEST_SENTENCES = [
 
 def convert(model_path: str, output_path: str) -> None:
     sp = spm.SentencePieceProcessor(model_file=model_path)
-    vocab = [(sp.id_to_piece(i), sp.get_score(i)) for i in range(sp.get_piece_size())]
+    control = {i for i in range(sp.get_piece_size()) if sp.is_control(i) or sp.is_unknown(i)}
+    vocab = [
+        ((SENTINEL if i in control else "") + sp.id_to_piece(i), sp.get_score(i))
+        for i in range(sp.get_piece_size())
+    ]
 
     tokenizer = Tokenizer(Unigram(vocab, unk_id=sp.unk_id(), byte_fallback=True))
     # SentencePiece's `add_dummy_prefix` always prepends a space before encoding,
@@ -53,31 +66,34 @@ def convert(model_path: str, output_path: str) -> None:
     )
 
     # Register control/unknown tokens as special so the decoder skips them.
-    for i in range(sp.get_piece_size()):
-        if sp.is_control(i) or sp.is_unknown(i):
-            tokenizer.add_special_tokens(
-                [AddedToken(sp.id_to_piece(i), special=True)]
-            )
+    for i in sorted(control):
+        tokenizer.add_special_tokens(
+            [AddedToken(SENTINEL + sp.id_to_piece(i), special=True)]
+        )
 
     # Sanity check before writing anything: a tokenizer.json that disagrees with the
     # .model yields plausible audio from the wrong ids, which is exactly what `ptts`
     # refuses to do silently -- so a mismatch has to fail, not warn. A pipeline with
     # nobody reading stderr would otherwise upload a broken tokenizer.
+    pieces = [sp.id_to_piece(i) for i in sorted(control)]
+    checks = [(t, True) for t in TEST_SENTENCES]
+    checks += [(t, False) for p in pieces for t in (p, f"Mixed {p} tag")]
+
     mismatches = 0
-    for test in TEST_SENTENCES:
+    for test, verbose in checks:
         sp_encoded = sp.encode(test, out_type=int)
-        sp_decoded = sp.decode(sp_encoded)
         hf_encoded = tokenizer.encode(test).ids
-        hf_decoded = tokenizer.decode(hf_encoded)
-        print(f"SentencePiece: '{test}' -> {sp_encoded} -> '{sp_decoded}'")
-        print(f"HuggingFace:   '{test}' -> {hf_encoded} -> '{hf_decoded}'")
+        if verbose:
+            print(f"SentencePiece: '{test}' -> {sp_encoded} -> '{sp.decode(sp_encoded)}'")
+            print(f"HuggingFace:   '{test}' -> {hf_encoded} -> '{tokenizer.decode(hf_encoded)}'")
         if sp_encoded != hf_encoded:
             mismatches += 1
-            print("WARNING: token ids differ!", file=sys.stderr)
+            print(f"WARNING: token ids differ for '{test}'!", file=sys.stderr)
+    print(f"Checked {len(pieces)} control pieces as literal input text")
 
     if mismatches:
         print(
-            f"Error: {mismatches}/{len(TEST_SENTENCES)} test sentences tokenize "
+            f"Error: {mismatches}/{len(checks)} test sentences tokenize "
             f"differently; not writing {output_path}",
             file=sys.stderr,
         )
