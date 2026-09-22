@@ -19,7 +19,6 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rubato = { workspace = true, optional = true }
-sentencepiece = { workspace = true, optional = true }
 symphonia = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
 safetensors = { workspace = true }
@@ -42,7 +41,6 @@ vulkan = ["xn/vulkan"]
 metal = ["xn/metal", "dep:half"]
 webgpu = ["xn/webgpu"]
 accelerate = ["xn/accelerate"]
-sp = ["dep:sentencepiece"]
 # Hugging Face `tokenizers` support in `ptts::tok`.
 hf = ["dep:tokenizers"]
 # Decoding and resampling audio files (`ptts::audio`), for voice cloning.
@@ -50,15 +48,15 @@ audio = ["dep:symphonia", "dep:rubato"]
 
 [[example]]
 name = "say"
-required-features = ["sp"]
+required-features = ["hf"]
 
 [[example]]
 name = "pocket_tts"
-required-features = ["sp", "audio"]
+required-features = ["hf", "audio"]
 
 [[example]]
 name = "bench"
-required-features = ["sp"]
+required-features = ["hf"]
 
 [[example]]
 name = "quantize"

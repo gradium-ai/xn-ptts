@@ -12,7 +12,7 @@ license.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-ptts = { workspace = true }
+ptts = { workspace = true, features = ["hf"] }
 xn = { workspace = true }
 wasm-bindgen = { workspace = true }
 js-sys = { workspace = true }

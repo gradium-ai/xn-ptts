@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 pub use ptts::loader::{is_unused_by_tts_model, load_voice_emb, load_weights, remap_key};
-#[cfg(feature = "sp")]
+#[cfg(feature = "hf")]
 pub use ptts::tok::Tok;
 
 use ptts::synth::{Synth, SynthBuilder};
@@ -41,16 +41,11 @@ pub const VOICES: &[&str] =
 pub const WEIGHT_CANDIDATES: &[&str] =
     &["model.safetensors", "model.q8.gguf", "tts_b6369a24.safetensors"];
 
-/// Tokenizer file names tried, in order. `tokenizer.json` is the Hugging Face `tokenizers`
-/// format, `tokenizer.model` is SentencePiece, and `ptts::tok::Tok` picks the reader by
-/// extension -- so the order follows which of the two this build can read. A checkpoint that
-/// ships both is common, and picking the one whose feature is off would fail a load that had
-/// a usable tokenizer sitting beside it.
-pub const TOKENIZER_CANDIDATES: &[&str] = if cfg!(feature = "hf") {
-    &["tokenizer.json", "tokenizer.model"]
-} else {
-    &["tokenizer.model", "tokenizer.json"]
-};
+/// Tokenizer file names tried. Only the Hugging Face `tokenizers` format is read: a
+/// checkpoint that ships just a SentencePiece `tokenizer.model` needs converting once with
+/// `scripts/convert-tokenizer.py`, and `ptts::tok::Tok` says so rather than guessing at a
+/// vocabulary.
+pub const TOKENIZER_CANDIDATES: &[&str] = &["tokenizer.json"];
 
 /// A checkpoint whose files have been located and whose config is parsed.
 pub struct Checkpoint {

@@ -12,7 +12,7 @@
 //! use ptts::tts_model::TTSConfig;
 //!
 //! let tts = Synth::builder(TTSConfig::v202601(0.5), "model/model.safetensors")
-//!     .tokenizer_file("model/tokenizer.model")
+//!     .tokenizer_file("model/tokenizer.json")
 //!     .add_voice("alba", "model/voices/alba.safetensors")
 //!     .build()?;
 //! let pcm = tts.say("Hello world")?;
@@ -28,7 +28,7 @@
 //! # fn main() -> xn::Result<()> {
 //! # let cfg = ptts::tts_model::TTSConfig::v202601(0.5);
 //! # let tts = ptts::synth::Synth::builder(cfg, "model/model.safetensors")
-//! #     .tokenizer_file("model/tokenizer.model")
+//! #     .tokenizer_file("model/tokenizer.json")
 //! #     .build()?;
 //! for chunk in tts.stream("Hello world")? {
 //!     let pcm: Vec<f32> = chunk?;
@@ -1051,7 +1051,7 @@ impl SynthBuilder {
     }
 
     /// Supply the tokenizer explicitly. Required when the checkpoint ships no
-    /// tokenizer file, or when neither the `sp` nor the `hf` feature is enabled.
+    /// tokenizer file, or when the `hf` feature is not enabled.
     pub fn tokenizer(mut self, tokenizer: Box<dyn crate::Tokenizer + Send + Sync>) -> Self {
         self.tokenizer = Some(tokenizer);
         self
@@ -1233,20 +1233,20 @@ impl SynthBuilder {
         Ok(synth)
     }
 
-    /// A caller-supplied tokenizer wins — `ptts-wasm` tokenizes in JavaScript
-    /// and has no tokenizer file at all. Otherwise load the one the checkpoint
-    /// shipped, if a tokenizer backend is compiled in.
+    /// A caller-supplied tokenizer wins, for callers with no filesystem to read
+    /// one from. Otherwise load the one the checkpoint shipped, if a tokenizer
+    /// backend is compiled in.
     fn take_tokenizer(&mut self) -> Result<Box<dyn crate::Tokenizer + Send + Sync>> {
         if let Some(tokenizer) = self.tokenizer.take() {
             return Ok(tokenizer);
         }
-        #[cfg(any(feature = "sp", feature = "hf"))]
+        #[cfg(feature = "hf")]
         if let Some(path) = self.tokenizer_file.as_deref() {
             return Ok(Box::new(crate::tok::Tok::open(path)?));
         }
         xn::bail!(
             "no tokenizer available: none was passed to SynthBuilder::tokenizer, the checkpoint \
-             shipped none, and neither the `sp` nor the `hf` feature of `ptts` is enabled."
+             shipped none, and the `hf` feature of `ptts` is not enabled."
         )
     }
 }

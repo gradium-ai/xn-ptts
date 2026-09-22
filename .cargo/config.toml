@@ -8,8 +8,8 @@ rustflags = ["-C", "target-feature=+simd128,+relaxed-simd", "--cfg", "getrandom_
 runner = "wasmtime"
 rustflags = ["-C", "target-feature=+simd128,+relaxed-simd"]
 
-# `cc-rs` build scripts (e.g. for `onig_sys`) need a sysroot when targeting
-# wasi. These vars are target-prefixed so they're harmless on host builds.
+# `cc-rs` build scripts need a sysroot when targeting wasi. These vars are
+# target-prefixed so they're harmless on host builds.
 [env]
 WASI_SYSROOT = "/usr/share/wasi-sysroot"
 CC_wasm32_wasip1 = "clang"

@@ -88,12 +88,6 @@ jobs:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter --manifest-path ptts-pyo3/Cargo.toml
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        env:
-          # `esaxx-rs` (via `tokenizers`, built with cc) links the static CRT
-          # while `sentencepiece-sys` (built with cmake) links the dynamic CRT,
-          # which fails with LNK2038 RuntimeLibrary mismatch. Force the static
-          # CRT everywhere so Rust, cc and cmake all agree on /MT.
-          RUSTFLAGS: "-C target-feature=+crt-static"
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:

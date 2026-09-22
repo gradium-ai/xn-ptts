@@ -1,7 +1,7 @@
 //! Generate speech from text on the command line.
 //!
 //! ```text
-//! cargo run --release --example pocket_tts --features sp,audio -- "hello world" -o out.wav
+//! cargo run --release --example pocket_tts --features hf,audio -- "hello world" -o out.wav
 //! ```
 //!
 //! Everything between the text and the WAV file is [`ptts::synth::Synth`]; what
@@ -50,6 +50,12 @@ struct Args {
     /// voices/ instead of downloading from the Hugging Face Hub.
     #[arg(long)]
     dir: Option<std::path::PathBuf>,
+
+    /// Tokenizer to load, as a path to a `tokenizer.json`. Defaults to the one
+    /// the checkpoint ships. A checkpoint that carries only a SentencePiece
+    /// `tokenizer.model` needs converting once with `scripts/convert-tokenizer.py`.
+    #[arg(long)]
+    tokenizer: Option<std::path::PathBuf>,
 
     /// Weights file to load from the repo or directory, e.g. `model.q8.gguf` for
     /// a checkpoint that ships both f32 and quantized weights. Defaults to the
@@ -115,6 +121,9 @@ fn main() -> Result<()> {
         .device(DeviceKind::parse(&args.device)?)
         .temperature(args.temperature)
         .seed(args.seed);
+    if let Some(tokenizer) = args.tokenizer.as_deref() {
+        builder = builder.tokenizer_file(tokenizer);
+    }
     if let Some(quant) = args.quant.as_deref() {
         builder = builder.quant(Quant::parse(quant)?);
     }
