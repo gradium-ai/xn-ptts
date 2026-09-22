@@ -10,13 +10,18 @@
 //!
 //! ```no_run
 //! # fn main() -> xn::Result<()> {
+//! use ptts::preprocess::{Lang, Normalize};
 //! use ptts::synth::Synth;
 //! use ptts::tts_model::TTSConfig;
 //!
-//! let tts = Synth::builder(TTSConfig::v202601(0.5), "model/model.safetensors")
-//!     .tokenizer_file("model/tokenizer.json")
-//!     .add_voice("alba", "model/voices/alba.safetensors")
-//!     .build()?;
+//! let tts = Synth::builder(
+//!     TTSConfig::v202601(0.5),
+//!     "model/model.safetensors",
+//!     Normalize::For(Lang::En),
+//! )
+//! .tokenizer_file("model/tokenizer.json")
+//! .add_voice("alba", "model/voices/alba.safetensors")
+//! .build()?;
 //! let pcm = tts.say("Hello world")?;
 //! ptts::wav::write_wav_file("out.wav", &pcm, tts.sample_rate() as u32)?;
 //! # Ok(())
@@ -49,6 +54,12 @@
 //! Which files a checkpoint ships, and what they are called, is the caller's to
 //! know: `ptts` reads the config, weights, tokenizer and voice files it is
 //! handed, and never guesses at names or downloads anything itself.
+//!
+//! Text is normalized before it is tokenized — see [`preprocess`]. Which
+//! language, or [`preprocess::Normalize::Off`], is a required argument to
+//! [`synth::SynthBuilder::new`]: the model reads normalized text noticeably
+//! better, but the spoken forms are per-language, so guessing is worse than
+//! doing nothing.
 //!
 //! A server answering many requests for one voice wants
 //! [`synth::Synth::session`], which conditions on the voice prompt once

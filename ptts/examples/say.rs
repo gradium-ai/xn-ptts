@@ -7,13 +7,16 @@
 #[path = "model_helpers.rs"]
 mod model_helpers;
 
+use ptts::preprocess::{Lang, Normalize};
+
 fn main() -> anyhow::Result<()> {
     let text = std::env::args().nth(1).unwrap_or_else(|| "Hello from Pocket TTS.".to_string());
 
     // `ptts` reads the files it is handed; finding them is the frontend's job,
     // and for the examples `model_helpers` is where that knowledge lives.
     let checkpoint = model_helpers::Checkpoint::from_hub(model_helpers::REPO_ID, None)?;
-    let mut tts = checkpoint.builder().build()?;
+    // Which language to normalize as has no default: see `SynthBuilder::new`.
+    let mut tts = checkpoint.builder(Normalize::For(Lang::En)).build()?;
     checkpoint.register_voices(&mut tts);
 
     let pcm = tts.say_with(&text, &ptts::synth::SpeechOptions::default().voice("alba"))?;

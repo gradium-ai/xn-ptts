@@ -7,6 +7,12 @@
 //!
 //! This is deliberately conservative: it does not expand numbers, dates or abbreviations, which
 //! the model handles natively.
+//!
+//! Every caller says which language, or says not to normalize: [`Normalize`] is a required
+//! argument to [`crate::synth::SynthBuilder::new`], and every frontend takes it as a required
+//! flag. There is no default, deliberately. Output is noticeably better with normalization than
+//! without, but normalizing German as English speaks `@` as "at" rather than "ät", so guessing
+//! the language is worse than doing nothing.
 
 /// Spoken forms of the punctuation characters that are read aloud rather than dropped.
 #[derive(Debug, Clone)]
@@ -71,6 +77,9 @@ pub const SPECIAL_CHARS_PT: SpecialChars = SpecialChars {
 };
 
 /// Language driving the spoken forms used by [`normalize_text`].
+///
+/// Deliberately has no `Default`: the spoken forms differ per language, so a caller that has not
+/// said which language it has is better off not normalizing at all. See [`Normalize`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lang {
     En,
@@ -81,21 +90,35 @@ pub enum Lang {
 }
 
 impl std::str::FromStr for Lang {
-    type Err = xn::Error;
+    type Err = crate::Error;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+    fn from_str(s: &str) -> crate::Result<Self> {
         match s.to_lowercase().as_str() {
             "en" => Ok(Lang::En),
             "fr" => Ok(Lang::Fr),
             "de" => Ok(Lang::De),
             "es" => Ok(Lang::Es),
             "pt" => Ok(Lang::Pt),
-            _ => xn::bail!("unsupported language code: {s}"),
+            _ => Err(crate::Error::invalid_argument(format!(
+                "unsupported language code: {s}; expected en, fr, de, es, pt, or none to skip \
+                 normalization"
+            ))),
         }
     }
 }
 
 impl Lang {
+    /// The language code this variant parses from.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Lang::En => "en",
+            Lang::Fr => "fr",
+            Lang::De => "de",
+            Lang::Es => "es",
+            Lang::Pt => "pt",
+        }
+    }
+
     pub fn special_chars(self) -> &'static SpecialChars {
         match self {
             Lang::En => &SPECIAL_CHARS_EN,
@@ -187,6 +210,48 @@ impl Lang {
             '€' => Some(self.euros_singular()),
             '£' => Some(self.pounds_singular()),
             _ => None,
+        }
+    }
+}
+
+/// Whether to normalize, and in which language.
+///
+/// There is no default and no "unset": [`crate::synth::SynthBuilder::new`] takes one of these,
+/// so choosing is not something a caller can forget. [`Normalize::Off`] is the way to say "hand
+/// the text to the tokenizer as written", which is for callers that normalize it themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Normalize {
+    For(Lang),
+    Off,
+}
+
+impl Normalize {
+    /// Parse what the frontends' `--lang` flag accepts: a language code, or `none` / `off`.
+    pub fn parse(s: &str) -> crate::Result<Self> {
+        match s.to_lowercase().as_str() {
+            "none" | "off" => Ok(Self::Off),
+            other => other.parse().map(Self::For),
+        }
+    }
+
+    /// How this policy spells itself back, round-tripping through [`Self::parse`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::For(lang) => lang.as_str(),
+            Self::Off => "none",
+        }
+    }
+
+    /// Normalize `text`, or hand it back untouched when this is [`Self::Off`].
+    ///
+    /// Borrows when off, so opting out costs no allocation per request.
+    ///
+    /// This has to run before `prepare_text_prompt`, which pads short text with leading spaces
+    /// that normalization would collapse away.
+    pub fn apply<'a>(self, text: &'a str) -> std::borrow::Cow<'a, str> {
+        match self {
+            Self::Off => std::borrow::Cow::Borrowed(text),
+            Self::For(lang) => std::borrow::Cow::Owned(normalize_text(text, lang)),
         }
     }
 }
@@ -354,6 +419,38 @@ mod tests {
         assert_eq!(normalize_text("a@b", Lang::De), "a ät b");
         assert_eq!(normalize_text("1+1=2", Lang::Es), "1 mas 1 igual 2");
         assert_eq!(normalize_text("1+1=2", Lang::Pt), "1 mais 1 igual 2");
+    }
+
+    /// The frontends take one flag for the language and for turning
+    /// normalization off, so both spellings of "off" have to parse rather than
+    /// error, and every policy has to spell itself back.
+    #[test]
+    fn normalize_parses_and_round_trips() {
+        for lang in [Lang::En, Lang::Fr, Lang::De, Lang::Es, Lang::Pt] {
+            let norm = Normalize::For(lang);
+            assert_eq!(Normalize::parse(lang.as_str()).unwrap(), norm);
+            assert_eq!(Normalize::parse(norm.as_str()).unwrap(), norm);
+        }
+        assert_eq!(Normalize::parse("EN").unwrap(), Normalize::For(Lang::En));
+        assert_eq!(Normalize::parse("none").unwrap(), Normalize::Off);
+        assert_eq!(Normalize::parse("off").unwrap(), Normalize::Off);
+        assert_eq!(Normalize::parse(Normalize::Off.as_str()).unwrap(), Normalize::Off);
+        let err = Normalize::parse("klingon").unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidArgument(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("klingon"), "{msg}");
+        assert!(msg.contains("none"), "the error must name the opt-out: {msg}");
+    }
+
+    /// Opting out has to hand the text through untouched, and without
+    /// allocating: `apply` runs on every request.
+    #[test]
+    fn apply_follows_the_policy() {
+        use std::borrow::Cow;
+        assert_eq!(Normalize::Off.apply("a@b (c)"), "a@b (c)");
+        assert_eq!(Normalize::For(Lang::En).apply("a@b (c)"), "a at b, c,");
+        assert_eq!(Normalize::For(Lang::Fr).apply("a@b"), "a arobaze b");
+        assert!(matches!(Normalize::Off.apply("text"), Cow::Borrowed(_)));
     }
 
     #[test]

@@ -11,8 +11,14 @@
 //! use ptts::synth::Synth;
 //! use ptts::tts_model::TTSConfig;
 //!
-//! let tts = Synth::builder(TTSConfig::v202601(0.5), "model/model.safetensors")
-//!     .tokenizer_file("model/tokenizer.json")
+//! use ptts::preprocess::{Lang, Normalize};
+//!
+//! let tts = Synth::builder(
+//!     TTSConfig::v202601(0.5),
+//!     "model/model.safetensors",
+//!     Normalize::For(Lang::En),
+//! )
+//! .tokenizer_file("model/tokenizer.json")
 //!     .add_voice("alba", "model/voices/alba.safetensors")
 //!     .build()?;
 //! let pcm = tts.say("Hello world")?;
@@ -27,7 +33,8 @@
 //! ```no_run
 //! # fn main() -> xn::Result<()> {
 //! # let cfg = ptts::tts_model::TTSConfig::v202601(0.5);
-//! # let tts = ptts::synth::Synth::builder(cfg, "model/model.safetensors")
+//! # let norm = ptts::preprocess::Normalize::For(ptts::preprocess::Lang::En);
+//! # let tts = ptts::synth::Synth::builder(cfg, "model/model.safetensors", norm)
 //! #     .tokenizer_file("model/tokenizer.json")
 //! #     .build()?;
 //! for chunk in tts.stream("Hello world")? {
@@ -41,6 +48,12 @@
 //! A server answering many requests for one voice wants [`Synth::session`],
 //! which conditions on the voice prompt once instead of per request.
 //!
+//! Text is normalized before it is tokenized — see [`crate::preprocess`]. Which
+//! language, or [`Normalize::Off`], is a required argument to
+//! [`SynthBuilder::new`]: the model reads normalized text noticeably better,
+//! but the spoken forms are per-language, so guessing is worse than doing
+//! nothing.
+//!
 //! Callers that want to name the weight format at compile time — `ptts-wasm`
 //! supports exactly two — can use [`SynthOf<Q>`] directly via
 //! [`SynthBuilder::load`], and skip the runtime dispatch in [`Synth`]. Driving
@@ -50,6 +63,7 @@
 use crate::flow_lm::NormalRng;
 use crate::loader;
 use crate::plan::{self, EosPolicy};
+use crate::preprocess::Normalize;
 use crate::tts_model::{
     MAX_TOKENS_PER_CHUNK, MimiEnc, TTSConfig, TTSModel, TTSState, prepare_text_prompt,
     split_into_best_sentences,
@@ -274,6 +288,8 @@ pub struct SynthOf<Q: BackendQ> {
     cfg: TTSConfig,
     voices: BTreeMap<String, Voice<Q>>,
     defaults: Defaults,
+    /// How every request's text is normalized. See [`SynthBuilder::new`].
+    normalize: Normalize,
 }
 
 impl<Q: BackendQ> SynthOf<Q> {
@@ -283,6 +299,15 @@ impl<Q: BackendQ> SynthOf<Q> {
 
     pub fn config(&self) -> &TTSConfig {
         &self.cfg
+    }
+
+    /// How requests are normalized.
+    ///
+    /// Every text-taking method here applies it already; it is public for
+    /// callers that drive [`SessionOf::stream_tokens`] and so tokenize
+    /// themselves, and want [`Normalize::apply`] first.
+    pub fn normalization(&self) -> Normalize {
+        self.normalize
     }
 
     pub fn device_name(&self) -> String {
@@ -458,6 +483,7 @@ impl<Q: BackendQ> SynthOf<Q> {
             base,
             cfg_base,
             seq_budget,
+            normalize: self.normalize,
         })
     }
 
@@ -490,6 +516,7 @@ impl<Q: BackendQ> SynthOf<Q> {
             self.cfg.mimi.frame_rate,
             text,
             settings.max_tokens_per_chunk,
+            self.normalize,
         )?;
         // A one-shot call primes a session sized to this text and drops it
         // afterwards, so there is one generation path rather than two.
@@ -585,6 +612,7 @@ fn plan_chunks<Q: BackendQ>(
     frame_rate: f64,
     text: &str,
     max_tokens_per_chunk: usize,
+    normalize: Normalize,
 ) -> Result<Vec<ChunkPlan>> {
     let tokenizer = match model.flow_lm.conditioner.tokenizer.as_ref() {
         Some(tokenizer) => tokenizer.as_ref(),
@@ -596,7 +624,11 @@ fn plan_chunks<Q: BackendQ>(
             ));
         }
     };
-    let texts = split_into_best_sentences(tokenizer, text, Some(max_tokens_per_chunk))?;
+    // Normalization runs first, on the whole input: it rewrites the characters
+    // the sentence splitter looks for, and `prepare_text_prompt` pads short
+    // text with leading spaces that normalization would collapse away.
+    let text = normalize.apply(text);
+    let texts = split_into_best_sentences(tokenizer, &text, Some(max_tokens_per_chunk))?;
     let mut chunks = Vec::with_capacity(texts.len());
     for text in texts {
         let (prepared, frames_after_eos) = prepare_text_prompt(&text);
@@ -644,6 +676,9 @@ pub struct SessionOf<Q: BackendQ> {
     base: TTSState<Q>,
     cfg_base: Option<(f32, TTSState<Q>)>,
     seq_budget: usize,
+    /// How text is normalized, inherited from the [`SynthOf`] this session was
+    /// built from.
+    normalize: Normalize,
     /// Slots the voice prompt already occupies, so the budget check can use it
     /// instead of [`plan::PROMPT_SEQ_HEADROOM`]'s fixed reserve.
     prompt_len: usize,
@@ -659,6 +694,17 @@ impl<Q: BackendQ> SessionOf<Q> {
 
     pub fn sample_rate(&self) -> usize {
         self.model.sample_rate()
+    }
+
+    /// How text is normalized.
+    ///
+    /// [`Self::stream`] and [`Self::say`] apply it themselves. Callers that
+    /// tokenize by hand for [`Self::stream_tokens`] should run their text
+    /// through [`Normalize::apply`] first, before [`prepare_text_prompt`]:
+    /// normalization collapses runs of whitespace, including the padding
+    /// `prepare_text_prompt` adds to short text.
+    pub fn normalization(&self) -> Normalize {
+        self.normalize
     }
 
     /// Synthesize `text`, returning the whole waveform.
@@ -697,7 +743,13 @@ impl<Q: BackendQ> SessionOf<Q> {
         text: &str,
         rng: Box<dyn crate::flow_lm::Rng + Send>,
     ) -> Result<SpeechStream> {
-        let chunks = plan_chunks(&self.model, self.frame_rate, text, self.max_tokens_per_chunk)?;
+        let chunks = plan_chunks(
+            &self.model,
+            self.frame_rate,
+            text,
+            self.max_tokens_per_chunk,
+            self.normalize,
+        )?;
         self.stream_chunks(chunks, rng)
     }
 
@@ -1021,10 +1073,11 @@ impl Iterator for SpeechStream {
 
 /// Configures and loads a [`SynthOf`].
 ///
-/// The config and the weights path are required, and neither has a default:
-/// which files a checkpoint ships, what they are called and where its voices
-/// live all change from one release to the next, so locating them belongs to
-/// the frontend. This reads the files it is handed.
+/// The config, the weights path and the normalization policy are required, and
+/// none has a default. Which files a checkpoint ships, what they are called and
+/// where its voices live all change from one release to the next, so locating
+/// them belongs to the frontend; this reads the files it is handed. The
+/// language is required for a different reason: see [`Self::new`].
 pub struct SynthBuilder {
     config: TTSConfig,
     weights: PathBuf,
@@ -1039,14 +1092,42 @@ pub struct SynthBuilder {
     voice: Option<String>,
     max_tokens_per_chunk: usize,
     voices: Vec<(String, PathBuf)>,
+    normalize: Normalize,
 }
 
 impl SynthBuilder {
-    /// A checkpoint's config and its weights file, GGUF or safetensors.
-    pub fn new(config: TTSConfig, weights: impl Into<PathBuf>) -> Self {
+    /// A checkpoint's config, its weights file (GGUF or safetensors), and how
+    /// to normalize text.
+    ///
+    /// `normalize` has no default on purpose. Normalization makes the model
+    /// noticeably better, so it should not be something a caller forgets to
+    /// turn on — but the spoken forms of `@`, `+` and `=` are per-language, so
+    /// normalizing German as English makes it say "at" where it should say
+    /// "ät". Guessing is worse than doing nothing, so the caller says which:
+    /// [`Normalize::For`] with a language, or [`Normalize::Off`] to hand text
+    /// to the tokenizer as written.
+    ///
+    /// ```no_run
+    /// # fn main() -> xn::Result<()> {
+    /// use ptts::preprocess::{Lang, Normalize};
+    /// use ptts::synth::SynthBuilder;
+    /// use ptts::tts_model::TTSConfig;
+    ///
+    /// let tts = SynthBuilder::new(
+    ///     TTSConfig::v202601(0.5),
+    ///     "model/model.safetensors",
+    ///     Normalize::For(Lang::De),
+    /// )
+    /// .tokenizer_file("model/tokenizer.model")
+    /// .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new(config: TTSConfig, weights: impl Into<PathBuf>, normalize: Normalize) -> Self {
         Self {
             config,
             weights: weights.into(),
+            normalize,
             tokenizer_file: None,
             device: DeviceKind::Auto,
             quant: Quant::F32,
@@ -1245,6 +1326,7 @@ impl SynthBuilder {
                 cfg_coef: self.cfg_coef,
                 max_tokens_per_chunk: self.max_tokens_per_chunk,
             },
+            normalize: self.normalize,
         };
 
         for (name, path) in self.voices.iter() {
@@ -1402,6 +1484,11 @@ impl Session {
         dispatch_session!(&self.0, |s| s.sample_rate())
     }
 
+    /// How text is normalized — see [`SessionOf::normalization`].
+    pub fn normalization(&self) -> Normalize {
+        dispatch_session!(&self.0, |s| s.normalization())
+    }
+
     /// Synthesize `text`, returning the whole waveform.
     pub fn say(&self, text: &str) -> Result<Vec<f32>> {
         dispatch_session!(&self.0, |s| s.say(text))
@@ -1459,8 +1546,12 @@ impl Synth {
     ///
     /// Finding those -- and the tokenizer and voices beside them -- is the
     /// caller's job: see [`SynthBuilder`].
-    pub fn builder(config: TTSConfig, weights: impl Into<PathBuf>) -> SynthBuilder {
-        SynthBuilder::new(config, weights)
+    pub fn builder(
+        config: TTSConfig,
+        weights: impl Into<PathBuf>,
+        normalize: Normalize,
+    ) -> SynthBuilder {
+        SynthBuilder::new(config, weights, normalize)
     }
 
     /// Prime a voice once and keep it, for callers that generate repeatedly.
@@ -1527,6 +1618,11 @@ impl Synth {
 
     pub fn config(&self) -> &TTSConfig {
         dispatch!(&self.0, |s| s.config())
+    }
+
+    /// How requests are normalized — see [`SynthOf::normalization`].
+    pub fn normalization(&self) -> Normalize {
+        dispatch!(&self.0, |s| s.normalization())
     }
 
     /// Name of the device the model is running on, e.g. `"cpu"` or `"cuda:0"`.
@@ -1612,6 +1708,7 @@ impl std::fmt::Debug for Synth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::preprocess::Lang;
 
     fn defaults() -> Defaults {
         Defaults {
@@ -1667,6 +1764,17 @@ mod tests {
         assert_eq!(one.seed, 99);
         assert_eq!(one.temperature, 0.5);
         assert_eq!(one.voice.as_deref(), Some("alba"));
+    }
+
+    /// The builder carries the policy it was constructed with, unchanged:
+    /// there is no setter that could quietly replace it, and no default that
+    /// could stand in for a language the caller never named.
+    #[test]
+    fn the_builder_keeps_the_policy_it_was_given() {
+        for norm in [Normalize::For(Lang::En), Normalize::For(Lang::De), Normalize::Off] {
+            let b = SynthBuilder::new(TTSConfig::v202601(0.5), "model.safetensors", norm);
+            assert_eq!(b.normalize, norm);
+        }
     }
 
     /// The in-flight flag is what makes "one generation at a time" an error

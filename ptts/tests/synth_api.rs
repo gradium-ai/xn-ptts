@@ -9,12 +9,14 @@
 //! allowed to be reworded; which class of failure it is, is the contract.
 
 use ptts::Error;
+use ptts::preprocess::{Lang, Normalize};
 use ptts::synth::{DeviceKind, Quant, SpeechOptions, Synth, SynthBuilder};
 
 /// A builder over `weights`, with the shipped config: every test here fails
-/// before the weights are read, so the config's contents do not matter.
+/// before the weights are read, so the config's contents do not matter, and
+/// neither does which language it would have normalized as.
 fn builder(weights: impl Into<std::path::PathBuf>) -> SynthBuilder {
-    Synth::builder(ptts::tts_model::TTSConfig::v202601(0.5), weights)
+    Synth::builder(ptts::tts_model::TTSConfig::v202601(0.5), weights, Normalize::For(Lang::En))
 }
 
 #[test]

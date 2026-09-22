@@ -3,6 +3,10 @@ import init, { Model, cpu_features } from './ptts_wasm.js';
 const HF_BASE = 'https://huggingface.co/kyutai/pocket-tts-without-voice-cloning/resolve/main';
 const HF_BASE_Q8 = 'https://huggingface.co/lmz/pocket-tts-without-voice-cloning-q8/resolve/main';
 const TOKENIZER_URL = `${HF_BASE}/tokenizer.json`;
+// Language the demo normalizes its input as, before tokenizing. `Model` requires
+// one: the spoken forms of `@`, `+` and `=` differ per language, so there is
+// nothing safe to default to. Use 'none' to send text to the tokenizer as written.
+const LANG = 'en';
 
 function modelUrl(quant) {
   if (quant === 'q8') return `${HF_BASE_Q8}/tts_b6369a24.gguf`;
@@ -70,7 +74,7 @@ async function handleLoad(quant) {
   const modelWeights = await fetchWithProgress(modelUrl(quant), 'Model weights');
 
   post('status', { message: `Initializing model (quant=${quant})...` });
-  model = new Model(modelWeights, tokenizerJson, quant);
+  model = new Model(modelWeights, tokenizerJson, quant, LANG);
 
   for (const name of VOICE_NAMES) {
     post('status', { message: `Loading voice: ${name}...` });

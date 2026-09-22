@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use ptts::flow_lm::NormalRng;
 use ptts::plan::{EosPolicy, frame_budget};
+use ptts::preprocess::Normalize;
 use ptts::tok::Tok;
 use ptts::tts_model::{TTSConfig, TTSModel, TTSState};
 use xn::{BackendQ, Tensor};
@@ -70,10 +71,11 @@ struct Args {
     #[arg(long, default_value_t = false)]
     per_iter: bool,
 
-    /// Normalize the input for this language before tokenizing: `en`, `fr`, `de`, `es` or `pt`.
-    /// Off by default so measurements stay comparable with runs that predate the flag.
+    /// Language the input is normalized as before tokenizing: `en`, `fr`, `de`, `es` or `pt`.
+    /// Required, as everywhere else: there is nothing safe to guess.
+    /// `none` measures the unnormalized text, as runs that predate this flag did.
     #[arg(long)]
-    lang: Option<String>,
+    lang: String,
 }
 
 /// One iteration's timings.
@@ -184,7 +186,7 @@ fn row(label: &str, unit: &str, prec: usize, st: &Stats) {
     );
 }
 
-struct Bench<'a>(&'a Args);
+struct Bench<'a>(&'a Args, Normalize);
 
 impl xn::WithQ for Bench<'_> {
     type Output = ();
@@ -222,14 +224,7 @@ impl Bench<'_> {
 
         // Tokenize up front: the loop needs the tokens anyway, and the KV cache is sized from
         // them. Long inputs are split into sentences, as `pocket_tts` does.
-        let input = match args.lang.as_deref() {
-            None => std::borrow::Cow::Borrowed(args.input.as_str()),
-            Some(lang) => {
-                use std::str::FromStr;
-                let lang = ptts::preprocess::Lang::from_str(lang)?;
-                std::borrow::Cow::Owned(ptts::preprocess::normalize_text(&args.input, lang))
-            }
-        };
+        let input = self.1.apply(&args.input);
         let chunks = ptts::tts_model::split_into_best_sentences(
             model.flow_lm.conditioner.tokenizer.as_deref().context("no tokenizer")?,
             &input,
@@ -322,6 +317,8 @@ fn main() -> Result<()> {
     use std::str::FromStr;
 
     let args = Args::parse();
+    // Parsed before the weights are read, so a bad --lang does not cost a model load.
+    let normalize = Normalize::parse(&args.lang)?;
     if let Some(threads) = args.threads {
         // Must happen before the first tensor op, since it sets the size of rayon's global pool.
         xn::set_num_threads(threads);
@@ -340,6 +337,6 @@ fn main() -> Result<()> {
         xn::with_simd128(),
         xn::with_f16c()
     );
-    xn::Runner::new().cpu_only(args.cpu).dtype(dtype).run(Bench(&args), 0)?;
+    xn::Runner::new().cpu_only(args.cpu).dtype(dtype).run(Bench(&args, normalize), 0)?;
     Ok(())
 }

@@ -14,6 +14,7 @@ use ptts::flow_lm::{FlowLMState, NormalRng};
 use ptts::loader::remap_key;
 use ptts::mimi::MimiDecoderState;
 use ptts::plan::{self, EosPolicy};
+use ptts::preprocess::Normalize;
 use ptts::tok::Tok;
 use ptts::transformer::{LayerAttentionState, StreamingMHAState, StreamingTransformerState};
 use ptts::tts_model::{TTSConfig, TTSModel, TTSState, prepare_text_prompt};
@@ -123,11 +124,20 @@ pub struct Model {
     cfg: TTSConfig,
     gen_state: Option<GenState>,
     voice_states: Vec<RawState>,
+    /// How `start_generation` normalizes, named by the page when it built the
+    /// model. See `Model::new`.
+    normalize: Normalize,
 }
 
 impl Model {
-    pub fn new_(model_weights: &[u8], tokenizer_json: &[u8], quant: &str) -> xn::Result<Model> {
+    pub fn new_(
+        model_weights: &[u8],
+        tokenizer_json: &[u8],
+        quant: &str,
+        lang: &str,
+    ) -> xn::Result<Model> {
         let quant = Quant::parse(quant)?;
+        let normalize = Normalize::parse(lang)?;
         console_log!("[new] loading model with quant={quant:?}");
         let cfg = TTSConfig::v202601(0.5);
 
@@ -153,7 +163,7 @@ impl Model {
             Quant::Q8 => ModelInner::Q8(TTSModel::<Q80F32>::load(&root, tokenizer_box, &cfg)?),
         };
 
-        Ok(Model { inner, cfg, gen_state: None, voice_states: Vec::new() })
+        Ok(Model { inner, cfg, gen_state: None, voice_states: Vec::new(), normalize })
     }
 
     /// Load a pre-computed KV cache state from a safetensors buffer.
@@ -216,7 +226,9 @@ impl Model {
         // `prompt_text` runs a forward pass, not after.
         let rng = NormalRng::new(temperature, SEED)?;
 
-        let (text, frames_after_eos) = prepare_text_prompt(text);
+        // Normalization runs first: it collapses runs of whitespace, including
+        // the padding `prepare_text_prompt` adds to short text.
+        let (text, frames_after_eos) = prepare_text_prompt(&self.normalize.apply(text));
         let token_ids = match &self.inner {
             ModelInner::F32(m) => m.flow_lm.conditioner.tokenize(&text)?,
             ModelInner::Q8(m) => m.flow_lm.conditioner.tokenize(&text)?,
@@ -308,16 +320,28 @@ impl Model {
 #[wasm_bindgen]
 impl Model {
     /// `tokenizer_json` is the contents of a `tokenizer.json` for this checkpoint's vocabulary.
+    ///
+    /// `lang` is required: the language text is normalized as before it is
+    /// tokenized, one of `"en"`, `"fr"`, `"de"`, `"es"`, `"pt"`, or `"none"`
+    /// to hand text to the tokenizer as written. The spoken forms of `@`, `+`
+    /// and `=` differ per language, so there is nothing safe to default to.
     #[wasm_bindgen(constructor)]
-    pub fn new(model_weights: &[u8], tokenizer_json: &[u8], quant: &str) -> Result<Model, JsError> {
-        Self::new_(model_weights, tokenizer_json, quant).map_err(|e| JsError::new(&e.to_string()))
+    pub fn new(
+        model_weights: &[u8],
+        tokenizer_json: &[u8],
+        quant: &str,
+        lang: &str,
+    ) -> Result<Model, JsError> {
+        Self::new_(model_weights, tokenizer_json, quant, lang)
+            .map_err(|e| JsError::new(&e.to_string()))
     }
 
     pub fn add_voice(&mut self, voice_weights: &[u8]) -> Result<usize, JsError> {
         self.add_voice_(voice_weights).map_err(|e| JsError::new(&e.to_string()))
     }
 
-    /// Prepares and tokenizes `text`, then runs the prompt step. Returns the token count.
+    /// Normalizes, prepares and tokenizes `text`, then runs the prompt step.
+    /// Returns the token count.
     pub fn start_generation(
         &mut self,
         voice_index: usize,
