@@ -51,7 +51,7 @@ jobs:
       - name: Workspace, default features
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: ptts, every optional feature on
-        run: cargo clippy -p ptts --features sp,hf,audio --all-targets -- -D warnings
+        run: cargo clippy -p ptts --features hf,audio --all-targets -- -D warnings
 
   test:
     name: Test ${{ matrix.os }} / ${{ matrix.rust }}
@@ -75,13 +75,13 @@ jobs:
         run: cargo test --workspace --all-targets $WS_EXCLUDE
         shell: bash
       - name: ptts, every optional feature on
-        run: cargo test -p ptts --features sp,hf,audio --all-targets
+        run: cargo test -p ptts --features hf,audio --all-targets
         shell: bash
       # `-p ptts` rather than `--workspace`: it is the only crate with doctests, and selecting
       # the two `cdylib` crates only produces "doc tests are not supported for crate type(s)
       # `cdylib`" warnings.
       - name: Doctests
-        run: cargo test -p ptts --doc && cargo test -p ptts --features sp,hf,audio --doc
+        run: cargo test -p ptts --doc && cargo test -p ptts --features hf,audio --doc
         shell: bash
       # The two backends that only exist on this platform, so nowhere else can check them.
       - name: macOS-only backends compile
@@ -109,7 +109,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for features in "" sp hf audio sp,hf sp,audio hf,audio sp,hf,audio; do
+          for features in "" hf audio hf,audio; do
             echo "::group::ptts --features ${features:-<none>}"
             cargo check -p ptts --no-default-features --features "$features" --all-targets
             echo "::endgroup::"
@@ -158,14 +158,14 @@ jobs:
         env:
           RUSTDOCFLAGS: --cfg docsrs -D warnings
         # `+nightly` explicitly: the stable toolchain installed above is the default by then.
-        run: cargo +nightly doc -p ptts --no-deps --features sp,hf,audio
+        run: cargo +nightly doc -p ptts --no-deps --features hf,audio
 
       # Stable has no `docsrs` cfg and so no `feature(doc_cfg)`; this is what a contributor
       # running `cargo doc` gets, and it has to stay clean too.
       - name: And as a contributor will
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo +stable doc -p ptts --no-deps --features sp,hf,audio
+        run: cargo +stable doc -p ptts --no-deps --features hf,audio
 
   wasm:
     name: Wasm

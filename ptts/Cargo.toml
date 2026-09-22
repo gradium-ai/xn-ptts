@@ -40,7 +40,7 @@ libc = { workspace = true }
 # `all-features`: that turns on `cuda`, whose build script needs `nvcc`. The `docs` CI job
 # builds this same set, so a docs.rs failure shows up on the PR instead of after publishing.
 [package.metadata.docs.rs]
-features = ["sp", "hf", "audio"]
+features = ["hf", "audio"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]

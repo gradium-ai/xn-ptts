@@ -21,9 +21,9 @@ required check called `CI`:
 | Job | What it covers |
 |---|---|
 | `fmt` | `cargo fmt --all -- --check` (rustfmt.toml: `use_small_heuristics = "Max"`, edition 2024) |
-| `clippy` | whole workspace `--all-targets -D warnings`, then `ptts` with `sp,hf,audio` |
-| `test` | stable + nightly × Linux/macOS/Windows; default features, then `sp,hf,audio`, then doctests; `metal` and `accelerate` type-checked on the macOS leg |
-| `features` | every combination of `sp`/`hf`/`audio`, plus `vulkan` and `webgpu` |
+| `clippy` | whole workspace `--all-targets -D warnings`, then `ptts` with `hf,audio` |
+| `test` | stable + nightly × Linux/macOS/Windows; default features, then `hf,audio`, then doctests; `metal` and `accelerate` type-checked on the macOS leg |
+| `features` | every combination of `hf`/`audio`, plus `vulkan` and `webgpu` |
 | `docs` | `cargo doc` on nightly with `--cfg docsrs` exactly as docs.rs builds it, then again on stable |
 | `wasm` | `ptts-wasm` for `wasm32-unknown-unknown` with the SIMD flags real builds use |
 

@@ -66,9 +66,9 @@ runs:
     - name: Use the static CRT on Windows
       if: runner.os == 'Windows'
       shell: bash
-      # esaxx-rs (built with cc, /MT) and sentencepiece-sys (built with cmake, /MD) otherwise
-      # disagree on the MSVC runtime and fail to link with LNK2038. Force the static CRT
-      # everywhere so they all agree on /MT.
+      # Kept from when `sentencepiece-sys` (cmake, /MD) and `esaxx-rs` (cc, /MT) disagreed on
+      # the MSVC runtime and failed to link with LNK2038. `sentencepiece-sys` is gone, so this
+      # may no longer be needed -- drop it once Windows CI is green and confirms that.
       run: echo "RUSTFLAGS=-C target-feature=+crt-static" >> "$GITHUB_ENV"
 
     - name: Install the toolchain
