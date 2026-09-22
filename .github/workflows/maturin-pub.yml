@@ -3,6 +3,16 @@
 #
 #    maturin generate-ci github -m ptts-pyo3/Cargo.toml
 #
+# One thing is hand-added and a regeneration would drop it: every job deletes
+# `.cargo/config.toml` and sets `RUSTFLAGS` itself. That file pins `target-cpu=native`, which
+# in a published wheel means "whatever CPU the runner happened to have" -- a wheel that can
+# fault with SIGILL on someone's older machine.
+#
+# `xn` picks its quantized SIMD kernels with `cfg!(target_feature = "avx")`, at compile time,
+# so the x86_64 baseline decides whether `quant="q8_0"` gets the AVX path at all. `x86-64-v3`
+# is AVX2/FMA/F16C: Intel from 2013, AMD from 2015. Lower costs every quantized kernel;
+# higher, or `native`, costs users with older machines. aarch64 needs no flag -- NEON is
+# baseline for ARMv8, so those kernels are in either way.
 name: CI
 
 on:
@@ -11,7 +21,7 @@ on:
       - main
       - master
     tags:
-      - '*'
+      - 'v*'
   pull_request:
   workflow_dispatch:
 
@@ -28,6 +38,9 @@ jobs:
             target: x86_64
     steps:
       - uses: actions/checkout@v4
+      - name: Remove the local cargo config
+        shell: bash
+        run: rm -f .cargo/config.toml
       - uses: actions/setup-python@v5
         with:
           python-version: 3.x
@@ -38,6 +51,8 @@ jobs:
           args: --release --out dist --find-interpreter --manifest-path ptts-pyo3/Cargo.toml
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           manylinux: auto
+        env:
+          RUSTFLAGS: -C target-cpu=x86-64-v3
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -53,6 +68,9 @@ jobs:
             target: x86_64
     steps:
       - uses: actions/checkout@v4
+      - name: Remove the local cargo config
+        shell: bash
+        run: rm -f .cargo/config.toml
       - uses: actions/setup-python@v5
         with:
           python-version: 3.x
@@ -63,6 +81,8 @@ jobs:
           args: --release --out dist --find-interpreter --manifest-path ptts-pyo3/Cargo.toml
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           manylinux: musllinux_1_2
+        env:
+          RUSTFLAGS: -C target-cpu=x86-64-v3
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -78,6 +98,9 @@ jobs:
             target: x64
     steps:
       - uses: actions/checkout@v4
+      - name: Remove the local cargo config
+        shell: bash
+        run: rm -f .cargo/config.toml
       - uses: actions/setup-python@v5
         with:
           python-version: 3.x
@@ -88,6 +111,8 @@ jobs:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter --manifest-path ptts-pyo3/Cargo.toml
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        env:
+          RUSTFLAGS: -C target-cpu=x86-64-v3
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -103,9 +128,8 @@ jobs:
             target: aarch64
     steps:
       - uses: actions/checkout@v4
-      - name: Remove local cargo config
+      - name: Remove the local cargo config
         shell: bash
-        # Remove the target-arch=native as it breaks some dependencies.
         run: rm -f .cargo/config.toml
       - uses: actions/setup-python@v5
         with:
@@ -142,7 +166,7 @@ jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
-    if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
+    if: ${{ startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' }}
     needs: [linux, musllinux, windows, macos, sdist]
     permissions:
       # Use to sign the release artifacts
@@ -160,7 +184,7 @@ jobs:
       - name: Consolidate wheels
         run: mkdir -p dist && cp wheels-*/* dist/
       - name: Publish to PyPI
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/

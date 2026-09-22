@@ -13,4 +13,7 @@ dependencies = ["numpy"]
 dynamic = ["version"]
 
 [tool.maturin]
-features = ["pyo3/extension-module"]
+# No `features` key on purpose. A `--features` on the maturin command line *replaces* this
+# list rather than adding to it, so the macOS wheel job's `--features accelerate` was quietly
+# dropping `pyo3/extension-module`. It is a non-optional feature of the `pyo3` dependency in
+# Cargo.toml instead, where nothing on a command line can take it away.
