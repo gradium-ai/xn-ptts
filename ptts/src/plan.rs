@@ -7,9 +7,11 @@
 //! EOS countdown loop. They are pure functions of the token count and the config,
 //! so they belong here, where they can be unit tested once.
 //!
-//! The two examples are converted; `ptts-pyo3`, `ptts-wasm` and `ptts-ws-server`
-//! still carry their copies and are left for a follow-up, since each also has its
-//! own generation loop to untangle.
+//! Every frontend is converted now. `ptts-pyo3` and `ptts-ws-server` reach these
+//! through [`crate::synth`]; `bench` and `ptts-wasm` call them directly, because
+//! both drive [`crate::tts_model::TTSModel`] themselves — `bench` to attribute
+//! sampling and decoding time to the frame that caused them, `ptts-wasm` because
+//! `Synth` generates on background threads and the browser has none.
 
 /// Extra KV-cache entries reserved on top of the text tokens and the generated
 /// frames, covering the voice-prompt frames (~125 at 12.5Hz for a 10s prompt)
