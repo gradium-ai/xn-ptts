@@ -58,6 +58,17 @@ struct Args {
     #[arg(long)]
     weights: Option<String>,
 
+    /// Subdirectory of the repo or directory holding the checkpoint, for repos
+    /// that ship several side by side, e.g. `languages/italian`.
+    #[arg(long)]
+    subdir: Option<String>,
+
+    /// Git revision of the repo to load: a branch, tag or commit sha. Defaults
+    /// to the main branch, which is updated in place -- pin it for anything
+    /// that has to stay reproducible.
+    #[arg(long, conflicts_with = "dir")]
+    revision: Option<String>,
+
     /// Device to run on: auto, cpu, cuda, vulkan or metal.
     #[arg(long, default_value = "auto")]
     device: String,
@@ -103,13 +114,20 @@ fn main() -> Result<()> {
         xn::with_f16c()
     );
 
-    // Which files the checkpoint ships, and what they are called, is this
-    // example's business rather than the library's.
-    let source = match args.dir.as_deref() {
-        Some(dir) => model_helpers::Source::Dir(dir),
-        None => model_helpers::Source::Hub(&args.repo),
+    let mut source = match args.dir.as_deref() {
+        Some(dir) => model_helpers::ModelSource::dir(dir),
+        None => model_helpers::ModelSource::hub(&args.repo),
     };
-    let checkpoint = model_helpers::Checkpoint::locate(source, args.weights.as_deref())?;
+    if let Some(weights) = args.weights.as_deref() {
+        source = source.weights(weights);
+    }
+    if let Some(subdir) = args.subdir.as_deref() {
+        source = source.subdir(subdir);
+    }
+    if let Some(revision) = args.revision.as_deref() {
+        source = source.revision(revision);
+    }
+    let checkpoint = source.resolve()?;
     let mut builder = checkpoint
         .builder()
         .device(DeviceKind::parse(&args.device)?)
@@ -135,16 +153,9 @@ fn main() -> Result<()> {
 
     let mut opts = SpeechOptions::default();
     match &voice {
-        // The bundled voices are registered after the load, so the builder's
-        // own "first voice by name" default never saw them; pick it here. A
-        // checkpoint that ships a `default-voice.safetensors` gets that one.
-        VoiceArg::Default => {
-            let voices = tts.voices();
-            let pick = voices.iter().find(|v| v.as_str() == "default").or(voices.first());
-            if let Some(name) = pick {
-                opts = opts.voice(name.clone());
-            }
-        }
+        // Left unset: `register_voices` already picked the checkpoint's default,
+        // and an unset `SpeechOptions::voice` falls back to it.
+        VoiceArg::Default => {}
         VoiceArg::Bundled(name) => opts = opts.voice(name.clone()),
         VoiceArg::Embedding(_) => opts = opts.voice(VoiceArg::REGISTERED),
         VoiceArg::Audio(path) => {

@@ -37,31 +37,25 @@ fn main() -> Result<()> {
 }
 
 fn run(args: Args) -> Result<()> {
-    use std::str::FromStr;
-
     let dev = xn::CpuDevice;
     tracing::info!("loading config from {}", args.config);
-    let (cfg, model_path) = if args.config.ends_with("json") {
-        let cfg: ptts::tts_model::TTSConfig =
-            serde_json::from_str(&std::fs::read_to_string(&args.config)?)?;
-        let config = std::fs::canonicalize(args.config)?;
+
+    // `--config` is either a local `config.json` -- in which case the checkpoint is the
+    // directory holding it -- or a Hub repo id. `ModelSource` searches both the same way.
+    let source = if args.config.ends_with("json") {
+        let config = std::fs::canonicalize(&args.config)?;
         let parent = config.parent().context("config path has no parent")?;
-        let model_path = match args.weights.as_ref() {
-            None => parent.join("model.safetensors"),
-            Some(p) => std::path::PathBuf::from_str(p)?,
-        };
-        (cfg, model_path)
+        model_helpers::ModelSource::dir(parent)
     } else {
-        let api = hf_hub::HFClientSync::new()?;
-        let (owner, name) = hf_hub::split_id(&args.config);
-        let repo = api.model(owner, name);
-        let cfg = repo.download_file().filename("config.json").send()?;
-        let cfg: ptts::tts_model::TTSConfig = serde_json::from_str(&std::fs::read_to_string(cfg)?)?;
-        let model_path = match args.weights.as_ref() {
-            None => repo.download_file().filename("model.safetensors").send()?,
-            Some(p) => std::path::PathBuf::from_str(p)?,
-        };
-        (cfg, model_path)
+        model_helpers::ModelSource::hub(&args.config)
+    };
+    let checkpoint = source.resolve()?;
+    let cfg = checkpoint.config;
+    // `--weights` names a local file, not one inside the source: this example is usually
+    // pointed at a checkpoint whose weights are already unpacked somewhere else.
+    let model_path = match args.weights.as_ref() {
+        None => checkpoint.weights,
+        Some(p) => std::path::PathBuf::from(p),
     };
     let model_ext = cfg.model_ext();
     tracing::info!(?model_ext, "model extension");

@@ -27,7 +27,7 @@ CI deletes `.cargo/config.toml` before building because it pins `target-cpu=nati
 
 Cargo features that gate optional functionality:
 
-- `ptts`: `sp` (SentencePiece tokenizer, required by the `say`, `pocket_tts` and `bench` examples), `hf` (Hugging Face `tokenizers`), `audio` (`ptts::audio`, decoding and resampling audio files for voice cloning — pulls in `symphonia` and `rubato`, so it is off by default and out of the wasm build; required by `pocket_tts` and `create_voice`), `cuda`, `accelerate`. The library never downloads anything, so there is no hub feature: `hf-hub` is a dev-dependency used by the examples.
+- `ptts`: `sp` (SentencePiece tokenizer, required by the `say`, `pocket_tts` and `bench` examples), `hf` (Hugging Face `tokenizers`), `audio` (`ptts::audio`, decoding and resampling audio files for voice cloning — pulls in `symphonia` and `rubato`, so it is off by default and out of the wasm build; required by `pocket_tts` and `create_voice`), `hub` (`loader::ModelSource::hub` and `Synth::from_pretrained`, which download a checkpoint from the Hugging Face Hub — off by default, and with it off the crate makes no network calls at all; required by `say` and `pocket_tts`), `cuda`, `accelerate`.
 - `ptts-pyo3`: `cuda`, `accelerate` (each forwards to both `xn/*` and `ptts/*`).
 
 Run the CLI example:
@@ -36,12 +36,12 @@ Run the CLI example:
 cargo run --release --example pocket_tts --features sp,audio -- "hello world" -o out.wav
 ```
 
-It downloads weights from the `kyutai/pocket-tts` HuggingFace repo on first run. Which files that means — the repo id, the weight and tokenizer file names, the bundled voice list, the config to assume when a directory ships none — lives in `ptts/examples/model_helpers.rs`, not in the library: it changes with each published checkpoint, and `ptts` only reads the files it is handed. Built-in voice IDs: `alba`, `marius`, `javert`, `jean`, `fantine`, `cosette`, `eponine`, `azelma`. `--voice` also accepts a path to a 10s audio file or a voice safetensors: either a precomputed `emb` or the training pipeline's `speaker_wavs` latents, which `ptts::loader::load_voice_emb` runs through the checkpoint's speaker projection. `--repo <id>` downloads from another Hub repo with the same layout (`config.json`, weights, tokenizer, optional `embeddings/*.safetensors` voices and an optional `default-voice.safetensors`, which is picked when no `--voice` is given); `--weights <file>` names the weights file inside the repo or directory so only that one is downloaded (`--weights model.q8.gguf --quant q8` for the pre-quantized weights); `--dir` loads a local checkpoint instead of downloading; `--device auto|cpu|cuda|vulkan|metal` picks the backend.
+It downloads weights from the `kyutai/pocket-tts` HuggingFace repo on first run — a **gated** repo, so this needs `huggingface-cli login` or `HF_TOKEN`; `--repo kyutai/pocket-tts-without-voice-cloning` is the ungated variant, minus the speaker encoder that cloning needs. Finding a checkpoint's files — the weight and tokenizer name candidates, the voice directories, the config to assume when one ships none — is `ptts::loader::ModelSource`, which searches a Hub repo or a local directory the same way; `model_helpers.rs` keeps only the default repo id and the examples' log filter. Voice IDs bundled at the repo root: `alba`, `marius`, `javert`, `jean`, `fantine`, `cosette`, `eponine`, `azelma`. `--voice` also accepts a path to a 10s audio file or a voice safetensors: either a precomputed `emb` or the training pipeline's `speaker_wavs` latents, which `ptts::loader::load_voice_emb` runs through the checkpoint's speaker projection. `--repo <id>` downloads from another Hub repo with the same layout (`config.json`, weights, tokenizer, `voices/` or `embeddings/` voices and an optional `default-voice.safetensors`, which is picked when no `--voice` is given); `--weights <file>` names the weights file inside the repo or directory so only that one is downloaded (`--weights model.q8.gguf --quant q8` for the pre-quantized weights); `--subdir <path>` selects one checkpoint out of a repo holding several — `kyutai/pocket-tts` ships fifteen under `languages/`, six languages with 26 voices each, half of them 24-layer variants that need their own `config.json` and currently fail to load without one; `--revision <ref>` pins a branch, tag or sha, worth setting since the published repos are updated in place; `--dir` loads a local checkpoint instead of downloading; `--device auto|cpu|cuda|vulkan|metal` picks the backend.
 
-`say` is the same thing in fifteen lines, for checking that the library works:
+`say` is the same thing in one call, for checking that the library works:
 
 ```
-cargo run --release --example say --features sp -- "hello world"
+cargo run --release --example say --features sp,hub -- "hello world"
 ```
 
 Benchmark a local model:

@@ -1,28 +1,24 @@
 //! Bits the examples share that are not worth a place in the library.
 //!
-//! Two kinds of thing live here. The first is re-exports: weight loading, key remapping and
-//! voice-embedding loading live in `ptts::loader` and the tokenizer in `ptts::tok`, and this
-//! gives each example one place to look. `ptts::plan` is used directly, since it is not tied to
-//! a backend type.
+//! Locating a checkpoint used to live here: the repo it sits in, the names its files go by, the
+//! voices it bundles and the config to assume when it ships none. That moved to
+//! [`ptts::loader::ModelSource`], because a library user needs it as much as an example does --
+//! reproducing `say.rs` meant re-deriving a layout the crate already knew.
 //!
-//! The second is everything specific to the *published* pocket-tts checkpoint: the repo it
-//! lives in, the names its files go by, the voices it bundles, and the config to assume when a
-//! directory ships none. That set changes with every release, so `ptts` does not carry it --
-//! the library reads the config, weights, tokenizer and voice files it is handed, and finding
-//! them belongs to whatever tracks a particular checkpoint. For the examples, that is here.
+//! What is left is the two things that really are the frontend's: which repo to default to, and
+//! how the examples want their logs.
 #![allow(dead_code, unused_imports)]
 
-use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
-
-pub use ptts::loader::{is_unused_by_tts_model, load_voice_emb, load_weights, remap_key};
+pub use ptts::loader::{
+    Checkpoint, ModelSource, is_unused_by_tts_model, load_voice_emb, load_weights, remap_key,
+};
 #[cfg(feature = "sp")]
 pub use ptts::tok::Tok;
 
-use ptts::synth::{Synth, SynthBuilder};
-use ptts::tts_model::TTSConfig;
-
-/// Hugging Face repo holding the published checkpoint.
+/// Hugging Face repo the examples download from unless `--repo` names another.
+///
+/// A deployment choice rather than a fact about the format, which is why it is here and not in
+/// `ptts`: the library loads whatever repo it is pointed at.
 pub const REPO_ID: &str = "kyutai/pocket-tts";
 
 /// Default `tracing` directives for the examples: `info` for everything but the Hub download
@@ -31,233 +27,3 @@ pub const REPO_ID: &str = "kyutai/pocket-tts";
 /// download. `RUST_LOG` overrides this.
 pub const LOG_DIRECTIVES: &str =
     "info,xet=warn,xet_client=warn,xet_data=warn,xet_runtime=warn,xet_core_structures=warn";
-
-/// Voices the published checkpoint bundles, under `embeddings/`.
-pub const VOICES: &[&str] =
-    &["alba", "marius", "javert", "jean", "fantine", "cosette", "eponine", "azelma"];
-
-/// Weight file names tried, in order. `tts_b6369a24.safetensors` is what the published repo
-/// calls its f32 weights today; a local directory more often holds one of the first two.
-pub const WEIGHT_CANDIDATES: &[&str] =
-    &["model.safetensors", "model.q8.gguf", "tts_b6369a24.safetensors"];
-
-/// Tokenizer file names tried, in order. `tokenizer.json` is the Hugging Face `tokenizers`
-/// format, `tokenizer.model` is SentencePiece, and `ptts::tok::Tok` picks the reader by
-/// extension -- so the order follows which of the two this build can read. A checkpoint that
-/// ships both is common, and picking the one whose feature is off would fail a load that had
-/// a usable tokenizer sitting beside it.
-pub const TOKENIZER_CANDIDATES: &[&str] = if cfg!(feature = "hf") {
-    &["tokenizer.json", "tokenizer.model"]
-} else {
-    &["tokenizer.model", "tokenizer.json"]
-};
-
-/// A checkpoint whose files have been located and whose config is parsed.
-pub struct Checkpoint {
-    pub config: TTSConfig,
-    pub weights: PathBuf,
-    /// `None` when no tokenizer file was found; the caller must then pass one to
-    /// [`SynthBuilder::tokenizer`].
-    pub tokenizer: Option<PathBuf>,
-    /// Voice name to embedding file, sorted by name.
-    pub voices: Vec<(String, PathBuf)>,
-}
-
-/// Where a checkpoint's files come from.
-#[derive(Clone, Copy, Debug)]
-pub enum Source<'a> {
-    /// A local directory, see [`Checkpoint::from_dir`].
-    Dir(&'a Path),
-    /// A Hugging Face model repo, see [`Checkpoint::from_hub`].
-    Hub(&'a str),
-}
-
-impl Checkpoint {
-    /// Locate a checkpoint in `source`.
-    ///
-    /// `weights` names the weights file inside the source, e.g. `model.q8.gguf`, for a
-    /// checkpoint that ships several. When `None`, the first of [`WEIGHT_CANDIDATES`] that
-    /// exists is used.
-    pub fn locate(source: Source<'_>, weights: Option<&str>) -> Result<Self> {
-        match source {
-            Source::Dir(dir) => Self::from_dir(dir, weights),
-            Source::Hub(repo_id) => Self::from_hub(repo_id, weights),
-        }
-    }
-
-    /// Download from a Hugging Face model repo laid out like [`REPO_ID`]: an optional
-    /// `config.json`, a weights file, a tokenizer, voices under `embeddings/` and an optional
-    /// `default-voice.safetensors`. Only the files that are used get downloaded, so naming the
-    /// weights file with `weights` avoids fetching the f32 weights of a repo that also ships a
-    /// quantized GGUF.
-    pub fn from_hub(repo_id: &str, weights: Option<&str>) -> Result<Self> {
-        let repo = HubRepo::open(repo_id)?;
-        tracing::info!(?repo_id, "resolving checkpoint on the Hugging Face Hub");
-
-        let config = match repo.get_optional("config.json") {
-            Some(path) => read_config(&path)?,
-            None => shipped_config(),
-        };
-        let weights = match weights {
-            Some(name) => repo.get(name)?,
-            None => match WEIGHT_CANDIDATES.iter().find_map(|name| repo.get_optional(name)) {
-                Some(path) => path,
-                None => anyhow::bail!(
-                    "no weights file in `{repo_id}`; expected one of {}",
-                    WEIGHT_CANDIDATES.join(", ")
-                ),
-            },
-        };
-        let tokenizer = TOKENIZER_CANDIDATES.iter().find_map(|name| repo.get_optional(name));
-
-        let mut voices = vec![];
-        for voice in VOICES {
-            if let Some(path) = repo.get_optional(&format!("embeddings/{voice}.safetensors")) {
-                voices.push((voice.to_string(), path));
-            }
-        }
-        if let Some(path) = repo.get_optional("default-voice.safetensors") {
-            voices.push(("default".to_string(), path));
-        }
-        voices.sort();
-
-        Ok(Self { config, weights, tokenizer, voices })
-    }
-
-    /// A local directory holding `config.json`, a weights file, a tokenizer and an optional
-    /// `voices/` or `embeddings/` subdirectory -- both layouts are in circulation. `weights`
-    /// is as for [`Self::locate`].
-    pub fn from_dir(dir: &Path, weights: Option<&str>) -> Result<Self> {
-        if !dir.is_dir() {
-            anyhow::bail!("not a directory: {}", dir.display())
-        }
-        let config_path = dir.join("config.json");
-        let config =
-            if config_path.is_file() { read_config(&config_path)? } else { shipped_config() };
-
-        let weights = match weights {
-            Some(name) => {
-                let path = dir.join(name);
-                if !path.is_file() {
-                    anyhow::bail!("no weights file `{name}` in {}", dir.display())
-                }
-                path
-            }
-            None => WEIGHT_CANDIDATES
-                .iter()
-                .map(|name| dir.join(name))
-                .find(|path| path.is_file())
-                .with_context(|| {
-                    format!(
-                        "no weights file in {}; expected one of {}",
-                        dir.display(),
-                        WEIGHT_CANDIDATES.join(", ")
-                    )
-                })?,
-        };
-        let tokenizer =
-            TOKENIZER_CANDIDATES.iter().map(|name| dir.join(name)).find(|path| path.is_file());
-
-        let mut voices = vec![];
-        for sub in ["voices", "embeddings"] {
-            collect_voice_dir(&dir.join(sub), &mut voices);
-        }
-        let default_voice = dir.join("default-voice.safetensors");
-        if default_voice.is_file() {
-            voices.push(("default".to_string(), default_voice));
-        }
-        voices.sort();
-        voices.dedup_by(|a, b| a.0 == b.0);
-
-        Ok(Self { config, weights, tokenizer, voices })
-    }
-
-    /// A builder over this checkpoint, with its tokenizer file set.
-    ///
-    /// The bundled voices are deliberately not registered here: see
-    /// [`Self::register_voices`].
-    pub fn builder(&self) -> SynthBuilder {
-        let mut builder = SynthBuilder::new(self.config.clone(), &self.weights);
-        if let Some(tokenizer) = self.tokenizer.as_ref() {
-            builder = builder.tokenizer_file(tokenizer);
-        }
-        builder
-    }
-
-    /// Register the bundled voices, warning about any that fail to load rather than failing
-    /// the run: one bad embedding -- an interrupted download, a voice from another
-    /// checkpoint -- should not make the model unusable. A voice the user named explicitly
-    /// goes through `SynthBuilder::add_voice`, where a failure is fatal.
-    pub fn register_voices(&self, tts: &mut Synth) {
-        for (name, path) in self.voices.iter() {
-            if let Err(e) = tts.add_voice_file(name, path) {
-                tracing::warn!(voice = %name, error = %e, "skipping voice embedding");
-            }
-        }
-    }
-}
-
-/// The config the published checkpoint ships, for repos and directories that carry no
-/// `config.json`. `temp` is not read by the runtime -- sampling temperature reaches the model
-/// through `SynthBuilder::temperature` -- so any value does.
-fn shipped_config() -> TTSConfig {
-    TTSConfig::v202601(0.5)
-}
-
-fn read_config(path: &Path) -> Result<TTSConfig> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("cannot read config {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("cannot parse config {}", path.display()))
-}
-
-/// Adds every `*.safetensors` file in `dir` to `voices`, keyed by file stem. A missing or
-/// unreadable directory is not an error: voices are optional.
-fn collect_voice_dir(dir: &Path, voices: &mut Vec<(String, PathBuf)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("safetensors") {
-            continue;
-        }
-        if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-            voices.push((name.to_string(), path));
-        }
-    }
-}
-
-/// A Hugging Face model repo, wrapped so a download failure names the repo and the file --
-/// `hf_hub` does so for a missing file but not for an HTTP or authentication failure, which
-/// makes a gated repo hard to diagnose -- and so the callers need not spell out the download
-/// builder.
-struct HubRepo {
-    repo: hf_hub::HFRepositorySync<hf_hub::repository::RepoTypeModel>,
-    repo_id: String,
-}
-
-impl HubRepo {
-    /// The client reads `HF_TOKEN`, `HF_ENDPOINT` and the cache location from the environment,
-    /// falling back to the token `huggingface-cli login` stores.
-    fn open(repo_id: &str) -> Result<Self> {
-        let client = hf_hub::HFClientSync::new().context("cannot reach the Hugging Face Hub")?;
-        let (owner, name) = hf_hub::split_id(repo_id);
-        Ok(Self { repo: client.model(owner, name), repo_id: repo_id.to_string() })
-    }
-
-    /// Download `filename`, or find it in the local cache.
-    fn get(&self, filename: &str) -> Result<PathBuf> {
-        self.repo.download_file().filename(filename).send().map_err(|e| {
-            anyhow::anyhow!(
-                "failed to fetch `{filename}` from `{}`: {e}\n\
-                 If the repo is gated, accept its terms on huggingface.co and run \
-                 `huggingface-cli login` (or set HF_TOKEN).",
-                self.repo_id
-            )
-        })
-    }
-
-    /// Like [`Self::get`] but maps any failure to `None`, for files that may legitimately be
-    /// absent from a given repo layout.
-    fn get_optional(&self, filename: &str) -> Option<PathBuf> {
-        self.repo.download_file().filename(filename).send().ok()
-    }
-}

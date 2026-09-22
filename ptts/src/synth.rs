@@ -274,6 +274,27 @@ impl<Q: BackendQ> SynthOf<Q> {
         self.model.device().name()
     }
 
+    /// The voice used by calls that name none.
+    pub fn default_voice(&self) -> Option<&str> {
+        self.defaults.voice.as_deref()
+    }
+
+    /// Choose the voice used by calls that name none.
+    ///
+    /// [`SynthBuilder`] picks one during `build`, which is before voices registered afterwards
+    /// exist -- so a caller that registers a checkpoint's own voices on a loaded model, as
+    /// [`crate::loader::Checkpoint::register_voices`] does, sets the default here.
+    pub fn set_default_voice(&mut self, name: &str) -> Result<()> {
+        if !self.voices.contains_key(name) {
+            xn::bail!(
+                "no voice '{name}' is registered; this model has {}",
+                self.voices.keys().cloned().collect::<Vec<_>>().join(", ")
+            )
+        }
+        self.defaults.voice = Some(name.to_string());
+        Ok(())
+    }
+
     /// Registered voice names, sorted.
     pub fn voices(&self) -> Vec<String> {
         self.voices.keys().cloned().collect()
@@ -1187,6 +1208,7 @@ impl SynthBuilder {
         let tokenizer = self.take_tokenizer()?;
 
         let vb = loader::load_weights::<Q>(&self.weights, &device)?;
+        check_layer_count(&vb, &config, &self.weights)?;
         let model = TTSModel::<Q>::load(&vb, tokenizer, &config)?;
         let model = match self.eos_threshold {
             Some(threshold) => model.with_eos_threshold(threshold),
@@ -1249,6 +1271,38 @@ impl SynthBuilder {
              shipped none, and neither the `sp` nor the `hf` feature of `ptts` is enabled."
         )
     }
+}
+
+/// Fails when the weights hold more transformer layers than the config claims.
+///
+/// A checkpoint that ships no `config.json` is loaded against
+/// [`TTSConfig::v202601`], which is a 6-layer architecture -- and the published
+/// repo also carries 24-layer checkpoints under the same layout. Loading one
+/// against the wrong config would otherwise surface as a list of unused tensors
+/// from `check_all_used_with_ignore`, which says nothing about the cause.
+///
+/// Only the too-many direction is checked here. Too few layers means a tensor
+/// the model asks for is missing, which `TTSModel::load` already reports by
+/// name.
+fn check_layer_count<B: xn::Backend>(
+    vb: &xn::nn::Path<B>,
+    config: &TTSConfig,
+    weights: &FsPath,
+) -> Result<()> {
+    let claimed = config.flow_lm.num_layers;
+    if !vb.contains(&format!("flow_lm.transformer.layers.{claimed}.linear1.weight")) {
+        return Ok(());
+    }
+    let mut found = claimed + 1;
+    while vb.contains(&format!("flow_lm.transformer.layers.{found}.linear1.weight")) {
+        found += 1;
+    }
+    xn::bail!(
+        "{} holds {found} transformer layers but the config describes {claimed}. This checkpoint \
+         needs its own `config.json`; the one assumed for a checkpoint that ships none describes \
+         a {claimed}-layer model.",
+        weights.display()
+    )
 }
 
 /// Every weight format and device this build supports.
@@ -1426,6 +1480,54 @@ impl Synth {
         SynthBuilder::new(config, weights)
     }
 
+    /// Load a checkpoint from a Hugging Face model repo, voices and all.
+    ///
+    /// ```no_run
+    /// # fn main() -> xn::Result<()> {
+    /// let tts = ptts::synth::Synth::from_pretrained("kyutai/pocket-tts")?;
+    /// let pcm = tts.say("Hello world")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Everything is defaulted: the device is [`DeviceKind::Auto`], the weights
+    /// are whichever of [`loader::WEIGHT_CANDIDATES`] the repo has, and the
+    /// default voice is the first one it ships. To choose any of that -- a
+    /// quantized weight file, one checkpoint out of a repo that holds several,
+    /// a pinned revision -- go through [`loader::ModelSource`] and build from
+    /// the [`loader::Checkpoint`] it resolves:
+    ///
+    /// ```no_run
+    /// # fn main() -> xn::Result<()> {
+    /// use ptts::loader::ModelSource;
+    /// use ptts::synth::Quant;
+    ///
+    /// let checkpoint = ModelSource::hub("kyutai/pocket-tts")
+    ///     .subdir("languages/italian")
+    ///     .weights("model.q8.gguf")
+    ///     .resolve()?;
+    /// let mut tts = checkpoint.builder().quant(Quant::Q80).build()?;
+    /// checkpoint.register_voices(&mut tts);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Requires the `hub` feature. Without it the crate makes no network calls
+    /// at all, and a checkpoint already on disk loads through
+    /// [`loader::ModelSource::dir`] or [`Self::builder`].
+    #[cfg(feature = "hub")]
+    pub fn from_pretrained(repo_id: &str) -> Result<Self> {
+        let checkpoint = loader::ModelSource::hub(repo_id).resolve()?;
+        let mut tts = checkpoint.builder().build()?;
+        if checkpoint.register_voices(&mut tts) == 0 {
+            tracing::warn!(
+                repo_id,
+                "no voices found; pass one to `say_with`, or register one with `add_voice_file`"
+            );
+        }
+        Ok(tts)
+    }
+
     /// Prime a voice once and keep it, for callers that generate repeatedly.
     ///
     /// See [`SynthOf::session`]. `max_seq_len` is the KV budget allocated up
@@ -1514,6 +1616,17 @@ impl Synth {
     }
 
     /// Register a precomputed voice embedding, replacing any voice of the same name.
+    /// The voice used by calls that name none.
+    pub fn default_voice(&self) -> Option<&str> {
+        dispatch!(&self.0, |s| s.default_voice())
+    }
+
+    /// Choose the voice used by calls that name none. See
+    /// [`SynthOf::set_default_voice`].
+    pub fn set_default_voice(&mut self, name: &str) -> Result<()> {
+        dispatch!(&mut self.0, |s| s.set_default_voice(name))
+    }
+
     pub fn add_voice_file(&mut self, name: &str, path: &FsPath) -> Result<()> {
         dispatch!(&mut self.0, |s| s.add_voice_file(name, path))
     }

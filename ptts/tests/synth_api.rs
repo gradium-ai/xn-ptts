@@ -153,6 +153,35 @@ fn speech_options_default_to_the_builders_settings() {
 /// A session is the fix for re-priming the voice on every call, so the type has
 /// to be nameable and its budget visible without a model in hand.
 #[test]
+fn model_source_reaches_a_checkpoint_without_the_frontend_knowing_its_layout() {
+    // The point of `ModelSource`: a caller names a directory, not a file set. Anything it
+    // cannot find it says so about, naming what it looked for.
+    let dir = std::env::temp_dir().join("ptts-synth-api-source");
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(dir.join("embeddings")).unwrap();
+    std::fs::write(dir.join("model.safetensors"), b"").unwrap();
+    std::fs::write(dir.join("tokenizer.model"), b"").unwrap();
+    std::fs::write(dir.join("embeddings/alba.safetensors"), b"").unwrap();
+
+    let checkpoint = ptts::loader::ModelSource::dir(&dir).resolve().unwrap();
+    assert_eq!(checkpoint.weights, dir.join("model.safetensors"));
+    assert_eq!(checkpoint.tokenizer, Some(dir.join("tokenizer.model")));
+    assert_eq!(checkpoint.voices.len(), 1);
+    // The builder it hands back is a plain `SynthBuilder`: every option still applies.
+    let _ = checkpoint.builder().temperature(0.9).seed(7);
+}
+
+#[test]
+fn a_default_voice_can_be_chosen_after_the_model_is_loaded() {
+    // Registering a checkpoint's voices happens after `build`, so the default has to be
+    // settable then. Signature-only: choosing one needs weights.
+    fn _accepts(tts: &mut ptts::synth::Synth) -> xn::Result<()> {
+        let _: Option<&str> = tts.default_voice();
+        tts.set_default_voice("alba")
+    }
+}
+
+#[test]
 fn session_is_part_of_the_public_api() {
     fn _accepts(_: &ptts::synth::Session) {}
     fn _budget(s: &ptts::synth::Session) -> usize {

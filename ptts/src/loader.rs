@@ -366,3 +366,626 @@ mod tests {
         assert!(err.contains("2 channels") && err.contains("takes 3"), "{err}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Locating a checkpoint
+// ---------------------------------------------------------------------------
+
+/// Weight file names tried, in order, when the caller names none.
+///
+/// A search order across the layouts in circulation, not a promise about any one release: a
+/// checkpoint is free to call its weights anything, and [`ModelSource::weights`] names the file
+/// when it does.
+pub const WEIGHT_CANDIDATES: &[&str] =
+    &["model.safetensors", "model.q8.gguf", "tts_b6369a24.safetensors"];
+
+/// Tokenizer file names tried, in order. `tokenizer.json` is the Hugging Face `tokenizers`
+/// format and `tokenizer.model` is SentencePiece; [`crate::tok::Tok`] picks the reader by
+/// extension, so the order follows which of the two this build can read. A checkpoint that ships
+/// both is common, and picking the one whose feature is off would fail a load that had a usable
+/// tokenizer sitting beside it.
+pub const TOKENIZER_CANDIDATES: &[&str] = if cfg!(feature = "hf") {
+    &["tokenizer.json", "tokenizer.model"]
+} else {
+    &["tokenizer.model", "tokenizer.json"]
+};
+
+/// Subdirectories searched for voice embeddings, relative to the checkpoint.
+pub const VOICE_DIRS: &[&str] = &["voices", "embeddings"];
+
+/// A voice file that sits beside the weights rather than in a voice directory, registered under
+/// the name `default`.
+pub const DEFAULT_VOICE_FILE: &str = "default-voice.safetensors";
+
+/// Where a checkpoint's files come from.
+///
+/// [`load_weights`] and [`load_voice_emb`] read files someone has already located. This decides
+/// *which* files, across the two layouts in circulation -- a Hugging Face model repo and a local
+/// directory -- so that every frontend does not carry its own copy of the search.
+///
+/// ```no_run
+/// # fn main() -> xn::Result<()> {
+/// use ptts::loader::ModelSource;
+///
+/// // The published checkpoint, from the Hub.
+/// let tts = ModelSource::hub("kyutai/pocket-tts").resolve()?.builder().build()?;
+///
+/// // A specific checkpoint inside a repo that ships several, with its quantized weights.
+/// let checkpoint = ModelSource::hub("kyutai/pocket-tts")
+///     .subdir("languages/italian")
+///     .weights("model.q8.gguf")
+///     .resolve()?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Callers that already have explicit paths do not need this: pass them to
+/// [`crate::synth::SynthBuilder::new`] directly.
+#[derive(Clone, Debug)]
+pub struct ModelSource {
+    location: Location,
+    subdir: Option<String>,
+    weights: Option<String>,
+    revision: Option<String>,
+}
+
+/// The two checkpoint layouts [`ModelSource`] knows how to search.
+#[derive(Clone, Debug)]
+enum Location {
+    /// A Hugging Face model repo id, e.g. `kyutai/pocket-tts`.
+    Hub(String),
+    /// A local directory.
+    Dir(std::path::PathBuf),
+}
+
+impl ModelSource {
+    /// A Hugging Face model repo, by id. Requires the `hub` feature.
+    ///
+    /// Only the files that get used are downloaded, so naming the weights file with
+    /// [`Self::weights`] avoids fetching the f32 weights of a repo that also ships a quantized
+    /// GGUF.
+    pub fn hub(repo_id: impl Into<String>) -> Self {
+        Self {
+            location: Location::Hub(repo_id.into()),
+            subdir: None,
+            weights: None,
+            revision: None,
+        }
+    }
+
+    /// A local directory holding a weights file, optionally `config.json`, a tokenizer and a
+    /// `voices/` or `embeddings/` subdirectory.
+    pub fn dir(path: impl Into<std::path::PathBuf>) -> Self {
+        Self { location: Location::Dir(path.into()), subdir: None, weights: None, revision: None }
+    }
+
+    /// Look inside this subdirectory of the repo or directory, for checkpoints that ship several
+    /// side by side -- `languages/italian`, say. Everything a checkpoint owns is searched for
+    /// under it: the config, the weights, the tokenizer and the voice directories.
+    pub fn subdir(mut self, subdir: impl Into<String>) -> Self {
+        self.subdir = Some(subdir.into());
+        self
+    }
+
+    /// Name the weights file, e.g. `model.q8.gguf`, for a checkpoint that ships several. When
+    /// unset, the first of [`WEIGHT_CANDIDATES`] that exists is used.
+    pub fn weights(mut self, filename: impl Into<String>) -> Self {
+        self.weights = Some(filename.into());
+        self
+    }
+
+    /// Pin a git revision -- a branch, tag or commit sha. Hub sources only; defaults to the
+    /// repo's main branch.
+    ///
+    /// Worth setting for anything reproducible: the published checkpoints are updated in place,
+    /// so `main` is not a fixed set of weights.
+    pub fn revision(mut self, revision: impl Into<String>) -> Self {
+        self.revision = Some(revision.into());
+        self
+    }
+
+    /// The subdirectory, trimmed of a trailing slash the caller may have written and of the
+    /// empty string. Both searches go through this so a subdir means the same thing on disk as
+    /// it does on the Hub: if the two disagreed, a checkpoint would resolve locally and miss
+    /// remotely.
+    fn prefix(&self) -> Option<&str> {
+        self.subdir.as_deref().map(|s| s.trim_end_matches('/')).filter(|s| !s.is_empty())
+    }
+
+    /// Repo-relative path of `name` within the source, honouring [`Self::subdir`]. The local
+    /// search joins [`Self::prefix`] onto a `Path` instead, so this is only reached on the Hub
+    /// path -- but the contract it encodes is tested in every build.
+    #[cfg_attr(not(feature = "hub"), allow(dead_code))]
+    fn at(&self, name: &str) -> String {
+        match self.prefix() {
+            Some(prefix) => format!("{prefix}/{name}"),
+            None => name.to_string(),
+        }
+    }
+
+    /// Locate every file this source provides and parse the config, downloading what is needed.
+    pub fn resolve(&self) -> Result<Checkpoint> {
+        match &self.location {
+            Location::Dir(dir) => self.resolve_dir(dir),
+            Location::Hub(repo_id) => self.resolve_hub(repo_id),
+        }
+    }
+
+    fn resolve_dir(&self, dir: &std::path::Path) -> Result<Checkpoint> {
+        if !dir.is_dir() {
+            xn::bail!("not a directory: {}", dir.display())
+        }
+        let root = match self.prefix() {
+            Some(prefix) => dir.join(prefix),
+            None => dir.to_path_buf(),
+        };
+        if !root.is_dir() {
+            xn::bail!(
+                "no subdirectory `{}` in {}",
+                self.subdir.as_deref().unwrap_or(""),
+                dir.display()
+            )
+        }
+
+        let config_path = root.join("config.json");
+        let (config, config_read) = if config_path.is_file() {
+            (read_config(&config_path)?, true)
+        } else {
+            (assumed_config(), false)
+        };
+
+        let weights = match self.weights.as_deref() {
+            Some(name) => {
+                let path = root.join(name);
+                if !path.is_file() {
+                    xn::bail!("no weights file `{name}` in {}", root.display())
+                }
+                path
+            }
+            None => WEIGHT_CANDIDATES
+                .iter()
+                .map(|name| root.join(name))
+                .find(|path| path.is_file())
+                .ok_or_else(|| {
+                    xn::Error::msg(format!(
+                        "no weights file in {}; expected one of {}",
+                        root.display(),
+                        WEIGHT_CANDIDATES.join(", ")
+                    ))
+                })?,
+        };
+
+        let tokenizer =
+            TOKENIZER_CANDIDATES.iter().map(|name| root.join(name)).find(|path| path.is_file());
+
+        let mut voices = vec![];
+        for sub in VOICE_DIRS {
+            let Ok(entries) = std::fs::read_dir(root.join(sub)) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("safetensors") {
+                    continue;
+                }
+                if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                    voices.push((name.to_string(), path));
+                }
+            }
+        }
+        let default_voice = root.join(DEFAULT_VOICE_FILE);
+        if default_voice.is_file() {
+            voices.push(("default".to_string(), default_voice));
+        }
+        voices.sort();
+        voices.dedup_by(|a, b| a.0 == b.0);
+
+        Ok(Checkpoint { config, config_read, weights, tokenizer, voices })
+    }
+}
+
+/// The config assumed for a checkpoint that ships no `config.json`.
+///
+/// `temp` is not read by the runtime -- sampling temperature reaches the model through
+/// [`crate::synth::SynthBuilder::temperature`] -- so any value does.
+fn assumed_config() -> TTSConfig {
+    TTSConfig::v202601(0.5)
+}
+
+fn read_config(path: &std::path::Path) -> Result<TTSConfig> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| xn::Error::msg(format!("cannot read config {}: {e}", path.display())))?;
+    serde_json::from_str(&text)
+        .map_err(|e| xn::Error::msg(format!("cannot parse config {}: {e}", path.display())))
+}
+
+/// A checkpoint whose files have been located and whose config is parsed.
+#[derive(Clone, Debug)]
+pub struct Checkpoint {
+    /// The checkpoint's config, read from `config.json` or assumed -- see [`Self::config_read`].
+    pub config: TTSConfig,
+    /// True when `config` was read from the source, false when it was assumed because the source
+    /// ships none. An assumed config describes one architecture; a checkpoint built to another
+    /// will fail to load rather than load wrongly, but the error is clearer when a caller can
+    /// say which case it is in.
+    pub config_read: bool,
+    pub weights: std::path::PathBuf,
+    /// `None` when the source carries no tokenizer file; the caller must then pass one to
+    /// [`crate::synth::SynthBuilder::tokenizer`].
+    pub tokenizer: Option<std::path::PathBuf>,
+    /// Voice name to embedding file, sorted by name.
+    pub voices: Vec<(String, std::path::PathBuf)>,
+}
+
+impl Checkpoint {
+    /// A builder over this checkpoint, with its config, weights and tokenizer file set.
+    ///
+    /// The bundled voices are deliberately not registered here: see [`Self::register_voices`].
+    pub fn builder(&self) -> crate::synth::SynthBuilder {
+        let mut builder = crate::synth::SynthBuilder::new(self.config.clone(), &self.weights);
+        if let Some(tokenizer) = self.tokenizer.as_ref() {
+            builder = builder.tokenizer_file(tokenizer);
+        }
+        builder
+    }
+
+    /// Register the bundled voices on a loaded model, and pick a default if it has none.
+    ///
+    /// A voice that fails to load is warned about rather than fatal: one bad embedding -- an
+    /// interrupted download, a voice from another checkpoint -- should not make the model
+    /// unusable. A voice the user named explicitly goes through
+    /// [`crate::synth::SynthBuilder::add_voice`], where a failure *is* fatal.
+    ///
+    /// The default goes to a voice named `default` -- what a checkpoint's
+    /// [`DEFAULT_VOICE_FILE`] is registered as -- and otherwise to the first by name. Setting it
+    /// here rather than on the builder is what makes a bare [`crate::synth::Synth::say`] work:
+    /// `build` picks its own default before these voices exist, so it finds none.
+    ///
+    /// Returns the number of voices registered.
+    pub fn register_voices(&self, tts: &mut crate::synth::Synth) -> usize {
+        let mut registered = vec![];
+        for (name, path) in self.voices.iter() {
+            match tts.add_voice_file(name, path) {
+                Ok(()) => registered.push(name.as_str()),
+                Err(e) => tracing::warn!(voice = %name, error = %e, "skipping voice embedding"),
+            }
+        }
+        if tts.default_voice().is_none()
+            && let Some(pick) = registered.iter().find(|n| **n == "default").or(registered.first())
+            // Registered a moment ago, so this cannot fail; a warning beats an unwrap either way.
+            && let Err(e) = tts.set_default_voice(pick)
+        {
+            tracing::warn!(error = %e, "could not set the default voice");
+        }
+        registered.len()
+    }
+}
+
+#[cfg(not(feature = "hub"))]
+impl ModelSource {
+    fn resolve_hub(&self, repo_id: &str) -> Result<Checkpoint> {
+        xn::bail!(
+            "cannot load `{repo_id}`: reading from the Hugging Face Hub needs the `hub` feature \
+             of the `ptts` crate. Either enable it, or download the checkpoint yourself and use \
+             `ModelSource::dir`."
+        )
+    }
+}
+
+#[cfg(feature = "hub")]
+impl ModelSource {
+    fn resolve_hub(&self, repo_id: &str) -> Result<Checkpoint> {
+        let repo = HubRepo::open(repo_id, self.revision.clone())?;
+        tracing::info!(repo_id, subdir = self.prefix(), "resolving checkpoint on the Hub");
+
+        // Listed before anything is fetched. The Hub serves a repo's file tree without
+        // authentication even when the weights themselves are gated, so this both tells us what
+        // the checkpoint actually ships -- rather than guessing names and reading a failed
+        // download as "absent" -- and leaves the first real 401 to `get`, which explains it.
+        let listing = repo.list(self.prefix().unwrap_or(""))?;
+        let has = |name: &str| listing.iter().any(|f| f == name);
+
+        let weights = match self.weights.as_deref() {
+            Some(name) => {
+                if !has(name) {
+                    xn::bail!("{}", self.no_such_file(repo_id, name, &listing))
+                }
+                name.to_string()
+            }
+            None => match WEIGHT_CANDIDATES.iter().find(|name| has(name)) {
+                Some(name) => name.to_string(),
+                None => xn::bail!("{}", self.no_weights(repo_id, &listing)),
+            },
+        };
+        // The first fetch, and the one that decides whether this user can read the repo at all.
+        let weights = repo.get(&self.at(&weights))?;
+
+        let (config, config_read) = match has("config.json") {
+            true => (read_config(&repo.get(&self.at("config.json"))?)?, true),
+            false => (assumed_config(), false),
+        };
+
+        let tokenizer = match TOKENIZER_CANDIDATES.iter().find(|name| has(name)) {
+            Some(name) => Some(repo.get(&self.at(name))?),
+            None => None,
+        };
+
+        // Listed rather than guessed by name: the published repo ships eight voices at its root
+        // and twenty-six in each `languages/*` checkpoint, so a hardcoded list would reach a
+        // fraction of them and would go stale with every release.
+        let mut voices = vec![];
+        for sub in VOICE_DIRS {
+            let dir = self.at(sub);
+            let Ok(files) = repo.list(&dir) else { continue };
+            for file in files {
+                let Some(name) = file.strip_suffix(".safetensors") else { continue };
+                let (name, path) = (name.to_string(), format!("{dir}/{file}"));
+                match repo.get(&path) {
+                    Ok(path) => voices.push((name, path)),
+                    Err(e) => tracing::warn!(voice = %name, error = %e, "skipping voice embedding"),
+                }
+            }
+        }
+        if has(DEFAULT_VOICE_FILE) {
+            voices.push(("default".to_string(), repo.get(&self.at(DEFAULT_VOICE_FILE))?));
+        }
+        voices.sort();
+        voices.dedup_by(|a, b| a.0 == b.0);
+
+        Ok(Checkpoint { config, config_read, weights, tokenizer, voices })
+    }
+
+    /// Message for a weights file the caller named that the checkpoint does not have.
+    fn no_such_file(&self, repo_id: &str, name: &str, listing: &[String]) -> String {
+        format!("no file `{name}` in `{repo_id}`{}. It holds: {}", self.under(), summarize(listing))
+    }
+
+    /// Message for a checkpoint with no weights file under any name we know.
+    ///
+    /// Names what the checkpoint does hold: the usual cause is a repo that keeps its checkpoints
+    /// in subdirectories, and seeing `languages` in the listing is what tells a reader to reach
+    /// for [`Self::subdir`].
+    fn no_weights(&self, repo_id: &str, listing: &[String]) -> String {
+        format!(
+            "no weights file in `{repo_id}`{}; expected one of {}. It holds: {}. Name the file \
+             with `ModelSource::weights`, or point at a subdirectory with `ModelSource::subdir`.",
+            self.under(),
+            WEIGHT_CANDIDATES.join(", "),
+            summarize(listing)
+        )
+    }
+
+    fn under(&self) -> String {
+        self.prefix().map(|p| format!(" under `{p}`")).unwrap_or_default()
+    }
+}
+
+/// A listing, shortened: enough to recognize the layout, not a directory dump.
+#[cfg(feature = "hub")]
+fn summarize(listing: &[String]) -> String {
+    const MAX: usize = 12;
+    if listing.is_empty() {
+        return "nothing".to_string();
+    }
+    if listing.len() <= MAX {
+        return listing.join(", ");
+    }
+    format!("{}, and {} more", listing[..MAX].join(", "), listing.len() - MAX)
+}
+
+/// A Hugging Face model repo, wrapped so a download failure names the repo and the file.
+///
+/// `hf_hub` says so for a missing file but not for an HTTP or authentication failure, which is
+/// exactly the case a first-time user hits: the published checkpoint is gated, and an
+/// unauthenticated fetch comes back as a bare 401.
+#[cfg(feature = "hub")]
+struct HubRepo {
+    repo: hf_hub::HFRepositorySync<hf_hub::repository::RepoTypeModel>,
+    repo_id: String,
+    revision: Option<String>,
+}
+
+#[cfg(feature = "hub")]
+impl HubRepo {
+    /// The client reads `HF_TOKEN`, `HF_ENDPOINT` and the cache location from the environment,
+    /// falling back to the token `huggingface-cli login` stores.
+    fn open(repo_id: &str, revision: Option<String>) -> Result<Self> {
+        let client = hf_hub::HFClientSync::new()
+            .map_err(|e| xn::Error::msg(format!("cannot reach the Hugging Face Hub: {e}")))?;
+        let (owner, name) = hf_hub::split_id(repo_id);
+        Ok(Self { repo: client.model(owner, name), repo_id: repo_id.to_string(), revision })
+    }
+
+    /// Download `filename`, or find it in the local cache.
+    fn get(&self, filename: &str) -> Result<std::path::PathBuf> {
+        self.repo
+            .download_file()
+            .filename(filename)
+            .maybe_revision(self.revision.clone())
+            .send()
+            .map_err(|e| xn::Error::msg(self.explain(filename, &e)))
+    }
+
+    /// Names of the entries directly inside `dir`, sorted, relative to `dir` itself. Pass `""`
+    /// for the repo root. Directories are included, so a caller can tell an empty checkpoint
+    /// from one whose files are a level down.
+    fn list(&self, dir: &str) -> Result<Vec<String>> {
+        let entries = self
+            .repo
+            .list_tree()
+            .maybe_revision(self.revision.clone())
+            .maybe_path_in_repo((!dir.is_empty()).then(|| dir.to_string()))
+            .recursive(false)
+            .send()
+            .map_err(|e| {
+                let what = if dir.is_empty() { "the file listing" } else { dir };
+                xn::Error::msg(self.explain(what, &e))
+            })?;
+        // The Hub returns repo-relative paths; callers want names within `dir`.
+        let strip = |path: String| match dir.is_empty() {
+            true => Some(path),
+            false => path.strip_prefix(dir)?.trim_start_matches('/').to_string().into(),
+        };
+        let mut names: Vec<String> = entries
+            .into_iter()
+            .filter_map(|entry| match entry {
+                hf_hub::repository::RepoTreeEntry::File { path, .. } => strip(path),
+                hf_hub::repository::RepoTreeEntry::Directory { path, .. } => strip(path),
+            })
+            .filter(|name| !name.is_empty())
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+
+    /// Turn a Hub failure into something a reader can act on.
+    ///
+    /// Authentication is the one worth spelling out: the published checkpoint is gated, so a
+    /// rejected fetch is the first thing a new user meets, and neither "Authentication required"
+    /// nor a bare 401 says what to do about it. Matched on the typed variants rather than on the
+    /// message, which is not ours and can be reworded.
+    fn explain(&self, what: &str, error: &hf_hub::HFError) -> String {
+        use hf_hub::HFError;
+
+        let repo_id = &self.repo_id;
+        let base = format!("failed to fetch {what} from `{repo_id}`: {error}");
+        match error {
+            HFError::AuthRequired { .. } | HFError::Forbidden { .. } => format!(
+                "{base}\n\
+                 This repo is gated. Accept its terms at https://huggingface.co/{repo_id}, then \
+                 authenticate with `huggingface-cli login` or by setting HF_TOKEN."
+            ),
+            HFError::RepoNotFound { .. } => format!(
+                "{base}\n\
+                 No such repo, or it is private and this token cannot see it."
+            ),
+            HFError::RevisionNotFound { .. } => format!(
+                "{base}\n\
+                 No such revision `{}` in `{repo_id}`.",
+                self.revision.as_deref().unwrap_or("main")
+            ),
+            _ => base,
+        }
+    }
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    /// A directory laid out like a checkpoint, under a unique name so tests do not collide.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ptts-source-{name}"));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_missing_directory_names_itself() {
+        let err =
+            ModelSource::dir("/definitely/not/a/model/dir").resolve().unwrap_err().to_string();
+        assert!(err.contains("/definitely/not/a/model/dir"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_directory_lists_the_weight_files_it_looked_for() {
+        let dir = scratch("empty");
+        let err = ModelSource::dir(&dir).resolve().unwrap_err().to_string();
+        for candidate in WEIGHT_CANDIDATES {
+            assert!(err.contains(candidate), "should list `{candidate}`: {err}");
+        }
+    }
+
+    #[test]
+    fn a_directory_without_a_config_says_the_config_was_assumed() {
+        let dir = scratch("no-config");
+        std::fs::write(dir.join("model.safetensors"), b"").unwrap();
+        let checkpoint = ModelSource::dir(&dir).resolve().unwrap();
+        assert!(!checkpoint.config_read);
+        assert_eq!(checkpoint.weights, dir.join("model.safetensors"));
+        assert!(checkpoint.tokenizer.is_none());
+    }
+
+    #[test]
+    fn a_config_beside_the_weights_is_read() {
+        let dir = scratch("with-config");
+        std::fs::write(dir.join("model.safetensors"), b"").unwrap();
+        let mut config = assumed_config();
+        config.lsd_decode_steps = 17;
+        std::fs::write(dir.join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+
+        let checkpoint = ModelSource::dir(&dir).resolve().unwrap();
+        assert!(checkpoint.config_read);
+        assert_eq!(checkpoint.config.lsd_decode_steps, 17);
+    }
+
+    #[test]
+    fn voices_are_collected_from_either_directory_and_sorted() {
+        let dir = scratch("voices");
+        std::fs::write(dir.join("model.safetensors"), b"").unwrap();
+        std::fs::create_dir_all(dir.join("embeddings")).unwrap();
+        std::fs::create_dir_all(dir.join("voices")).unwrap();
+        std::fs::write(dir.join("embeddings/marius.safetensors"), b"").unwrap();
+        std::fs::write(dir.join("voices/alba.safetensors"), b"").unwrap();
+        // Not a voice: the extension is what decides.
+        std::fs::write(dir.join("voices/README.md"), b"").unwrap();
+        std::fs::write(dir.join(DEFAULT_VOICE_FILE), b"").unwrap();
+
+        let checkpoint = ModelSource::dir(&dir).resolve().unwrap();
+        let names: Vec<&str> = checkpoint.voices.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["alba", "default", "marius"]);
+    }
+
+    #[test]
+    fn a_named_weights_file_is_required_to_exist() {
+        let dir = scratch("named-weights");
+        std::fs::write(dir.join("model.safetensors"), b"").unwrap();
+        let err =
+            ModelSource::dir(&dir).weights("model.q4k.gguf").resolve().unwrap_err().to_string();
+        assert!(err.contains("model.q4k.gguf"), "{err}");
+    }
+
+    #[test]
+    fn a_subdir_scopes_every_file_the_checkpoint_owns() {
+        let dir = scratch("subdir");
+        // A decoy at the root: picking it up would mean the subdir was ignored.
+        std::fs::write(dir.join("model.safetensors"), b"").unwrap();
+        std::fs::create_dir_all(dir.join("languages/italian/embeddings")).unwrap();
+        std::fs::write(dir.join("languages/italian/model.safetensors"), b"").unwrap();
+        std::fs::write(dir.join("languages/italian/tokenizer.model"), b"").unwrap();
+        std::fs::write(dir.join("languages/italian/embeddings/lola.safetensors"), b"").unwrap();
+
+        let checkpoint = ModelSource::dir(&dir).subdir("languages/italian").resolve().unwrap();
+        assert_eq!(checkpoint.weights, dir.join("languages/italian/model.safetensors"));
+        assert_eq!(checkpoint.voices.len(), 1, "{:?}", checkpoint.voices);
+        assert_eq!(checkpoint.voices[0].0, "lola");
+        assert!(checkpoint.tokenizer.is_some());
+    }
+
+    #[test]
+    fn a_missing_subdir_names_it() {
+        let dir = scratch("missing-subdir");
+        std::fs::write(dir.join("model.safetensors"), b"").unwrap();
+        let err =
+            ModelSource::dir(&dir).subdir("languages/klingon").resolve().unwrap_err().to_string();
+        assert!(err.contains("languages/klingon"), "{err}");
+    }
+
+    #[test]
+    fn at_joins_with_and_without_a_subdir() {
+        let plain = ModelSource::dir(".");
+        assert_eq!(plain.at("config.json"), "config.json");
+        let nested = ModelSource::dir(".").subdir("languages/italian");
+        assert_eq!(nested.at("config.json"), "languages/italian/config.json");
+        // A trailing slash is the caller's to get wrong, not a reason to produce `a//b`.
+        let slashed = ModelSource::dir(".").subdir("languages/italian/");
+        assert_eq!(slashed.at("config.json"), "languages/italian/config.json");
+    }
+
+    #[cfg(not(feature = "hub"))]
+    #[test]
+    fn without_the_hub_feature_the_error_says_which_feature() {
+        let err = ModelSource::hub("kyutai/pocket-tts").resolve().unwrap_err().to_string();
+        assert!(err.contains("hub"), "{err}");
+        assert!(err.contains("kyutai/pocket-tts"), "{err}");
+    }
+}

@@ -6,7 +6,23 @@
 //!
 //! # Getting started
 //!
-//! [`synth::Synth`] is the whole pipeline behind one call:
+//! [`synth::Synth`] is the whole pipeline behind one call. With the `hub`
+//! feature, so is fetching the checkpoint:
+//!
+//! ```no_run
+//! # fn main() -> xn::Result<()> {
+//! # #[cfg(feature = "hub")] {
+//! use ptts::synth::Synth;
+//!
+//! let tts = Synth::from_pretrained("kyutai/pocket-tts")?;
+//! let pcm = tts.say("Hello world")?;
+//! ptts::wav::write_wav_file("out.wav", &pcm, tts.sample_rate() as u32)?;
+//! # }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Without it -- and for any checkpoint already on disk -- name the files:
 //!
 //! ```no_run
 //! # fn main() -> xn::Result<()> {
@@ -17,18 +33,20 @@
 //!     .tokenizer_file("model/tokenizer.model")
 //!     .add_voice("alba", "model/voices/alba.safetensors")
 //!     .build()?;
-//! let pcm = tts.say("Hello world")?;
-//! ptts::wav::write_wav_file("out.wav", &pcm, tts.sample_rate() as u32)?;
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! [`loader::ModelSource`] sits between the two: it searches a local directory
+//! or a Hub repo for the files a checkpoint ships, and is what
+//! [`synth::Synth::from_pretrained`] is built on.
 //!
 //! # Layers
 //!
 //! | Module | Role |
 //! |---|---|
 //! | [`synth`] | The one-call API: load, prime, generate, decode. Start here. |
-//! | [`loader`] | Reading weights and voice files, and the checkpoint key mapping. |
+//! | [`loader`] | Locating a checkpoint, reading weights and voice files, and the key mapping. |
 //! | [`plan`] | Frame and KV budgets, the end-of-speech policy. |
 //! | [`preprocess`] | Per-language text normalization, applied before tokenizing. |
 //! | [`tok`] | Tokenizers, behind the `sp` / `hf` features. |
@@ -37,9 +55,11 @@
 //! | [`flow_lm`], [`transformer`] | The token-conditioned flow-matching LM. |
 //! | [`mimi`], [`seanet`] | The neural audio codec. |
 //!
-//! Which files a checkpoint ships, and what they are called, is the caller's to
-//! know: `ptts` reads the config, weights, tokenizer and voice files it is
-//! handed, and never guesses at names or downloads anything itself.
+//! Downloading is opt-in. With the `hub` feature off -- the default -- `ptts`
+//! makes no network calls at all and reads only files the caller has already
+//! put on disk, which is what an embedded or offline build wants. Turning it on
+//! adds [`loader::ModelSource::hub`] and [`synth::Synth::from_pretrained`], and
+//! nothing else changes.
 //!
 //! A server answering many requests for one voice wants
 //! [`synth::Synth::session`], which conditions on the voice prompt once

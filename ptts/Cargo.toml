@@ -24,12 +24,12 @@ symphonia = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
 safetensors = { workspace = true }
 half = { workspace = true, optional = true }
+hf-hub = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
 half = { workspace = true }
-hf-hub = { workspace = true }
 tracing-chrome = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
@@ -47,14 +47,18 @@ sp = ["dep:sentencepiece"]
 hf = ["dep:tokenizers"]
 # Decoding and resampling audio files (`ptts::audio`), for voice cloning.
 audio = ["dep:symphonia", "dep:rubato"]
+# Locating a checkpoint on the Hugging Face Hub (`loader::ModelSource::hub`,
+# `Synth::from_pretrained`). Off by default: without it the crate reads only
+# files the caller has already put on disk and makes no network calls.
+hub = ["dep:hf-hub"]
 
 [[example]]
 name = "say"
-required-features = ["sp"]
+required-features = ["sp", "hub"]
 
 [[example]]
 name = "pocket_tts"
-required-features = ["sp", "audio"]
+required-features = ["sp", "audio", "hub"]
 
 [[example]]
 name = "bench"
