@@ -30,6 +30,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           components: rustfmt
+          audio-deps: "false"
       - run: cargo fmt --all -- --check
 
   clippy:
@@ -42,7 +43,7 @@ jobs:
         with:
           components: clippy
           cache-key: clippy
-      - run: cargo clippy --workspace --exclude ptts-ws-server -- -D warnings
+      - run: cargo clippy --workspace -- -D warnings
 
   check:
     name: Check ${{ matrix.os }} / ${{ matrix.rust }}
@@ -59,7 +60,8 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
           cache-key: check-${{ matrix.rust }}
-      - run: cargo check --workspace --exclude ptts-ws-server
+      - run: cargo check --workspace $WS_EXCLUDE
+        shell: bash
 
   test:
     name: Test ${{ matrix.os }} / ${{ matrix.rust }}
@@ -76,4 +78,5 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
           cache-key: test-${{ matrix.rust }}
-      - run: cargo test --workspace --exclude ptts-ws-server
+      - run: cargo test --workspace $WS_EXCLUDE
+        shell: bash
