@@ -7,9 +7,10 @@
 //! EOS countdown loop. They are pure functions of the token count and the config,
 //! so they belong here, where they can be unit tested once.
 //!
-//! Every frontend is converted now. `ptts-pyo3` and `ptts-ws-server` reach these
-//! through [`crate::synth`]; `bench` and `ptts-wasm` call them directly, because
-//! both drive [`crate::tts_model::TTSModel`] themselves — `bench` to attribute
+//! Every frontend is converted now. `pocket_tts`, `say`, `ptts-pyo3` and
+//! `ptts-ws-server` reach these through [`crate::synth`], which applies them on
+//! the caller's behalf; `bench` and `ptts-wasm` call them directly, because both
+//! drive [`crate::tts_model::TTSModel`] themselves — `bench` to attribute
 //! sampling and decoding time to the frame that caused them, `ptts-wasm` because
 //! `Synth` generates on background threads and the browser has none.
 

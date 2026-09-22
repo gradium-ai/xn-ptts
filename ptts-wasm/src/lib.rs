@@ -206,6 +206,16 @@ impl Model {
         text: &str,
         temperature: f32,
     ) -> xn::Result<usize> {
+        // Dropped before anything else can fail. `generation_step_` only puts the state back
+        // while the utterance is unfinished, so an abandoned one is still here -- and every
+        // early return below would otherwise leave a caller that swallows the error polling
+        // `generation_step` and quietly resuming the *previous* utterance.
+        self.gen_state = None;
+        // Built here rather than after the prompt pass: a temperature that cannot produce a
+        // distribution should be refused before `resize_state` allocates the KV cache and
+        // `prompt_text` runs a forward pass, not after.
+        let rng = NormalRng::new(temperature, SEED)?;
+
         let (text, frames_after_eos) = prepare_text_prompt(text);
         let token_ids = match &self.inner {
             ModelInner::F32(m) => m.flow_lm.conditioner.tokenize(&text)?,
@@ -241,8 +251,6 @@ impl Model {
             m.init_mimi_state(1)?
         });
         console_log!("[start_generation] prompt_text done, starting generation loop");
-
-        let rng = NormalRng::new(temperature, SEED)?;
 
         let ldim = self.cfg.flow_lm.ldim;
         let nan_data: Vec<f32> = vec![f32::NAN; ldim];
