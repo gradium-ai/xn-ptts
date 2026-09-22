@@ -3,8 +3,12 @@
 //! The generation path itself needs a checkpoint, so it is covered by the
 //! examples rather than here. What is testable without one is the surface most
 //! likely to break for a first-time user: argument parsing, feature gating, and
-//! the error messages on the paths they will hit by accident.
+//! the errors on the paths they will hit by accident.
+//!
+//! Those errors are asserted on as values -- the variant -- as well as by message. A message is
+//! allowed to be reworded; which class of failure it is, is the contract.
 
+use ptts::Error;
 use ptts::synth::{DeviceKind, Quant, SpeechOptions, Synth, SynthBuilder};
 
 /// A builder over `weights`, with the shipped config: every test here fails
@@ -58,7 +62,9 @@ fn quant_round_trips_through_its_canonical_name() {
 
 #[test]
 fn unknown_quant_lists_the_valid_ones() {
-    let err = Quant::parse("q3k").unwrap_err().to_string();
+    let err = Quant::parse("q3k").unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+    let err = err.to_string();
     assert!(err.contains("q3k"), "{err}");
     assert!(err.contains("q4k"), "should list the supported formats: {err}");
 }
@@ -70,8 +76,9 @@ fn device_parses_and_rejects_unknown_names() {
     assert_eq!(DeviceKind::parse("cuda").unwrap(), DeviceKind::Cuda);
     assert_eq!(DeviceKind::parse("vulkan").unwrap(), DeviceKind::Vulkan);
     assert_eq!(DeviceKind::parse("metal").unwrap(), DeviceKind::Metal);
-    let err = DeviceKind::parse("tpu").unwrap_err().to_string();
-    assert!(err.contains("tpu"), "{err}");
+    let err = DeviceKind::parse("tpu").unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+    assert!(err.to_string().contains("tpu"), "{err}");
 }
 
 #[test]
@@ -92,12 +99,12 @@ fn explicit_device_survives_resolution() {
 }
 
 #[test]
-fn missing_weights_name_the_path() {
+fn missing_weights_are_a_not_found_naming_the_path() {
     let err = builder("/definitely/not/a/model/weights.safetensors")
         .load::<xn::Unquantized<f32, xn::CpuDevice>>(xn::CPU)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("/definitely/not/a/model/weights.safetensors"), "{err}");
+        .unwrap_err();
+    assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+    assert!(err.to_string().contains("/definitely/not/a/model/weights.safetensors"), "{err}");
 }
 
 #[test]
@@ -106,11 +113,9 @@ fn a_load_without_a_tokenizer_says_how_to_supply_one() {
     // is not a checkpoint, but the tokenizer is resolved before it is read.
     let weights = std::env::temp_dir().join("ptts-synth-api-no-tokenizer.safetensors");
     std::fs::write(&weights, b"").unwrap();
-    let err = builder(&weights)
-        .load::<xn::Unquantized<f32, xn::CpuDevice>>(xn::CPU)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("SynthBuilder::tokenizer"), "{err}");
+    let err = builder(&weights).load::<xn::Unquantized<f32, xn::CpuDevice>>(xn::CPU).unwrap_err();
+    assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+    assert!(err.to_string().contains("SynthBuilder::tokenizer"), "{err}");
     std::fs::remove_file(&weights).ok();
 }
 
@@ -120,8 +125,11 @@ fn quantization_on_a_gpu_is_rejected_before_the_weights_are_touched() {
         .device(DeviceKind::Cuda)
         .quant(Quant::Q40)
         .build()
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+    // Not `NotFound`: the check has to happen before the weights are opened, and the variant is
+    // what proves the order rather than which words came out.
+    assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+    let err = err.to_string();
     assert!(err.contains("CPU-only"), "{err}");
     assert!(err.contains("q4_0"), "the error should name the format: {err}");
 }
@@ -176,9 +184,22 @@ fn a_generic_session_is_nameable_too() {
 fn the_types_the_frontends_move_between_threads_still_can() {
     fn send_sync<T: Send + Sync>() {}
     fn send<T: Send>() {}
+    // `ptts-ws-server` is built on `anyhow`, which only accepts a `Send + Sync` error.
+    send_sync::<ptts::Error>();
     send_sync::<ptts::synth::Synth>();
     send_sync::<ptts::synth::SynthOf<xn::Unquantized<f32, xn::CpuDevice>>>();
     send_sync::<ptts::synth::Session>();
     send_sync::<ptts::synth::SessionOf<xn::Unquantized<f32, xn::CpuDevice>>>();
     send::<ptts::synth::SpeechStream>();
+}
+
+#[test]
+fn a_frontend_on_xn_result_still_compiles() {
+    // The compatibility bridge: `?` on this crate inside a function returning `xn::Result` is
+    // what every existing frontend does, and it has to keep working.
+    fn _frontend() -> xn::Result<()> {
+        let _ = Quant::parse("q8_0")?;
+        let _ = DeviceKind::parse("cpu")?;
+        Ok(())
+    }
 }

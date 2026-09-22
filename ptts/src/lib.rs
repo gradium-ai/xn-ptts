@@ -29,6 +29,7 @@
 //! |---|---|
 //! | [`synth`] | The one-call API: load, prime, generate, decode. Start here. |
 //! | [`loader`] | Reading weights and voice files, and the checkpoint key mapping. |
+//! | [`error`] | [`Error`], what those two return. |
 //! | [`plan`] | Frame and KV budgets, the end-of-speech policy. |
 //! | [`preprocess`] | Per-language text normalization, applied before tokenizing. |
 //! | [`tok`] | The Hugging Face tokenizer, behind the `hf` feature. |
@@ -36,6 +37,14 @@
 //! | [`tts_model`] | [`tts_model::TTSModel`], the streaming primitives `synth` drives. |
 //! | [`flow_lm`], [`transformer`] | The token-conditioned flow-matching LM. |
 //! | [`mimi`], [`seanet`] | The neural audio codec. |
+//!
+//! # Errors
+//!
+//! [`synth`] and [`loader`] return [`Error`]; the model modules below them keep `xn::Result`,
+//! because a shape mismatch inside the codec is not something a caller acts on. `?` crosses the
+//! boundary in both directions, so a frontend whose own functions return `xn::Result` keeps
+//! compiling. The variants are failure classes, so a binding maps them onto its host language's
+//! exceptions in one match.
 //!
 //! Which files a checkpoint ships, and what they are called, is the caller's to
 //! know: `ptts` reads the config, weights, tokenizer and voice files it is
@@ -55,6 +64,7 @@ pub mod audio;
 pub mod conditioners;
 pub mod conv;
 pub mod dummy_quantizer;
+pub mod error;
 pub mod flow_lm;
 pub mod layer_scale;
 pub mod loader;
@@ -72,6 +82,8 @@ pub mod transformer;
 pub mod tts_model;
 pub mod utils;
 pub mod wav;
+
+pub use error::{Error, Result};
 
 pub trait Tokenizer {
     fn encode(&self, text: &str) -> xn::Result<Vec<u32>>;

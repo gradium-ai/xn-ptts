@@ -5,8 +5,9 @@
 //! way. Keeping that here means a checkpoint layout change is one edit rather than four.
 
 use crate::tts_model::TTSConfig;
+use crate::{Error, Result};
 use xn::nn::{Linear, Path, VB};
-use xn::{Backend, BackendQ, Result, Tensor};
+use xn::{Backend, BackendQ, Tensor};
 
 /// Maps upstream checkpoint names onto the names this crate's modules expect, dropping the
 /// tensors the runtime has no use for.
@@ -129,7 +130,9 @@ pub fn load_voice_emb<B: Backend>(
     } else if names.contains(&SPEAKER_WAVS_TENSOR) {
         (SPEAKER_WAVS_TENSOR, VoiceTensor::Latents)
     } else {
-        let first = names.first().context("no tensors found in voice embedding file")?;
+        let first = names.first().ok_or_else(|| {
+            Error::invalid_data(format!("no tensors found in voice file {}", path.display()))
+        })?;
         (*first, VoiceTensor::Emb)
     };
     let shape = vb.shape(name).context("voice tensor not found")?;
@@ -138,10 +141,12 @@ pub fn load_voice_emb<B: Backend>(
     let tensor = match dims.as_slice() {
         [a, b] => tensor.reshape((1, *a, *b))?,
         [_, _, _] => tensor,
-        _ => xn::bail!(
-            "voice tensor `{name}` in {} has shape {dims:?}, expected two or three dimensions",
-            path.display()
-        ),
+        _ => {
+            return Err(Error::invalid_data(format!(
+                "voice tensor `{name}` in {} has shape {dims:?}, expected two or three dimensions",
+                path.display()
+            )));
+        }
     };
     let emb = match kind {
         VoiceTensor::Emb => tensor,
@@ -149,23 +154,23 @@ pub fn load_voice_emb<B: Backend>(
             // [1, C, T] -> [1, T, C]
             let latents = tensor.transpose(1, 2)?.contiguous()?;
             let Some(proj) = speaker_proj else {
-                xn::bail!(
+                return Err(Error::invalid_data(format!(
                     "{} holds `{SPEAKER_WAVS_TENSOR}` latents, but this checkpoint has no speaker \
                      projection (`{SPEAKER_PROJ_WEIGHT}`) to turn them into a voice embedding. A \
                      GGUF written by an older `quantize --no-mimi-encoder` dropped it: regenerate \
                      the GGUF from the safetensors checkpoint, or use a precomputed `{EMB_TENSOR}` \
                      voice.",
                     path.display()
-                )
+                )));
             };
             let channels = latents.dim(2usize)?;
             let in_dim = proj.weight().dims()[1];
             if channels != in_dim {
-                xn::bail!(
+                return Err(Error::invalid_data(format!(
                     "`{SPEAKER_WAVS_TENSOR}` in {} has {channels} channels but the speaker \
                      projection takes {in_dim}",
                     path.display()
-                )
+                )));
             }
             proj.forward(&latents)?
         }
@@ -183,16 +188,17 @@ fn check_model_ext(path: &std::path::Path, model_ext: &str) -> Result<()> {
     // Not `SafeTensors::read_metadata`: it validates that the buffer holds the
     // tensor data as well as the header, which is exactly what is not read here.
     let header: serde_json::Value = serde_json::from_slice(&header).map_err(|e| {
-        xn::Error::msg(format!("cannot parse safetensors header of {}: {e}", path.display()))
+        Error::invalid_data(format!("cannot parse safetensors header of {}: {e}", path.display()))
     })?;
     if let Some(voice_model_ext) = header.get("__metadata__").and_then(|m| m.get("model_ext"))
         && let Some(voice_model_ext) = voice_model_ext.as_str()
     {
         tracing::info!(?voice_model_ext, "voice embedding model_ext from metadata");
         if voice_model_ext != model_ext {
-            xn::bail!(
-                "voice embedding model_ext '{voice_model_ext}' does not match config model_ext '{model_ext}'"
-            )
+            return Err(Error::invalid_data(format!(
+                "voice embedding model_ext '{voice_model_ext}' does not match config model_ext \
+                 '{model_ext}'"
+            )));
         }
     }
     Ok(())
@@ -214,7 +220,10 @@ fn read_safetensors_header(path: &std::path::Path) -> Result<Vec<u8>> {
     // A file that is not safetensors can claim an absurd header length; refuse
     // to allocate on its word.
     if header_len > 100 * 1024 * 1024 {
-        xn::bail!("{} does not look like a safetensors file", path.display())
+        return Err(Error::invalid_data(format!(
+            "{} does not look like a safetensors file",
+            path.display()
+        )));
     }
     let mut buf = vec![0u8; header_len as usize];
     file.read_exact(&mut buf)?;
