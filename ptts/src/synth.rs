@@ -296,6 +296,11 @@ pub struct SynthOf<Q: BackendQ> {
     primed: Mutex<HashMap<(String, bool), Primed<Q>>>,
 }
 
+/// How many primed prefixes to keep. A process that clones voices under fresh names -- which
+/// `ptts-pyo3` exposes -- would otherwise grow the map without bound. Past the cap it is cleared;
+/// generation still works, it just re-primes.
+const MAX_PRIMED: usize = 16;
+
 /// A voice's conditioning, run through the transformer once.
 struct Primed<Q: BackendQ> {
     state: TTSState<Q>,
@@ -531,8 +536,8 @@ impl<Q: BackendQ> SynthOf<Q> {
             settings.max_tokens_per_chunk,
             self.normalize,
         )?;
-        // A one-shot call primes a session sized to this text and drops it
-        // afterwards, so there is one generation path rather than two.
+        // A one-shot call is a session sized to this text and dropped afterwards,
+        // so there is one generation path rather than two.
         let seq_budget = chunks.iter().map(|c| c.seq_budget).max().unwrap_or(0);
         self.session_at(&settings, seq_budget)?.stream_chunks(chunks, rng)
     }
@@ -604,10 +609,12 @@ impl<Q: BackendQ> SynthOf<Q> {
             None => {
                 let fresh = self.prime(voice, cfg_coef.is_some(), frames)?;
                 let out = (fresh.state.clone(), fresh.null_state.clone());
-                self.primed
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(key, fresh);
+                let mut primed =
+                    self.primed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if primed.len() >= MAX_PRIMED {
+                    primed.clear();
+                }
+                primed.insert(key, fresh);
                 out
             }
         };
@@ -615,7 +622,14 @@ impl<Q: BackendQ> SynthOf<Q> {
         let state = grow(&prefix, seq_budget)?;
         let cfg_state = match (cfg_coef, null_prefix) {
             (Some(coef), Some(null)) => Some((coef, grow(&null, seq_budget)?)),
-            _ => None,
+            (None, _) => None,
+            // A guidance-keyed entry always carries a null branch. Spelled out rather than
+            // folded into a catch-all, which would silently generate without guidance.
+            (Some(_), None) => {
+                return Err(Error::Tensor(xn::Error::msg(
+                    "internal: a primed entry keyed with guidance has no null branch",
+                )));
+            }
         };
         Ok((state, cfg_state))
     }
@@ -629,7 +643,13 @@ impl<Q: BackendQ> SynthOf<Q> {
         let null_state = if !cfg_on {
             None
         } else {
-            let mut null_state = self.model.init_flow_lm_state(1, frames)?;
+            // Sized to what the null branch will consume, so the `emb`/`null_emb` length
+            // invariant stays local to registration rather than load-bearing here.
+            let null_frames = match voice.null_emb.as_ref() {
+                Some(null_emb) if !self.cfg.cfg_null_audio_empty => null_emb.dim(1usize)?,
+                _ => frames,
+            };
+            let mut null_state = self.model.init_flow_lm_state(1, null_frames)?;
             if !self.cfg.cfg_null_audio_empty {
                 match voice.null_emb.as_ref() {
                     Some(null_emb) => self.model.prompt_audio(&mut null_state, null_emb)?,

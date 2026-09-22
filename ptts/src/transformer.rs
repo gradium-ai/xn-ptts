@@ -725,7 +725,9 @@ mod with_seq_budget_tests {
         let LayerAttentionState::FlowLm(src) = &small.layer_states[0] else { panic!() };
         let poison = Tensor::from_vec(vec![9e9f32; 6], (1, 1, 2, 3), &CpuDevice).unwrap();
         dst.k_cache.slice_set(&poison, 1usize, 0).unwrap();
-        assert_eq!(flat(&src.k_cache)[0], 0.0, "writing the copy must not reach the source");
+        // Index 3 is (pos 0, head 1) = 100.0 in the pattern, so this also fails if the source
+        // were zeros all along.
+        assert_eq!(flat(&src.k_cache)[3], 100.0, "writing the copy must not reach the source");
     }
 
     #[test]
