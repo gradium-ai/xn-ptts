@@ -246,8 +246,18 @@ async fn generate_one(
 
     // One request is one utterance: prepare and tokenize it here rather than
     // letting `Session::stream` split it on sentence boundaries, which is what
-    // this server did before and what its stream ids assume.
-    let (prepared, frames_after_eos) = ptts::tts_model::prepare_text_prompt(text);
+    // this server did before and what its stream ids assume. Normalization is
+    // the session's, and has to run before `prepare_text_prompt`, whose padding
+    // of short text it would otherwise collapse.
+    let text = session.normalization().apply(text);
+    // Normalization drops whole classes of characters, so a buffer that was
+    // non-empty when it was flushed can be empty here: emoji or quotes on their
+    // own. There is nothing to say, and an empty token list would come back to
+    // the client as an INTERNAL error rather than as silence.
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    let (prepared, frames_after_eos) = ptts::tts_model::prepare_text_prompt(&text);
     let tokens = session.tokenize(&prepared)?;
     let seed = app.seed_base ^ (stream_id as u64).wrapping_mul(0x9E3779B97F4A7C15);
     let rng = Box::new(ptts::flow_lm::NormalRng::new(app.temperature, seed)?);

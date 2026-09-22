@@ -19,6 +19,7 @@ pub use ptts::loader::{is_unused_by_tts_model, load_voice_emb, load_weights, rem
 #[cfg(feature = "hf")]
 pub use ptts::tok::Tok;
 
+use ptts::preprocess::Normalize;
 use ptts::synth::{Synth, SynthBuilder};
 use ptts::tts_model::TTSConfig;
 
@@ -169,10 +170,13 @@ impl Checkpoint {
 
     /// A builder over this checkpoint, with its tokenizer file set.
     ///
+    /// `normalize` is passed straight through; it has no default here for the
+    /// same reason it has none on [`SynthBuilder::new`].
+    ///
     /// The bundled voices are deliberately not registered here: see
     /// [`Self::register_voices`].
-    pub fn builder(&self) -> SynthBuilder {
-        let mut builder = SynthBuilder::new(self.config.clone(), &self.weights);
+    pub fn builder(&self, normalize: Normalize) -> SynthBuilder {
+        let mut builder = SynthBuilder::new(self.config.clone(), &self.weights, normalize);
         if let Some(tokenizer) = self.tokenizer.as_ref() {
             builder = builder.tokenizer_file(tokenizer);
         }

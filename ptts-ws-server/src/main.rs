@@ -9,6 +9,7 @@ use anyhow::Result;
 use axum::Router;
 use axum::routing::any;
 use clap::Parser;
+use ptts::preprocess::Normalize;
 use ptts::synth::{DeviceKind, Quant};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
@@ -55,6 +56,12 @@ struct Args {
     /// CPU only.
     #[arg(long)]
     quant: Option<String>,
+
+    /// Language incoming text is normalized as before tokenizing: `en`, `fr`, `de`, `es` or
+    /// `pt`. Required: the spoken forms differ per language, so there is nothing safe to guess.
+    /// `none` serves the text as written, which the model reads less well.
+    #[arg(long)]
+    lang: String,
 }
 
 fn init_tracing() {
@@ -118,6 +125,7 @@ async fn build_app_state(args: &Args) -> Result<model::AppState> {
     // Both checks happen before `load_ptts` downloads anything: `SynthBuilder`
     // would catch them, but only after the checkpoint is on disk.
     quant.check_device(device)?;
+    let normalize = Normalize::parse(&args.lang)?;
     let unavailable = match device {
         DeviceKind::Cuda if !cfg!(feature = "cuda") => Some("cuda"),
         DeviceKind::Vulkan if !cfg!(feature = "vulkan") => Some("vulkan"),
@@ -135,6 +143,7 @@ async fn build_app_state(args: &Args) -> Result<model::AppState> {
         args.temperature,
         args.seed,
         args.max_seq_len,
+        normalize,
     )
     .await
 }

@@ -14,8 +14,8 @@ mod model_helpers;
 
 use anyhow::Result;
 use clap::Parser;
+use ptts::preprocess::Normalize;
 use ptts::synth::{DeviceKind, Quant, SpeechOptions};
-use std::str::FromStr;
 
 #[derive(Parser, Debug)]
 #[command(name = "pocket-tts", about = "Generate speech from text using Pocket TTS")]
@@ -89,13 +89,17 @@ struct Args {
     #[arg(long)]
     threads: Option<usize>,
 
-    /// Normalize the text for this language before tokenizing: `en`, `fr`, `de`, `es` or `pt`.
+    /// Language the text is normalized as before tokenizing: `en`, `fr`, `de`, `es` or `pt`.
+    /// Required: the spoken forms differ per language, so there is nothing safe to guess.
+    /// `none` hands the text to the tokenizer as written, which the model reads less well.
     #[arg(long)]
-    lang: Option<String>,
+    lang: String,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    // Parsed before anything is downloaded, so a bad --lang fails in milliseconds.
+    let normalize = Normalize::parse(&args.lang)?;
     if let Some(threads) = args.threads {
         // Must happen before the first tensor op, since it sets the size of rayon's global pool.
         xn::set_num_threads(threads);
@@ -117,7 +121,7 @@ fn main() -> Result<()> {
     };
     let checkpoint = model_helpers::Checkpoint::locate(source, args.weights.as_deref())?;
     let mut builder = checkpoint
-        .builder()
+        .builder(normalize)
         .device(DeviceKind::parse(&args.device)?)
         .temperature(args.temperature)
         .seed(args.seed);
@@ -163,26 +167,24 @@ fn main() -> Result<()> {
         }
     }
 
-    // Text normalization is a property of the text, not of the model, so it runs
-    // before anything is handed to `Synth`.
-    let text = match args.lang.as_deref() {
-        None => std::borrow::Cow::Borrowed(args.text.as_str()),
-        Some(lang) => {
-            let lang = ptts::preprocess::Lang::from_str(lang)?;
-            let normalized = ptts::preprocess::normalize_text(&args.text, lang);
-            tracing::info!(?normalized, "normalized input text");
-            std::borrow::Cow::Owned(normalized)
-        }
-    };
+    // `Synth` normalizes the text itself; log what it will see.
+    let text = args.text.as_str();
+    if normalize != Normalize::Off {
+        tracing::info!(
+            lang = normalize.as_str(),
+            normalized = %normalize.apply(text),
+            "normalizing text"
+        );
+    }
 
     tracing::info!("generating");
     let start = std::time::Instant::now();
     let stream = match args.rng_values.as_ref() {
-        None => tts.stream_with(&text, &opts)?,
+        None => tts.stream_with(text, &opts)?,
         Some(path) => {
             let values: Vec<f32> = serde_json::from_str(&std::fs::read_to_string(path)?)?;
             let rng = ptts::flow_lm::ReplayRng::new(values)?;
-            tts.stream_with_rng(&text, &opts, Box::new(rng))?
+            tts.stream_with_rng(text, &opts, Box::new(rng))?
         }
     };
 

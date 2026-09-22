@@ -5,6 +5,7 @@
 //! holding the result for the request handlers.
 
 use anyhow::{Context as _, Result};
+use ptts::preprocess::Normalize;
 use ptts::synth::{DeviceKind, Quant, Synth, SynthBuilder};
 use ptts::tts_model::TTSConfig;
 use std::sync::Arc;
@@ -143,6 +144,7 @@ fn collect_voice_files(dir: &std::path::Path, files: &mut Vec<(String, std::path
 
 /// Load the model named by `config` -- a local `config.json`, a Hub repo id, or
 /// nothing for the published checkpoint.
+#[allow(clippy::too_many_arguments)]
 pub async fn load_ptts(
     config: Option<&std::path::PathBuf>,
     voice_dir: Option<&std::path::PathBuf>,
@@ -151,6 +153,7 @@ pub async fn load_ptts(
     temperature: f32,
     seed_base: u64,
     max_seq_len: usize,
+    normalize: Normalize,
 ) -> Result<AppState> {
     let mut m = match config {
         Some(config) if config.is_file() || config.extension().is_some_and(|v| v == "json") => {
@@ -166,7 +169,7 @@ pub async fn load_ptts(
         collect_voice_files(voice_dir, &mut m.voice_files);
     }
     let frame_rate = m.cfg.mimi.frame_rate;
-    let mut synth = SynthBuilder::new(m.cfg, &m.model_path)
+    let mut synth = SynthBuilder::new(m.cfg, &m.model_path, normalize)
         .tokenizer_file(&m.tokenizer_path)
         .device(device)
         .quant(quant)
@@ -190,6 +193,7 @@ pub async fn load_ptts(
         weights = %synth.quant().as_str(),
         num_voices = voices.len(),
         %default_voice,
+        lang = normalize.as_str(),
         "model loaded"
     );
 
