@@ -2779,7 +2779,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
 name = "ptts"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2803,7 +2803,7 @@ dependencies = [
 
 [[package]]
 name = "ptts-pyo3"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "hf-hub",
  "numpy",
@@ -2815,7 +2815,7 @@ dependencies = [
 
 [[package]]
 name = "ptts-wasm"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "getrandom 0.3.4",
  "js-sys",
@@ -2828,7 +2828,7 @@ dependencies = [
 
 [[package]]
 name = "ptts-ws-server"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
