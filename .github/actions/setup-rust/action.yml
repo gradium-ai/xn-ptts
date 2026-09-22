@@ -32,7 +32,8 @@ runs:
   steps:
     - name: Remove the local cargo config
       shell: bash
-      # It pins `target-cpu=native`, which breaks portable dependency builds.
+      # It pins `target-cpu=native`, which breaks portable dependency builds. Jobs that need
+      # target-specific flags (the wasm one) set them explicitly instead.
       run: rm -f .cargo/config.toml
 
     - name: Install libopus
