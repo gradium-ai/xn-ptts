@@ -54,10 +54,11 @@ use crate::tts_model::{
     MAX_TOKENS_PER_CHUNK, MimiEnc, TTSConfig, TTSModel, TTSState, prepare_text_prompt,
     split_into_best_sentences,
 };
+use crate::{Error, Result};
 use std::collections::BTreeMap;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
-use xn::{Backend, BackendQ, Result, Tensor};
+use xn::{Backend, BackendQ, Tensor};
 
 /// Which device to run on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -80,9 +81,9 @@ impl DeviceKind {
             "cuda" => Ok(Self::Cuda),
             "vulkan" => Ok(Self::Vulkan),
             "metal" => Ok(Self::Metal),
-            other => {
-                xn::bail!("unknown device '{other}'; expected auto, cpu, cuda, vulkan or metal")
-            }
+            other => Err(Error::invalid_argument(format!(
+                "unknown device '{other}'; expected auto, cpu, cuda, vulkan or metal"
+            ))),
         }
     }
 
@@ -135,10 +136,10 @@ impl Quant {
             "q4" | "q4_0" => Ok(Self::Q40),
             "q4_1" => Ok(Self::Q41),
             "q4k" => Ok(Self::Q4k),
-            other => xn::bail!(
+            other => Err(Error::invalid_argument(format!(
                 "unsupported quantization '{other}'; expected one of \
                  f32, q8_0, q8_1, q8k, q6k, q5_0, q5_1, q5k, q4_0, q4_1, q4k"
-            ),
+            ))),
         }
     }
 
@@ -151,10 +152,10 @@ impl Quant {
     pub fn check_device(self, device: DeviceKind) -> Result<()> {
         let device = device.resolve();
         if device != DeviceKind::Cpu && self != Self::F32 {
-            xn::bail!(
+            return Err(Error::unsupported(format!(
                 "quantization ({}) is CPU-only, but the selected device is {device:?}",
                 self.as_str()
-            )
+            )));
         }
         Ok(())
     }
@@ -310,19 +311,23 @@ impl<Q: BackendQ> SynthOf<Q> {
     pub fn add_voice_from_pcm(&mut self, name: &str, pcm: &[f32]) -> Result<()> {
         let enc = match self.mimi_enc.as_ref() {
             Some(enc) => enc,
-            None => xn::bail!("this checkpoint has no speaker encoder, so it cannot clone voices"),
+            None => {
+                return Err(Error::unsupported(
+                    "this checkpoint has no speaker encoder, so it cannot clone voices",
+                ));
+            }
         };
         let sr = self.voice_prompt_sample_rate();
         let min_len = (sr as f32 * self.cfg.audio_prompt_min_duration).round() as usize;
         let max_len = (sr as f32 * self.cfg.audio_prompt_max_duration).round() as usize;
         if pcm.len() < min_len {
-            xn::bail!(
+            return Err(Error::invalid_argument(format!(
                 "voice prompt is too short: got {} samples ({:.2}s at {sr}Hz), need at least \
                  {min_len} ({:.2}s)",
                 pcm.len(),
                 pcm.len() as f32 / sr as f32,
                 self.cfg.audio_prompt_min_duration
-            );
+            )));
         }
         let mut pcm = pcm[..pcm.len().min(max_len)].to_vec();
         crate::utils::normalize_loudness(&mut pcm, sr as u32)?;
@@ -359,17 +364,23 @@ impl<Q: BackendQ> SynthOf<Q> {
         null_emb: Option<&[f32]>,
     ) -> Result<()> {
         if emb.len() != frames * dim {
-            xn::bail!("embedding has {} values, expected {frames} x {dim}", emb.len());
+            return Err(Error::invalid_argument(format!(
+                "embedding has {} values, expected {frames} x {dim}",
+                emb.len()
+            )));
         }
         let dev = self.model.device().clone();
-        let to_tensor = |data: &[f32]| -> Result<Tensor<Q::T, Q::B>> {
+        let to_tensor = |data: &[f32]| -> xn::Result<Tensor<Q::T, Q::B>> {
             Tensor::from_vec(data.to_vec(), (1, frames, dim), &dev)?.to::<Q::T>()
         };
         let emb = to_tensor(emb)?;
         let null_emb = match null_emb {
             None => None,
             Some(null) if null.len() != frames * dim => {
-                xn::bail!("null embedding has {} values, expected {frames} x {dim}", null.len())
+                return Err(Error::invalid_argument(format!(
+                    "null embedding has {} values, expected {frames} x {dim}",
+                    null.len()
+                )));
             }
             Some(null) => Some(to_tensor(null)?),
         };
@@ -483,26 +494,27 @@ impl<Q: BackendQ> SynthOf<Q> {
     ) -> Result<(TTSState<Q>, Option<(f32, TTSState<Q>)>)> {
         let voice = match voice {
             None if self.voices.is_empty() => None,
-            None => xn::bail!(
-                "no voice selected; this model has {}",
-                self.voices.keys().cloned().collect::<Vec<_>>().join(", ")
-            ),
+            None => {
+                return Err(Error::not_found(format!(
+                    "no voice selected; this model has {}",
+                    self.voices.keys().cloned().collect::<Vec<_>>().join(", ")
+                )));
+            }
             Some(name) => match self.voices.get(name) {
                 Some(voice) => Some(voice),
-                None => xn::bail!(
-                    "unknown voice '{name}'; available voices are {}",
-                    self.voices.keys().cloned().collect::<Vec<_>>().join(", ")
-                ),
+                None => {
+                    return Err(Error::UnknownVoice {
+                        name: name.to_string(),
+                        known: self.voices(),
+                    });
+                }
             },
         };
 
         if let Some(voice) = voice {
             let frames = voice.emb.dim(1usize)?;
             if frames >= seq_budget {
-                xn::bail!(
-                    "the voice prompt is {frames} frames but the KV budget is {seq_budget}; \
-                     build the session with a larger max_seq_len"
-                )
+                return Err(Error::SeqBudgetExceeded { needed: frames, budget: seq_budget });
             }
         }
         let mut state = self.model.init_flow_lm_state(1, seq_budget)?;
@@ -519,12 +531,14 @@ impl<Q: BackendQ> SynthOf<Q> {
                 {
                     match voice.null_emb.as_ref() {
                         Some(null_emb) => self.model.prompt_audio(&mut null_state, null_emb)?,
-                        None => xn::bail!(
-                            "this model conditions its CFG null branch on silence \
-                             (cfg_null_audio_empty=false), which needs the voice's source audio. \
-                             Register the voice with add_voice_from_pcm instead of a precomputed \
-                             embedding, or disable CFG."
-                        ),
+                        None => {
+                            return Err(Error::unsupported(
+                                "this model conditions its CFG null branch on silence \
+                                 (cfg_null_audio_empty=false), which needs the voice's source \
+                                 audio. Register the voice with add_voice_from_pcm instead of a \
+                                 precomputed embedding, or disable CFG.",
+                            ));
+                        }
                     }
                 }
                 Some((coef, null_state))
@@ -557,11 +571,13 @@ fn plan_chunks<Q: BackendQ>(
 ) -> Result<Vec<ChunkPlan>> {
     let tokenizer = match model.flow_lm.conditioner.tokenizer.as_ref() {
         Some(tokenizer) => tokenizer.as_ref(),
-        None => xn::bail!(
-            "this model was loaded without a tokenizer; pass one to \
+        None => {
+            return Err(Error::unsupported(
+                "this model was loaded without a tokenizer; pass one to \
                  SynthBuilder::tokenizer, or use the lower-level TTSModel API with \
-                 pre-tokenized input"
-        ),
+                 pre-tokenized input",
+            ));
+        }
     };
     let texts = split_into_best_sentences(tokenizer, text, Some(max_tokens_per_chunk))?;
     let mut chunks = Vec::with_capacity(texts.len());
@@ -573,7 +589,7 @@ fn plan_chunks<Q: BackendQ>(
         chunks.push(ChunkPlan { tokens, frame_budget, frames_after_eos, seq_budget });
     }
     if chunks.is_empty() {
-        xn::bail!("nothing to synthesize: the text is empty");
+        return Err(Error::invalid_argument("nothing to synthesize: the text is empty"));
     }
     Ok(chunks)
 }
@@ -674,7 +690,7 @@ impl<Q: BackendQ> SessionOf<Q> {
     /// Paired with [`Self::stream_tokens`] for callers that want one utterance
     /// per request and prepare the text themselves.
     pub fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
-        self.model.flow_lm.conditioner.tokenize(text)
+        Ok(self.model.flow_lm.conditioner.tokenize(text)?)
     }
 
     /// Synthesize from tokens produced elsewhere, as one chunk.
@@ -688,7 +704,7 @@ impl<Q: BackendQ> SessionOf<Q> {
         rng: Box<dyn crate::flow_lm::Rng + Send>,
     ) -> Result<SpeechStream> {
         if tokens.is_empty() {
-            xn::bail!("nothing to synthesize: no tokens");
+            return Err(Error::invalid_argument("nothing to synthesize: no tokens"));
         }
         let frame_budget = plan::frame_budget(tokens.len(), self.frame_rate);
         let seq_budget = plan::seq_budget(tokens.len(), frame_budget);
@@ -714,11 +730,7 @@ impl<Q: BackendQ> SessionOf<Q> {
             .max()
             .unwrap_or(0);
         if needed > self.seq_budget {
-            xn::bail!(
-                "this text needs a KV budget of {needed} but the session was primed with \
-                 {}; build the session with a larger max_seq_len, or split the text",
-                self.seq_budget
-            )
+            return Err(Error::SeqBudgetExceeded { needed, budget: self.seq_budget });
         }
         // Claimed before anything is cloned: the state clone shares its KV
         // storage, so a second generation would write into the same buffers.
@@ -732,10 +744,10 @@ impl<Q: BackendQ> SessionOf<Q> {
             )
             .is_err()
         {
-            xn::bail!(
+            return Err(Error::busy(
                 "a generation is already in flight on this session; finish or drop that \
-                 SpeechStream first, or build a second session"
-            )
+                 SpeechStream first, or build a second session",
+            ));
         }
         let in_flight = InFlight(Arc::clone(&self.in_flight));
 
@@ -786,14 +798,15 @@ impl<Q: BackendQ> SessionOf<Q> {
                     _ => match Tensor::cat(&batch.iter().collect::<Vec<_>>(), 1) {
                         Ok(latent) => latent,
                         Err(e) => {
-                            let _ = decode_tx.send(Err(e));
+                            let _ = decode_tx.send(Err(e.into()));
                             return;
                         }
                     },
                 };
                 let pcm = decode_model
                     .decode_latent(&latent, &mut state)
-                    .and_then(|audio| audio.narrow(0, ..1)?.contiguous()?.to_vec());
+                    .and_then(|audio| audio.narrow(0, ..1)?.contiguous()?.to_vec())
+                    .map_err(Error::from);
                 let failed = pcm.is_err();
                 if decode_tx.send(pcm).is_err() || failed {
                     return;
@@ -978,9 +991,9 @@ impl Iterator for SpeechStream {
                 let workers = self.workers.take()?;
                 let died = workers.into_iter().any(|h| h.join().is_err());
                 if died {
-                    Some(Err(xn::Error::msg(
+                    Some(Err(Error::Tensor(xn::Error::msg(
                         "a generation worker panicked; the audio is incomplete",
-                    )))
+                    ))))
                 } else {
                     None
                 }
@@ -1164,23 +1177,28 @@ impl SynthBuilder {
 
     #[cfg(not(feature = "cuda"))]
     fn build_cuda(self) -> Result<Synth> {
-        xn::bail!("this build has no CUDA support; rebuild with the `cuda` feature")
+        Err(Error::unsupported("this build has no CUDA support; rebuild with the `cuda` feature"))
     }
 
     #[cfg(not(feature = "vulkan"))]
     fn build_vulkan(self) -> Result<Synth> {
-        xn::bail!("this build has no Vulkan support; rebuild with the `vulkan` feature")
+        Err(Error::unsupported(
+            "this build has no Vulkan support; rebuild with the `vulkan` feature",
+        ))
     }
 
     #[cfg(not(feature = "metal"))]
     fn build_metal(self) -> Result<Synth> {
-        xn::bail!("this build has no Metal support; rebuild with the `metal` feature")
+        Err(Error::unsupported("this build has no Metal support; rebuild with the `metal` feature"))
     }
 
     /// Load the weights and register the voices.
     pub fn load<Q: BackendQ>(mut self, device: Q::B) -> Result<SynthOf<Q>> {
         if !self.weights.is_file() {
-            xn::bail!("weights file not found: {}", self.weights.display())
+            return Err(Error::not_found(format!(
+                "weights file not found: {}",
+                self.weights.display()
+            )));
         }
         let config = self.config.clone();
         let tokenizer = self.take_tokenizer()?;
@@ -1224,10 +1242,8 @@ impl SynthBuilder {
         if let Some(name) = synth.defaults.voice.as_ref()
             && !synth.voices.contains_key(name)
         {
-            xn::bail!(
-                "default voice '{name}' was not found; available voices are {}",
-                synth.voices.keys().cloned().collect::<Vec<_>>().join(", ")
-            );
+            let known = synth.voices();
+            return Err(Error::UnknownVoice { name: name.clone(), known });
         }
         Ok(synth)
     }
@@ -1243,14 +1259,14 @@ impl SynthBuilder {
             #[cfg(feature = "hf")]
             Some(path) => Ok(Box::new(crate::tok::Tok::open(path)?)),
             #[cfg(not(feature = "hf"))]
-            Some(path) => xn::bail!(
+            Some(path) => Err(Error::unsupported(format!(
                 "cannot read the tokenizer at {}: `ptts` was built without the `hf` feature.",
                 path.display()
-            ),
-            None => xn::bail!(
+            ))),
+            None => Err(Error::unsupported(
                 "no tokenizer available: no `tokenizer.json` was found beside the checkpoint, \
-                 and none was passed to SynthBuilder::tokenizer or SynthBuilder::tokenizer_file."
-            ),
+                 and none was passed to SynthBuilder::tokenizer or SynthBuilder::tokenizer_file.",
+            )),
         }
     }
 }

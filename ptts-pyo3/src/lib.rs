@@ -495,7 +495,7 @@ impl AudioStream {
         py: Python<'py>,
     ) -> PyResult<Option<Bound<'py, PyArray1<f32>>>> {
         let inner = &slf.inner;
-        let next = py.detach(|| -> PyResult<Option<Result<Vec<f32>, xn::Error>>> {
+        let next = py.detach(|| -> PyResult<Option<Result<Vec<f32>, ptts::Error>>> {
             let mut guard = inner.lock().map_err(|_| poisoned())?;
             Ok(guard.as_mut().and_then(|stream| stream.next()))
         })?;
