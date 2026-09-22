@@ -19,6 +19,9 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# `--all-features` is never used anywhere here: it turns on `cuda`, whose `cudarc` build script
+# shells out to `nvcc` and fails on every runner. Feature sets are named explicitly.
+
 jobs:
 
   fmt:
@@ -43,25 +46,12 @@ jobs:
         with:
           components: clippy
           cache-key: clippy
-      - run: cargo clippy --workspace -- -D warnings
-
-  check:
-    name: Check ${{ matrix.os }} / ${{ matrix.rust }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        rust: [stable, nightly]
-    steps:
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/setup-rust
-        with:
-          toolchain: ${{ matrix.rust }}
-          cache-key: check-${{ matrix.rust }}
-      - run: cargo check --workspace $WS_EXCLUDE
-        shell: bash
+      # `--all-targets` so the examples are linted too. This subsumes the old `check` job,
+      # which compiled strictly less.
+      - name: Workspace, default features
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: ptts, every optional feature on
+        run: cargo clippy -p ptts --features sp,hf,audio --all-targets -- -D warnings
 
   test:
     name: Test ${{ matrix.os }} / ${{ matrix.rust }}
@@ -78,5 +68,69 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
           cache-key: test-${{ matrix.rust }}
-      - run: cargo test --workspace $WS_EXCLUDE
+      # Two runs because they cover different things: `--all-targets` builds the examples but
+      # skips doctests, and a plain `cargo test` runs the doctests. The crate documentation is
+      # full of runnable examples, so both matter.
+      - name: Workspace, default features
+        run: cargo test --workspace --all-targets $WS_EXCLUDE
         shell: bash
+      - name: ptts, every optional feature on
+        run: cargo test -p ptts --features sp,hf,audio --all-targets
+        shell: bash
+      - name: Doctests
+        run: cargo test --workspace --doc $WS_EXCLUDE && cargo test -p ptts --features sp,hf,audio --doc
+        shell: bash
+      # The two backends that only exist on this platform, so nowhere else can check them.
+      - name: macOS-only backends compile
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p ptts --features metal
+          cargo check -p ptts --features accelerate
+
+  features:
+    name: Feature combinations
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: features
+          audio-deps: "false"
+      # Every optional feature of `ptts` alone and in combination. `sp` and `hf` did reach the
+      # compiler before, but only because `ptts-pyo3` asks for them and workspace feature
+      # unification turned them on for everyone -- `audio`, and any combination with `sp` or
+      # `hf` off, was never type-checked. `-p ptts --no-default-features` escapes unification,
+      # which is the only way to get at those.
+      - name: Each combination
+        shell: bash
+        run: |
+          set -euo pipefail
+          for features in "" sp hf audio sp,hf sp,audio hf,audio sp,hf,audio; do
+            echo "::group::ptts --features ${features:-<none>}"
+            cargo check -p ptts --no-default-features --features "$features" --all-targets
+            echo "::endgroup::"
+          done
+
+      - name: Install glslc
+        # `xn`'s build script compiles the Vulkan compute shaders with `glslc`, so the `vulkan`
+        # feature cannot even be type-checked without it.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends glslc
+          glslc --version
+
+      # The GPU backends cannot run here, but they can be type-checked, and they break more
+      # often than the CPU path because nothing exercises them locally either. `cuda` is the one
+      # left out: `cudarc`'s build script needs `nvcc`, which no free runner has.
+      - name: GPU backends still compile
+        shell: bash
+        run: |
+          set -euo pipefail
+          for features in vulkan webgpu; do
+            echo "::group::ptts --features $features"
+            cargo check -p ptts --features "$features"
+            echo "::endgroup::"
+          done
