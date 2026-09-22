@@ -8,7 +8,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.2.3"
+version = "0.3.0"
 description = "Pocket TTS inference and serving using xn"
 repository = "https://github.com/LaurentMazare/xn-ptts"
 keywords = ["pytorch", "deep-learning", "machine-learning"]
@@ -16,7 +16,7 @@ categories = ["science"]
 license = "MIT/Apache-2.0"
 
 [workspace.dependencies]
-ptts = { path = "ptts", version = "0.2.3" }
+ptts = { path = "ptts", version = "0.3.0" }
 
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["ws", "tokio", "http1", "macros"] }
@@ -36,11 +36,10 @@ rand = { version = "0.9.0", default-features = false }
 rand_distr = "0.5.0"
 rubato = "0.15.0"
 safetensors = "0.7.0"
-sentencepiece = "0.13.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 symphonia = { version = "0.5.3", features = ["all"] }
-tokenizers = "0.23.1"
+tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1.44"

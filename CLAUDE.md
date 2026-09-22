@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Cargo workspace (resolver "3", edition 2024) with three members:
 
-- `ptts/` — core TTS library. Pure Rust, depends on the `xn` tensor/nn crate. Examples live under `ptts/examples/`: `say` (shortest end-to-end call) and `bench` (benchmark harness) require the `sp` feature for SentencePiece, `pocket_tts` (full CLI) requires `sp` and `audio`, `create_voice` (voice embeddings from audio samples) requires `audio`, and `quantize` (safetensors → GGUF converter that selectively quantizes `flow_lm.transformer.layers.*` weights) requires nothing. `model_helpers.rs` is not an example — it is a shared module each example pulls in with `#[path = "..."] mod`, so `autoexamples = false` and every example is listed explicitly in `Cargo.toml`.
+- `ptts/` — core TTS library. Pure Rust, depends on the `xn` tensor/nn crate. Examples live under `ptts/examples/`: `say` (shortest end-to-end call) and `bench` (benchmark harness) require the `hf` feature for the tokenizer, `pocket_tts` (full CLI) requires `hf` and `audio`, `create_voice` (voice embeddings from audio samples) requires `audio`, and `quantize` (safetensors → GGUF converter that selectively quantizes `flow_lm.transformer.layers.*` weights) requires nothing. `model_helpers.rs` is not an example — it is a shared module each example pulls in with `#[path = "..."] mod`, so `autoexamples = false` and every example is listed explicitly in `Cargo.toml`.
 - `ptts-pyo3/` — PyO3 bindings exposing `TTSModel` to Python. Built with maturin; the cdylib is named `ptts`. Has its own `pyproject.toml` and `uv.lock`.
 - `ptts-wasm/` — browser build via `wasm-bindgen` / `wasm-pack`. Ships a demo in `ptts-wasm/www/` (`index.html` + `worker.js`).
 
@@ -27,27 +27,27 @@ CI deletes `.cargo/config.toml` before building because it pins `target-cpu=nati
 
 Cargo features that gate optional functionality:
 
-- `ptts`: `sp` (SentencePiece tokenizer, required by the `say`, `pocket_tts` and `bench` examples), `hf` (Hugging Face `tokenizers`), `audio` (`ptts::audio`, decoding and resampling audio files for voice cloning — pulls in `symphonia` and `rubato`, so it is off by default and out of the wasm build; required by `pocket_tts` and `create_voice`), `cuda`, `accelerate`. The library never downloads anything, so there is no hub feature: `hf-hub` is a dev-dependency used by the examples.
+- `ptts`: `hf` (Hugging Face `tokenizers`, i.e. `ptts::tok`, required by the `say`, `pocket_tts` and `bench` examples), `audio` (`ptts::audio`, decoding and resampling audio files for voice cloning — pulls in `symphonia` and `rubato`, so it is off by default and out of the wasm build; required by `pocket_tts` and `create_voice`), `cuda`, `accelerate`. The library never downloads anything, so there is no hub feature: `hf-hub` is a dev-dependency used by the examples.
 - `ptts-pyo3`: `cuda`, `accelerate` (each forwards to both `xn/*` and `ptts/*`).
 
 Run the CLI example:
 
 ```
-cargo run --release --example pocket_tts --features sp,audio -- "hello world" -o out.wav
+cargo run --release --example pocket_tts --features hf,audio -- "hello world" -o out.wav
 ```
 
-It downloads weights from the `kyutai/pocket-tts` HuggingFace repo on first run. Which files that means — the repo id, the weight and tokenizer file names, the bundled voice list, the config to assume when a directory ships none — lives in `ptts/examples/model_helpers.rs`, not in the library: it changes with each published checkpoint, and `ptts` only reads the files it is handed. Built-in voice IDs: `alba`, `marius`, `javert`, `jean`, `fantine`, `cosette`, `eponine`, `azelma`. `--voice` also accepts a path to a 10s audio file or a voice safetensors: either a precomputed `emb` or the training pipeline's `speaker_wavs` latents, which `ptts::loader::load_voice_emb` runs through the checkpoint's speaker projection. `--repo <id>` downloads from another Hub repo with the same layout (`config.json`, weights, tokenizer, optional `embeddings/*.safetensors` voices and an optional `default-voice.safetensors`, which is picked when no `--voice` is given); `--weights <file>` names the weights file inside the repo or directory so only that one is downloaded (`--weights model.q8.gguf --quant q8` for the pre-quantized weights); `--dir` loads a local checkpoint instead of downloading; `--device auto|cpu|cuda|vulkan|metal` picks the backend.
+It downloads weights from the `kyutai/pocket-tts` HuggingFace repo on first run. Which files that means — the repo id, the weight and tokenizer file names, the bundled voice list, the config to assume when a directory ships none — lives in `ptts/examples/model_helpers.rs`, not in the library: it changes with each published checkpoint, and `ptts` only reads the files it is handed. Built-in voice IDs: `alba`, `marius`, `javert`, `jean`, `fantine`, `cosette`, `eponine`, `azelma`. `--voice` also accepts a path to a 10s audio file or a voice safetensors: either a precomputed `emb` or the training pipeline's `speaker_wavs` latents, which `ptts::loader::load_voice_emb` runs through the checkpoint's speaker projection. `--repo <id>` downloads from another Hub repo with the same layout (`config.json`, weights, tokenizer, optional `embeddings/*.safetensors` voices and an optional `default-voice.safetensors`, which is picked when no `--voice` is given); `--weights <file>` names the weights file inside the repo or directory so only that one is downloaded (`--weights model.q8.gguf --quant q8` for the pre-quantized weights); `--tokenizer <file>` points at a `tokenizer.json` outside the checkpoint, for a repo that ships only a SentencePiece `tokenizer.model`; `--dir` loads a local checkpoint instead of downloading; `--device auto|cpu|cuda|vulkan|metal` picks the backend.
 
 `say` is the same thing in fifteen lines, for checking that the library works:
 
 ```
-cargo run --release --example say --features sp -- "hello world"
+cargo run --release --example say --features hf -- "hello world"
 ```
 
 Benchmark a local model:
 
 ```
-cargo run --release --features sp,accelerate --example bench -- \
+cargo run --release --features hf,accelerate --example bench -- \
   --model model/model.q8.gguf --config model/config.json --quant q8 \
   --voice voices/freya.safetensors --threads 8 --iters 20
 ```
@@ -82,9 +82,10 @@ The library implements Pocket TTS: text → tokens → flow-matching language mo
 
 `ptts/src/lib.rs` exposes a single `Tokenizer` trait (`encode` / `decode`) so each binding plugs in its own implementation:
 
-- `say` / `pocket_tts` examples: the tokenizer file found beside the weights, passed to `SynthBuilder::tokenizer_file` and read by `ptts::tok::Tok`, which picks SentencePiece or HF `tokenizers` by extension.
-- `ptts-pyo3`: tokenizer is built from `tokenizer.model` shipped in the HF repo.
-- `ptts-wasm`: `PresetTokenizer` — JS tokenizes in the browser and pushes IDs into the Rust state before each step.
+- `say` / `pocket_tts` / `bench` examples, `ptts-pyo3` and `ptts-ws-server`: `ptts::tok::Tok` (the `hf` feature), a Hugging Face `tokenizers` wrapper. The examples find the file beside the weights and pass it to `SynthBuilder::tokenizer_file`.
+- `ptts-wasm`: the same `ptts::tok::Tok`, built from the `tokenizer.json` the demo fetches and handed to `Model::new`; the browser passes text, not token ids.
+
+Every frontend loads a `tokenizer.json` and nothing else, and none is bundled or defaulted to: each checkpoint has its own vocabulary, and loading the wrong one yields plausible audio from the wrong ids, so `Tok::open` refuses to guess. `pocket_tts --tokenizer <path>` and `bench --tokenizer <path>` override where the examples look; otherwise they, `ptts-pyo3` and `ptts-ws-server` all expect `tokenizer.json` in the HF repo or beside the config. A checkpoint that carries only a `tokenizer.model` needs converting once with `scripts/convert-tokenizer.py`, which writes the equivalent json.
 
 Top-level orchestrator is `tts_model::TTSModel<Q>`, generic over a backend-quantization parameter `Q: BackendQ` from `xn`. It owns:
 

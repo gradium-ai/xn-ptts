@@ -14,7 +14,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 xn = { workspace = true }
-ptts = { workspace = true, features = ["sp", "hf"] }
+ptts = { workspace = true, features = ["hf"] }
 hf-hub = { workspace = true }
 numpy = "0.28"
 pyo3 = { version = "0.28", features = ["extension-module"] }

@@ -1,7 +1,7 @@
 //! The shortest thing that makes a sound.
 //!
 //! ```text
-//! cargo run --release --example say --features sp -- "hello world"
+//! cargo run --release --example say --features hf -- "hello world"
 //! ```
 
 #[path = "model_helpers.rs"]

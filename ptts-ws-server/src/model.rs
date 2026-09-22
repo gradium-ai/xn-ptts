@@ -62,7 +62,7 @@ impl LoadedModel {
 
         let model_path = repo.get("model.q8.gguf").await?;
         tracing::info!(?model_path, "model weights ready");
-        let tokenizer_path = repo.get("tokenizer.model").await?;
+        let tokenizer_path = repo.get("tokenizer.json").await?;
 
         let default_voice_path = repo.get("default-voice.safetensors").await?;
         let voice_files = vec![("default".to_string(), default_voice_path)];
@@ -75,7 +75,7 @@ impl LoadedModel {
         let repo = crate::utils::HfRepo::model(DEFAULT_REPO_ID)?;
         let model_path = repo.get(DEFAULT_MODEL_FILE).await?;
         tracing::info!(?model_path, "model weights ready");
-        let tokenizer_path = repo.get("tokenizer.model").await?;
+        let tokenizer_path = repo.get("tokenizer.json").await?;
 
         let mut voice_files = Vec::new();
         for &voice in VOICES {
@@ -106,7 +106,7 @@ impl LoadedModel {
                 "model file not found in directory {parent_dir:?}; expected model.safetensors or model.gguf"
             );
         };
-        let tokenizer_path = parent_dir.join("tokenizer.model");
+        let tokenizer_path = parent_dir.join("tokenizer.json");
         let mut voice_files = Vec::new();
         collect_voice_files(&parent_dir.join("voices"), &mut voice_files);
         Ok(Self { cfg, voice_files, tokenizer_path, model_path })

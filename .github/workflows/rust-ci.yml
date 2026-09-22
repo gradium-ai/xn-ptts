@@ -16,13 +16,6 @@ jobs:
         shell: bash
         # Remove the target-arch=native as it breaks some dependencies.
         run: rm -f .cargo/config.toml
-      - name: Use static CRT on Windows
-        if: runner.os == 'Windows'
-        shell: bash
-        # esaxx-rs (built with cc, /MT) and sentencepiece-sys (built with cmake,
-        # /MD) otherwise disagree on the MSVC runtime and fail to link with
-        # LNK2038. Force the static CRT everywhere so they all agree on /MT.
-        run: echo "RUSTFLAGS=-C target-feature=+crt-static" >> "$GITHUB_ENV"
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
@@ -46,13 +39,6 @@ jobs:
         shell: bash
         # Remove the target-arch=native as it breaks some dependencies.
         run: rm -f .cargo/config.toml
-      - name: Use static CRT on Windows
-        if: runner.os == 'Windows'
-        shell: bash
-        # esaxx-rs (built with cc, /MT) and sentencepiece-sys (built with cmake,
-        # /MD) otherwise disagree on the MSVC runtime and fail to link with
-        # LNK2038. Force the static CRT everywhere so they all agree on /MT.
-        run: echo "RUSTFLAGS=-C target-feature=+crt-static" >> "$GITHUB_ENV"
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal

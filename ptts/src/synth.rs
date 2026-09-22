@@ -12,7 +12,7 @@
 //! use ptts::tts_model::TTSConfig;
 //!
 //! let tts = Synth::builder(TTSConfig::v202601(0.5), "model/model.safetensors")
-//!     .tokenizer_file("model/tokenizer.model")
+//!     .tokenizer_file("model/tokenizer.json")
 //!     .add_voice("alba", "model/voices/alba.safetensors")
 //!     .build()?;
 //! let pcm = tts.say("Hello world")?;
@@ -28,7 +28,7 @@
 //! # fn main() -> xn::Result<()> {
 //! # let cfg = ptts::tts_model::TTSConfig::v202601(0.5);
 //! # let tts = ptts::synth::Synth::builder(cfg, "model/model.safetensors")
-//! #     .tokenizer_file("model/tokenizer.model")
+//! #     .tokenizer_file("model/tokenizer.json")
 //! #     .build()?;
 //! for chunk in tts.stream("Hello world")? {
 //!     let pcm: Vec<f32> = chunk?;
@@ -1031,9 +1031,8 @@ impl SynthBuilder {
         }
     }
 
-    /// The tokenizer file the checkpoint ships, read by [`crate::tok::Tok`],
-    /// which picks the family from the extension. Ignored when
-    /// [`Self::tokenizer`] supplies one directly.
+    /// The `tokenizer.json` the checkpoint ships, read by [`crate::tok::Tok`].
+    /// Ignored when [`Self::tokenizer`] supplies one directly.
     pub fn tokenizer_file(mut self, path: impl Into<PathBuf>) -> Self {
         self.tokenizer_file = Some(path.into());
         self
@@ -1051,7 +1050,7 @@ impl SynthBuilder {
     }
 
     /// Supply the tokenizer explicitly. Required when the checkpoint ships no
-    /// tokenizer file, or when neither the `sp` nor the `hf` feature is enabled.
+    /// tokenizer file, or when the `hf` feature is not enabled.
     pub fn tokenizer(mut self, tokenizer: Box<dyn crate::Tokenizer + Send + Sync>) -> Self {
         self.tokenizer = Some(tokenizer);
         self
@@ -1233,21 +1232,26 @@ impl SynthBuilder {
         Ok(synth)
     }
 
-    /// A caller-supplied tokenizer wins — `ptts-wasm` tokenizes in JavaScript
-    /// and has no tokenizer file at all. Otherwise load the one the checkpoint
-    /// shipped, if a tokenizer backend is compiled in.
+    /// A caller-supplied tokenizer wins, for callers with no filesystem to read
+    /// one from. Otherwise load the one the checkpoint shipped, if a tokenizer
+    /// backend is compiled in.
     fn take_tokenizer(&mut self) -> Result<Box<dyn crate::Tokenizer + Send + Sync>> {
         if let Some(tokenizer) = self.tokenizer.take() {
             return Ok(tokenizer);
         }
-        #[cfg(any(feature = "sp", feature = "hf"))]
-        if let Some(path) = self.tokenizer_file.as_deref() {
-            return Ok(Box::new(crate::tok::Tok::open(path)?));
+        match self.tokenizer_file.as_deref() {
+            #[cfg(feature = "hf")]
+            Some(path) => Ok(Box::new(crate::tok::Tok::open(path)?)),
+            #[cfg(not(feature = "hf"))]
+            Some(path) => xn::bail!(
+                "cannot read the tokenizer at {}: `ptts` was built without the `hf` feature.",
+                path.display()
+            ),
+            None => xn::bail!(
+                "no tokenizer available: no `tokenizer.json` was found beside the checkpoint, \
+                 and none was passed to SynthBuilder::tokenizer or SynthBuilder::tokenizer_file."
+            ),
         }
-        xn::bail!(
-            "no tokenizer available: none was passed to SynthBuilder::tokenizer, the checkpoint \
-             shipped none, and neither the `sp` nor the `hf` feature of `ptts` is enabled."
-        )
     }
 }
 

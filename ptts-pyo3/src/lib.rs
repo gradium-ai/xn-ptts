@@ -74,12 +74,7 @@ fn resolve(config: Option<&str>, temperature: f32) -> xn::Result<Artifacts> {
             cfg.temp = temperature;
             let mut voices = vec![];
             collect_voices(&parent.join("voices"), &mut voices);
-            Ok(Artifacts {
-                cfg,
-                model_path,
-                tokenizer_path: parent.join("tokenizer.model"),
-                voices,
-            })
+            Ok(Artifacts { cfg, model_path, tokenizer_path: parent.join("tokenizer.json"), voices })
         }
         // A Hub repo laid out with config.json and a quantized checkpoint.
         Some(repo_id) => {
@@ -93,7 +88,7 @@ fn resolve(config: Option<&str>, temperature: f32) -> xn::Result<Artifacts> {
             Ok(Artifacts {
                 cfg,
                 model_path: hub_get(&repo, "model.q8.gguf")?,
-                tokenizer_path: hub_get(&repo, "tokenizer.model")?,
+                tokenizer_path: hub_get(&repo, "tokenizer.json")?,
                 voices: vec![],
             })
         }
@@ -101,7 +96,7 @@ fn resolve(config: Option<&str>, temperature: f32) -> xn::Result<Artifacts> {
         None => {
             let repo = hub(DEFAULT_REPO_ID)?;
             let model_path = hub_get(&repo, DEFAULT_MODEL_FILE)?;
-            let tokenizer_path = hub_get(&repo, "tokenizer.model")?;
+            let tokenizer_path = hub_get(&repo, "tokenizer.json")?;
             let mut voices = vec![];
             for &voice in POCKET_TTS_VOICES {
                 if let Ok(path) = hub_get(&repo, &format!("embeddings/{voice}.safetensors")) {

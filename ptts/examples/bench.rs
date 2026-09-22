@@ -29,7 +29,7 @@ struct Args {
     #[arg(long)]
     config: std::path::PathBuf,
 
-    /// SentencePiece tokenizer. Defaults to `tokenizer.model` next to the config.
+    /// Tokenizer json. Defaults to `tokenizer.json` next to the config.
     #[arg(long)]
     tokenizer: Option<std::path::PathBuf>,
 
@@ -202,7 +202,7 @@ impl Bench<'_> {
         let tokenizer_path = match args.tokenizer.clone() {
             Some(path) => path,
             None => {
-                args.config.parent().context("config path has no parent")?.join("tokenizer.model")
+                args.config.parent().context("config path has no parent")?.join("tokenizer.json")
             }
         };
 

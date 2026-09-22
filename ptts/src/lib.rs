@@ -14,7 +14,7 @@
 //! use ptts::tts_model::TTSConfig;
 //!
 //! let tts = Synth::builder(TTSConfig::v202601(0.5), "model/model.safetensors")
-//!     .tokenizer_file("model/tokenizer.model")
+//!     .tokenizer_file("model/tokenizer.json")
 //!     .add_voice("alba", "model/voices/alba.safetensors")
 //!     .build()?;
 //! let pcm = tts.say("Hello world")?;
@@ -31,7 +31,7 @@
 //! | [`loader`] | Reading weights and voice files, and the checkpoint key mapping. |
 //! | [`plan`] | Frame and KV budgets, the end-of-speech policy. |
 //! | [`preprocess`] | Per-language text normalization, applied before tokenizing. |
-//! | [`tok`] | Tokenizers, behind the `sp` / `hf` features. |
+//! | [`tok`] | The Hugging Face tokenizer, behind the `hf` feature. |
 //! | [`audio`] | Decoding and resampling audio files for voice cloning, behind `audio`. |
 //! | [`tts_model`] | [`tts_model::TTSModel`], the streaming primitives `synth` drives. |
 //! | [`flow_lm`], [`transformer`] | The token-conditioned flow-matching LM. |
@@ -66,7 +66,7 @@ pub mod resample;
 pub mod rope;
 pub mod seanet;
 pub mod synth;
-#[cfg(any(feature = "sp", feature = "hf"))]
+#[cfg(feature = "hf")]
 pub mod tok;
 pub mod transformer;
 pub mod tts_model;

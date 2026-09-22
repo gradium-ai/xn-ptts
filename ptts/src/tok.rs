@@ -1,89 +1,79 @@
-//! A [`crate::Tokenizer`] over the two tokenizer families the shipped checkpoints use.
+//! A [`crate::Tokenizer`] backed by Hugging Face [`tokenizers`].
 //!
-//! Which one a checkpoint wants is decided by its file: `tokenizer.model` is SentencePiece,
-//! `tokenizer.json` is a Hugging Face `tokenizers` file. [`Tok::open`] picks by extension so
-//! callers do not each reimplement that.
+//! The published checkpoints ship a SentencePiece `tokenizer.model`, which this crate does not
+//! read: `scripts/convert-tokenizer.py` turns one into an equivalent `tokenizer.json` (same ids,
+//! same round-trip, checked against `sentencepiece` as it converts) and [`Tok::open`] loads that.
 //!
-//! Available with either the `sp` or `hf` feature; the corresponding variant only exists when
-//! its feature is on.
+//! Available with the `hf` feature.
 
-/// A tokenizer of either supported family.
-pub enum Tok {
-    #[cfg(feature = "sp")]
-    Sp(std::sync::Arc<sentencepiece::SentencePieceProcessor>),
-    #[cfg(feature = "hf")]
-    Hf(Box<tokenizers::Tokenizer>),
-}
-
-#[cfg(feature = "sp")]
-impl From<sentencepiece::SentencePieceProcessor> for Tok {
-    fn from(sp: sentencepiece::SentencePieceProcessor) -> Self {
-        Tok::Sp(std::sync::Arc::new(sp))
-    }
-}
-
-#[cfg(feature = "hf")]
-impl From<tokenizers::Tokenizer> for Tok {
-    fn from(tok: tokenizers::Tokenizer) -> Self {
-        Tok::Hf(Box::new(tok))
-    }
-}
+/// A Hugging Face tokenizer.
+pub struct Tok(tokenizers::Tokenizer);
 
 impl Tok {
-    /// Opens a tokenizer, choosing the family from the extension: `.model` is SentencePiece,
-    /// anything else is treated as a Hugging Face `tokenizers` file.
+    /// Opens a `tokenizer.json`. A SentencePiece `.model` path — or a missing `tokenizer.json`
+    /// sitting next to one — is refused with a pointer at the conversion script: every checkpoint
+    /// has its own vocabulary, so there is no tokenizer to fall back to.
     pub fn open(path: &std::path::Path) -> xn::Result<Self> {
-        use xn::error::Context;
-
-        let path = path.to_str().context("invalid tokenizer path")?;
-        if path.ends_with(".model") { Self::open_sp(path) } else { Self::open_hf(path) }
-    }
-
-    #[cfg(feature = "sp")]
-    fn open_sp(path: &str) -> xn::Result<Self> {
-        tracing::info!(?path, "loading SentencePiece tokenizer");
-        let sp = sentencepiece::SentencePieceProcessor::open(path).map_err(xn::Error::wrap)?;
-        Ok(Tok::from(sp))
-    }
-
-    #[cfg(not(feature = "sp"))]
-    fn open_sp(path: &str) -> xn::Result<Self> {
-        xn::bail!("{path} needs a SentencePiece tokenizer; rebuild ptts with the 'sp' feature")
-    }
-
-    #[cfg(feature = "hf")]
-    fn open_hf(path: &str) -> xn::Result<Self> {
+        if path.extension().and_then(|v| v.to_str()) == Some("model") {
+            return Err(needs_conversion(path));
+        }
+        if !path.is_file() {
+            let sp = path.with_file_name("tokenizer.model");
+            if sp.is_file() {
+                return Err(needs_conversion(&sp));
+            }
+        }
         tracing::info!(?path, "loading Hugging Face tokenizer");
-        let tok = tokenizers::Tokenizer::from_file(path).map_err(xn::Error::wrap)?;
-        Ok(Tok::from(tok))
+        let tok = tokenizers::Tokenizer::from_file(path)
+            .map_err(|e| xn::Error::wrap(e).with_path(path))?;
+        Ok(Tok(tok))
     }
 
-    #[cfg(not(feature = "hf"))]
-    fn open_hf(path: &str) -> xn::Result<Self> {
-        xn::bail!("{path} needs a Hugging Face tokenizer; rebuild ptts with the 'hf' feature")
+    /// Loads the contents of a `tokenizer.json`, for callers with no filesystem to read it from
+    /// (the wasm demo fetches it over the network).
+    pub fn from_bytes(json: &[u8]) -> xn::Result<Self> {
+        let tok = tokenizers::Tokenizer::from_bytes(json).map_err(xn::Error::wrap)?;
+        Ok(Tok(tok))
     }
+}
+
+fn needs_conversion(sp: &std::path::Path) -> xn::Error {
+    xn::Error::msg(format!(
+        "this is a SentencePiece model, which ptts does not read; convert it once with \
+         `uv run scripts/convert-tokenizer.py {}` and pass the tokenizer.json it writes",
+        sp.display()
+    ))
+    .with_path(sp)
 }
 
 impl crate::Tokenizer for Tok {
     fn encode(&self, text: &str) -> xn::Result<Vec<u32>> {
-        let tokens = match self {
-            #[cfg(feature = "sp")]
-            Tok::Sp(sp) => {
-                sp.encode(text).map_err(xn::Error::wrap)?.into_iter().map(|v| v.id).collect()
-            }
-            #[cfg(feature = "hf")]
-            Tok::Hf(tok) => tok.encode(text, false).map_err(xn::Error::wrap)?.get_ids().to_vec(),
-        };
-        Ok(tokens)
+        let encoded = self.0.encode(text, false).map_err(xn::Error::wrap)?;
+        Ok(encoded.get_ids().to_vec())
     }
 
     fn decode(&self, ids: &[u32]) -> xn::Result<String> {
-        let decoded = match self {
-            #[cfg(feature = "sp")]
-            Tok::Sp(sp) => sp.decode_piece_ids(ids).map_err(xn::Error::wrap)?,
-            #[cfg(feature = "hf")]
-            Tok::Hf(tok) => tok.decode(ids, true).map_err(xn::Error::wrap)?,
-        };
-        Ok(decoded)
+        self.0.decode(ids, true).map_err(xn::Error::wrap)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    const MINIMAL: &str = r#"{"version":"1.0","added_tokens":[],
+      "model":{"type":"Unigram","unk_id":0,"vocab":[["<unk>",0.0],["ab",-1.0],["c",-2.0]]}}"#;
+
+    #[test]
+    fn from_bytes_reads_a_tokenizer_json() {
+        use crate::Tokenizer as _;
+        let tok = super::Tok::from_bytes(MINIMAL.as_bytes()).unwrap();
+        assert_eq!(tok.encode("abc").unwrap(), [1, 2]);
+    }
+
+    #[test]
+    fn sentencepiece_models_point_at_the_converter() {
+        let err = super::Tok::open(std::path::Path::new("weights/tokenizer.model"))
+            .err()
+            .expect("a .model path is not a tokenizer.json");
+        assert!(err.to_string().contains("convert-tokenizer.py"), "{err}");
     }
 }
