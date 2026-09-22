@@ -26,7 +26,7 @@
 //!
 //! Two variants carry fields instead of only a message, because a caller does something with
 //! them: [`Error::UnknownVoice`] hands back the names that would have worked, and
-//! [`Error::SeqBudgetExceeded`] hands back the budget to ask for next time.
+//! [`Error::SeqBudgetExceeded`] hands back the budget this text needs.
 
 /// A [`Result`](std::result::Result) over [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;
@@ -43,11 +43,25 @@ pub enum Error {
 
     /// More KV slots were needed than the session was primed with. Build the session with
     /// `max_seq_len` at least `needed`, or split the text.
+    ///
+    /// `needed` is what this text needs, so a session rebuilt with it will fit this text. A
+    /// *longer* one will not: size the session for the longest text it will see, not the first
+    /// one that failed.
     #[error(
         "needs a KV budget of {needed} but the session was primed with {budget}; build the \
          session with a larger max_seq_len, or split the text"
     )]
     SeqBudgetExceeded { needed: usize, budget: usize },
+
+    /// The voice prompt alone does not fit the session's KV budget, before any text is
+    /// considered. Splitting the text cannot help, which is why this is not
+    /// [`Self::SeqBudgetExceeded`]; `frames + 1` is the floor a budget has to clear, not a
+    /// value that will work.
+    #[error(
+        "the voice prompt alone is {frames} frames, which does not fit a KV budget of \
+         {budget}; build the session with a larger max_seq_len, or use a shorter voice prompt"
+    )]
+    VoicePromptTooLong { frames: usize, budget: usize },
 
     /// The caller passed something this call cannot accept: an unparseable name, a mis-shaped
     /// array, an empty text, a prompt that is too short.
@@ -79,7 +93,40 @@ pub enum Error {
     /// A failure from the tensor layer, or from anything below the API layer that reports
     /// through it -- including a panicked generation worker.
     #[error(transparent)]
-    Tensor(#[from] xn::Error),
+    Tensor(xn::Error),
+}
+
+/// Hand-written rather than `#[from]`, so an I/O failure gets one class wherever it was caught.
+///
+/// `xn::Error` carries its own `Io` variant, and plenty of I/O reaches us through it: opening a
+/// voice file goes `VB::load` -> `File::open` -> `xn::Error::Io`. Deriving `From` would file all
+/// of that under `Tensor`, so a missing voice path would be a `RuntimeError` in Python while a
+/// missing weights path was a `LookupError` and a missing config was an `OSError`.
+impl From<xn::Error> for Error {
+    fn from(e: xn::Error) -> Self {
+        match io_kind(&e) {
+            // Rebuilt rather than unwrapped. The useful half of the message is usually in the
+            // wrapper -- `WithPath` is what carries the filename -- so keep the whole rendering
+            // and take only the kind from the `io::Error` at the centre.
+            Some(kind) => Self::Io(std::io::Error::new(kind, e.to_string())),
+            None => Self::Tensor(e),
+        }
+    }
+}
+
+/// The kind of the I/O failure at the centre of `e`, if there is one.
+///
+/// `xn::Error` nests: by the time a failed `File::open` reaches this crate it is normally inside
+/// a `WithPath`, and may also be inside a `Context` or a `WithBacktrace`. Matching only the bare
+/// `Io` variant would miss nearly every real one.
+fn io_kind(e: &xn::Error) -> Option<std::io::ErrorKind> {
+    match e {
+        xn::Error::Io(io) => Some(io.kind()),
+        xn::Error::WithPath { inner, .. }
+        | xn::Error::Context { inner, .. }
+        | xn::Error::WithBacktrace { inner, .. } => io_kind(inner),
+        _ => None,
+    }
 }
 
 impl Error {
@@ -129,6 +176,27 @@ mod tests {
 
         let io = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
         assert!(matches!(xn::Error::from(Error::Io(io)), xn::Error::Io(_)));
+    }
+
+    #[test]
+    fn an_io_failure_gets_one_class_whichever_layer_caught_it() {
+        // The reason `From<xn::Error>` is hand-written. Opening a voice file goes through the
+        // tensor layer and comes back as `xn::Error::Io`; opening a config does not. Both are
+        // the same failure and must not land in different variants.
+        let bare = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        assert!(matches!(Error::from(xn::Error::Io(bare)), Error::Io(_)));
+
+        // And through the wrappers `xn` actually uses -- a failed `File::open` arrives inside a
+        // `WithPath`, so matching only the bare variant would miss nearly every real one.
+        let nested = xn::Error::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "nope"))
+            .with_path("/some/voice.safetensors");
+        let converted = Error::from(nested);
+        assert!(matches!(converted, Error::Io(_)), "{converted:?}");
+        // The path lives in the wrapper, so it has to survive the conversion.
+        assert!(converted.to_string().contains("voice.safetensors"), "{converted}");
+
+        // Anything else from that layer is still a tensor failure.
+        assert!(matches!(Error::from(xn::Error::msg("shape mismatch")), Error::Tensor(_)));
     }
 
     #[test]

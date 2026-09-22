@@ -155,10 +155,18 @@ fn hub(repo_id: &str) -> ptts::Result<HubRepo> {
 
 /// Download `filename` from `repo`, or find it in the local cache.
 fn hub_get(repo: &HubRepo, filename: &str) -> ptts::Result<std::path::PathBuf> {
-    repo.download_file()
-        .filename(filename)
-        .send()
-        .map_err(|e| ptts::Error::NotFound(format!("cannot fetch `{filename}`: {e}")))
+    // Only a genuine not-found is a name that failed to resolve. Offline, a timeout, a 429 or a
+    // 5xx are environment failures: they reach Python as `OSError`, which is what a caller
+    // retries on, rather than as a `LookupError` that says the file does not exist.
+    repo.download_file().filename(filename).send().map_err(|e| match e {
+        hf_hub::HFError::EntryNotFound { .. } | hf_hub::HFError::LocalEntryNotFound { .. } => {
+            ptts::Error::NotFound(format!("`{filename}` is not in the repo: {e}"))
+        }
+        hf_hub::HFError::Io(io) => ptts::Error::Io(io),
+        other => {
+            ptts::Error::Io(std::io::Error::other(format!("cannot fetch `{filename}`: {other}")))
+        }
+    })
 }
 
 /// Add every `*.safetensors` file in `dir` to `voices`, keyed by file stem.

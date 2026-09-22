@@ -230,17 +230,31 @@ struct Defaults {
 ///
 /// A `cfg_coef` of 1.0 becomes `None`: guidance at 1.0 is the identity, and
 /// computing it would cost a second forward pass.
-fn resolve(defaults: &Defaults, opts: &SpeechOptions) -> Defaults {
-    Defaults {
+///
+/// The temperature is checked here rather than at the three `NormalRng::new` call sites: this
+/// is the one place every request passes through, so the builder's default is covered as well
+/// as a per-request override. Left unchecked it reaches `rand_distr::Normal` and comes back as
+/// a `BadVariance` wrapped in a tensor error, which is a `RuntimeError` in Python carrying a
+/// message about variance rather than about the argument the caller passed.
+fn resolve(defaults: &Defaults, opts: &SpeechOptions) -> Result<Defaults> {
+    let temperature = opts.temperature.unwrap_or(defaults.temperature);
+    // NaN spelled out rather than `!(t >= 0)`, which clippy rejects on partially ordered
+    // types. Zero is fine: it is greedy sampling, and `Normal::new` takes a zero std dev.
+    if temperature.is_nan() || temperature < 0.0 {
+        return Err(Error::invalid_argument(format!(
+            "temperature must be >= 0, got {temperature}"
+        )));
+    }
+    Ok(Defaults {
         voice: opts.voice.clone().or_else(|| defaults.voice.clone()),
-        temperature: opts.temperature.unwrap_or(defaults.temperature),
+        temperature,
         seed: opts.seed.unwrap_or(defaults.seed),
         cfg_coef: match opts.cfg_coef.or(defaults.cfg_coef) {
             Some(coef) if coef != 1.0 => Some(coef),
             _ => None,
         },
         max_tokens_per_chunk: opts.max_tokens_per_chunk.unwrap_or(defaults.max_tokens_per_chunk),
-    }
+    })
 }
 
 /// A registered voice: the conditioning embedding, plus the encoding of
@@ -426,7 +440,7 @@ impl<Q: BackendQ> SynthOf<Q> {
     /// single chunk; longer text is split into chunks of that size rather than
     /// needing more.
     pub fn session(&self, opts: &SpeechOptions, max_seq_len: usize) -> Result<SessionOf<Q>> {
-        self.session_at(&resolve(&self.defaults, opts), max_seq_len)
+        self.session_at(&resolve(&self.defaults, opts)?, max_seq_len)
     }
 
     /// Build a session, sized to `seq_budget`.
@@ -453,7 +467,7 @@ impl<Q: BackendQ> SynthOf<Q> {
     /// the Mimi decoder — so decoding overlaps the next backbone step. Dropping
     /// the returned [`SpeechStream`] stops both.
     pub fn stream_with(&self, text: &str, opts: &SpeechOptions) -> Result<SpeechStream> {
-        let settings = resolve(&self.defaults, opts);
+        let settings = resolve(&self.defaults, opts)?;
         let rng = Box::new(NormalRng::new(settings.temperature, settings.seed)?);
         self.stream_with_rng(text, opts, rng)
     }
@@ -470,7 +484,7 @@ impl<Q: BackendQ> SynthOf<Q> {
         opts: &SpeechOptions,
         rng: Box<dyn crate::flow_lm::Rng + Send>,
     ) -> Result<SpeechStream> {
-        let settings = resolve(&self.defaults, opts);
+        let settings = resolve(&self.defaults, opts)?;
         let chunks = plan_chunks(
             &self.model,
             self.cfg.mimi.frame_rate,
@@ -514,9 +528,10 @@ impl<Q: BackendQ> SynthOf<Q> {
         if let Some(voice) = voice {
             let frames = voice.emb.dim(1usize)?;
             if frames >= seq_budget {
-                // The prompt must leave room for at least one generated frame, so the budget
-                // that would have worked is one more than the prompt, never equal to it.
-                return Err(Error::SeqBudgetExceeded { needed: frames + 1, budget: seq_budget });
+                // Its own variant rather than `SeqBudgetExceeded`: nothing about the text is
+                // wrong here, so "split the text" would be useless advice, and the prompt
+                // length alone cannot say what budget would actually work.
+                return Err(Error::VoicePromptTooLong { frames, budget: seq_budget });
             }
         }
         let mut state = self.model.init_flow_lm_state(1, seq_budget)?;
@@ -1609,9 +1624,23 @@ mod tests {
     }
 
     #[test]
+    fn a_nonsensical_temperature_is_rejected_as_an_argument() {
+        // Unchecked it reaches `rand_distr::Normal` and returns as a tensor error about
+        // variance, which tells the caller nothing about what they passed.
+        for bad in [-0.5f32, f32::NAN] {
+            let opts = SpeechOptions::default().temperature(bad);
+            let err = resolve(&defaults(), &opts).unwrap_err();
+            assert!(matches!(err, Error::InvalidArgument(_)), "{bad}: {err:?}");
+        }
+        // Zero is greedy sampling, not an error.
+        let opts = SpeechOptions::default().temperature(0.0);
+        assert_eq!(resolve(&defaults(), &opts).unwrap().temperature, 0.0);
+    }
+
+    #[test]
     fn unset_options_leave_the_defaults_alone() {
         let d = defaults();
-        let got = resolve(&d, &SpeechOptions::default());
+        let got = resolve(&d, &SpeechOptions::default()).unwrap();
         assert_eq!(got.voice, d.voice);
         assert_eq!(got.temperature, d.temperature);
         assert_eq!(got.seed, d.seed);
@@ -1628,13 +1657,13 @@ mod tests {
             .temperature(0.9)
             .seed(7)
             .max_tokens_per_chunk(80);
-        let got = resolve(&defaults(), &all);
+        let got = resolve(&defaults(), &all).unwrap();
         assert_eq!(got.voice.as_deref(), Some("marius"));
         assert_eq!(got.temperature, 0.9);
         assert_eq!(got.seed, 7);
         assert_eq!(got.max_tokens_per_chunk, 80);
 
-        let one = resolve(&defaults(), &SpeechOptions::default().seed(99));
+        let one = resolve(&defaults(), &SpeechOptions::default().seed(99)).unwrap();
         assert_eq!(one.seed, 99);
         assert_eq!(one.temperature, 0.5);
         assert_eq!(one.voice.as_deref(), Some("alba"));
@@ -1668,19 +1697,20 @@ mod tests {
     #[test]
     fn guidance_at_one_is_normalized_away() {
         let from_request = SpeechOptions::default().cfg_coef(1.0);
-        assert_eq!(resolve(&defaults(), &from_request).cfg_coef, None);
+        assert_eq!(resolve(&defaults(), &from_request).unwrap().cfg_coef, None);
         assert_eq!(
-            resolve(&defaults(), &SpeechOptions::default().cfg_coef(2.0)).cfg_coef,
+            resolve(&defaults(), &SpeechOptions::default().cfg_coef(2.0)).unwrap().cfg_coef,
             Some(2.0)
         );
         // From the builder, and when a request turns the builder's off.
         let enabled = Defaults { cfg_coef: Some(3.0), ..defaults() };
         assert_eq!(
             resolve(&Defaults { cfg_coef: Some(1.0), ..defaults() }, &SpeechOptions::default())
+                .unwrap()
                 .cfg_coef,
             None
         );
-        assert_eq!(resolve(&enabled, &from_request).cfg_coef, None);
-        assert_eq!(resolve(&enabled, &SpeechOptions::default()).cfg_coef, Some(3.0));
+        assert_eq!(resolve(&enabled, &from_request).unwrap().cfg_coef, None);
+        assert_eq!(resolve(&enabled, &SpeechOptions::default()).unwrap().cfg_coef, Some(3.0));
     }
 }

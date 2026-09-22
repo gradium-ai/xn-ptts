@@ -130,7 +130,9 @@ pub fn load_voice_emb<B: Backend>(
     } else if names.contains(&SPEAKER_WAVS_TENSOR) {
         (SPEAKER_WAVS_TENSOR, VoiceTensor::Latents)
     } else {
-        let first = names.first().context("no tensors found in voice embedding file")?;
+        let first = names.first().ok_or_else(|| {
+            Error::invalid_data(format!("no tensors found in voice file {}", path.display()))
+        })?;
         (*first, VoiceTensor::Emb)
     };
     let shape = vb.shape(name).context("voice tensor not found")?;
