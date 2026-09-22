@@ -19,7 +19,11 @@ xn = { workspace = true }
 ptts = { workspace = true, features = ["hf"] }
 hf-hub = { workspace = true }
 numpy = "0.28"
-pyo3 = { version = "0.28", features = ["extension-module"] }
+# `abi3-py39`: one wheel per platform for every CPython from 3.9 on, rather than one
+# per interpreter. This crate takes minutes to compile, so the alternative is a release
+# matrix of platforms times interpreters -- and a new CPython release needing a rebuild
+# before anyone on it can install at all.
+pyo3 = { version = "0.28", features = ["extension-module", "abi3-py39"] }
 serde_json = { workspace = true }
 
 [features]
