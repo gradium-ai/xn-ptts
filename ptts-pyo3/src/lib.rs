@@ -29,15 +29,38 @@ const POCKET_TTS_VOICES: &[&str] =
 const DEFAULT_REPO_ID: &str = "kyutai/pocket-tts";
 const DEFAULT_MODEL_FILE: &str = "tts_b6369a24.safetensors";
 
-/// Map a `ptts` error onto a Python exception. `ValueError` throughout: every
-/// failure here is a bad argument, a missing file or a bad checkpoint.
+/// Map a `ptts` error onto the Python exception its class calls for.
+///
+/// `ptts::Error`'s variants are failure classes rather than one per message, so this is a table
+/// rather than a pattern-match on prose -- and a misspelt voice stops being the same exception
+/// as an unreadable checkpoint, which is what `ValueError` throughout made it.
+fn to_py_err(e: ptts::Error) -> PyErr {
+    use pyo3::exceptions as exc;
+
+    let msg = e.to_string();
+    match e {
+        ptts::Error::InvalidArgument(_) => exc::PyValueError::new_err(msg),
+        // `LookupError` is the base of `KeyError` and covers both "no such voice" and "no such
+        // checkpoint file" without claiming either is a dict lookup.
+        ptts::Error::UnknownVoice { .. } | ptts::Error::NotFound(_) => {
+            exc::PyLookupError::new_err(msg)
+        }
+        ptts::Error::Unsupported(_) => exc::PyNotImplementedError::new_err(msg),
+        ptts::Error::Io(e) => PyErr::from(e),
+        // `Busy` is retryable and the rest are not, but Python has no better shared base than
+        // `RuntimeError` for any of them. `Error` is `#[non_exhaustive]`, so the `_` arm is
+        // where a variant added upstream lands rather than being folded into one above.
+        _ => exc::PyRuntimeError::new_err(msg),
+    }
+}
+
 trait IntoPy<R> {
     fn py(self) -> PyResult<R>;
 }
 
-impl<R, E: Into<xn::Error>> IntoPy<R> for Result<R, E> {
+impl<R, E: Into<ptts::Error>> IntoPy<R> for Result<R, E> {
     fn py(self) -> PyResult<R> {
-        self.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.into().to_string()))
+        self.map_err(|e| to_py_err(e.into()))
     }
 }
 
@@ -51,15 +74,15 @@ struct Artifacts {
 
 /// Resolve `config` — a local `config.json`, a Hub repo id, or nothing for the
 /// published checkpoint — into the files needed to load it.
-fn resolve(config: Option<&str>, temperature: f32) -> xn::Result<Artifacts> {
-    use xn::error::Context;
-
+fn resolve(config: Option<&str>, temperature: f32) -> ptts::Result<Artifacts> {
     match config {
         // A local config path: load the weights sitting next to it.
         Some(path) if std::path::Path::new(path).is_file() || path.ends_with(".json") => {
             let config_path = std::fs::canonicalize(path)
-                .map_err(|e| xn::Error::msg(format!("cannot read config {path}: {e}")))?;
-            let parent = config_path.parent().context("config path has no parent")?;
+                .map_err(|e| ptts::Error::NotFound(format!("cannot read config {path}: {e}")))?;
+            let parent = config_path
+                .parent()
+                .ok_or_else(|| ptts::Error::NotFound(format!("{path} has no parent directory")))?;
             // Prefer an unquantized safetensors checkpoint, falling back to a
             // pre-quantized GGUF if that is what sits next to the config.
             let model_path = if parent.join("model.safetensors").is_file() {
@@ -67,10 +90,10 @@ fn resolve(config: Option<&str>, temperature: f32) -> xn::Result<Artifacts> {
             } else {
                 parent.join("model.q8.gguf")
             };
-            let text = std::fs::read_to_string(&config_path)
-                .map_err(|e| xn::Error::msg(e).with_path(&config_path))?;
-            let mut cfg: TTSConfig = serde_json::from_str(&text)
-                .map_err(|e| xn::Error::msg(e).with_path(&config_path))?;
+            let text =
+                std::fs::read_to_string(&config_path).map_err(|e| config_error(&config_path, e))?;
+            let mut cfg: TTSConfig =
+                serde_json::from_str(&text).map_err(|e| config_error(&config_path, e))?;
             cfg.temp = temperature;
             let mut voices = vec![];
             collect_voices(&parent.join("voices"), &mut voices);
@@ -80,10 +103,10 @@ fn resolve(config: Option<&str>, temperature: f32) -> xn::Result<Artifacts> {
         Some(repo_id) => {
             let repo = hub(repo_id)?;
             let config_path = hub_get(&repo, "config.json")?;
-            let text = std::fs::read_to_string(&config_path)
-                .map_err(|e| xn::Error::msg(e).with_path(&config_path))?;
-            let mut cfg: TTSConfig = serde_json::from_str(&text)
-                .map_err(|e| xn::Error::msg(e).with_path(&config_path))?;
+            let text =
+                std::fs::read_to_string(&config_path).map_err(|e| config_error(&config_path, e))?;
+            let mut cfg: TTSConfig =
+                serde_json::from_str(&text).map_err(|e| config_error(&config_path, e))?;
             cfg.temp = temperature;
             Ok(Artifacts {
                 cfg,
@@ -113,20 +136,26 @@ fn resolve(config: Option<&str>, temperature: f32) -> xn::Result<Artifacts> {
     }
 }
 
+/// A config that is there but unreadable, as opposed to one that is missing.
+fn config_error(path: &std::path::Path, e: impl std::fmt::Display) -> ptts::Error {
+    ptts::Error::InvalidData(format!("cannot read config {}: {e}", path.display()))
+}
+
 type HubRepo = hf_hub::HFRepositorySync<hf_hub::repository::RepoTypeModel>;
 
-fn hub(repo_id: &str) -> xn::Result<HubRepo> {
-    let client = hf_hub::HFClientSync::new().map_err(xn::Error::msg)?;
+fn hub(repo_id: &str) -> ptts::Result<HubRepo> {
+    let client = hf_hub::HFClientSync::new()
+        .map_err(|e| ptts::Error::NotFound(format!("cannot reach the Hugging Face Hub: {e}")))?;
     let (owner, name) = hf_hub::split_id(repo_id);
     Ok(client.model(owner, name))
 }
 
 /// Download `filename` from `repo`, or find it in the local cache.
-fn hub_get(repo: &HubRepo, filename: &str) -> xn::Result<std::path::PathBuf> {
+fn hub_get(repo: &HubRepo, filename: &str) -> ptts::Result<std::path::PathBuf> {
     repo.download_file()
         .filename(filename)
         .send()
-        .map_err(|e| xn::Error::msg(e).with_path(filename))
+        .map_err(|e| ptts::Error::NotFound(format!("cannot fetch `{filename}`: {e}")))
 }
 
 /// Add every `*.safetensors` file in `dir` to `voices`, keyed by file stem.
