@@ -38,12 +38,12 @@ impl Tok {
 }
 
 fn needs_conversion(sp: &std::path::Path) -> xn::Error {
-    let sp = sp.display();
     xn::Error::msg(format!(
-        "{sp} is a SentencePiece model, which ptts does not read; convert it once with \
-         `uv run scripts/convert-tokenizer.py {sp}` and pass the tokenizer.json it writes"
+        "this is a SentencePiece model, which ptts does not read; convert it once with \
+         `uv run scripts/convert-tokenizer.py {}` and pass the tokenizer.json it writes",
+        sp.display()
     ))
-    .with_path(sp.to_string())
+    .with_path(sp)
 }
 
 impl crate::Tokenizer for Tok {

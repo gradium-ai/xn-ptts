@@ -1240,14 +1240,19 @@ impl SynthBuilder {
         if let Some(tokenizer) = self.tokenizer.take() {
             return Ok(tokenizer);
         }
-        #[cfg(feature = "hf")]
-        if let Some(path) = self.tokenizer_file.as_deref() {
-            return Ok(Box::new(crate::tok::Tok::open(path)?));
+        match self.tokenizer_file.as_deref() {
+            #[cfg(feature = "hf")]
+            Some(path) => Ok(Box::new(crate::tok::Tok::open(path)?)),
+            #[cfg(not(feature = "hf"))]
+            Some(path) => xn::bail!(
+                "cannot read the tokenizer at {}: `ptts` was built without the `hf` feature.",
+                path.display()
+            ),
+            None => xn::bail!(
+                "no tokenizer available: the checkpoint shipped none and none was passed to \
+                 SynthBuilder::tokenizer or SynthBuilder::tokenizer_file."
+            ),
         }
-        xn::bail!(
-            "no tokenizer available: none was passed to SynthBuilder::tokenizer, the checkpoint \
-             shipped none, and the `hf` feature of `ptts` is not enabled."
-        )
     }
 }
 

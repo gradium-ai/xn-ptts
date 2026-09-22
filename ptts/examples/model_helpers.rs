@@ -41,11 +41,11 @@ pub const VOICES: &[&str] =
 pub const WEIGHT_CANDIDATES: &[&str] =
     &["model.safetensors", "model.q8.gguf", "tts_b6369a24.safetensors"];
 
-/// Tokenizer file names tried. Only the Hugging Face `tokenizers` format is read: a
-/// checkpoint that ships just a SentencePiece `tokenizer.model` needs converting once with
-/// `scripts/convert-tokenizer.py`, and `ptts::tok::Tok` says so rather than guessing at a
-/// vocabulary.
-pub const TOKENIZER_CANDIDATES: &[&str] = &["tokenizer.json"];
+/// Tokenizer file names tried, in order. Only `tokenizer.json` can be read; a SentencePiece
+/// `tokenizer.model` is looked for anyway so that a checkpoint carrying just that one fails
+/// with `ptts::tok::Tok`'s "convert it once with `scripts/convert-tokenizer.py`" rather than
+/// with a bare "no tokenizer here".
+pub const TOKENIZER_CANDIDATES: &[&str] = &["tokenizer.json", "tokenizer.model"];
 
 /// A checkpoint whose files have been located and whose config is parsed.
 pub struct Checkpoint {
