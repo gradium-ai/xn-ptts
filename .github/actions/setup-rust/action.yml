@@ -1,0 +1,78 @@
+name: Set up Rust
+description: >
+  Toolchain, cache and the platform quirks every job in this repo needs. One place, so the
+  reasons are written down once rather than copied into each job.
+
+inputs:
+  toolchain:
+    description: Rust toolchain to install.
+    required: false
+    default: stable
+  components:
+    description: Space- or comma-separated rustup components, e.g. "clippy rustfmt".
+    required: false
+    default: ""
+  targets:
+    description: Extra rustup targets, e.g. "wasm32-unknown-unknown".
+    required: false
+    default: ""
+  cache-key:
+    description: Extra key so jobs with different flags do not share a cache entry.
+    required: false
+    default: ""
+  audio-deps:
+    description: >
+      Install libopus, which `ptts-ws-server` needs through `kaudio`. Set to "false" for jobs
+      that do not touch that crate.
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Remove the local cargo config
+      shell: bash
+      # It pins `target-cpu=native`, which breaks portable dependency builds. Jobs that need
+      # target-specific flags (the wasm one) set them explicitly instead.
+      run: rm -f .cargo/config.toml
+
+    - name: Install libopus
+      if: inputs.audio-deps == 'true' && runner.os != 'Windows'
+      shell: bash
+      # `ptts-ws-server` -> `kaudio` -> `libopus_sys`, which looks for a system libopus via
+      # pkg-config. Without this the crate cannot be built at all, which is why it used to be
+      # excluded from every CI job.
+      run: |
+        if [ "${{ runner.os }}" = "Linux" ]; then
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libopus-dev pkg-config
+        else
+          brew list opus >/dev/null 2>&1 || brew install opus
+          brew list pkg-config >/dev/null 2>&1 || brew install pkg-config
+        fi
+
+    - name: Work out what this platform can build
+      shell: bash
+      # Windows has no one-line libopus, so `ptts-ws-server` is skipped there and only there.
+      # Every job uses $WS_EXCLUDE rather than hardcoding the exclusion, so the crate is
+      # covered everywhere it can be.
+      run: |
+        if [ "${{ runner.os }}" = "Windows" ]; then
+          echo "WS_EXCLUDE=--exclude ptts-ws-server" >> "$GITHUB_ENV"
+        else
+          echo "WS_EXCLUDE=" >> "$GITHUB_ENV"
+        fi
+
+    - name: Install the toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+
+    - name: Cache the build
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.cache-key }}
+        # A green run on `main` is what every PR branch restores from.
+        save-if: ${{ github.ref == 'refs/heads/main' }}

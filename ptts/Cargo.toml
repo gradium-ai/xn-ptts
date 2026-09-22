@@ -35,6 +35,14 @@ tracing-chrome = { workspace = true }
 [target.'cfg(unix)'.dev-dependencies]
 libc = { workspace = true }
 
+# docs.rs builds with default features unless told otherwise, which would render the crate
+# without `tok` or `audio` and with no implementation of the `Tokenizer` trait in sight. Not
+# `all-features`: that turns on `cuda`, whose build script needs `nvcc`. The `docs` CI job
+# builds this same set, so a docs.rs failure shows up on the PR instead of after publishing.
+[package.metadata.docs.rs]
+features = ["hf", "audio"]
+rustdoc-args = ["--cfg", "docsrs"]
+
 [features]
 default = []
 cuda = ["xn/cuda", "dep:half"]

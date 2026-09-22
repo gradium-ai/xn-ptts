@@ -1,86 +1,223 @@
-on: [push, pull_request]
+name: Rust
 
-name: Continuous integration
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A PR that gets three pushes in a minute should not leave two runs burning runners. Pushes to
+# `main` get a group of their own, keyed by run id, so they never queue behind each other:
+# GitHub keeps only one *pending* run per group, so merging three PRs in a row would otherwise
+# cancel the middle run before it started -- and those are the runs whose caches every branch
+# restores from.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# `--all-features` is never used anywhere here: it turns on `cuda`, whose `cudarc` build script
+# shells out to `nvcc` and fails on every runner. Feature sets are named explicitly.
 
 jobs:
-  check:
-    name: Check
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macOS-latest]
-        rust: [stable, nightly]
-    steps:
-      - uses: actions/checkout@v2
-      - name: Remove local cargo config
-        shell: bash
-        # Remove the target-arch=native as it breaks some dependencies.
-        run: rm -f .cargo/config.toml
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: ${{ matrix.rust }}
-          override: true
-      - uses: actions-rs/cargo@v1
-        with:
-          command: check
-          args: --workspace --exclude ptts-ws-server
-
-  test:
-    name: Test Suite
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macOS-latest]
-        rust: [stable, nightly]
-    steps:
-      - uses: actions/checkout@v2
-      - name: Remove local cargo config
-        shell: bash
-        # Remove the target-arch=native as it breaks some dependencies.
-        run: rm -f .cargo/config.toml
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: ${{ matrix.rust }}
-          override: true
-      - uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --workspace --exclude ptts-ws-server
 
   fmt:
-    name: Rustfmt
+    name: Format
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-rust
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
-      - run: rustup component add rustfmt
-      - uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: --all -- --check
+          components: rustfmt
+          audio-deps: "false"
+      - run: cargo fmt --all -- --check
 
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v2
-      - name: Remove local cargo config
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: clippy
+          cache-key: clippy
+      # `--all-targets` so the examples are linted too, and the whole workspace including
+      # `ptts-ws-server`, which used to be excluded from every job.
+      - name: Workspace, default features
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: ptts, every optional feature on
+        run: cargo clippy -p ptts --features hf,audio --all-targets -- -D warnings
+
+  test:
+    name: Test ${{ matrix.os }} / ${{ matrix.rust }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust: [stable, nightly]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: ${{ matrix.rust }}
+          cache-key: test-${{ matrix.rust }}
+      # Two runs because they cover different things: `--all-targets` builds the examples but
+      # skips doctests, and a plain `cargo test` runs the doctests. The crate documentation is
+      # full of runnable examples, so both matter.
+      - name: Workspace, default features
+        run: cargo test --workspace --all-targets $WS_EXCLUDE
         shell: bash
-        # Remove the target-arch=native as it breaks some dependencies.
-        run: rm -f .cargo/config.toml
-      - uses: actions-rs/toolchain@v1
+      - name: ptts, every optional feature on
+        run: cargo test -p ptts --features hf,audio --all-targets
+        shell: bash
+      # `-p ptts` rather than `--workspace`: it is the only crate with doctests, and selecting
+      # the two `cdylib` crates only produces "doc tests are not supported for crate type(s)
+      # `cdylib`" warnings.
+      - name: Doctests
+        run: cargo test -p ptts --doc && cargo test -p ptts --features hf,audio --doc
+        shell: bash
+      # The two backends that only exist on this platform, so nowhere else can check them.
+      - name: macOS-only backends compile
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p ptts --features metal
+          cargo check -p ptts --features accelerate
+
+  features:
+    name: Feature combinations
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-rust
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
-      - run: rustup component add clippy
-      - uses: actions-rs/cargo@v1
+          cache-key: features
+          audio-deps: "false"
+      # Every optional feature of `ptts` alone and in combination. Nothing but the default set
+      # was ever compiled in CI before, so a `#[cfg(feature = ...)]` that did not build was
+      # invisible until someone enabled it.
+      - name: Each combination
+        shell: bash
+        run: |
+          set -euo pipefail
+          for features in "" hf audio hf,audio; do
+            echo "::group::ptts --features ${features:-<none>}"
+            cargo check -p ptts --no-default-features --features "$features" --all-targets
+            echo "::endgroup::"
+          done
+      - name: Install glslc
+        # `xn`'s build script compiles the Vulkan compute shaders with `glslc`, so the `vulkan`
+        # feature cannot even be type-checked without it.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends glslc
+          glslc --version
+
+      # The GPU backends cannot run here, but they can be type-checked, and they break more
+      # often than the CPU path because nothing exercises them locally either. `cuda` is the one
+      # left out: `cudarc`'s build script needs `nvcc`, which no free runner has.
+      - name: GPU backends still compile
+        shell: bash
+        run: |
+          set -euo pipefail
+          for features in vulkan webgpu; do
+            echo "::group::ptts --features $features"
+            cargo check -p ptts --features "$features"
+            echo "::endgroup::"
+          done
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-rust
         with:
-          command: clippy
-          args: --workspace --exclude ptts-ws-server -- -D warnings
+          # docs.rs builds on nightly with `--cfg docsrs`, and that is what turns on the
+          # `doc_cfg` annotations ("Available on crate feature `audio` only"). Matching it here
+          # means a docs.rs build that would fail, or a nightly change that breaks the
+          # annotations, shows up on the PR rather than after publishing.
+          toolchain: nightly
+          cache-key: docs
+          audio-deps: "false"
+      - name: Stable, for the contributor-facing check below
+        uses: dtolnay/rust-toolchain@stable
+      # The same feature set `[package.metadata.docs.rs]` names. `-D warnings` catches broken
+      # intra-doc links, which are the usual way published documentation rots.
+      - name: Build the documentation as docs.rs will
+        env:
+          RUSTDOCFLAGS: --cfg docsrs -D warnings
+        # `+nightly` explicitly: the stable toolchain installed above is the default by then.
+        run: cargo +nightly doc -p ptts --no-deps --features hf,audio
+
+      # Stable has no `docsrs` cfg and so no `feature(doc_cfg)`; this is what a contributor
+      # running `cargo doc` gets, and it has to stay clean too.
+      - name: And as a contributor will
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +stable doc -p ptts --no-deps --features hf,audio
+
+  wasm:
+    name: Wasm
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: wasm32-unknown-unknown
+          cache-key: wasm
+          audio-deps: "false"
+      # The browser build is a shipped surface and nothing was checking it: `--workspace`
+      # compiles `ptts-wasm` for the host, which is not the target it runs on. The SIMD flags
+      # are the ones `.cargo/config.toml` sets for real builds, repeated here because CI
+      # deletes that file.
+      #
+      # That file also sets `--cfg getrandom_backend="wasm_js"`, which is deliberately *not*
+      # repeated. getrandom 0.3.4 reaches its wasm_js backend two ways: through that cfg, or
+      # through the target-based branch that needs only the `wasm_js` cargo feature, which
+      # `ptts-wasm` enables directly. Its `compile_error!` text still claims "the `wasm_js`
+      # feature flag alone is insufficient", but that arm only fires when the feature is
+      # absent. Keeping the cfg out means this job proves the feature alone carries the build.
+      - name: Check the browser build
+        env:
+          RUSTFLAGS: -C target-feature=+simd128,+relaxed-simd
+        run: cargo check -p ptts-wasm --target wasm32-unknown-unknown --all-targets
+      # `ptts-wasm`'s `webgpu` feature is deliberately not checked here: it does not compile for
+      # this target, and has not since before this workflow. `xn 0.2.4`'s webgpu backend wants
+      # `Send + Sync` storage, while `wgpu`'s browser backend holds a `RefCell` and so is
+      # `!Sync` on wasm32 -- 48 errors, all of them that. The feature builds fine for the host,
+      # which is why nothing had noticed. Add the check here once `xn` is fixed.
+
+  # One job to require in branch protection, instead of every matrix leg by name.
+  ci-ok:
+    name: CI
+    if: always()
+    needs: [fmt, clippy, test, features, docs, wasm]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail if anything upstream did
+        shell: bash
+        run: |
+          results="${{ join(needs.*.result, ' ') }}"
+          echo "$results"
+          for result in $results; do
+            if [ "$result" != "success" ]; then
+              echo "::error::a required job reported '$result'"
+              exit 1
+            fi
+          done
