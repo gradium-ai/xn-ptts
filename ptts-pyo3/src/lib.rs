@@ -144,8 +144,11 @@ fn config_error(path: &std::path::Path, e: impl std::fmt::Display) -> ptts::Erro
 type HubRepo = hf_hub::HFRepositorySync<hf_hub::repository::RepoTypeModel>;
 
 fn hub(repo_id: &str) -> ptts::Result<HubRepo> {
-    let client = hf_hub::HFClientSync::new()
-        .map_err(|e| ptts::Error::NotFound(format!("cannot reach the Hugging Face Hub: {e}")))?;
+    // Not `NotFound`: a client that will not start is an environment failure, not a name that
+    // failed to resolve. `Io` reaches Python as `OSError`, which is what a caller retries on.
+    let client = hf_hub::HFClientSync::new().map_err(|e| {
+        ptts::Error::Io(std::io::Error::other(format!("cannot reach the Hugging Face Hub: {e}")))
+    })?;
     let (owner, name) = hf_hub::split_id(repo_id);
     Ok(client.model(owner, name))
 }
@@ -240,10 +243,10 @@ impl Tts {
             _ => None,
         };
         if let Some(name) = unavailable {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            return Err(to_py_err(ptts::Error::Unsupported(format!(
                 "device '{name}' is not available in this build; available: {:?}",
                 available_devices()
-            )));
+            ))));
         }
         // Loading reads hundreds of megabytes and runs no Python.
         py.detach(move || {
@@ -272,10 +275,10 @@ impl Tts {
             if let Some(name) = voice.as_deref()
                 && !synth.voices().iter().any(|v| v == name)
             {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "unknown voice '{name}'; available voices are {:?}",
-                    synth.voices()
-                )));
+                return Err(to_py_err(ptts::Error::UnknownVoice {
+                    name: name.to_string(),
+                    known: synth.voices(),
+                }));
             }
             Ok(Self { inner: Arc::new(Mutex::new(synth)), default_voice: voice })
         })

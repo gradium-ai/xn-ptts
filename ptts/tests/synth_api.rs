@@ -184,6 +184,8 @@ fn a_generic_session_is_nameable_too() {
 fn the_types_the_frontends_move_between_threads_still_can() {
     fn send_sync<T: Send + Sync>() {}
     fn send<T: Send>() {}
+    // `ptts-ws-server` is built on `anyhow`, which only accepts a `Send + Sync` error.
+    send_sync::<ptts::Error>();
     send_sync::<ptts::synth::Synth>();
     send_sync::<ptts::synth::SynthOf<xn::Unquantized<f32, xn::CpuDevice>>>();
     send_sync::<ptts::synth::Session>();

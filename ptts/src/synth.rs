@@ -514,7 +514,9 @@ impl<Q: BackendQ> SynthOf<Q> {
         if let Some(voice) = voice {
             let frames = voice.emb.dim(1usize)?;
             if frames >= seq_budget {
-                return Err(Error::SeqBudgetExceeded { needed: frames, budget: seq_budget });
+                // The prompt must leave room for at least one generated frame, so the budget
+                // that would have worked is one more than the prompt, never equal to it.
+                return Err(Error::SeqBudgetExceeded { needed: frames + 1, budget: seq_budget });
             }
         }
         let mut state = self.model.init_flow_lm_state(1, seq_budget)?;
