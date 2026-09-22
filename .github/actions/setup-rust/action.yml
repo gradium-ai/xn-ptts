@@ -1,0 +1,52 @@
+name: Set up Rust
+description: >
+  Toolchain, cache and the platform quirks every job in this repo needs. One place, so the
+  reasons are written down once rather than copied into each job.
+
+inputs:
+  toolchain:
+    description: Rust toolchain to install.
+    required: false
+    default: stable
+  components:
+    description: Space- or comma-separated rustup components, e.g. "clippy rustfmt".
+    required: false
+    default: ""
+  targets:
+    description: Extra rustup targets, e.g. "wasm32-unknown-unknown".
+    required: false
+    default: ""
+  cache-key:
+    description: Extra key so jobs with different flags do not share a cache entry.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Remove the local cargo config
+      shell: bash
+      # It pins `target-cpu=native`, which breaks portable dependency builds.
+      run: rm -f .cargo/config.toml
+
+    - name: Use the static CRT on Windows
+      if: runner.os == 'Windows'
+      shell: bash
+      # esaxx-rs (built with cc, /MT) and sentencepiece-sys (built with cmake, /MD) otherwise
+      # disagree on the MSVC runtime and fail to link with LNK2038. Force the static CRT
+      # everywhere so they all agree on /MT.
+      run: echo "RUSTFLAGS=-C target-feature=+crt-static" >> "$GITHUB_ENV"
+
+    - name: Install the toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+
+    - name: Cache the build
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.cache-key }}
+        # A green run on `main` is what every PR branch restores from.
+        save-if: ${{ github.ref == 'refs/heads/main' }}
