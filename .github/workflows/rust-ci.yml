@@ -135,6 +135,38 @@ jobs:
             echo "::endgroup::"
           done
 
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-rust
+        with:
+          # docs.rs builds on nightly with `--cfg docsrs`, and that is what turns on the
+          # `doc_cfg` annotations ("Available on crate feature `audio` only"). Matching it here
+          # means a docs.rs build that would fail, or a nightly change that breaks the
+          # annotations, shows up on the PR rather than after publishing.
+          toolchain: nightly
+          cache-key: docs
+          audio-deps: "false"
+      - name: Stable, for the contributor-facing check below
+        uses: dtolnay/rust-toolchain@stable
+      # The same feature set `[package.metadata.docs.rs]` names. `-D warnings` catches broken
+      # intra-doc links, which are the usual way published documentation rots.
+      - name: Build the documentation as docs.rs will
+        env:
+          RUSTDOCFLAGS: --cfg docsrs -D warnings
+        # `+nightly` explicitly: the stable toolchain installed above is the default by then.
+        run: cargo +nightly doc -p ptts --no-deps --features sp,hf,audio
+
+      # Stable has no `docsrs` cfg and so no `feature(doc_cfg)`; this is what a contributor
+      # running `cargo doc` gets, and it has to stay clean too.
+      - name: And as a contributor will
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +stable doc -p ptts --no-deps --features sp,hf,audio
+
   wasm:
     name: Wasm
     runs-on: ubuntu-latest
