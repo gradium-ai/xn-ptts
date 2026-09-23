@@ -192,6 +192,16 @@ impl<Q: BackendQ> TTSState<Q> {
     pub fn batch_size(&self) -> Result<usize> {
         self.flow_lm_state.transformer_state.batch_size()
     }
+
+    /// Repeats a one-row state `n` times along the batch axis, copying its cache.
+    ///
+    /// This is how a state primed with a voice once is fanned out over a batch of texts: every
+    /// row starts from the same voice prompt, and copying the cache is much cheaper than running
+    /// the prompt through the backbone again. Unlike `clone`, the result shares no storage with
+    /// `self`.
+    pub fn repeat_batch(&self, n: usize) -> Result<Self> {
+        Ok(Self { flow_lm_state: self.flow_lm_state.repeat_batch(n)? })
+    }
 }
 
 impl<Q: BackendQ> TTSModel<Q> {

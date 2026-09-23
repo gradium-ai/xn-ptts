@@ -132,6 +132,14 @@ pub struct FlowLMState<Q: BackendQ> {
     pub transformer_state: StreamingTransformerState<Q::T, Q::B>,
 }
 
+impl<Q: BackendQ> FlowLMState<Q> {
+    /// Repeats a one-row state `n` times along the batch axis, see
+    /// [`crate::transformer::StreamingMHAState::repeat_batch`].
+    pub fn repeat_batch(&self, n: usize) -> Result<Self> {
+        Ok(Self { transformer_state: self.transformer_state.repeat_batch(n)? })
+    }
+}
+
 impl<Q: BackendQ> FlowLM<Q> {
     pub fn load(
         vb: &Path<Q::B>,

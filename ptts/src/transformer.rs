@@ -37,6 +37,21 @@ impl<T: WithDTypeF, B: Backend> StreamingMHAState<T, B> {
         Ok((keys, values))
     }
 
+    /// Repeats a one-row state `n` times along the batch axis.
+    ///
+    /// The copy shares no storage with `self`, unlike `clone`, so the two can be stepped
+    /// independently. This is how a voice primed once is fanned out over a batch: copying the
+    /// cache is much cheaper than prompting every row with the voice again.
+    pub fn repeat_batch(&self, n: usize) -> Result<Self> {
+        let (b, s, h, d) = self.k_cache.dims4()?;
+        if b != 1 {
+            xn::bail!("repeat_batch: expected a one-row state, got {b} rows")
+        }
+        let k_cache = self.k_cache.expand((n, s, h, d))?.contiguous_always_copy()?;
+        let v_cache = self.v_cache.expand((n, s, h, d))?.contiguous_always_copy()?;
+        Ok(Self { k_cache, v_cache, current_end: self.current_end })
+    }
+
     pub fn materialize_causal_mask(&self, num_queries: usize) -> Result<Tensor<T, B>> {
         let num_keys = self.current_end + num_queries;
         // Upper-left triangular mask (causal)
@@ -232,6 +247,93 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformerState<T, B> {
             Some(LayerAttentionState::FlowLm(mha)) => mha.k_cache.dim(0),
             _ => xn::bail!("batch_size: only a flow-LM state has one"),
         }
+    }
+
+    /// Repeats a one-row flow-LM state `n` times along the batch axis, see
+    /// [`StreamingMHAState::repeat_batch`]. A Mimi state is built for its batch by
+    /// `init_state` instead, so one is refused here.
+    pub fn repeat_batch(&self, n: usize) -> Result<Self> {
+        let layer_states = self
+            .layer_states
+            .iter()
+            .map(|layer| match layer {
+                LayerAttentionState::FlowLm(mha) => {
+                    Ok(LayerAttentionState::FlowLm(mha.repeat_batch(n)?))
+                }
+                LayerAttentionState::Mimi(_) => {
+                    xn::bail!("repeat_batch: only a flow-LM state is batched this way")
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { layer_states })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn one_row_state() -> StreamingMHAState<f32, xn::CpuDevice> {
+        let k_cache = Tensor::zeros((1, 4, 2, 3), &xn::CPU).unwrap();
+        let v_cache = Tensor::zeros((1, 4, 2, 3), &xn::CPU).unwrap();
+        // Two positions filled, with distinct keys and values.
+        let k =
+            Tensor::from_vec((0..12).map(|i| i as f32).collect(), (1, 2, 2, 3), &xn::CPU).unwrap();
+        let v = Tensor::from_vec((100..112).map(|i| i as f32).collect(), (1, 2, 2, 3), &xn::CPU)
+            .unwrap();
+        k_cache.slice_set(&k, 1usize, 0).unwrap();
+        v_cache.slice_set(&v, 1usize, 0).unwrap();
+        StreamingMHAState { k_cache, v_cache, current_end: 2 }
+    }
+
+    #[test]
+    fn repeat_batch_copies_every_row_and_keeps_the_position() {
+        let base = one_row_state();
+        let batched = base.repeat_batch(3).unwrap();
+        assert_eq!(batched.k_cache.dims(), &[3, 4, 2, 3]);
+        assert_eq!(batched.current_end, 2);
+        let row0 = base.k_cache.to_vec().unwrap();
+        let all = batched.k_cache.to_vec().unwrap();
+        for row in 0..3 {
+            assert_eq!(&all[row * row0.len()..(row + 1) * row0.len()], &row0[..], "row {row}");
+        }
+        assert_eq!(batched.v_cache.to_vec().unwrap()[..12], base.v_cache.to_vec().unwrap()[..12]);
+    }
+
+    #[test]
+    fn repeat_batch_shares_no_storage_with_the_original() {
+        let base = one_row_state();
+        let batched = base.repeat_batch(2).unwrap();
+        let ones = Tensor::from_vec(vec![1f32; 12], (2, 1, 2, 3), &xn::CPU).unwrap();
+        batched.k_cache.slice_set(&ones, 1usize, 2).unwrap();
+        let untouched = base.k_cache.to_vec().unwrap();
+        assert!(untouched[12..].iter().all(|&x| x == 0.0), "the original was written through");
+    }
+
+    #[test]
+    fn repeat_batch_refuses_a_state_that_already_has_rows() {
+        let base = one_row_state().repeat_batch(2).unwrap();
+        let err = base.repeat_batch(2).unwrap_err().to_string();
+        assert!(err.contains("one-row"), "{err}");
+    }
+
+    #[test]
+    fn a_transformer_state_repeats_every_layer() {
+        let state = StreamingTransformerState {
+            layer_states: vec![
+                LayerAttentionState::FlowLm(one_row_state()),
+                LayerAttentionState::FlowLm(one_row_state()),
+            ],
+        };
+        assert_eq!(state.batch_size().unwrap(), 1);
+        let batched = state.repeat_batch(4).unwrap();
+        assert_eq!(batched.batch_size().unwrap(), 4);
+        assert_eq!(batched.layer_states.len(), 2);
+
+        let mimi = StreamingTransformerState::<f32, xn::CpuDevice> {
+            layer_states: vec![LayerAttentionState::Mimi(KvCache::new(8))],
+        };
+        assert!(mimi.repeat_batch(2).is_err());
     }
 }
 
