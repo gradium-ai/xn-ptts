@@ -682,7 +682,9 @@ fn plan_chunks<Q: BackendQ>(
 }
 
 /// Chunk indices in groups of at most `batch_size`, all of one group with the same token
-/// count, each group in the order the chunks were planned in.
+/// count. Groups are ordered by their first chunk, and chunks keep their planned order within
+/// a group, so with a `batch_size` of 1 the chunks run in the order `say` runs them and draw
+/// the same noise.
 ///
 /// The rows of a batch must have the same length, see
 /// [`crate::conditioners::LUTConditioner::embed_tokens_batch`], so this is what decides how
@@ -692,10 +694,12 @@ fn equal_length_groups(lens: &[usize], batch_size: usize) -> Vec<Vec<usize>> {
     for (i, &n) in lens.iter().enumerate() {
         by_len.entry(n).or_default().push(i);
     }
-    by_len
+    let mut groups: Vec<Vec<usize>> = by_len
         .into_values()
         .flat_map(|idx| idx.chunks(batch_size).map(<[usize]>::to_vec).collect::<Vec<_>>())
-        .collect()
+        .collect();
+    groups.sort_unstable_by_key(|group| group[0]);
+    groups
 }
 
 /// [`plan_chunks`] over several texts, each chunk tagged with the index of the text it came
@@ -2207,6 +2211,12 @@ mod tests {
     fn a_batch_size_of_one_is_one_chunk_per_group() {
         let groups = equal_length_groups(&[4, 4, 4], 1);
         assert_eq!(groups, vec![vec![0], vec![1], vec![2]]);
+    }
+
+    /// Groups run in plan order, not in order of length: the first chunk always comes first.
+    #[test]
+    fn groups_run_in_plan_order() {
+        assert_eq!(equal_length_groups(&[7, 5, 5], 2), vec![vec![0], vec![1, 2]]);
     }
 
     #[test]
