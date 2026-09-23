@@ -222,6 +222,19 @@ pub struct StreamingTransformerState<T: WithDTypeF, B: Backend> {
     pub layer_states: Vec<LayerAttentionState<T, B>>,
 }
 
+impl<T: WithDTypeF, B: Backend> StreamingTransformerState<T, B> {
+    /// Rows in this state's batch, read off the first layer's cache.
+    ///
+    /// Only a flow-LM state has one: its cache is allocated up front, while a Mimi cache is
+    /// only allocated on its first append, and nothing asks a Mimi state for its batch size.
+    pub fn batch_size(&self) -> Result<usize> {
+        match self.layer_states.first() {
+            Some(LayerAttentionState::FlowLm(mha)) => mha.k_cache.dim(0),
+            _ => xn::bail!("batch_size: only a flow-LM state has one"),
+        }
+    }
+}
+
 // ---- MimiStreamingMultiheadAttention ----
 // Uses KV cache with context window.
 

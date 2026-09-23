@@ -177,9 +177,21 @@ pub struct TTSModel<Q: BackendQ> {
     eos_threshold: f32,
 }
 
+/// The flow-LM's KV cache for one generation, allocated by [`TTSModel::init_flow_lm_state`].
+///
+/// Every row of the batch is at the same position: the prompt and step methods below take
+/// tensors with the state's batch size as their leading dimension and advance every row
+/// together.
 #[derive(Clone, Debug)]
 pub struct TTSState<Q: BackendQ> {
     pub flow_lm_state: FlowLMState<Q>,
+}
+
+impl<Q: BackendQ> TTSState<Q> {
+    /// Rows in this state's batch.
+    pub fn batch_size(&self) -> Result<usize> {
+        self.flow_lm_state.transformer_state.batch_size()
+    }
 }
 
 impl<Q: BackendQ> TTSModel<Q> {
@@ -229,7 +241,7 @@ impl<Q: BackendQ> TTSModel<Q> {
     pub fn prompt_text(&self, state: &mut TTSState<Q>, text_tokens: &[u32]) -> Result<()> {
         let text_embeddings = self.flow_lm.conditioner.embed_tokens(text_tokens)?;
         let dev = text_embeddings.device();
-        let empty_latents = Tensor::zeros((1, 0, self.flow_lm.ldim), dev)?;
+        let empty_latents = Tensor::zeros((text_embeddings.dim(0)?, 0, self.flow_lm.ldim), dev)?;
         self.run_backbone_and_increment(state, &text_embeddings, &empty_latents)?;
         Ok(())
     }
@@ -254,7 +266,7 @@ impl<Q: BackendQ> TTSModel<Q> {
             text_embeddings
         };
         let dev = text_embeddings.device();
-        let empty_latents = Tensor::zeros((1, 0, self.flow_lm.ldim), dev)?;
+        let empty_latents = Tensor::zeros((batch_size, 0, self.flow_lm.ldim), dev)?;
         self.run_backbone_and_increment(state, &text_embeddings, &empty_latents)?;
         Ok(())
     }
@@ -265,8 +277,11 @@ impl<Q: BackendQ> TTSModel<Q> {
             Some(p) => p,
         };
         let dev = empty_text.device();
-        let empty_latents = Tensor::zeros((1, 0, self.flow_lm.ldim), dev)?;
-        self.run_backbone_and_increment(state, empty_text, &empty_latents)?;
+        // The learnt padding is one row; every row of the batch is prompted with it.
+        let batch_size = state.batch_size()?;
+        let empty_text = empty_text.expand((batch_size, 1, empty_text.dim(2)?))?.contiguous()?;
+        let empty_latents = Tensor::zeros((batch_size, 0, self.flow_lm.ldim), dev)?;
+        self.run_backbone_and_increment(state, &empty_text, &empty_latents)?;
         Ok(())
     }
 
@@ -277,8 +292,9 @@ impl<Q: BackendQ> TTSModel<Q> {
         audio_conditioning: &Tensor<Q::T, Q::B>,
     ) -> Result<()> {
         let dev = audio_conditioning.device();
-        let empty_text = Tensor::zeros((1, 0, self.flow_lm.conditioner.dim), dev)?;
-        let empty_latents = Tensor::zeros((1, 0, self.flow_lm.ldim), dev)?;
+        let batch_size = audio_conditioning.dim(0)?;
+        let empty_text = Tensor::zeros((batch_size, 0, self.flow_lm.conditioner.dim), dev)?;
+        let empty_latents = Tensor::zeros((batch_size, 0, self.flow_lm.ldim), dev)?;
         let text_embeddings = Tensor::cat(&[&empty_text, audio_conditioning], 1)?;
         self.run_backbone_and_increment(state, &text_embeddings, &empty_latents)?;
         Ok(())
@@ -294,7 +310,8 @@ impl<Q: BackendQ> TTSModel<Q> {
         rng: &mut impl crate::flow_lm::Rng,
     ) -> Result<(Tensor<Q::T, Q::B>, Vec<bool>)> {
         let dev = backbone_input.device();
-        let empty_text = Tensor::zeros((1, 0, self.flow_lm.conditioner.dim), dev)?;
+        let empty_text =
+            Tensor::zeros((backbone_input.dim(0)?, 0, self.flow_lm.conditioner.dim), dev)?;
 
         let (latent, is_eos) = self.flow_lm.sample_next_latent(
             backbone_input,
@@ -318,7 +335,8 @@ impl<Q: BackendQ> TTSModel<Q> {
         rng: &mut impl crate::flow_lm::Rng,
     ) -> Result<(Tensor<Q::T, Q::B>, Vec<bool>)> {
         let dev = backbone_input.device();
-        let empty_text = Tensor::zeros((1, 0, self.flow_lm.conditioner.dim), dev)?;
+        let empty_text =
+            Tensor::zeros((backbone_input.dim(0)?, 0, self.flow_lm.conditioner.dim), dev)?;
 
         let (latent, is_eos) = self.flow_lm.sample_next_latent_cfg(
             backbone_input,
