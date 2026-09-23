@@ -258,9 +258,17 @@ impl<Q: BackendQ> TTSModel<Q> {
     /// [`crate::conditioners::LUTConditioner::embed_tokens_batch`], and there must be as many
     /// as the state has rows.
     pub fn prompt_text_batch(&self, state: &mut TTSState<Q>, rows: &[&[u32]]) -> Result<()> {
+        let batch_size = state.batch_size()?;
+        if rows.len() != batch_size {
+            xn::bail!(
+                "prompt_text_batch: {} text rows for a state with {batch_size} rows; every row \
+                 of the state is prompted, so the counts must match",
+                rows.len()
+            )
+        }
         let text_embeddings = self.flow_lm.conditioner.embed_tokens_batch(rows)?;
         let dev = text_embeddings.device();
-        let empty_latents = Tensor::zeros((rows.len(), 0, self.flow_lm.ldim), dev)?;
+        let empty_latents = Tensor::zeros((batch_size, 0, self.flow_lm.ldim), dev)?;
         self.run_backbone_and_increment(state, &text_embeddings, &empty_latents)?;
         Ok(())
     }
