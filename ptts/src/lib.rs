@@ -63,7 +63,9 @@
 //!
 //! A server answering many requests for one voice wants
 //! [`synth::Synth::session`], which conditions on the voice prompt once
-//! instead of per request.
+//! instead of per request. Several texts can be synthesized together with
+//! [`synth::Synth::say_batch`], which steps chunks of equal token count
+//! through the flow LM as one batch, sharing the voice.
 //!
 //! Callers that need to drive the loop themselves — a browser build stepping
 //! from an event loop, with no threads to spawn — should use

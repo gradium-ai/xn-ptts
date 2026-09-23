@@ -48,6 +48,11 @@
 //! A server answering many requests for one voice wants [`Synth::session`],
 //! which conditions on the voice prompt once instead of per request.
 //!
+//! Several texts at once go through [`Synth::say_batch`]: chunks of equal
+//! token count are stepped through the flow LM as one batch, `batch_size` rows
+//! at a time, and each text gets its audio back whole. [`SessionOf::say_batch`]
+//! says what is and is not batched.
+//!
 //! Text is normalized before it is tokenized — see [`crate::preprocess`]. Which
 //! language, or [`Normalize::Off`], is a required argument to
 //! [`SynthBuilder::new`]: the model reads normalized text noticeably better,
