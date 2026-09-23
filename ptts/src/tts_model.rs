@@ -177,9 +177,31 @@ pub struct TTSModel<Q: BackendQ> {
     eos_threshold: f32,
 }
 
+/// The flow-LM's KV cache for one generation, allocated by [`TTSModel::init_flow_lm_state`].
+///
+/// Every row of the batch is at the same position: the prompt and step methods below take
+/// tensors with the state's batch size as their leading dimension and advance every row
+/// together.
 #[derive(Clone, Debug)]
 pub struct TTSState<Q: BackendQ> {
     pub flow_lm_state: FlowLMState<Q>,
+}
+
+impl<Q: BackendQ> TTSState<Q> {
+    /// Rows in this state's batch.
+    pub fn batch_size(&self) -> Result<usize> {
+        self.flow_lm_state.transformer_state.batch_size()
+    }
+
+    /// Repeats a one-row state `n` times along the batch axis, copying its cache.
+    ///
+    /// This is how a state primed with a voice once is fanned out over a batch of texts: every
+    /// row starts from the same voice prompt, and copying the cache is much cheaper than running
+    /// the prompt through the backbone again. Unlike `clone`, the result shares no storage with
+    /// `self`.
+    pub fn repeat_batch(&self, n: usize) -> Result<Self> {
+        Ok(Self { flow_lm_state: self.flow_lm_state.repeat_batch(n)? })
+    }
 }
 
 impl<Q: BackendQ> TTSModel<Q> {
@@ -227,9 +249,26 @@ impl<Q: BackendQ> TTSModel<Q> {
 
     /// Run flow LM step with text tokens. Increments state.
     pub fn prompt_text(&self, state: &mut TTSState<Q>, text_tokens: &[u32]) -> Result<()> {
-        let text_embeddings = self.flow_lm.conditioner.embed_tokens(text_tokens)?;
+        self.prompt_text_batch(state, &[text_tokens])
+    }
+
+    /// Run flow LM step with one text prompt per batch row. Increments state.
+    ///
+    /// The rows must have the same number of tokens, see
+    /// [`crate::conditioners::LUTConditioner::embed_tokens_batch`], and there must be as many
+    /// as the state has rows.
+    pub fn prompt_text_batch(&self, state: &mut TTSState<Q>, rows: &[&[u32]]) -> Result<()> {
+        let batch_size = state.batch_size()?;
+        if rows.len() != batch_size {
+            xn::bail!(
+                "prompt_text_batch: {} text rows for a state with {batch_size} rows; every row \
+                 of the state is prompted, so the counts must match",
+                rows.len()
+            )
+        }
+        let text_embeddings = self.flow_lm.conditioner.embed_tokens_batch(rows)?;
         let dev = text_embeddings.device();
-        let empty_latents = Tensor::zeros((1, 0, self.flow_lm.ldim), dev)?;
+        let empty_latents = Tensor::zeros((batch_size, 0, self.flow_lm.ldim), dev)?;
         self.run_backbone_and_increment(state, &text_embeddings, &empty_latents)?;
         Ok(())
     }
@@ -254,7 +293,7 @@ impl<Q: BackendQ> TTSModel<Q> {
             text_embeddings
         };
         let dev = text_embeddings.device();
-        let empty_latents = Tensor::zeros((1, 0, self.flow_lm.ldim), dev)?;
+        let empty_latents = Tensor::zeros((batch_size, 0, self.flow_lm.ldim), dev)?;
         self.run_backbone_and_increment(state, &text_embeddings, &empty_latents)?;
         Ok(())
     }
@@ -265,8 +304,11 @@ impl<Q: BackendQ> TTSModel<Q> {
             Some(p) => p,
         };
         let dev = empty_text.device();
-        let empty_latents = Tensor::zeros((1, 0, self.flow_lm.ldim), dev)?;
-        self.run_backbone_and_increment(state, empty_text, &empty_latents)?;
+        // The learnt padding is one row; every row of the batch is prompted with it.
+        let batch_size = state.batch_size()?;
+        let empty_text = empty_text.expand((batch_size, 1, empty_text.dim(2)?))?.contiguous()?;
+        let empty_latents = Tensor::zeros((batch_size, 0, self.flow_lm.ldim), dev)?;
+        self.run_backbone_and_increment(state, &empty_text, &empty_latents)?;
         Ok(())
     }
 
@@ -277,24 +319,26 @@ impl<Q: BackendQ> TTSModel<Q> {
         audio_conditioning: &Tensor<Q::T, Q::B>,
     ) -> Result<()> {
         let dev = audio_conditioning.device();
-        let empty_text = Tensor::zeros((1, 0, self.flow_lm.conditioner.dim), dev)?;
-        let empty_latents = Tensor::zeros((1, 0, self.flow_lm.ldim), dev)?;
+        let batch_size = audio_conditioning.dim(0)?;
+        let empty_text = Tensor::zeros((batch_size, 0, self.flow_lm.conditioner.dim), dev)?;
+        let empty_latents = Tensor::zeros((batch_size, 0, self.flow_lm.ldim), dev)?;
         let text_embeddings = Tensor::cat(&[&empty_text, audio_conditioning], 1)?;
         self.run_backbone_and_increment(state, &text_embeddings, &empty_latents)?;
         Ok(())
     }
 
     /// Run one autoregressive generation step.
-    /// Returns (next_latent [B, 1, ldim], is_eos).
+    /// Returns (next_latent [B, 1, ldim], is_eos), with one EOS flag per batch row.
     #[allow(clippy::type_complexity)]
     pub fn generate_step(
         &self,
         state: &mut TTSState<Q>,
         backbone_input: &Tensor<Q::T, Q::B>,
         rng: &mut impl crate::flow_lm::Rng,
-    ) -> Result<(Tensor<Q::T, Q::B>, bool)> {
+    ) -> Result<(Tensor<Q::T, Q::B>, Vec<bool>)> {
         let dev = backbone_input.device();
-        let empty_text = Tensor::zeros((1, 0, self.flow_lm.conditioner.dim), dev)?;
+        let empty_text =
+            Tensor::zeros((backbone_input.dim(0)?, 0, self.flow_lm.conditioner.dim), dev)?;
 
         let (latent, is_eos) = self.flow_lm.sample_next_latent(
             backbone_input,
@@ -316,9 +360,10 @@ impl<Q: BackendQ> TTSModel<Q> {
         cfg_coef: f32,
         backbone_input: &Tensor<Q::T, Q::B>,
         rng: &mut impl crate::flow_lm::Rng,
-    ) -> Result<(Tensor<Q::T, Q::B>, bool)> {
+    ) -> Result<(Tensor<Q::T, Q::B>, Vec<bool>)> {
         let dev = backbone_input.device();
-        let empty_text = Tensor::zeros((1, 0, self.flow_lm.conditioner.dim), dev)?;
+        let empty_text =
+            Tensor::zeros((backbone_input.dim(0)?, 0, self.flow_lm.conditioner.dim), dev)?;
 
         let (latent, is_eos) = self.flow_lm.sample_next_latent_cfg(
             backbone_input,

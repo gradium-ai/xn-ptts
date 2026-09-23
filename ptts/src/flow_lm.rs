@@ -132,6 +132,14 @@ pub struct FlowLMState<Q: BackendQ> {
     pub transformer_state: StreamingTransformerState<Q::T, Q::B>,
 }
 
+impl<Q: BackendQ> FlowLMState<Q> {
+    /// Repeats a one-row state `n` times along the batch axis, see
+    /// [`crate::transformer::StreamingMHAState::repeat_batch`].
+    pub fn repeat_batch(&self, n: usize) -> Result<Self> {
+        Ok(Self { transformer_state: self.transformer_state.repeat_batch(n)? })
+    }
+}
+
 impl<Q: BackendQ> FlowLM<Q> {
     pub fn load(
         vb: &Path<Q::B>,
@@ -230,7 +238,7 @@ impl<Q: BackendQ> FlowLM<Q> {
     }
 
     /// Sample next latent using flow matching.
-    /// Returns (next_latent [B, 1, ldim], is_eos [B, 1]).
+    /// Returns (next_latent [B, 1, ldim], is_eos), with one EOS flag per batch row.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn sample_next_latent(
         &self,
@@ -240,7 +248,7 @@ impl<Q: BackendQ> FlowLM<Q> {
         lsd_decode_steps: usize,
         rng: &mut impl Rng,
         eos_threshold: f32,
-    ) -> Result<(Tensor<Q::T, Q::B>, bool)> {
+    ) -> Result<(Tensor<Q::T, Q::B>, Vec<bool>)> {
         let (b, s, _) = sequence.dims3()?;
         let dev = sequence.device();
 
@@ -252,8 +260,7 @@ impl<Q: BackendQ> FlowLM<Q> {
         let transformer_out = transformer_out.reshape((b, self.dim))?;
 
         let eos_logit = self.out_eos.forward(&transformer_out)?;
-        let eos_val = eos_logit.to_vec()?;
-        let is_eos = eos_val[0].to_f32() > eos_threshold;
+        let is_eos = Self::eos_flags(&eos_logit, eos_threshold)?;
         let noise_data: Vec<Q::T> =
             (0..b * self.ldim).map(|_| Q::T::from_f32(rng.sample())).collect();
         let noise = Tensor::from_vec(noise_data, (b, self.ldim), dev)?;
@@ -273,7 +280,7 @@ impl<Q: BackendQ> FlowLM<Q> {
         lsd_decode_steps: usize,
         rng: &mut impl Rng,
         eos_threshold: f32,
-    ) -> Result<(Tensor<Q::T, Q::B>, bool)> {
+    ) -> Result<(Tensor<Q::T, Q::B>, Vec<bool>)> {
         let (b, s, _) = sequence.dims3()?;
         let dev = sequence.device();
 
@@ -289,14 +296,18 @@ impl<Q: BackendQ> FlowLM<Q> {
         let s = Q::T::from_f32(cfg_coef);
         let t_out = t_out.sub(&null_out)?.scale(s)?.add(&null_out)?;
         let eos_logit = self.out_eos.forward(&t_out)?;
-        let eos_val = eos_logit.to_vec()?;
-        let is_eos = eos_val[0].to_f32() > eos_threshold;
+        let is_eos = Self::eos_flags(&eos_logit, eos_threshold)?;
         let noise_data: Vec<Q::T> =
             (0..b * self.ldim).map(|_| Q::T::from_f32(rng.sample())).collect();
         let noise = Tensor::from_vec(noise_data, (b, self.ldim), dev)?;
         let latent = lsd_decode(&self.flow_net, &t_out, &noise, lsd_decode_steps)?;
         let latent = latent.reshape((b, 1, self.ldim))?;
         Ok((latent, is_eos))
+    }
+
+    /// One EOS decision per batch row, from the `[B, 1]` logits of the EOS head.
+    fn eos_flags(eos_logit: &Tensor<Q::T, Q::B>, eos_threshold: f32) -> Result<Vec<bool>> {
+        Ok(eos_logit.to_vec()?.iter().map(|v| v.to_f32() > eos_threshold).collect())
     }
 
     /// Replace NaN values in sequence with bos_emb.

@@ -137,7 +137,7 @@ fn one<Q: BackendQ>(
                 samples += pcm.len();
             }
 
-            if eos.should_stop(is_eos) {
+            if eos.should_stop(is_eos[0]) {
                 break;
             }
             prev_latent = next_latent;

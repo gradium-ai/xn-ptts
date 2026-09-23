@@ -170,6 +170,27 @@ fn session_is_part_of_the_public_api() {
     }
 }
 
+/// Batched synthesis is reachable from every layer: the erased types a CLI
+/// holds, and the generic ones a frontend with a fixed weight format holds.
+#[test]
+fn say_batch_is_part_of_the_public_api() {
+    fn _erased(tts: &ptts::synth::Synth, session: &ptts::synth::Session) -> ptts::Result<()> {
+        let texts = ["First.", "Second."];
+        let _: Vec<Vec<f32>> = tts.say_batch(&texts, 2)?;
+        let _: Vec<Vec<f32>> = tts.say_batch_with(&texts, &SpeechOptions::default(), 2)?;
+        let _: Vec<Vec<f32>> = session.say_batch(&texts, 2)?;
+        Ok(())
+    }
+    fn _generic<Q: xn::BackendQ>(
+        tts: &ptts::synth::SynthOf<Q>,
+        session: &ptts::synth::SessionOf<Q>,
+    ) -> ptts::Result<()> {
+        let _ = tts.say_batch(&["One."], 1)?;
+        let _ = session.say_batch(&["One."], 1)?;
+        Ok(())
+    }
+}
+
 #[test]
 fn a_generic_session_is_nameable_too() {
     // `ptts-wasm` and anything else that fixes its weight format at compile

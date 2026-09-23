@@ -300,7 +300,7 @@ impl Model {
 
         // `should_stop` is called after the frame has gone to the decoder: the EOS frame
         // itself is part of the output.
-        let done = state.eos.should_stop(is_eos);
+        let done = state.eos.should_stop(is_eos[0]);
 
         state.prev_latent = next_latent;
         state.step += 1;
