@@ -239,9 +239,18 @@ impl<Q: BackendQ> TTSModel<Q> {
 
     /// Run flow LM step with text tokens. Increments state.
     pub fn prompt_text(&self, state: &mut TTSState<Q>, text_tokens: &[u32]) -> Result<()> {
-        let text_embeddings = self.flow_lm.conditioner.embed_tokens(text_tokens)?;
+        self.prompt_text_batch(state, &[text_tokens])
+    }
+
+    /// Run flow LM step with one text prompt per batch row. Increments state.
+    ///
+    /// The rows must have the same number of tokens, see
+    /// [`crate::conditioners::LUTConditioner::embed_tokens_batch`], and there must be as many
+    /// as the state has rows.
+    pub fn prompt_text_batch(&self, state: &mut TTSState<Q>, rows: &[&[u32]]) -> Result<()> {
+        let text_embeddings = self.flow_lm.conditioner.embed_tokens_batch(rows)?;
         let dev = text_embeddings.device();
-        let empty_latents = Tensor::zeros((text_embeddings.dim(0)?, 0, self.flow_lm.ldim), dev)?;
+        let empty_latents = Tensor::zeros((rows.len(), 0, self.flow_lm.ldim), dev)?;
         self.run_backbone_and_increment(state, &text_embeddings, &empty_latents)?;
         Ok(())
     }
