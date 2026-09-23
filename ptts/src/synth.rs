@@ -524,6 +524,39 @@ impl<Q: BackendQ> SynthOf<Q> {
         self.session_at(&settings, seq_budget)?.stream_chunks(chunks, rng)
     }
 
+    /// Synthesize several texts at once with the default settings, `batch_size` rows at a
+    /// time. See [`SessionOf::say_batch`].
+    pub fn say_batch(&self, texts: &[&str], batch_size: usize) -> Result<Vec<Vec<f32>>> {
+        self.say_batch_with(texts, &SpeechOptions::default(), batch_size)
+    }
+
+    /// Synthesize several texts at once with per-request overrides, `batch_size` rows at a
+    /// time. See [`SessionOf::say_batch`].
+    pub fn say_batch_with(
+        &self,
+        texts: &[&str],
+        opts: &SpeechOptions,
+        batch_size: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        let settings = resolve(&self.defaults, opts)?;
+        let plans = plan_batch(
+            &self.model,
+            self.cfg.mimi.frame_rate,
+            texts,
+            settings.max_tokens_per_chunk,
+            self.normalize,
+        )?;
+        // As for a one-shot `say`: a session sized to these texts, dropped afterwards.
+        let seq_budget = plans.iter().map(|(_, c)| c.seq_budget).max().unwrap_or(0);
+        let rng = Box::new(NormalRng::new(settings.temperature, settings.seed)?);
+        self.session_at(&settings, seq_budget)?.say_chunks_batched(
+            texts.len(),
+            plans,
+            batch_size,
+            rng,
+        )
+    }
+
     /// Build the state every chunk starts from: allocated, then conditioned on
     /// the voice. Cloning it per chunk is much cheaper than re-priming.
     #[allow(clippy::type_complexity)]
@@ -1778,6 +1811,12 @@ impl Session {
         dispatch_session!(&self.0, |s| s.stream_seeded(text, seed))
     }
 
+    /// Synthesize several texts at once, `batch_size` rows at a time — see
+    /// [`SessionOf::say_batch`].
+    pub fn say_batch(&self, texts: &[&str], batch_size: usize) -> Result<Vec<Vec<f32>>> {
+        dispatch_session!(&self.0, |s| s.say_batch(texts, batch_size))
+    }
+
     /// Tokenize `text` as given — see [`SessionOf::tokenize`].
     pub fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
         dispatch_session!(&self.0, |s| s.tokenize(text))
@@ -1862,6 +1901,22 @@ impl Synth {
     /// Start generating `text`, yielding PCM as the decoder produces it.
     pub fn stream(&self, text: &str) -> Result<SpeechStream> {
         dispatch!(&self.0, |s| s.stream(text))
+    }
+
+    /// Synthesize several texts at once, `batch_size` rows at a time — see
+    /// [`SessionOf::say_batch`].
+    pub fn say_batch(&self, texts: &[&str], batch_size: usize) -> Result<Vec<Vec<f32>>> {
+        dispatch!(&self.0, |s| s.say_batch(texts, batch_size))
+    }
+
+    /// As [`Self::say_batch`], with per-request overrides.
+    pub fn say_batch_with(
+        &self,
+        texts: &[&str],
+        opts: &SpeechOptions,
+        batch_size: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        dispatch!(&self.0, |s| s.say_batch_with(texts, opts, batch_size))
     }
 
     /// Start generating `text` with per-request overrides.
