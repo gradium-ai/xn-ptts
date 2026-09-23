@@ -25,3 +25,13 @@ tmp/
 *.wav
 .DS_Store
 .claude
+
+# maturin drops the built extension into the python source dir so the mixed
+# layout is importable in place; it is a build artifact, not a source file.
+ptts-pyo3/python/ptts/*.so
+ptts-pyo3/python/ptts/*.pyd
+ptts-pyo3/python/ptts/*.dylib
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
