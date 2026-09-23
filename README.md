@@ -44,23 +44,6 @@ tts.save("out.wav", "Hello world")
 
 The first run downloads the checkpoint (~240 MB) from the Hugging Face Hub. The published one is gated — accept its terms on [`kyutai/pocket-tts`](https://huggingface.co/kyutai/pocket-tts) once, then `huggingface-cli login` or set `HF_TOKEN`. See [Models, voices and languages](#models-voices-and-languages).
 
-## Why this runtime
-
-Most open TTS ships as a PyTorch research repo, and every fast or portable way to run it — ONNX, browser, a server — is a separate port somebody else maintains. This is the other way round: **one Rust implementation, compiled to every surface**, so a model change lands everywhere at once and nothing has to be re-exported.
-
-What that means at install time, from the packages' own PyPI metadata (September 2026):
-
-| | **`ptts`** | `kokoro` 0.9.4 | `neutts` 1.4.1 |
-|---|---|---|---|
-| Runtime dependencies | **`numpy`** | `torch`, `transformers`, `misaki`, `huggingface-hub`, `loguru` + the **`espeak-ng` binary** | `torch`, `torchaudio`, `transformers`, `librosa`, `phonemizer`, `neucodec`, `resemble-perth`, `soundfile` |
-| Python versions | **≥ 3.9** | ≥ 3.10, **< 3.13** | ≥ 3.10, **< 3.14** |
-| Install footprint | a wheel and a checkpoint | ~2 GB before the checkpoint | ~2 GB before the checkpoint |
-| Embeddable without Python | **`cargo add ptts`** | — | — |
-| Browser | **first-party WASM** | community port | — |
-| Server | **first-party WebSocket** | community project | — |
-
-The runtime is the same ~4 MB of compiled Rust whether you call it from Python, a shell, a browser tab or another Rust crate.
-
 ## What you get
 
 - **24 kHz speech** from a flow-matching language model and the Mimi neural codec, streamed frame by frame as it is generated.
