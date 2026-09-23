@@ -14,7 +14,7 @@
 //! use ptts::preprocess::{Lang, Normalize};
 //!
 //! let tts = Synth::builder(
-//!     TTSConfig::v202601(0.5),
+//!     TTSConfig::v202601(0.3),
 //!     "model/model.safetensors",
 //!     Normalize::For(Lang::En),
 //! )
@@ -32,7 +32,7 @@
 //!
 //! ```no_run
 //! # fn main() -> xn::Result<()> {
-//! # let cfg = ptts::tts_model::TTSConfig::v202601(0.5);
+//! # let cfg = ptts::tts_model::TTSConfig::v202601(0.3);
 //! # let norm = ptts::preprocess::Normalize::For(ptts::preprocess::Lang::En);
 //! # let tts = ptts::synth::Synth::builder(cfg, "model/model.safetensors", norm)
 //! #     .tokenizer_file("model/tokenizer.json")
@@ -1114,7 +1114,7 @@ impl SynthBuilder {
     /// use ptts::tts_model::TTSConfig;
     ///
     /// let tts = SynthBuilder::new(
-    ///     TTSConfig::v202601(0.5),
+    ///     TTSConfig::v202601(0.3),
     ///     "model/model.safetensors",
     ///     Normalize::For(Lang::De),
     /// )
@@ -1132,7 +1132,7 @@ impl SynthBuilder {
             device: DeviceKind::Auto,
             quant: Quant::F32,
             tokenizer: None,
-            temperature: 0.5,
+            temperature: 0.3,
             seed: 4242424242424242,
             cfg_coef: None,
             eos_threshold: None,

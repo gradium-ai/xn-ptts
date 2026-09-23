@@ -210,7 +210,7 @@ struct Tts {
 
 #[pymethods]
 impl Tts {
-    /// `TTS(*, lang, config=None, device=None, quant=None, voice=None, temperature=0.5, seed=..., cfg_coef=None, eos_threshold=None)`
+    /// `TTS(*, lang, config=None, device=None, quant=None, voice=None, temperature=0.3, seed=..., cfg_coef=None, eos_threshold=None)`
     ///
     /// `lang` is required and keyword-only: the language text is normalized as
     /// before it is tokenized, one of `"en"`, `"fr"`, `"de"`, `"es"` or
@@ -224,7 +224,7 @@ impl Tts {
         device = None,
         quant = None,
         voice = None,
-        temperature = 0.5,
+        temperature = 0.3,
         seed = 4242424242424242,
         cfg_coef = None,
         eos_threshold = None,

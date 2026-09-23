@@ -34,7 +34,7 @@ struct Args {
     voice: Option<String>,
 
     /// Sampling temperature.
-    #[arg(short, long, default_value_t = 0.5)]
+    #[arg(short, long, default_value_t = 0.3)]
     temperature: f32,
 
     /// Sampling seed.

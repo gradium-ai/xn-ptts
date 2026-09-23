@@ -48,7 +48,7 @@ def main() -> None:
         "-o", "--output", default="out.wav", help="Output WAV path (default: out.wav)"
     )
     parser.add_argument(
-        "--temperature", type=float, default=0.5, help="Sampling temperature"
+        "--temperature", type=float, default=0.3, help="Sampling temperature"
     )
     parser.add_argument(
         "--seed", type=int, default=4242424242424242, help="Random seed"

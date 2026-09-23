@@ -30,7 +30,7 @@ struct Args {
     #[arg(long)]
     voice_dir: Option<std::path::PathBuf>,
 
-    #[arg(long, default_value_t = 0.4)]
+    #[arg(long, default_value_t = 0.3)]
     temperature: f32,
 
     #[arg(long, default_value_t = 4242424242424242)]
