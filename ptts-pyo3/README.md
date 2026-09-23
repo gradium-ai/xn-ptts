@@ -24,7 +24,7 @@ resampler — is a Rust extension inside this wheel. There is nothing to install
 |---|---|---|
 | Runtime dependencies | `numpy` | `torch`, `transformers`, and a phonemizer binary |
 | Install size | a wheel and a checkpoint | ~2 GB before the checkpoint |
-| Python versions | 3.9+ | usually capped two releases back |
+| Python versions | 3.9+, one abi3 wheel per platform | usually capped two releases back |
 | System packages | none | `espeak-ng` or `phonemizer`, per platform |
 
 ## Using it
