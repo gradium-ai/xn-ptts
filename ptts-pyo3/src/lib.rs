@@ -624,7 +624,7 @@ fn build_info(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     Ok(info)
 }
 
-#[pymodule(name = "ptts")]
+#[pymodule(name = "_ptts")]
 fn ptts_(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<Tts>()?;

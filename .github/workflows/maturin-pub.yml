@@ -3,7 +3,8 @@
 #
 #    maturin generate-ci github -m ptts-pyo3/Cargo.toml
 #
-# One thing is hand-added and a regeneration would drop it: every job deletes
+# Two things are hand-added and a regeneration would drop them: the `test-wheel` step, which
+# installs the wheel a job just built and runs pytest against it; and every job deleting
 # `.cargo/config.toml` and sets `RUSTFLAGS` itself. That file pins `target-cpu=native`, which
 # in a published wheel means "whatever CPU the runner happened to have" -- a wheel that can
 # fault with SIGILL on someone's older machine.
@@ -53,6 +54,7 @@ jobs:
           manylinux: auto
         env:
           RUSTFLAGS: -C target-cpu=x86-64-v3
+      - uses: ./.github/actions/test-wheel
       - name: Upload wheels
         uses: actions/upload-artifact@v7
         with:
@@ -83,6 +85,8 @@ jobs:
           manylinux: musllinux_1_2
         env:
           RUSTFLAGS: -C target-cpu=x86-64-v3
+      # No test step: these are musl wheels and the runner is glibc, so there is no
+      # interpreter here that can install one.
       - name: Upload wheels
         uses: actions/upload-artifact@v7
         with:
@@ -113,6 +117,7 @@ jobs:
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
         env:
           RUSTFLAGS: -C target-cpu=x86-64-v3
+      - uses: ./.github/actions/test-wheel
       - name: Upload wheels
         uses: actions/upload-artifact@v7
         with:
@@ -142,6 +147,7 @@ jobs:
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
         env:
           RUSTFLAGS: "-C target-cpu=apple-m1"
+      - uses: ./.github/actions/test-wheel
       - name: Upload wheels
         uses: actions/upload-artifact@v7
         with:

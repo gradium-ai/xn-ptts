@@ -12,8 +12,23 @@ classifiers = [
 dependencies = ["numpy"]
 dynamic = ["version"]
 
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
 [tool.maturin]
 # No `features` key on purpose. A `--features` on the maturin command line *replaces* this
 # list rather than adding to it, so the macOS wheel job's `--features accelerate` was quietly
 # dropping `pyo3/extension-module`. It is a non-optional feature of the `pyo3` dependency in
 # Cargo.toml instead, where nothing on a command line can take it away.
+# A mixed layout: `python/ptts/` is the package, and the Rust cdylib lands inside it as
+# `ptts._ptts`. A pure-Rust layout would have nowhere to put `py.typed`.
+python-source = "python"
+module-name = "ptts._ptts"
+# sdist only: a source build should be testable, but the tests have no business in the wheel.
+include = [{ path = "tests/**/*.py", format = "sdist" }]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "checkpoint: needs model weights; deselect with -m 'not checkpoint'",
+]

@@ -9,7 +9,9 @@ categories.workspace = true
 license.workspace = true
 
 [lib]
-name = "ptts"
+# The package is `ptts`; this is the extension inside it, re-exported by
+# `python/ptts/__init__.py`. A pure-Rust layout has nowhere to put `py.typed`.
+name = "_ptts"
 crate-type = ["cdylib"]
 
 [dependencies]
