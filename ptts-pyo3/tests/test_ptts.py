@@ -8,6 +8,8 @@ deselected by default -- see `pyproject.toml`.
 from __future__ import annotations
 
 import ast
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -118,6 +120,77 @@ def test_nothing_is_downloaded_before_the_arguments_are_checked():
         with pytest.raises(Exception):
             ptts.TTS(**kwargs, lang="en")
     assert time.monotonic() - start < 5.0
+
+
+# --- the module CLI --------------------------------------------------------------------------
+
+
+def _cli(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "ptts", *args], capture_output=True, text=True, timeout=120
+    )
+
+
+def test_cli_reports_its_version():
+    out = _cli("--version")
+    assert out.returncode == 0, out.stderr
+    assert ptts.__version__ in out.stdout
+
+
+def test_cli_prints_build_info():
+    out = _cli("--build-info")
+    assert out.returncode == 0, out.stderr
+    assert "version:" in out.stdout
+
+
+def test_cli_with_nothing_to_say_explains_itself():
+    out = _cli("--lang", "en")
+    assert out.returncode != 0
+    assert "nothing to say" in out.stderr
+
+
+def test_cli_requires_a_language():
+    # `pocket_tts` and `ptts-ws-server` require `--lang` too: the spoken forms of `@`, `+`
+    # and `=` differ per language, so there is nothing safe to guess.
+    out = _cli("hello world")
+    assert out.returncode != 0
+    assert "--lang is required" in out.stderr
+
+
+def test_build_info_needs_no_language():
+    # The one flag that never builds a model, so argparse must not demand a language for it.
+    out = _cli("--build-info")
+    assert out.returncode == 0, out.stderr
+
+
+def test_cli_reports_a_bad_argument_without_a_traceback():
+    out = _cli("hello", "--lang", "en", "--quant", "q3k")
+    assert out.returncode == 1
+    assert "Traceback" not in out.stderr
+    assert "q3k" in out.stderr
+
+
+def test_the_wheel_installs_a_ptts_command():
+    # The console script is what `uvx ptts` and `pipx run ptts` invoke, and it is the only
+    # part of the package that `import ptts` does not exercise.
+    import shutil
+    import sysconfig
+
+    # `sysconfig` for the usual case, `which` for installs that land somewhere else --
+    # `pip install --user`, or a distro python that redirects the scheme.
+    scripts = Path(sysconfig.get_path("scripts"))
+    exe = scripts / ("ptts.exe" if sys.platform == "win32" else "ptts")
+    found = str(exe) if exe.is_file() else shutil.which("ptts")
+    assert found, f"no console script in {scripts}, and none on PATH"
+    exe = Path(found)
+
+    out = subprocess.run([str(exe), "--version"], capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr
+    assert ptts.__version__ in out.stdout
+
+    # It names itself, not `__main__.py`, in its own usage line.
+    usage = subprocess.run([str(exe), "--help"], capture_output=True, text=True, timeout=120)
+    assert usage.stdout.startswith("usage: ptts "), usage.stdout.splitlines()[:1]
 
 
 # --- needs a checkpoint ----------------------------------------------------------------------
