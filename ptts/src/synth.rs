@@ -643,6 +643,44 @@ fn plan_chunks<Q: BackendQ>(
     Ok(chunks)
 }
 
+/// Chunk indices in groups of at most `batch_size`, all of one group with the same token
+/// count, each group in the order the chunks were planned in.
+///
+/// The rows of a batch must have the same length, see
+/// [`crate::conditioners::LUTConditioner::embed_tokens_batch`], so this is what decides how
+/// much of a `say_batch` call is actually batched.
+fn equal_length_groups(lens: &[usize], batch_size: usize) -> Vec<Vec<usize>> {
+    let mut by_len: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (i, &n) in lens.iter().enumerate() {
+        by_len.entry(n).or_default().push(i);
+    }
+    by_len
+        .into_values()
+        .flat_map(|idx| idx.chunks(batch_size).map(<[usize]>::to_vec).collect::<Vec<_>>())
+        .collect()
+}
+
+/// [`plan_chunks`] over several texts, each chunk tagged with the index of the text it came
+/// from. The order is the order of the texts, then of their chunks.
+fn plan_batch<Q: BackendQ>(
+    model: &TTSModel<Q>,
+    frame_rate: f64,
+    texts: &[&str],
+    max_tokens_per_chunk: usize,
+    normalize: Normalize,
+) -> Result<Vec<(usize, ChunkPlan)>> {
+    if texts.is_empty() {
+        return Err(Error::invalid_argument("nothing to synthesize: no texts"));
+    }
+    let mut plans = Vec::new();
+    for (owner, text) in texts.iter().enumerate() {
+        for chunk in plan_chunks(model, frame_rate, text, max_tokens_per_chunk, normalize)? {
+            plans.push((owner, chunk));
+        }
+    }
+    Ok(plans)
+}
+
 /// A voice primed once, ready to generate repeatedly.
 ///
 /// # One generation at a time
@@ -753,6 +791,107 @@ impl<Q: BackendQ> SessionOf<Q> {
         self.stream_chunks(chunks, rng)
     }
 
+    /// Synthesize several texts at once, returning one waveform per text.
+    ///
+    /// Each text is split into chunks as [`Self::say`] would split it. Chunks with the same
+    /// number of tokens are then stepped through the flow LM together, `batch_size` rows at a
+    /// time, and every text's audio is reassembled from its chunks. How much of the work is
+    /// batched depends on the mix of lengths: the rows of a batch must have the same token
+    /// count, because every row of a state sits at the same position and the model has no
+    /// inert token to pad a shorter row with. Its learnt padding embedding changes what it
+    /// says, so it is not used.
+    ///
+    /// A row generates what it would on its own, up to the float rounding of the batched
+    /// matmuls, which the autoregressive loop amplifies over an utterance as a change of CPU
+    /// would. The rows share the session's voice and one noise stream, so the seed reproduces
+    /// a batch as a whole rather than each row on its own. Each row has its own KV cache of the
+    /// session's budget, so memory grows linearly with `batch_size`.
+    ///
+    /// The whole call runs on the calling thread, unlike [`Self::stream`], and counts as the
+    /// session's one generation in flight while it does.
+    pub fn say_batch(&self, texts: &[&str], batch_size: usize) -> Result<Vec<Vec<f32>>> {
+        let plans = plan_batch(
+            &self.model,
+            self.frame_rate,
+            texts,
+            self.max_tokens_per_chunk,
+            self.normalize,
+        )?;
+        let rng = Box::new(NormalRng::new(self.temperature, self.seed)?);
+        self.say_chunks_batched(texts.len(), plans, batch_size, rng)
+    }
+
+    /// Generate every planned chunk, in groups of up to `batch_size` chunks of equal token
+    /// count, and hand each text its PCM in chunk order.
+    ///
+    /// The single place batched generation is driven from, as [`Self::stream_chunks`] is for
+    /// streaming.
+    fn say_chunks_batched(
+        &self,
+        num_texts: usize,
+        plans: Vec<(usize, ChunkPlan)>,
+        batch_size: usize,
+        mut rng: Box<dyn crate::flow_lm::Rng + Send>,
+    ) -> Result<Vec<Vec<f32>>> {
+        if batch_size == 0 {
+            return Err(Error::invalid_argument("batch_size must be at least 1"));
+        }
+        let needed = plans
+            .iter()
+            .map(|(_, c)| self.prompt_len + c.tokens.len() + c.frame_budget)
+            .max()
+            .unwrap_or(0);
+        if needed > self.seq_budget {
+            return Err(Error::SeqBudgetExceeded { needed, budget: self.seq_budget });
+        }
+        let _in_flight = self.claim()?;
+        let ldim = self.model.flow_lm.ldim;
+        let (owners, chunks): (Vec<usize>, Vec<ChunkPlan>) = plans.into_iter().unzip();
+        let lens: Vec<usize> = chunks.iter().map(|c| c.tokens.len()).collect();
+        // Groups run out of order, so each chunk's audio is parked by its index and the texts
+        // are assembled in chunk order afterwards.
+        let mut parts: Vec<Vec<f32>> = vec![Vec::new(); chunks.len()];
+        for group in equal_length_groups(&lens, batch_size) {
+            let rows: Vec<&ChunkPlan> = group.iter().map(|&i| &chunks[i]).collect();
+            let latents = run_backbone_batch(
+                &self.model,
+                &rows,
+                &self.base,
+                self.cfg_base.as_ref(),
+                &mut rng,
+                ldim,
+            )?;
+            for (&i, row) in group.iter().zip(decode_rows(&self.model, &latents)?) {
+                parts[i] = row;
+            }
+        }
+        let mut pcm = vec![Vec::new(); num_texts];
+        for (owner, part) in owners.iter().zip(&parts) {
+            pcm[*owner].extend_from_slice(part);
+        }
+        Ok(pcm)
+    }
+
+    /// Mark a generation as in flight, or fail if one already is. See the note on this type.
+    fn claim(&self) -> Result<InFlight> {
+        if self
+            .in_flight
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::Acquire,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return Err(Error::busy(
+                "a generation is already in flight on this session; finish or drop that \
+                 SpeechStream first, or build a second session",
+            ));
+        }
+        Ok(InFlight(Arc::clone(&self.in_flight)))
+    }
+
     /// Tokenize `text` as given, with none of the preparation [`Self::stream`]
     /// does first — no [`prepare_text_prompt`], no sentence splitting.
     ///
@@ -803,22 +942,7 @@ impl<Q: BackendQ> SessionOf<Q> {
         }
         // Claimed before anything is cloned: the state clone shares its KV
         // storage, so a second generation would write into the same buffers.
-        if self
-            .in_flight
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::Acquire,
-                std::sync::atomic::Ordering::Relaxed,
-            )
-            .is_err()
-        {
-            return Err(Error::busy(
-                "a generation is already in flight on this session; finish or drop that \
-                 SpeechStream first, or build a second session",
-            ));
-        }
-        let in_flight = InFlight(Arc::clone(&self.in_flight));
+        let in_flight = self.claim()?;
 
         // Each request starts from the primed state rather than re-conditioning
         // on the voice.
@@ -997,6 +1121,150 @@ fn run_backbone<Q: BackendQ>(
         }
     }
     Ok(())
+}
+
+/// The autoregressive loop over a batch: one chunk per row, all of the same token count, every
+/// row stepped together.
+///
+/// Returns each row's latents as `[1, frames, ldim]`, cut at that row's own stop. The rows share
+/// one KV cache, so a row that has stopped keeps being stepped until the last one does; the
+/// frames it produces meanwhile are dropped.
+///
+/// The rows also share `rng`, so a row's noise depends on what it was batched with: a seed
+/// reproduces the batch as a whole, not any one row on its own.
+fn run_backbone_batch<Q: BackendQ>(
+    model: &TTSModel<Q>,
+    chunks: &[&ChunkPlan],
+    base_state: &TTSState<Q>,
+    cfg_base: Option<&(f32, TTSState<Q>)>,
+    rng: &mut Box<dyn crate::flow_lm::Rng + Send>,
+    ldim: usize,
+) -> Result<Vec<Tensor<Q::T, Q::B>>> {
+    let device = model.device().clone();
+    let rows = chunks.len();
+    let mut state = base_state.repeat_batch(rows)?;
+    let tokens: Vec<&[u32]> = chunks.iter().map(|c| c.tokens.as_slice()).collect();
+    model.prompt_text_batch(&mut state, &tokens)?;
+    let mut cfg_state = match cfg_base {
+        None => None,
+        Some((coef, null_base)) => {
+            let mut null_state = null_base.repeat_batch(rows)?;
+            model.prompt_text_null(&mut null_state)?;
+            Some((*coef, null_state))
+        }
+    };
+
+    // A NaN latent marks the start of every row's sequence.
+    let nan = vec![f32::NAN; rows * ldim];
+    let mut prev: Tensor<Q::T, Q::B> =
+        Tensor::from_vec(nan, (rows, 1, ldim), &device)?.to::<Q::T>()?;
+    let mut stops = BatchStops::new(chunks);
+    let mut frames = Vec::new();
+
+    while !stops.all_stopped() {
+        let (next, is_eos) = match cfg_state.as_mut() {
+            Some((coef, null_state)) => {
+                model.generate_step_cfg(&mut state, null_state, *coef, &prev, rng)?
+            }
+            None => model.generate_step(&mut state, &prev, rng)?,
+        };
+        frames.push(next.clone());
+        stops.record(&is_eos);
+        prev = next;
+    }
+
+    // [rows, frames, ldim], then each row cut at its own stop.
+    let all = Tensor::cat(&frames.iter().collect::<Vec<_>>(), 1)?;
+    (0..rows)
+        .map(|row| Ok(all.narrow(0, row..row + 1)?.narrow(1, 0..stops.kept[row])?.contiguous()?))
+        .collect()
+}
+
+/// Decodes a batch of latent rows, `[1, frames, ldim]` each, to one PCM vector per row.
+///
+/// One Mimi call over the batch, with the shorter rows padded to the longest. The codec is
+/// causal, so the padding cannot reach back into a row's real frames, and each row's audio is
+/// cut at its own frame count afterwards.
+fn decode_rows<Q: BackendQ>(
+    model: &TTSModel<Q>,
+    latents: &[Tensor<Q::T, Q::B>],
+) -> Result<Vec<Vec<f32>>> {
+    let frames = latents.iter().map(|l| l.dim(1)).collect::<xn::Result<Vec<_>>>()?;
+    let longest = frames.iter().copied().max().unwrap_or(0);
+    let padded = latents
+        .iter()
+        .zip(&frames)
+        .map(
+            |(l, &n)| {
+                if n == longest { Ok(l.clone()) } else { l.pad_with_zeros(1, 0, longest - n) }
+            },
+        )
+        .collect::<xn::Result<Vec<_>>>()?;
+    let batch = Tensor::cat(&padded.iter().collect::<Vec<_>>(), 0)?;
+    let mut mimi_state = model.init_mimi_state(latents.len())?;
+    let audio = model.decode_latent(&batch, &mut mimi_state)?;
+    let samples = audio.dim(2)?;
+    if !samples.is_multiple_of(longest) {
+        return Err(Error::Tensor(xn::Error::msg(format!(
+            "the decoder produced {samples} samples for {longest} frames, which is not a whole \
+             number per frame"
+        ))));
+    }
+    let per_frame = samples / longest;
+    frames
+        .iter()
+        .enumerate()
+        .map(|(row, &n)| {
+            Ok(audio
+                .narrow(0, row..row + 1)?
+                .narrow(2, 0..per_frame * n)?
+                .contiguous()?
+                .to_vec()?)
+        })
+        .collect()
+}
+
+/// Per-row stopping for a batched generation: each row runs its own [`EosPolicy`] against its
+/// own frame budget, and the batch runs until every row has stopped.
+///
+/// Kept apart from the tensor work so the bookkeeping can be checked against the single-row
+/// loop without a model.
+struct BatchStops {
+    eos: Vec<EosPolicy>,
+    budgets: Vec<usize>,
+    /// Frames each row keeps; frozen once that row has stopped.
+    kept: Vec<usize>,
+    stopped: Vec<bool>,
+}
+
+impl BatchStops {
+    fn new(chunks: &[&ChunkPlan]) -> Self {
+        Self {
+            eos: chunks.iter().map(|c| EosPolicy::new(c.frames_after_eos)).collect(),
+            budgets: chunks.iter().map(|c| c.frame_budget).collect(),
+            kept: vec![0; chunks.len()],
+            stopped: vec![false; chunks.len()],
+        }
+    }
+
+    fn all_stopped(&self) -> bool {
+        self.stopped.iter().all(|&s| s)
+    }
+
+    /// Records the frame just generated, with each row's EOS flag. Call once per frame, after
+    /// the frame has been produced: the EOS frame itself is part of the output, as in the
+    /// single-row loop.
+    fn record(&mut self, is_eos: &[bool]) {
+        for (row, &eos_now) in is_eos.iter().enumerate() {
+            if self.stopped[row] {
+                continue;
+            }
+            self.kept[row] += 1;
+            if self.eos[row].should_stop(eos_now) || self.kept[row] >= self.budgets[row] {
+                self.stopped[row] = true;
+            }
+        }
+    }
 }
 
 /// PCM chunks from a running generation.
@@ -1800,6 +2068,85 @@ mod tests {
             flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok(),
             "and the next generation must be able to claim it"
         );
+    }
+
+    /// What the single-row loop in `run_backbone` emits for one chunk: every frame up to the
+    /// budget, or up to EOS plus the tail.
+    fn single_row_frames(eos_at: Option<usize>, frames_after_eos: usize, budget: usize) -> usize {
+        let mut eos = EosPolicy::new(frames_after_eos);
+        let mut emitted = 0;
+        for step in 0..budget {
+            emitted += 1;
+            if eos.should_stop(eos_at == Some(step)) {
+                break;
+            }
+        }
+        emitted
+    }
+
+    fn chunk(frame_budget: usize, frames_after_eos: usize) -> ChunkPlan {
+        ChunkPlan { tokens: vec![1], frame_budget, frames_after_eos, seq_budget: 0 }
+    }
+
+    /// Each row of a batch keeps exactly the frames it would have produced on its own, whatever
+    /// the other rows do.
+    #[test]
+    fn batch_stops_match_the_single_row_loop_per_row() {
+        let rows = [
+            (Some(3usize), 1usize, 20usize), // EOS early, short tail
+            (Some(3), 3, 20),                // same EOS, long tail
+            (None, 1, 7),                    // never EOS: capped by its own budget
+            (Some(30), 1, 10),               // EOS after its budget: capped too
+            (Some(0), 3, 20),                // EOS on the first frame
+        ];
+        let chunks: Vec<ChunkPlan> = rows.iter().map(|&(_, tail, b)| chunk(b, tail)).collect();
+        let mut stops = BatchStops::new(&chunks.iter().collect::<Vec<_>>());
+        let mut steps = 0;
+        while !stops.all_stopped() {
+            let flags: Vec<bool> = rows.iter().map(|&(at, _, _)| at == Some(steps)).collect();
+            stops.record(&flags);
+            steps += 1;
+        }
+        for (row, &(eos_at, tail, budget)) in rows.iter().enumerate() {
+            assert_eq!(stops.kept[row], single_row_frames(eos_at, tail, budget), "row {row}");
+        }
+        // The batch ran exactly as long as its slowest row needed.
+        assert_eq!(steps, stops.kept.iter().copied().max().unwrap());
+    }
+
+    #[test]
+    fn a_stopped_row_ignores_later_flags() {
+        let chunks = [chunk(10, 1), chunk(10, 1)];
+        let mut stops = BatchStops::new(&chunks.iter().collect::<Vec<_>>());
+        stops.record(&[true, false]);
+        stops.record(&[false, false]); // row 0's tail frame
+        assert!(!stops.all_stopped());
+        stops.record(&[true, false]); // a late EOS on a stopped row changes nothing
+        assert_eq!(stops.kept, [2, 3]);
+    }
+
+    /// Every chunk lands in exactly one group, a group never mixes token counts or exceeds
+    /// the batch size, and chunks keep their planned order within a group.
+    #[test]
+    fn equal_length_groups_cover_every_chunk_once() {
+        let lens = [5, 7, 5, 9, 7, 5, 5, 5];
+        let groups = equal_length_groups(&lens, 3);
+        let mut seen: Vec<usize> = groups.iter().flatten().copied().collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..lens.len()).collect::<Vec<_>>());
+        for group in &groups {
+            assert!(group.len() <= 3, "{group:?}");
+            assert!(group.windows(2).all(|w| w[0] < w[1]), "out of order: {group:?}");
+            assert!(group.iter().all(|&i| lens[i] == lens[group[0]]), "mixed lengths: {group:?}");
+        }
+        // Five chunks of length 5 need two groups of at most three.
+        assert_eq!(groups.iter().filter(|g| lens[g[0]] == 5).count(), 2);
+    }
+
+    #[test]
+    fn a_batch_size_of_one_is_one_chunk_per_group() {
+        let groups = equal_length_groups(&[4, 4, 4], 1);
+        assert_eq!(groups, vec![vec![0], vec![1], vec![2]]);
     }
 
     #[test]
