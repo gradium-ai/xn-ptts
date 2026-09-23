@@ -987,7 +987,7 @@ fn run_backbone<Q: BackendQ>(
             if latent_tx.send(Frame::Latent(next.clone())).is_err() {
                 return Ok(());
             }
-            if eos.should_stop(is_eos) {
+            if eos.should_stop(is_eos[0]) {
                 break;
             }
             prev = next;

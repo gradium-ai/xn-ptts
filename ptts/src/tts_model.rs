@@ -285,14 +285,14 @@ impl<Q: BackendQ> TTSModel<Q> {
     }
 
     /// Run one autoregressive generation step.
-    /// Returns (next_latent [B, 1, ldim], is_eos).
+    /// Returns (next_latent [B, 1, ldim], is_eos), with one EOS flag per batch row.
     #[allow(clippy::type_complexity)]
     pub fn generate_step(
         &self,
         state: &mut TTSState<Q>,
         backbone_input: &Tensor<Q::T, Q::B>,
         rng: &mut impl crate::flow_lm::Rng,
-    ) -> Result<(Tensor<Q::T, Q::B>, bool)> {
+    ) -> Result<(Tensor<Q::T, Q::B>, Vec<bool>)> {
         let dev = backbone_input.device();
         let empty_text = Tensor::zeros((1, 0, self.flow_lm.conditioner.dim), dev)?;
 
@@ -316,7 +316,7 @@ impl<Q: BackendQ> TTSModel<Q> {
         cfg_coef: f32,
         backbone_input: &Tensor<Q::T, Q::B>,
         rng: &mut impl crate::flow_lm::Rng,
-    ) -> Result<(Tensor<Q::T, Q::B>, bool)> {
+    ) -> Result<(Tensor<Q::T, Q::B>, Vec<bool>)> {
         let dev = backbone_input.device();
         let empty_text = Tensor::zeros((1, 0, self.flow_lm.conditioner.dim), dev)?;
 
