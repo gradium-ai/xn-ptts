@@ -5,9 +5,11 @@
 
 <div align="center">
 
-# Pocket TTS
+# Phonon
 
-**Text to 24 kHz speech, on device. One Rust runtime — a Python package, a CLI, a WebSocket server and a browser build, from the same source tree. No PyTorch anywhere.**
+**Gradium's on-device text-to-speech. 24 kHz speech from the Pocket TTS model, in one Rust runtime — a Python package, a CLI, a WebSocket server and a browser build, from the same source tree. No PyTorch anywhere.**
+
+Built on [Pocket TTS](https://huggingface.co/kyutai/pocket-tts), the model by [Kyutai](https://kyutai.org). The runtime, the bindings, the server and the browser build are by [Gradium](https://gradium.ai), and ship under one name everywhere: **`ptts`** on PyPI, on crates.io, and at the command line.
 
 [![Rust CI](https://github.com/gradium-ai/xn-ptts/actions/workflows/rust-ci.yml/badge.svg)](https://github.com/gradium-ai/xn-ptts/actions/workflows/rust-ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/ptts)](https://pypi.org/project/ptts/)
@@ -271,7 +273,7 @@ Details in [`ptts-wasm/README.md`](ptts-wasm/README.md).
 
 ## Models, voices and languages
 
-The runtime plays [Pocket TTS](https://huggingface.co/kyutai/pocket-tts) checkpoints from Kyutai. The published repo holds several:
+Phonon runs the [Pocket TTS](https://huggingface.co/kyutai/pocket-tts) checkpoints published by Kyutai. The published repo holds several:
 
 | Path in the repo | What it is |
 |---|---|
@@ -287,7 +289,7 @@ Bundled voices in the original checkpoint: `alba`, `azelma`, `cosette`, `eponine
 
 **Normalization** covers `en`, `fr`, `de`, `es`, `pt`. Italian is spoken by the model but has no normalizer yet — pass `--lang none` to hand the text to the tokenizer as written.
 
-**Your own checkpoint.** Anything laid out like the above loads with `--dir` / `config=` / `Synth::builder`. <!-- TODO: if Gradium's own checkpoints go public, a section for them belongs here. -->
+**Your own checkpoint.** Anything laid out like the above loads with `--dir` / `config=` / `Synth::builder`. <!-- TODO: Gradium's own Phonon checkpoint, if and when it is public — repo id, what it adds over the Kyutai ones, licence. -->
 
 ## Performance
 
@@ -312,7 +314,7 @@ cargo run --release --features hf,accelerate --example bench -- \
 
 Facts as of September 2026, from each project's README and PyPI metadata; corrections welcome.
 
-| | **Pocket TTS (this repo)** | [Kokoro](https://github.com/hexgrad/kokoro) | [NeuTTS](https://github.com/neuphonic/neutts) |
+| | **Phonon (`ptts`)** | [Kokoro](https://github.com/hexgrad/kokoro) | [NeuTTS](https://github.com/neuphonic/neutts) |
 |---|---|---|---|
 | Runtime | **Rust; no Python needed** | Python + PyTorch | Python + PyTorch |
 | Voice cloning | **~10 s of audio, no transcript** | — (fixed voice packs) | reference audio **plus its transcript** |
@@ -355,12 +357,12 @@ CI runs all of that on stable and nightly across Linux, macOS and Windows, every
 
 Two things, two licences:
 
-- **This code** — the runtime, the bindings, the server, the browser build — is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+- **Phonon** — the runtime, the bindings, the server, the browser build — is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
 - **The model weights** are published by Kyutai under [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/) with an acceptable-use agreement; see the [model card](https://huggingface.co/kyutai/pocket-tts). Redistributing them requires attribution.
 
 ## Acknowledgements
 
-Pocket TTS is a model by [Kyutai](https://kyutai.org); its [reference implementation](https://github.com/kyutai-labs/pocket-tts) in PyTorch is where to go to study or fine-tune it. This runtime is built on the [`xn`](https://crates.io/crates/xn) tensor library, and began as [Laurent Mazare](https://github.com/LaurentMazare)'s `xn-ptts`.
+Phonon exists because of [Pocket TTS](https://huggingface.co/kyutai/pocket-tts), the model by [Kyutai](https://kyutai.org). The weights are theirs, and their [reference implementation](https://github.com/kyutai-labs/pocket-tts) in PyTorch is where to go to study or fine-tune the model; this repository is the runtime for it, not a replacement. Phonon is built by [Gradium](https://gradium.ai) on the [`xn`](https://github.com/gradium-ai/xn) tensor library, and began as [Laurent Mazare](https://github.com/LaurentMazare)'s `xn-ptts`.
 
 <!--
   ================ ASSET / TODO CHECKLIST (delete when done) ================
@@ -371,7 +373,7 @@ Pocket TTS is a model by [Kyutai](https://kyutai.org); its [reference implementa
   [ ] Performance table: RTF + peak RSS from `bench`, ≥3 devices, f32 and q8_0
   [ ] Repo/org name if the repository is renamed at launch (search "gradium-ai/xn-ptts")
   [ ] Confirm the crates.io and PyPI names/badges once 0.3.x is published
-  [ ] "Your own checkpoint" section: Gradium's checkpoints, if they go public
+  [ ] "Your own checkpoint" section: Gradium's Phonon checkpoint, if it goes public
   [ ] Dockerfile + example WebSocket client; CONTRIBUTING.md, templates, code of conduct
   [ ] Social preview image (GitHub → Settings → Social preview)
   ============================================================================
