@@ -122,7 +122,7 @@ pub fn load_voice_emb<B: Backend>(
     dev: &B,
 ) -> Result<Tensor<f32, B>> {
     let vb = VB::load(&[path], dev.clone())?;
-    let label = path.display().to_string();
+    let label = format!("voice file {}", path.display());
     let emb = voice_emb_from_vb(&vb, &label, speaker_proj)?;
     if let Some(model_ext) = model_ext {
         check_model_ext(&read_safetensors_header(path)?, &label, model_ext)?;
@@ -138,13 +138,15 @@ pub fn load_voice_emb_from_bytes<B: Backend>(
     speaker_proj: Option<&Linear<f32, B>>,
     dev: &B,
 ) -> Result<Tensor<f32, B>> {
-    let vb = VB::from_bytes(vec![bytes.to_vec()], dev.clone())?;
     let label = "the voice file";
-    let emb = voice_emb_from_vb(&vb, label, speaker_proj)?;
+    // The header first: in memory it costs nothing, a mismatch is refused before any tensor is
+    // decoded, and a file that is not safetensors gets a clearer error than `VB` gives.
+    let header = safetensors_header_from_bytes(bytes, label)?;
     if let Some(model_ext) = model_ext {
-        check_model_ext(safetensors_header_from_bytes(bytes, label)?, label, model_ext)?;
+        check_model_ext(header, label, model_ext)?;
     }
-    Ok(emb)
+    let vb = VB::from_bytes(vec![bytes.to_vec()], dev.clone())?;
+    voice_emb_from_vb(&vb, label, speaker_proj)
 }
 
 /// The part of [`load_voice_emb`] that does not care where the file came from. `label` names
@@ -162,9 +164,9 @@ fn voice_emb_from_vb<B: Backend>(
     } else if names.contains(&SPEAKER_WAVS_TENSOR) {
         (SPEAKER_WAVS_TENSOR, VoiceTensor::Latents)
     } else {
-        let first = names.first().ok_or_else(|| {
-            Error::invalid_data(format!("no tensors found in voice file {label}"))
-        })?;
+        let first = names
+            .first()
+            .ok_or_else(|| Error::invalid_data(format!("no tensors found in {label}")))?;
         (*first, VoiceTensor::Emb)
     };
     let shape = vb.shape(name).context("voice tensor not found")?;
@@ -360,6 +362,14 @@ mod tests {
         assert_eq!(emb.dims(), [1, 2, 2]);
         assert_eq!(emb.to_vec().unwrap(), [0., 1., 2., 3.]);
         assert!(load_voice_emb_from_bytes(&bytes, Some("def@2"), None, &xn::CPU).is_err());
+
+        // Error messages name the file once.
+        let empty = [&2u64.to_le_bytes()[..], b"{}"].concat();
+        let err = load_voice_emb_from_bytes(&empty, None, None, &xn::CPU).unwrap_err().to_string();
+        assert!(err.contains("no tensors found in the voice file"), "{err}");
+        let err =
+            load_voice_emb_from_bytes(&[1, 2, 3], None, None, &xn::CPU).unwrap_err().to_string();
+        assert!(err.contains("the voice file does not look like a safetensors file"), "{err}");
 
         // Too short to hold a header length, and a length past the end of the buffer.
         assert!(safetensors_header_from_bytes(&[1, 2, 3], "voice").is_err());
