@@ -7,13 +7,14 @@
 
 # Phonon
 
-**Gradium's on-device text-to-speech. It turns text into 24 kHz speech with the Pocket TTS model, in one Rust runtime. That runtime ships as a Python package, a command-line tool, a WebSocket server and a browser build, all from the same source tree. No PyTorch anywhere.**
+**Gradium's on-device text-to-speech. It turns text into 24 kHz speech with the Pocket TTS model, in one Rust runtime. That runtime ships as a Python package, a command-line tool, a WebSocket server and a browser build.**
 
-Built on [Pocket TTS](https://huggingface.co/kyutai/pocket-tts), the model by [Kyutai](https://kyutai.org). The runtime, the bindings, the server and the browser build are by [Gradium](https://gradium.ai). They ship under one name everywhere: **`ptts`** on PyPI, on crates.io, and at the command line.
+Built on [Pocket TTS](https://huggingface.co/kyutai/pocket-tts), the model by [Kyutai](https://kyutai.org). The runtime, the bindings, the server and the model are by [Gradium](https://gradium.ai). They ship as **`ptts`** on PyPI, on crates.io and at the command line, and as **`phonon-tts`** on npm.
 
 [![Rust CI](https://github.com/gradium-ai/xn-ptts/actions/workflows/rust-ci.yml/badge.svg)](https://github.com/gradium-ai/xn-ptts/actions/workflows/rust-ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/ptts)](https://pypi.org/project/ptts/)
 [![crates.io](https://img.shields.io/crates/v/ptts)](https://crates.io/crates/ptts)
+[![npm](https://img.shields.io/npm/v/phonon-tts)](https://www.npmjs.com/package/phonon-tts)
 [![Python 3.9 and up](https://img.shields.io/pypi/pyversions/ptts)](https://pypi.org/project/ptts/)
 [![Licence: MIT OR Apache-2.0](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue)](#licence)
 
@@ -32,7 +33,7 @@ uvx ptts --lang en "Hello world" -o out.wav     # nothing to install
 ```
 
 ```bash
-pip install ptts                                 # numpy is the only dependency
+pip install ptts
 ```
 
 ```python
@@ -42,17 +43,17 @@ tts = ptts.TTS(lang="en")
 tts.save("out.wav", "Hello world")
 ```
 
+TODO(dave): Point to the gradium HF model when available
 The first run downloads the checkpoint (about 240 MB) from the Hugging Face Hub. The published checkpoint is gated. Accept its terms once on [`kyutai/pocket-tts`](https://huggingface.co/kyutai/pocket-tts). Then run `huggingface-cli login`, or set `HF_TOKEN`. See [Models, voices and languages](#models-voices-and-languages).
 
 ## What you get
-
+TODO(dave):
 - **24 kHz speech** from a flow-matching language model and the Mimi neural codec. Audio is streamed frame by frame as it is generated.
 - **Voice cloning from about 10 seconds of audio.** You only need the audio. No transcript.
 - **Six languages** in the published checkpoints: English, French, German, Italian, Portuguese and Spanish, with 26 voices each. See [Models](#models-voices-and-languages).
 - **Text normalization** for en, fr, de, es and pt. Numbers, currency, dates and symbols are read the way a speaker of that language would say them.
 - **Quantized weights** in ten GGML formats, from `q8_0` down to `q4k`. Make them with [`quantize`](ptts/examples/quantize.rs) and load them with one flag.
 - **Backends**: CPU everywhere, plus Apple Accelerate, Metal, CUDA, Vulkan and WebGPU. Pick them at build time with Cargo features.
-- **Errors you can catch.** A bad argument, a missing voice, a gated repo and running out of memory raise different exception classes, not the same string.
 
 <!-- TODO(assets): a short "hear it" block: one sample per bundled voice, hosted. GitHub cannot play audio inline, so link to a page or the model card. -->
 
@@ -64,7 +65,7 @@ The first run downloads the checkpoint (about 240 MB) from the Hugging Face Hub.
 pip install ptts
 ```
 
-One `abi3` wheel per platform works for every CPython from 3.9 on. Platforms: Linux x86_64 and aarch64 (glibc and musl), Windows x64 and ARM64, macOS Apple Silicon and Intel. Anything else installs from the source distribution. That is built and tested on every release.
+One wheel per platform works for every CPython from 3.9 on. Platforms: Linux x86_64 and aarch64 (glibc and musl), Windows x64 and ARM64, macOS Apple Silicon and Intel. Anything else installs from the source distribution.
 
 ### Use
 
@@ -90,7 +91,7 @@ with tts.stream(text) as audio:
             break
 ```
 
-Ctrl-C works during a generation, not only between generations.
+Ctrl-C works during a generation as well.
 
 ### Voices
 
@@ -110,8 +111,6 @@ ptts.TTS(lang="fr", config="model/config.json")   # a local checkpoint directory
 ptts.TTS(lang="en", device="cuda")                # see ptts.available_devices()
 ptts.TTS(lang="en", quant="q8_0")                 # smaller and faster on CPU; see ptts.available_quants()
 ```
-
-Quantized weights are CPU-only.
 
 ### Command line
 
@@ -139,20 +138,6 @@ ptts --lang fr "bonjour" -v marius -q q8_0 -o out.wav
 | `--list-voices`, `--build-info`, `--version` | |
 
 </details>
-
-### Errors
-
-| Exception | Cause |
-|---|---|
-| `ValueError` | a bad argument: an unknown weight format, a mis-shaped array, a negative temperature |
-| `LookupError` | an unknown voice, or a checkpoint file that is not there |
-| `NotImplementedError` | a backend this wheel was not built with, or cloning on a checkpoint without a speaker encoder |
-| `OSError` | the Hub could not be reached, or a file could not be read |
-| `RuntimeError` | anything else |
-
-### Types
-
-The package ships `py.typed` and complete type stubs. Editors and `mypy --strict` see the whole API. Full reference: [`ptts-pyo3/README.md`](ptts-pyo3/README.md).
 
 ## Rust
 
@@ -247,6 +232,14 @@ cargo run --release -p ptts-ws-server -- --lang en --addr 0.0.0.0:8080
 The same crate compiled to WebAssembly, tokenizer included. [Try it](https://laurentmazare.github.io/pocket-tts) <!-- TODO(assets): org-hosted demo URL -->. The page downloads the weights once and caches them.
 
 ```bash
+npm install phonon-tts
+```
+
+<!-- TODO: a short usage example once the phonon-tts package ships its API (0.0.1 is a placeholder). -->
+
+To build it yourself:
+
+```bash
 cd ptts-wasm && make build     # wasm-pack build --target web --release
 python3 -m http.server -d pkg 8080
 ```
@@ -256,21 +249,13 @@ Details in [`ptts-wasm/README.md`](ptts-wasm/README.md).
 
 ## Models, voices and languages
 
-Phonon runs the [Pocket TTS](https://huggingface.co/kyutai/pocket-tts) checkpoints published by Kyutai. The repo holds several:
-
-| Path in the repo | What it is |
-|---|---|
-| `tts_b6369a24.safetensors` + `embeddings/` | the original English checkpoint, 8 voices |
-| `languages/{english,french,german,italian,portuguese,spanish}/` | one checkpoint per language, **26 voices each** |
-| `languages/*_24l/` | 24-layer versions of the above. Larger and higher quality. They need their own `config.json` |
+TODO(dave): details
 
 Bundled voices in the original checkpoint: `alba`, `azelma`, `cosette`, `eponine`, `fantine`, `javert`, `jean`, `marius`.
 
 <!-- TODO(assets): per-voice audio samples, and a sample per language. -->
 
-**Getting the weights.** `kyutai/pocket-tts` is gated. Accept its terms on the model card, then run `huggingface-cli login` or export `HF_TOKEN`. [`kyutai/pocket-tts-without-voice-cloning`](https://huggingface.co/kyutai/pocket-tts-without-voice-cloning) has the same layout and is not gated.
-
-**Normalization** covers `en`, `fr`, `de`, `es` and `pt`. The model speaks Italian, but there is no Italian normalizer yet. Pass `--lang none` to give the text to the tokenizer as written.
+**Getting the weights.** TODO(dave):
 
 **Your own checkpoint.** Anything with the layout above loads with `--dir`, `config=` or `Synth::builder`. <!-- TODO: Gradium's own Phonon checkpoint, if and when it is public: repo id, what it adds over the Kyutai ones, licence. -->
 
@@ -284,6 +269,7 @@ Bundled voices in the original checkpoint: `alba`, `azelma`, `cosette`, `eponine
 | *Apple M-series* | f32 / q8_0 | | *TODO* | *TODO* |
 | *x86-64 laptop* | f32 / q8_0 | | *TODO* | *TODO* |
 | *Raspberry Pi 5* | q8_0 / q4k | | *TODO* | *TODO* |
+...
 
 Reproduce with the benchmark harness. It reports time to first audio, per-frame time and RTF over `--iters` runs, and leaves out the one-off model load:
 
@@ -293,35 +279,9 @@ cargo run --release --features hf,accelerate --example bench -- \
   --voice model/voices/alba.safetensors --threads 8 --iters 20
 ```
 
-## How it compares
-
-Facts as of September 2026, from each project's README and PyPI metadata. Corrections welcome.
-
-| | **Phonon (`ptts`)** | [Kokoro](https://github.com/hexgrad/kokoro) | [NeuTTS](https://github.com/neuphonic/neutts) |
-|---|---|---|---|
-| Runtime | **Rust. No Python needed** | Python + PyTorch | Python + PyTorch |
-| Voice cloning | **about 10 s of audio, no transcript** | no (fixed voice packs) | reference audio **plus its transcript** |
-| Voices / languages | 26 per language, 6 languages | 54 voices, 9 languages | per model |
-| Quantization | 10 GGML formats, first-party | community ONNX | GGUF via llama-cpp-python |
-| Browser / server / CLI | **all first-party, one code base** | community ports | no |
-| Watermarking | no | no | Perth, on by default |
-| Code licence | **MIT OR Apache-2.0** | Apache-2.0 | Apache-2.0 (Air). Bespoke licence (Nano, 2E) |
-| Model licence | CC-BY-4.0, gated | Apache-2.0 | per model |
-
-Kokoro and NeuTTS are good. Where they lead, in voice and language breadth, model sizes and watermarking, the answer is a better model, and this runtime does not try to be that. What it offers is deployment: one implementation you can put in a wheel, a binary, a browser tab and a phone, from one source tree.
-
 ## Responsible use
 
-The published weights are CC-BY-4.0 with an acceptable-use agreement. You accept it on the model card. In short: do not impersonate or clone anyone without their explicit, lawful consent. Do not make deceptive or fraudulent content. Do not pass generated audio off as a real recording. This runtime does not watermark its output. If you build cloning into a product, the consent flow is yours to design.
-
-## Repository layout
-
-| Crate | |
-|---|---|
-| [`ptts/`](ptts/) | the library. `synth` is the one-call API, `tts_model` the lower-level pieces. Examples: [`say`](ptts/examples/say.rs), [`pocket_tts`](ptts/examples/pocket_tts.rs), [`bench`](ptts/examples/bench.rs), [`create_voice`](ptts/examples/create_voice.rs), [`quantize`](ptts/examples/quantize.rs) |
-| [`ptts-pyo3/`](ptts-pyo3/) | the Python package, built with maturin |
-| [`ptts-ws-server/`](ptts-ws-server/) | the WebSocket server |
-| [`ptts-wasm/`](ptts-wasm/) | the browser build and demo page |
+TODO(dave): licensing & use
 
 ## Building and contributing
 
@@ -338,14 +298,11 @@ CI runs all of that on stable and nightly, on Linux, macOS and Windows, for ever
 
 ## Licence
 
-Two things, two licences:
-
-- **Phonon**, meaning the runtime, the bindings, the server and the browser build, is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
-- **The model weights** are published by Kyutai under [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/) with an acceptable-use agreement. See the [model card](https://huggingface.co/kyutai/pocket-tts). Redistributing them requires attribution.
+TODO(dave):
 
 ## Acknowledgements
 
-Phonon exists because of [Pocket TTS](https://huggingface.co/kyutai/pocket-tts), the model by [Kyutai](https://kyutai.org). The weights are theirs. Their [reference implementation](https://github.com/kyutai-labs/pocket-tts) in PyTorch is the place to study or fine-tune the model. This repository is the runtime for that model, not a replacement for it. Phonon is built by [Gradium](https://gradium.ai) on the [`xn`](https://github.com/gradium-ai/xn) tensor library. It began as [Laurent Mazare](https://github.com/LaurentMazare)'s `xn-ptts`.
+Phonon exists because of [Pocket TTS](https://huggingface.co/kyutai/pocket-tts), the model by [Kyutai](https://kyutai.org). Their [reference implementation](https://github.com/kyutai-labs/pocket-tts) in PyTorch. Phonon is built by [Gradium](https://gradium.ai) on the [`xn`](https://github.com/gradium-ai/xn) tensor library.
 
 <!--
   ================ ASSET / TODO CHECKLIST (delete when done) ================
@@ -356,6 +313,7 @@ Phonon exists because of [Pocket TTS](https://huggingface.co/kyutai/pocket-tts),
   [ ] Performance table: RTF and peak RSS from `bench`, 3 or more devices, f32 and q8_0
   [ ] Repo or org name, if the repository is renamed at launch (search "gradium-ai/xn-ptts")
   [ ] Confirm the crates.io and PyPI names and badges once 0.3.x is published
+  [ ] npm: publish a real phonon-tts release and add a usage example to the Browser section
   [ ] "Your own checkpoint" section: Gradium's Phonon checkpoint, if it goes public
   [ ] Dockerfile and example WebSocket client. CONTRIBUTING.md, templates, code of conduct
   [ ] Social preview image (GitHub, Settings, Social preview)
