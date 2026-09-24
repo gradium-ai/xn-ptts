@@ -16,7 +16,7 @@
 //! let tts = Synth::builder(
 //!     TTSConfig::v202601(0.3),
 //!     "model/model.safetensors",
-//!     Normalize::For(Lang::En),
+//!     Normalize::for_lang(Lang::En),
 //! )
 //! .tokenizer_file("model/tokenizer.json")
 //!     .add_voice("alba", "model/voices/alba.safetensors")
@@ -33,7 +33,7 @@
 //! ```no_run
 //! # fn main() -> xn::Result<()> {
 //! # let cfg = ptts::tts_model::TTSConfig::v202601(0.3);
-//! # let norm = ptts::preprocess::Normalize::For(ptts::preprocess::Lang::En);
+//! # let norm = ptts::preprocess::Normalize::for_lang(ptts::preprocess::Lang::En);
 //! # let tts = ptts::synth::Synth::builder(cfg, "model/model.safetensors", norm)
 //! #     .tokenizer_file("model/tokenizer.json")
 //! #     .build()?;
@@ -49,7 +49,7 @@
 //! which conditions on the voice prompt once instead of per request.
 //!
 //! Text is normalized before it is tokenized — see [`crate::preprocess`]. Which
-//! language, or [`Normalize::Off`], is a required argument to
+//! language, or [`Normalize::OFF`], is a required argument to
 //! [`SynthBuilder::new`]: the model reads normalized text noticeably better,
 //! but the spoken forms are per-language, so guessing is worse than doing
 //! nothing.
@@ -1104,7 +1104,7 @@ impl SynthBuilder {
     /// turn on — but the spoken forms of `@`, `+` and `=` are per-language, so
     /// normalizing German as English makes it say "at" where it should say
     /// "ät". Guessing is worse than doing nothing, so the caller says which:
-    /// [`Normalize::For`] with a language, or [`Normalize::Off`] to hand text
+    /// [`Normalize::for_lang`] with a language, or [`Normalize::OFF`] to hand text
     /// to the tokenizer as written.
     ///
     /// ```no_run
@@ -1116,7 +1116,7 @@ impl SynthBuilder {
     /// let tts = SynthBuilder::new(
     ///     TTSConfig::v202601(0.3),
     ///     "model/model.safetensors",
-    ///     Normalize::For(Lang::De),
+    ///     Normalize::for_lang(Lang::De),
     /// )
     /// .tokenizer_file("model/tokenizer.model")
     /// .build()?;
@@ -1771,7 +1771,7 @@ mod tests {
     /// could stand in for a language the caller never named.
     #[test]
     fn the_builder_keeps_the_policy_it_was_given() {
-        for norm in [Normalize::For(Lang::En), Normalize::For(Lang::De), Normalize::Off] {
+        for norm in [Normalize::for_lang(Lang::En), Normalize::for_lang(Lang::De), Normalize::OFF] {
             let b = SynthBuilder::new(TTSConfig::v202601(0.5), "model.safetensors", norm);
             assert_eq!(b.normalize, norm);
         }

@@ -17,7 +17,7 @@
 //! let tts = Synth::builder(
 //!     TTSConfig::v202601(0.3),
 //!     "model/model.safetensors",
-//!     Normalize::For(Lang::En),
+//!     Normalize::for_lang(Lang::En),
 //! )
 //! .tokenizer_file("model/tokenizer.json")
 //! .add_voice("alba", "model/voices/alba.safetensors")
@@ -56,7 +56,7 @@
 //! handed, and never guesses at names or downloads anything itself.
 //!
 //! Text is normalized before it is tokenized — see [`preprocess`]. Which
-//! language, or [`preprocess::Normalize::Off`], is a required argument to
+//! language, or [`preprocess::Normalize::OFF`], is a required argument to
 //! [`synth::SynthBuilder::new`]: the model reads normalized text noticeably
 //! better, but the spoken forms are per-language, so guessing is worse than
 //! doing nothing.

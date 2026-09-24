@@ -16,7 +16,7 @@ use ptts::synth::{DeviceKind, Quant, SpeechOptions, Synth, SynthBuilder};
 /// before the weights are read, so the config's contents do not matter, and
 /// neither does which language it would have normalized as.
 fn builder(weights: impl Into<std::path::PathBuf>) -> SynthBuilder {
-    Synth::builder(ptts::tts_model::TTSConfig::v202601(0.5), weights, Normalize::For(Lang::En))
+    Synth::builder(ptts::tts_model::TTSConfig::v202601(0.5), weights, Normalize::for_lang(Lang::En))
 }
 
 #[test]

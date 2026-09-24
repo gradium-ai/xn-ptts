@@ -16,7 +16,7 @@ fn main() -> anyhow::Result<()> {
     // and for the examples `model_helpers` is where that knowledge lives.
     let checkpoint = model_helpers::Checkpoint::from_hub(model_helpers::REPO_ID, None)?;
     // Which language to normalize as has no default: see `SynthBuilder::new`.
-    let mut tts = checkpoint.builder(Normalize::For(Lang::En)).build()?;
+    let mut tts = checkpoint.builder(Normalize::for_lang(Lang::En)).build()?;
     checkpoint.register_voices(&mut tts);
 
     let pcm = tts.say_with(&text, &ptts::synth::SpeechOptions::default().voice("alba"))?;
