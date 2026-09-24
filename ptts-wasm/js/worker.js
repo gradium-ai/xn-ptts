@@ -118,7 +118,11 @@ async function handleGenerate(id, { text, voice, temperature, seed }) {
       }
     }
   } finally {
-    model.stop_generation();
+    try {
+      model.stop_generation();
+    } catch {
+      // After a wasm trap every call on `model` throws; keep the original error.
+    }
     cancelled.delete(id);
   }
   if (stats.frames > 0) {

@@ -95,7 +95,12 @@ export class PhononTTS {
     worker.onmessage = ({ data }) => this.#pending.get(data.id)?.[data.type]?.(data);
     worker.onerror = (e) => {
       e.preventDefault?.();
-      this.#failAll(new Error(`phonon-tts worker failed: ${e.message ?? 'could not start'}`));
+      // A dead worker never replies: fail what is pending and refuse what comes next, rather
+      // than leaving later requests waiting forever.
+      const error = new Error(`phonon-tts worker failed: ${e.message ?? 'could not start'}`);
+      this.#disposed = true;
+      worker.terminate();
+      this.#failAll(error);
     };
   }
 

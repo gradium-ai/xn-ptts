@@ -26,7 +26,7 @@ serve: demo
 
 # Tests for the JS wrapper that need no browser and no model.
 test:
-	node --test js/test/
+	node --test js/test/*.test.mjs
 
 clean:
 	rm -rf pkg site

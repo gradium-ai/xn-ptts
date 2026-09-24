@@ -199,7 +199,7 @@ jobs:
       # The JS wrapper that `phonon-tts` ships around this build. Its tests need neither a
       # browser nor a model; building the package itself is `npm-publish.yml`'s job.
       - name: Test the JS wrapper
-        run: node --test ptts-wasm/js/test/
+        run: node --test ptts-wasm/js/test/*.test.mjs
       # `ptts-wasm`'s `webgpu` feature is deliberately not checked here: it does not compile for
       # this target, and has not since before this workflow. `xn 0.2.4`'s webgpu backend wants
       # `Send + Sync` storage, while `wgpu`'s browser backend holds a `RefCell` and so is

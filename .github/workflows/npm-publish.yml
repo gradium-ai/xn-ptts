@@ -18,6 +18,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/npm-publish.yml'
+      - '.github/actions/**'
   workflow_dispatch:
 
 permissions:
@@ -43,7 +44,7 @@ jobs:
           tool: wasm-pack
 
       - name: Test the JS wrapper
-        run: node --test ptts-wasm/js/test/
+        run: node --test ptts-wasm/js/test/*.test.mjs
 
       # The SIMD flags `.cargo/config.toml` sets for local builds, which setup-rust deleted.
       # `relaxed-simd` is not optional: xn's quantized kernels call `f32x4_relaxed_madd`
@@ -78,5 +79,5 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         working-directory: ptts-wasm/pkg
         run: |
-          npm install --global npm@latest
+          npm install --global npm@^11.5.1
           npm publish --access public
