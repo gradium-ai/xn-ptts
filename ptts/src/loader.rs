@@ -121,9 +121,41 @@ pub fn load_voice_emb<B: Backend>(
     speaker_proj: Option<&Linear<f32, B>>,
     dev: &B,
 ) -> Result<Tensor<f32, B>> {
+    let vb = VB::load(&[path], dev.clone())?;
+    let label = path.display().to_string();
+    let emb = voice_emb_from_vb(&vb, &label, speaker_proj)?;
+    if let Some(model_ext) = model_ext {
+        check_model_ext(&read_safetensors_header(path)?, &label, model_ext)?;
+    }
+    Ok(emb)
+}
+
+/// As [`load_voice_emb`], for a voice file already in memory -- the wasm build, which has no
+/// filesystem, fetches its voices.
+pub fn load_voice_emb_from_bytes<B: Backend>(
+    bytes: &[u8],
+    model_ext: Option<&str>,
+    speaker_proj: Option<&Linear<f32, B>>,
+    dev: &B,
+) -> Result<Tensor<f32, B>> {
+    let vb = VB::from_bytes(vec![bytes.to_vec()], dev.clone())?;
+    let label = "the voice file";
+    let emb = voice_emb_from_vb(&vb, label, speaker_proj)?;
+    if let Some(model_ext) = model_ext {
+        check_model_ext(safetensors_header_from_bytes(bytes, label)?, label, model_ext)?;
+    }
+    Ok(emb)
+}
+
+/// The part of [`load_voice_emb`] that does not care where the file came from. `label` names
+/// the file in error messages.
+fn voice_emb_from_vb<B: Backend>(
+    vb: &VB<B>,
+    label: &str,
+    speaker_proj: Option<&Linear<f32, B>>,
+) -> Result<Tensor<f32, B>> {
     use xn::error::Context;
 
-    let vb = VB::load(&[path], dev.clone())?;
     let names = vb.tensor_names();
     let (name, kind) = if names.contains(&EMB_TENSOR) {
         (EMB_TENSOR, VoiceTensor::Emb)
@@ -131,7 +163,7 @@ pub fn load_voice_emb<B: Backend>(
         (SPEAKER_WAVS_TENSOR, VoiceTensor::Latents)
     } else {
         let first = names.first().ok_or_else(|| {
-            Error::invalid_data(format!("no tensors found in voice file {}", path.display()))
+            Error::invalid_data(format!("no tensors found in voice file {label}"))
         })?;
         (*first, VoiceTensor::Emb)
     };
@@ -143,8 +175,8 @@ pub fn load_voice_emb<B: Backend>(
         [_, _, _] => tensor,
         _ => {
             return Err(Error::invalid_data(format!(
-                "voice tensor `{name}` in {} has shape {dims:?}, expected two or three dimensions",
-                path.display()
+                "voice tensor `{name}` in {label} has shape {dims:?}, expected two or three \
+                 dimensions"
             )));
         }
     };
@@ -155,40 +187,34 @@ pub fn load_voice_emb<B: Backend>(
             let latents = tensor.transpose(1, 2)?.contiguous()?;
             let Some(proj) = speaker_proj else {
                 return Err(Error::invalid_data(format!(
-                    "{} holds `{SPEAKER_WAVS_TENSOR}` latents, but this checkpoint has no speaker \
-                     projection (`{SPEAKER_PROJ_WEIGHT}`) to turn them into a voice embedding. A \
-                     GGUF written by an older `quantize --no-mimi-encoder` dropped it: regenerate \
-                     the GGUF from the safetensors checkpoint, or use a precomputed `{EMB_TENSOR}` \
-                     voice.",
-                    path.display()
+                    "{label} holds `{SPEAKER_WAVS_TENSOR}` latents, but this checkpoint has no \
+                     speaker projection (`{SPEAKER_PROJ_WEIGHT}`) to turn them into a voice \
+                     embedding. A GGUF written by an older `quantize --no-mimi-encoder` dropped \
+                     it: regenerate the GGUF from the safetensors checkpoint, or use a \
+                     precomputed `{EMB_TENSOR}` voice."
                 )));
             };
             let channels = latents.dim(2usize)?;
             let in_dim = proj.weight().dims()[1];
             if channels != in_dim {
                 return Err(Error::invalid_data(format!(
-                    "`{SPEAKER_WAVS_TENSOR}` in {} has {channels} channels but the speaker \
-                     projection takes {in_dim}",
-                    path.display()
+                    "`{SPEAKER_WAVS_TENSOR}` in {label} has {channels} channels but the speaker \
+                     projection takes {in_dim}"
                 )));
             }
             proj.forward(&latents)?
         }
     };
-    if let Some(model_ext) = model_ext {
-        check_model_ext(path, model_ext)?;
-    }
     Ok(emb)
 }
 
-/// Fails if the voice file records a `model_ext` other than `model_ext`. A file that records
-/// none is accepted: older voices predate the metadata.
-fn check_model_ext(path: &std::path::Path, model_ext: &str) -> Result<()> {
-    let header = read_safetensors_header(path)?;
+/// Fails if the voice file's safetensors `header` records a `model_ext` other than
+/// `model_ext`. A file that records none is accepted: older voices predate the metadata.
+fn check_model_ext(header: &[u8], label: &str, model_ext: &str) -> Result<()> {
     // Not `SafeTensors::read_metadata`: it validates that the buffer holds the
     // tensor data as well as the header, which is exactly what is not read here.
-    let header: serde_json::Value = serde_json::from_slice(&header).map_err(|e| {
-        Error::invalid_data(format!("cannot parse safetensors header of {}: {e}", path.display()))
+    let header: serde_json::Value = serde_json::from_slice(header).map_err(|e| {
+        Error::invalid_data(format!("cannot parse safetensors header of {label}: {e}"))
     })?;
     if let Some(voice_model_ext) = header.get("__metadata__").and_then(|m| m.get("model_ext"))
         && let Some(voice_model_ext) = voice_model_ext.as_str()
@@ -202,6 +228,18 @@ fn check_model_ext(path: &std::path::Path, model_ext: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The JSON header of a safetensors file held in memory: the 8-byte little-endian header
+/// length, then that many bytes.
+fn safetensors_header_from_bytes<'a>(bytes: &'a [u8], label: &str) -> Result<&'a [u8]> {
+    let not_safetensors =
+        || Error::invalid_data(format!("{label} does not look like a safetensors file"));
+    let len_bytes: [u8; 8] =
+        bytes.get(..8).and_then(|b| b.try_into().ok()).ok_or_else(not_safetensors)?;
+    let header_len =
+        usize::try_from(u64::from_le_bytes(len_bytes)).map_err(|_| not_safetensors())?;
+    bytes.get(8..8usize.saturating_add(header_len)).ok_or_else(not_safetensors)
 }
 
 /// Reads a safetensors file's JSON header: the 8-byte little-endian header
@@ -298,12 +336,34 @@ mod tests {
             "ptts-loader-voice-match.safetensors",
             &format!(r#"{{"__metadata__":{{"model_ext":"abc@1"}},{tensor}}}"#),
         );
-        check_model_ext(&matching, "abc@1").unwrap();
-        assert!(check_model_ext(&matching, "def@2").is_err());
+        let header = read_safetensors_header(&matching).unwrap();
+        check_model_ext(&header, "voice", "abc@1").unwrap();
+        assert!(check_model_ext(&header, "voice", "def@2").is_err());
 
         // A voice from before the metadata existed is accepted as-is.
         let bare = write("ptts-loader-voice-bare.safetensors", &format!(r#"{{{tensor}}}"#));
-        check_model_ext(&bare, "abc@1").unwrap();
+        check_model_ext(&read_safetensors_header(&bare).unwrap(), "voice", "abc@1").unwrap();
+    }
+
+    #[test]
+    fn voice_emb_loads_from_bytes() {
+        let file = |header: &str| {
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend_from_slice(header.as_bytes());
+            bytes.extend_from_slice(&[0f32, 1., 2., 3.].map(f32::to_le_bytes).concat());
+            bytes
+        };
+        let tensor = r#""emb":{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]}"#;
+        let bytes = file(&format!(r#"{{"__metadata__":{{"model_ext":"abc@1"}},{tensor}}}"#));
+
+        let emb = load_voice_emb_from_bytes(&bytes, Some("abc@1"), None, &xn::CPU).unwrap();
+        assert_eq!(emb.dims(), [1, 2, 2]);
+        assert_eq!(emb.to_vec().unwrap(), [0., 1., 2., 3.]);
+        assert!(load_voice_emb_from_bytes(&bytes, Some("def@2"), None, &xn::CPU).is_err());
+
+        // Too short to hold a header length, and a length past the end of the buffer.
+        assert!(safetensors_header_from_bytes(&[1, 2, 3], "voice").is_err());
+        assert!(safetensors_header_from_bytes(&u64::MAX.to_le_bytes(), "voice").is_err());
     }
 
     #[test]
