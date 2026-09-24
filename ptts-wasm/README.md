@@ -36,6 +36,4 @@ model weights from HuggingFace on first use (~240 MB) and cache them for subsequ
 
 ## Todo
 
-- Handle long prompts, see `split_into_best_sentences` in
-  [tts_model.py](https://github.com/kyutai-labs/pocket-tts/blob/aca7dc8db698e5885fe9dd4850bacfa757b429b1/pocket_tts/models/tts_model.py#L893).
 - Voice cloning.

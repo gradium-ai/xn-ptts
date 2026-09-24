@@ -1,3 +1,11 @@
+//! The raw WebAssembly surface of the browser build.
+//!
+//! This is what `wasm-bindgen` exports, and it is deliberately low level: it takes bytes the
+//! caller has already fetched and it generates one frame per call, because a browser has no
+//! threads to hand generation to and must yield to its event loop between frames. The npm
+//! package `phonon-tts` wraps it (see `js/`), running it in a worker and handling downloads,
+//! caching and voices by name. Most callers want that, not this.
+
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -11,21 +19,19 @@ macro_rules! console_log {
 }
 
 use ptts::flow_lm::{FlowLMState, NormalRng, StepInput};
-use ptts::loader::remap_key;
+use ptts::loader::{load_speaker_proj, load_voice_emb_from_bytes, remap_key};
 use ptts::mimi::MimiDecoderState;
 use ptts::plan::{self, EosPolicy};
 use ptts::preprocess::{Normalize, Rules};
 use ptts::tok::Tok;
 use ptts::transformer::{LayerAttentionState, StreamingMHAState, StreamingTransformerState};
-use ptts::tts_model::{TTSConfig, TTSModel, TTSState, prepare_text_prompt};
-use xn::nn::VB;
+use ptts::tts_model::{
+    MAX_TOKENS_PER_CHUNK, TTSConfig, TTSModel, TTSState, prepare_text_prompt,
+    split_into_best_sentences,
+};
+use xn::nn::{Linear, VB};
 use xn::quantized::Q80F32;
-use xn::{BackendQ, CPU, CpuDevice, Tensor, TypedTensor, Unquantized};
-
-/// Seed for the noise source. Fixed, as it was when this crate carried its own copy of the
-/// sampler: the browser has no way to pass one yet, and a fixed seed at least makes a
-/// generation reproducible across reloads.
-const SEED: u64 = 42;
+use xn::{BackendQ, CPU, CpuDevice, Result, Tensor, TypedTensor, Unquantized};
 
 /// Underlying type-erased transformer state, shared across all supported quantizations
 /// (all of them use `T = f32, B = CpuDevice`).
@@ -33,6 +39,19 @@ type RawState = StreamingTransformerState<f32, CpuDevice>;
 
 fn wrap_state<Q: BackendQ<T = f32, B = CpuDevice>>(raw: RawState) -> TTSState<Q> {
     TTSState { flow_lm_state: FlowLMState { transformer_state: raw } }
+}
+
+/// Slots a voice state already occupies: the voice prompt's frames. Every flow-LM layer
+/// advances together, so the first one says it for all of them.
+fn raw_len(state: &RawState) -> usize {
+    state
+        .layer_states
+        .iter()
+        .find_map(|layer| match layer {
+            LayerAttentionState::FlowLm(mha) => Some(mha.current_end),
+            _ => None,
+        })
+        .unwrap_or(0)
 }
 
 /// Quantization variants exposed to JS.
@@ -43,11 +62,11 @@ enum Quant {
 }
 
 impl Quant {
-    fn parse(s: &str) -> xn::Result<Self> {
+    fn parse(s: &str) -> Result<Self> {
         match s {
             "f32" => Ok(Self::F32),
             "q8" => Ok(Self::Q8),
-            other => xn::bail!("unsupported quantization '{other}'"),
+            other => xn::bail!("unsupported quantization '{other}', expected 'f32' or 'q8'"),
         }
     }
 }
@@ -62,6 +81,16 @@ enum StateInner {
     Q8(TTSState<Q80F32>),
 }
 
+/// Run a block against the active model. Within the block, `$m` is `&TTSModel<Q>`.
+macro_rules! with_model {
+    ($inner:expr, |$m:ident| $body:expr) => {
+        match $inner {
+            ModelInner::F32($m) => $body,
+            ModelInner::Q8($m) => $body,
+        }
+    };
+}
+
 /// Dispatch a block of code over the currently active (model, state) pair. Within the
 /// block, `$m` is `&TTSModel<Q>` and `$s` is `&mut TTSState<Q>` for the matching `Q`.
 macro_rules! dispatch {
@@ -74,20 +103,42 @@ macro_rules! dispatch {
     };
 }
 
-struct GenState {
+/// One sentence-aligned piece of the text, ready to prompt.
+struct ChunkPlan {
+    tokens: Vec<u32>,
+    frame_budget: usize,
+    frames_after_eos: usize,
+}
+
+/// The chunk currently being generated.
+struct ChunkState {
     tts_state: StateInner,
     mimi_state: MimiDecoderState<f32, CpuDevice>,
     prev_latent: Option<Tensor<f32, CpuDevice>>,
-    rng: NormalRng,
-    max_frames: usize,
+    frame_budget: usize,
     eos: EosPolicy,
     step: usize,
+    /// Set once `eos` has run out: the frame that did it has been returned, and the next
+    /// call ends the chunk.
+    done: bool,
+}
+
+struct GenState {
+    /// The voice state, resized to fit the longest chunk. Every chunk starts from a clone of
+    /// it, as `ptts::synth` does: chunks run one after the other, so sharing the KV storage
+    /// is safe, and each overwrites only what lies past the voice prompt.
+    base: RawState,
+    chunks: std::vec::IntoIter<ChunkPlan>,
+    current: Option<ChunkState>,
+    /// One noise source for the whole text, so a seed fixes every chunk.
+    rng: NormalRng,
 }
 
 #[wasm_bindgen]
 pub struct Model {
     inner: ModelInner,
     cfg: TTSConfig,
+    speaker_proj: Option<Linear<f32, CpuDevice>>,
     gen_state: Option<GenState>,
     voice_states: Vec<RawState>,
     /// How `start_generation` normalizes, named by the page when it built the
@@ -96,166 +147,207 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn new_(
+    fn new_(
         model_weights: &[u8],
         tokenizer_json: &[u8],
+        config_json: Option<Vec<u8>>,
         quant: &str,
         lang: &str,
         rewrites: Option<&str>,
-    ) -> xn::Result<Model> {
+    ) -> Result<Model> {
         let quant = Quant::parse(quant)?;
         let rules = match rewrites {
             Some(rewrites) => Rules::parse(rewrites)?,
             None => Rules::ALL,
         };
         let normalize = Normalize::parse(lang)?.with_rules(rules);
-        console_log!("[new] loading model with quant={quant:?}");
-        let cfg = TTSConfig::v202601(0.5);
+        let cfg = match config_json {
+            Some(json) => match serde_json::from_slice(&json) {
+                Ok(cfg) => cfg,
+                Err(e) => xn::bail!("cannot parse config.json: {e}"),
+            },
+            // `temp` is not read by the runtime: sampling temperature reaches the model
+            // through `start_generation`.
+            None => TTSConfig::v202601(0.3),
+        };
+        console_log!("[phonon] loading model with quant={quant:?}");
 
         let is_gguf = model_weights.len() >= 4 && &model_weights[..4] == b"GGUF";
         let vb = if is_gguf {
-            console_log!("[new] detected gguf format");
             let cursor = std::io::Cursor::new(model_weights.to_vec());
             VB::load_gguf_with_key_map(cursor, CPU, remap_key)?
         } else {
-            console_log!("[new] detected safetensors format");
             VB::from_bytes_with_key_map(vec![model_weights.to_vec()], CPU, remap_key)?
         };
         let root = vb.root();
-        let tokenizer_box: Box<dyn ptts::Tokenizer + Send + Sync> =
+        let tokenizer: Box<dyn ptts::Tokenizer + Send + Sync> =
             Box::new(Tok::from_bytes(tokenizer_json)?);
+        let speaker_proj = load_speaker_proj(&root, &cfg)?;
 
         let inner = match quant {
-            Quant::F32 => ModelInner::F32(TTSModel::<Unquantized<f32, CpuDevice>>::load(
-                &root,
-                tokenizer_box,
-                &cfg,
-            )?),
-            Quant::Q8 => ModelInner::Q8(TTSModel::<Q80F32>::load(&root, tokenizer_box, &cfg)?),
+            Quant::F32 => ModelInner::F32(TTSModel::load(&root, tokenizer, &cfg)?),
+            Quant::Q8 => ModelInner::Q8(TTSModel::load(&root, tokenizer, &cfg)?),
         };
 
-        Ok(Model { inner, cfg, gen_state: None, voice_states: Vec::new(), normalize })
+        Ok(Model { inner, cfg, speaker_proj, gen_state: None, voice_states: Vec::new(), normalize })
     }
 
-    /// Load a pre-computed KV cache state from a safetensors buffer.
-    /// The file contains `transformer.layers.{i}.self_attn/cache` (shape [2, 1, seq, 16, 64])
-    /// and `transformer.layers.{i}.self_attn/current_end` (single f32) for each layer.
-    /// Returns the voice index for use with start_generation.
-    pub fn add_voice_(&mut self, state_bytes: &[u8]) -> xn::Result<usize> {
-        console_log!("[add_voice] loading safetensors, {} bytes", state_bytes.len());
-        let tensors = xn::safetensors::load_from_buffer(state_bytes, &CPU)?;
+    fn add_voice_(&mut self, bytes: &[u8]) -> Result<usize> {
+        let tensors = xn::safetensors::load_from_buffer(bytes, &CPU)?;
+        let raw = if tensors.contains_key(&kv_cache_name(0)) {
+            self.voice_from_kv_cache(&tensors)?
+        } else {
+            self.voice_from_emb(bytes)?
+        };
+        self.voice_states.push(raw);
+        Ok(self.voice_states.len() - 1)
+    }
+
+    /// A voice stored as the flow LM's KV cache after the voice prompt, the format the
+    /// `embeddings_v2/` voices use: `transformer.layers.{i}.self_attn/cache`, shaped
+    /// `[2, 1, seq, heads, head_dim]`, for each layer. Nothing to run.
+    fn voice_from_kv_cache(
+        &self,
+        tensors: &std::collections::HashMap<String, TypedTensor<CpuDevice>>,
+    ) -> Result<RawState> {
         let num_layers = self.cfg.flow_lm.num_layers;
         let mut layer_states = Vec::with_capacity(num_layers);
-
         for i in 0..num_layers {
-            let cache_name = format!("transformer.layers.{i}.self_attn/cache");
-
+            let cache_name = kv_cache_name(i);
             let cache = match tensors.get(&cache_name) {
                 Some(TypedTensor::F32(t)) => t,
                 _ => xn::bail!("expected f32 tensor: {cache_name}"),
             };
-
-            // cache shape: (2, batch, seq_len, num_heads, head_dim)
             let (two, batch, seq_len, num_heads, head_dim) = cache.dims5()?;
             if two != 2 {
-                xn::bail!("expected first dim of size 2 in cache tensor");
+                xn::bail!("{cache_name}: expected a first dim of size 2, got {two}");
             }
-            let k_cache = cache
-                .narrow(0, 0..1)?
-                .contiguous()?
-                .reshape((batch, seq_len, num_heads, head_dim))?;
-            let v_cache = cache
-                .narrow(0, 1..2)?
-                .contiguous()?
-                .reshape((batch, seq_len, num_heads, head_dim))?;
+            let kv = |i: usize| -> Result<Tensor<f32, CpuDevice>> {
+                cache
+                    .narrow(0, i..i + 1)?
+                    .contiguous()?
+                    .reshape((batch, seq_len, num_heads, head_dim))
+            };
             layer_states.push(LayerAttentionState::FlowLm(StreamingMHAState {
-                k_cache,
-                v_cache,
+                k_cache: kv(0)?,
+                v_cache: kv(1)?,
                 current_end: seq_len,
             }));
         }
-
-        let raw = StreamingTransformerState { layer_states };
-        let idx = self.voice_states.len();
-        self.voice_states.push(raw);
-        Ok(idx)
+        Ok(StreamingTransformerState { layer_states })
     }
 
-    pub fn start_generation_(
+    /// A voice stored as an embedding (`emb`, `audio_prompt`) or as speaker-Mimi latents
+    /// (`speaker_wavs`), the formats every other frontend reads. It is run through the flow
+    /// LM once, here, so generation can start from the resulting state.
+    fn voice_from_emb(&self, bytes: &[u8]) -> Result<RawState> {
+        let model_ext = self.cfg.model_ext();
+        let emb = load_voice_emb_from_bytes(
+            bytes,
+            model_ext.as_deref(),
+            self.speaker_proj.as_ref(),
+            &CPU,
+        )?;
+        let frames = emb.dim(1usize)?;
+        with_model!(&self.inner, |m| {
+            let mut state = m.init_flow_lm_state(1, frames)?;
+            m.prompt_audio(&mut state, &emb)?;
+            Ok(state.flow_lm_state.transformer_state)
+        })
+    }
+
+    fn start_generation_(
         &mut self,
         voice_index: usize,
         text: &str,
         temperature: f32,
-    ) -> xn::Result<usize> {
-        // Dropped before anything else can fail. `generation_step_` only puts the state back
-        // while the utterance is unfinished, so an abandoned one is still here -- and every
-        // early return below would otherwise leave a caller that swallows the error polling
-        // `generation_step` and quietly resuming the *previous* utterance.
+        seed: u32,
+    ) -> Result<usize> {
+        // Dropped before anything else can fail, so a caller that swallows the error cannot
+        // go on stepping and quietly resume the *previous* utterance.
         self.gen_state = None;
-        // Built here rather than after the prompt pass: a temperature that cannot produce a
-        // distribution should be refused before `with_seq_budget` allocates the KV cache and
-        // `prompt_text` runs a forward pass, not after.
-        let rng = NormalRng::new(temperature, SEED)?;
-
-        // Normalization runs first: it collapses runs of whitespace, including
-        // the padding `prepare_text_prompt` adds to short text.
-        let (text, frames_after_eos) = prepare_text_prompt(&self.normalize.apply(text));
-        let token_ids = match &self.inner {
-            ModelInner::F32(m) => m.flow_lm.conditioner.tokenize(&text)?,
-            ModelInner::Q8(m) => m.flow_lm.conditioner.tokenize(&text)?,
+        // Built here rather than after planning: a temperature that cannot produce a
+        // distribution should be refused before any work is done.
+        let rng = NormalRng::new(temperature, seed as u64)?;
+        let Some(voice) = self.voice_states.get(voice_index) else {
+            xn::bail!("invalid voice index: {voice_index}")
         };
-        console_log!(
-            "[start_generation] voice_index={} num_tokens={} frames_after_eos={} temperature={}",
-            voice_index,
-            token_ids.len(),
-            frames_after_eos,
-            temperature
-        );
+        let chunks = self.plan_chunks(text)?;
 
-        let num_tokens = token_ids.len();
-        let max_frames = plan::frame_budget(num_tokens, self.cfg.mimi.frame_rate);
-        let seq_budget = plan::seq_budget(num_tokens, max_frames);
+        // The KV budget has to hold the voice prompt plus the longest chunk's text and audio.
+        let voice_len = raw_len(voice);
+        let seq_budget =
+            chunks.iter().map(|c| voice_len + c.tokens.len() + c.frame_budget).max().unwrap_or(0);
+        let base = voice.with_seq_budget(seq_budget)?;
 
-        // Resize the cached voice state (small budget) into a full-sized state.
-        if voice_index >= self.voice_states.len() {
-            xn::bail!("invalid voice index: {voice_index}");
-        }
-        let raw = self.voice_states[voice_index].with_seq_budget(seq_budget)?;
+        let num_chunks = chunks.len();
+        self.gen_state = Some(GenState { base, chunks: chunks.into_iter(), current: None, rng });
+        Ok(num_chunks)
+    }
 
+    /// Normalize the whole text, split it into sentence-aligned chunks and tokenize each,
+    /// exactly as `ptts::synth` does: normalization first, because it rewrites the characters
+    /// the splitter looks for and would collapse the padding `prepare_text_prompt` adds.
+    fn plan_chunks(&self, text: &str) -> Result<Vec<ChunkPlan>> {
+        let frame_rate = self.cfg.mimi.frame_rate;
+        let text = self.normalize.apply(text);
+        with_model!(&self.inner, |m| {
+            let conditioner = &m.flow_lm.conditioner;
+            let Some(tokenizer) = conditioner.tokenizer.as_deref() else {
+                xn::bail!("this model was loaded without a tokenizer")
+            };
+            let texts = split_into_best_sentences(tokenizer, &text, Some(MAX_TOKENS_PER_CHUNK))?;
+            let mut chunks = Vec::with_capacity(texts.len());
+            for text in texts {
+                let (prepared, frames_after_eos) = prepare_text_prompt(&text);
+                let tokens = conditioner.tokenize(&prepared)?;
+                let frame_budget = plan::frame_budget(tokens.len(), frame_rate);
+                chunks.push(ChunkPlan { tokens, frame_budget, frames_after_eos });
+            }
+            if chunks.is_empty() {
+                xn::bail!("nothing to synthesize: the text is empty")
+            }
+            Ok(chunks)
+        })
+    }
+
+    fn next_chunk_(&mut self) -> Result<Option<usize>> {
+        let Some(gen_state) = self.gen_state.as_mut() else { return Ok(None) };
+        gen_state.current = None;
+        let Some(chunk) = gen_state.chunks.next() else {
+            self.gen_state = None;
+            return Ok(None);
+        };
+        let raw = gen_state.base.clone();
         let mut tts_state = match &self.inner {
             ModelInner::F32(_) => StateInner::F32(wrap_state(raw)),
             ModelInner::Q8(_) => StateInner::Q8(wrap_state(raw)),
         };
-
-        console_log!("[start_generation] running prompt_text...");
         let mimi_state = dispatch!(&self.inner, &mut tts_state, |m, s| {
-            m.prompt_text(s, &token_ids)?;
+            m.prompt_text(s, &chunk.tokens)?;
             m.init_mimi_state(1)?
         });
-        console_log!("[start_generation] prompt_text done, starting generation loop");
-
-        self.gen_state = Some(GenState {
+        gen_state.current = Some(ChunkState {
             tts_state,
             mimi_state,
             prev_latent: None,
-            rng,
-            max_frames,
-            eos: EosPolicy::new(frames_after_eos),
+            frame_budget: chunk.frame_budget,
+            eos: EosPolicy::new(chunk.frames_after_eos),
             step: 0,
+            done: false,
         });
-        Ok(num_tokens)
+        Ok(Some(chunk.tokens.len()))
     }
 
-    pub fn generation_step_(&mut self) -> xn::Result<Option<js_sys::Float32Array>> {
-        let mut state = match self.gen_state.take() {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-
-        if state.step >= state.max_frames {
+    fn generation_step_(&mut self) -> Result<Option<js_sys::Float32Array>> {
+        let Some(gen_state) = self.gen_state.as_mut() else { return Ok(None) };
+        let Some(state) = gen_state.current.as_mut() else { return Ok(None) };
+        if state.done || state.step >= state.frame_budget {
+            gen_state.current = None;
             return Ok(None);
         }
 
+        let rng = &mut gen_state.rng;
         let (next_latent, audio_chunk, is_eos) =
             dispatch!(&self.inner, &mut state.tts_state, |m, s| {
                 // Inside the dispatch: `StepInput` is generic over the quantization,
@@ -264,33 +356,38 @@ impl Model {
                     None => StepInput::Bos { batch: 1 },
                     Some(t) => StepInput::Latent(t),
                 };
-                let (next_latent, is_eos) = m.generate_step(s, input, &mut state.rng)?;
+                let (next_latent, is_eos) = m.generate_step(s, input, rng)?;
                 let audio_chunk = m.decode_latent(&next_latent, &mut state.mimi_state)?;
                 (next_latent, audio_chunk, is_eos)
             });
 
         // `should_stop` is called after the frame has gone to the decoder: the EOS frame
-        // itself is part of the output.
-        let done = state.eos.should_stop(is_eos);
-
+        // itself is part of the output. The frame is returned either way; the next call
+        // reports the end of the chunk.
+        state.done = state.eos.should_stop(is_eos);
         state.prev_latent = Some(next_latent);
         state.step += 1;
 
-        let audio = audio_chunk.narrow(0, ..1)?.contiguous()?;
-        let pcm = audio.to_vec()?;
-        let result = js_sys::Float32Array::from(pcm.as_slice());
-
-        if !done {
-            self.gen_state = Some(state);
-        }
-
-        Ok(Some(result))
+        let pcm = audio_chunk.narrow(0, ..1)?.contiguous()?.to_vec()?;
+        Ok(Some(js_sys::Float32Array::from(pcm.as_slice())))
     }
+}
+
+fn kv_cache_name(layer: usize) -> String {
+    format!("transformer.layers.{layer}.self_attn/cache")
+}
+
+fn js_err(e: xn::Error) -> JsError {
+    JsError::new(&e.to_string())
 }
 
 #[wasm_bindgen]
 impl Model {
-    /// `tokenizer_json` is the contents of a `tokenizer.json` for this checkpoint's vocabulary.
+    /// `model_weights` is a safetensors or GGUF checkpoint, `tokenizer_json` the contents of
+    /// the `tokenizer.json` for its vocabulary, and `config_json` its `config.json`, or
+    /// `undefined` for the original Pocket TTS architecture.
+    ///
+    /// `quant` is `"f32"` or `"q8"`.
     ///
     /// `lang` is required: the language text is normalized as before it is
     /// tokenized, one of `"en"`, `"fr"`, `"de"`, `"es"`, `"pt"`, or `"none"`
@@ -304,39 +401,55 @@ impl Model {
     pub fn new(
         model_weights: &[u8],
         tokenizer_json: &[u8],
+        config_json: Option<Vec<u8>>,
         quant: &str,
         lang: &str,
         rewrites: Option<String>,
-    ) -> Result<Model, JsError> {
-        Self::new_(model_weights, tokenizer_json, quant, lang, rewrites.as_deref())
-            .map_err(|e| JsError::new(&e.to_string()))
+    ) -> std::result::Result<Model, JsError> {
+        Self::new_(model_weights, tokenizer_json, config_json, quant, lang, rewrites.as_deref())
+            .map_err(js_err)
     }
 
-    pub fn add_voice(&mut self, voice_weights: &[u8]) -> Result<usize, JsError> {
-        self.add_voice_(voice_weights).map_err(|e| JsError::new(&e.to_string()))
+    /// Registers a voice from a safetensors file and returns its index for
+    /// `start_generation`. Either a precomputed KV cache (`embeddings_v2/`) or a voice
+    /// embedding (`emb`, `audio_prompt` or `speaker_wavs`), told apart by tensor name.
+    pub fn add_voice(&mut self, voice: &[u8]) -> std::result::Result<usize, JsError> {
+        self.add_voice_(voice).map_err(js_err)
     }
 
-    /// Normalizes, prepares and tokenizes `text`, then runs the prompt step.
-    /// Returns the token count.
+    /// Normalizes `text`, splits it into sentence-aligned chunks and tokenizes them. Returns
+    /// the number of chunks. Runs no model: call `next_chunk` to start the first one.
     pub fn start_generation(
         &mut self,
         voice_index: usize,
         text: &str,
         temperature: f32,
-    ) -> Result<usize, JsError> {
-        self.start_generation_(voice_index, text, temperature)
-            .map_err(|e| JsError::new(&e.to_string()))
+        seed: u32,
+    ) -> std::result::Result<usize, JsError> {
+        self.start_generation_(voice_index, text, temperature, seed).map_err(js_err)
     }
 
-    pub fn generation_step(&mut self) -> Result<Option<js_sys::Float32Array>, JsError> {
-        self.generation_step_().map_err(|e| JsError::new(&e.to_string()))
+    /// Prompts the model with the next chunk's text and returns its token count, or
+    /// `undefined` once every chunk has been generated.
+    pub fn next_chunk(&mut self) -> std::result::Result<Option<usize>, JsError> {
+        self.next_chunk_().map_err(js_err)
+    }
+
+    /// Generates and decodes one frame of the current chunk: 80 ms of mono PCM at
+    /// `sample_rate`. Returns `undefined` when the chunk is finished.
+    pub fn generation_step(
+        &mut self,
+    ) -> std::result::Result<Option<js_sys::Float32Array>, JsError> {
+        self.generation_step_().map_err(js_err)
+    }
+
+    /// Drops the generation in progress, if any.
+    pub fn stop_generation(&mut self) {
+        self.gen_state = None;
     }
 
     pub fn sample_rate(&self) -> usize {
-        match &self.inner {
-            ModelInner::F32(m) => m.sample_rate(),
-            ModelInner::Q8(m) => m.sample_rate(),
-        }
+        with_model!(&self.inner, |m| m.sample_rate())
     }
 }
 
