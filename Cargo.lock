@@ -2821,6 +2821,7 @@ dependencies = [
  "getrandom 0.3.4",
  "js-sys",
  "ptts",
+ "serde_json",
  "wasm-bindgen",
  "xn",
 ]
