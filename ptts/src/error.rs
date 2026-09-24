@@ -129,19 +129,25 @@ fn io_kind(e: &xn::Error) -> Option<std::io::ErrorKind> {
     }
 }
 
+// The `allow`s below are for wasm only, where `synth` is not compiled and these three lose
+// their only callers. Per function rather than on the `impl`, so anything else going dead
+// still warns.
 impl Error {
     pub(crate) fn invalid_argument(detail: impl std::fmt::Display) -> Self {
         Self::InvalidArgument(detail.to_string())
     }
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn not_found(detail: impl std::fmt::Display) -> Self {
         Self::NotFound(detail.to_string())
     }
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn unsupported(detail: impl std::fmt::Display) -> Self {
         Self::Unsupported(detail.to_string())
     }
     pub(crate) fn invalid_data(detail: impl std::fmt::Display) -> Self {
         Self::InvalidData(detail.to_string())
     }
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn busy(detail: impl std::fmt::Display) -> Self {
         Self::Busy(detail.to_string())
     }

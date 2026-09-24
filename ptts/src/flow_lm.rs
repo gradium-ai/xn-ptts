@@ -118,13 +118,27 @@ pub struct FlowLM<Q: BackendQ> {
     pub transformer: StreamingTransformer<Q>,
     pub emb_std: Tensor<Q::T, Q::B>,
     pub emb_mean: Tensor<Q::T, Q::B>,
-    bos_emb: Vec<Q::T>,
+    /// On the device: reading it back at load would deadlock in a browser.
+    bos_emb: Tensor<Q::T, Q::B>,
     pub input_linear: Linear<Q::T, Q::B>,
     out_norm_weight: Tensor<Q::T, Q::B>,
     out_norm_bias: Tensor<Q::T, Q::B>,
     out_eos: Linear<Q::T, Q::B>,
     pub dim: usize,
     pub ldim: usize,
+}
+
+/// What a sampling step is conditioned on.
+///
+/// Saying "first step" in the type, rather than with a sentinel the model would
+/// have to read back to notice, is what keeps the step on the device. A NaN in
+/// `Latent` carries no meaning and reaches the model as it is.
+pub enum StepInput<'a, Q: BackendQ> {
+    /// Start the sequence; every row of the batch starts from `bos_emb`.
+    Bos {
+        batch: usize,
+    },
+    Latent(&'a Tensor<Q::T, Q::B>),
 }
 
 #[derive(Clone, Debug)]
@@ -180,7 +194,7 @@ impl<Q: BackendQ> FlowLM<Q> {
 
         let emb_std = vb.tensor("emb_std", (cfg.ldim,))?;
         let emb_mean = vb.tensor("emb_mean", (cfg.ldim,))?;
-        let bos_emb = vb.tensor("bos_emb", (cfg.ldim,))?.to_vec()?;
+        let bos_emb = vb.tensor("bos_emb", (cfg.ldim,))?;
         let input_linear = Linear::load(vb.pp("input_linear"), cfg.ldim, cfg.d_model)?;
         let out_norm_weight = vb.pp("out_norm").tensor("weight", (cfg.d_model,))?;
         let out_norm_bias = vb.pp("out_norm").tensor("bias", (cfg.d_model,))?;
@@ -229,43 +243,71 @@ impl<Q: BackendQ> FlowLM<Q> {
         out.narrow(1, start..total)?.contiguous()
     }
 
-    /// Sample next latent using flow matching.
-    /// Returns (next_latent [B, 1, ldim], is_eos [B, 1]).
-    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    pub fn sample_next_latent(
+    fn step_embedding(&self, input: StepInput<'_, Q>) -> Result<Tensor<Q::T, Q::B>> {
+        match input {
+            StepInput::Latent(t) => Ok(t.clone()),
+            StepInput::Bos { batch } => self
+                .bos_emb
+                .reshape((1, 1, self.ldim))?
+                .broadcast_as((batch, 1, self.ldim))?
+                .contiguous(),
+        }
+    }
+
+    /// The tail both samplers share. `t_out` is the backbone's last position, `[b, dim]`.
+    #[allow(clippy::type_complexity)]
+    fn sample_from(
         &self,
-        sequence: &Tensor<Q::T, Q::B>,
+        t_out: &Tensor<Q::T, Q::B>,
+        b: usize,
+        lsd_decode_steps: usize,
+        rng: &mut impl Rng,
+    ) -> Result<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>)> {
+        let eos_logit = self.out_eos.forward(t_out)?;
+        let noise_data: Vec<Q::T> =
+            (0..b * self.ldim).map(|_| Q::T::from_f32(rng.sample())).collect();
+        let noise = Tensor::from_vec(noise_data, (b, self.ldim), t_out.device())?;
+        let latent = lsd_decode(&self.flow_net, t_out, &noise, lsd_decode_steps)?;
+        Ok((latent.reshape((b, 1, self.ldim))?, eos_logit))
+    }
+
+    /// Records a sampling step, returning the latent and the *raw* eos logit.
+    ///
+    /// Thresholding the logit here would mean reading it back, which a browser
+    /// cannot block on. Every other op only records into the backend's batch, so
+    /// leaving it a tensor is what makes the whole step callable from one.
+    #[allow(clippy::type_complexity)]
+    pub fn sample_next_latent_parts(
+        &self,
+        input: StepInput<'_, Q>,
         text_embeddings: &Tensor<Q::T, Q::B>,
         state: &mut FlowLMState<Q>,
         lsd_decode_steps: usize,
         rng: &mut impl Rng,
-        eos_threshold: f32,
-    ) -> Result<(Tensor<Q::T, Q::B>, bool)> {
+    ) -> Result<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>)> {
+        let sequence = self.step_embedding(input)?;
         let (b, s, _) = sequence.dims3()?;
-        let dev = sequence.device();
 
-        let sequence = self.replace_nan_with_bos(sequence)?;
         let input = self.input_linear.forward(&sequence)?;
-        let transformer_out = self.backbone(&input, text_embeddings, s, state)?;
-        let t_len = transformer_out.dim(1usize)?;
-        let transformer_out = transformer_out.narrow(1, t_len - 1..t_len)?.contiguous()?;
-        let transformer_out = transformer_out.reshape((b, self.dim))?;
+        let t_out = self.backbone(&input, text_embeddings, s, state)?;
+        let t_len = t_out.dim(1usize)?;
+        let t_out = t_out.narrow(1, t_len - 1..t_len)?.contiguous()?.reshape((b, self.dim))?;
 
-        let eos_logit = self.out_eos.forward(&transformer_out)?;
-        let eos_val = eos_logit.to_vec()?;
-        let is_eos = eos_val[0].to_f32() > eos_threshold;
-        let noise_data: Vec<Q::T> =
-            (0..b * self.ldim).map(|_| Q::T::from_f32(rng.sample())).collect();
-        let noise = Tensor::from_vec(noise_data, (b, self.ldim), dev)?;
-        let latent = lsd_decode(&self.flow_net, &transformer_out, &noise, lsd_decode_steps)?;
-        let latent = latent.reshape((b, 1, self.ldim))?;
-        Ok((latent, is_eos))
+        self.sample_from(&t_out, b, lsd_decode_steps, rng)
     }
 
+    /// Threshold an eos logit already on the host. Only row 0 decides; an empty
+    /// slice is never eos.
+    pub fn eos_from_logit(eos_val: &[Q::T], eos_threshold: f32) -> bool {
+        eos_val.first().is_some_and(|v| v.to_f32() > eos_threshold)
+    }
+
+    /// Resolves eos itself, so unlike [`Self::sample_next_latent_parts`] it reads
+    /// back once per step and a browser cannot drive it. Nothing needs that yet.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn sample_next_latent_cfg(
         &self,
-        sequence: &Tensor<Q::T, Q::B>,
+        input: StepInput<'_, Q>,
         text_embeddings: &Tensor<Q::T, Q::B>,
         state: &mut FlowLMState<Q>,
         null_state: &mut FlowLMState<Q>,
@@ -274,46 +316,20 @@ impl<Q: BackendQ> FlowLM<Q> {
         rng: &mut impl Rng,
         eos_threshold: f32,
     ) -> Result<(Tensor<Q::T, Q::B>, bool)> {
+        let sequence = self.step_embedding(input)?;
         let (b, s, _) = sequence.dims3()?;
-        let dev = sequence.device();
 
-        let sequence = self.replace_nan_with_bos(sequence)?;
-        let input = self.input_linear.forward(&sequence)?;
-        let t_out = self.backbone(&input, text_embeddings, s, state)?;
+        let x = self.input_linear.forward(&sequence)?;
+        let t_out = self.backbone(&x, text_embeddings, s, state)?;
         let t_len = t_out.dim(1usize)?;
-        let t_out = t_out.narrow(1, t_len - 1..t_len)?.contiguous()?;
-        let t_out = t_out.reshape((b, self.dim))?;
-        let null_out = self.backbone(&input, text_embeddings, s, null_state)?;
+        let t_out = t_out.narrow(1, t_len - 1..t_len)?.contiguous()?.reshape((b, self.dim))?;
+        let null_out = self.backbone(&x, text_embeddings, s, null_state)?;
         let null_out =
             null_out.narrow(1, t_len - 1..t_len)?.contiguous()?.reshape((b, self.dim))?;
-        let s = Q::T::from_f32(cfg_coef);
-        let t_out = t_out.sub(&null_out)?.scale(s)?.add(&null_out)?;
-        let eos_logit = self.out_eos.forward(&t_out)?;
-        let eos_val = eos_logit.to_vec()?;
-        let is_eos = eos_val[0].to_f32() > eos_threshold;
-        let noise_data: Vec<Q::T> =
-            (0..b * self.ldim).map(|_| Q::T::from_f32(rng.sample())).collect();
-        let noise = Tensor::from_vec(noise_data, (b, self.ldim), dev)?;
-        let latent = lsd_decode(&self.flow_net, &t_out, &noise, lsd_decode_steps)?;
-        let latent = latent.reshape((b, 1, self.ldim))?;
-        Ok((latent, is_eos))
-    }
+        let t_out = t_out.sub(&null_out)?.scale(Q::T::from_f32(cfg_coef))?.add(&null_out)?;
 
-    /// Replace NaN values in sequence with bos_emb.
-    fn replace_nan_with_bos(&self, sequence: &Tensor<Q::T, Q::B>) -> Result<Tensor<Q::T, Q::B>> {
-        let data = sequence.to_vec()?;
-        // TODO(laurent): avoid the `to_vec` below. For this, we could introduce
-        // something like torch.where.
-        let bos_data = &self.bos_emb;
-        let mut out_data = data.clone();
-        let ldim = self.ldim;
-
-        for i in 0..out_data.len() {
-            if out_data[i].to_f32().is_nan() {
-                out_data[i] = bos_data[i % ldim];
-            }
-        }
-        Tensor::from_vec(out_data, sequence.shape().clone(), sequence.device())
+        let (latent, eos_logit) = self.sample_from(&t_out, b, lsd_decode_steps, rng)?;
+        Ok((latent, Self::eos_from_logit(&eos_logit.to_vec()?, eos_threshold)))
     }
 }
 

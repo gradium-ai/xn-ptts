@@ -60,7 +60,7 @@
 //! the loop by hand, from an event loop with no threads to spawn, is what
 //! [`crate::tts_model::TTSModel`]'s primitives are for.
 
-use crate::flow_lm::NormalRng;
+use crate::flow_lm::{NormalRng, StepInput};
 use crate::loader;
 use crate::plan::{self, EosPolicy};
 use crate::preprocess::Normalize;
@@ -825,7 +825,6 @@ impl<Q: BackendQ> SessionOf<Q> {
         let base_state = self.base.clone();
         let cfg_base = self.cfg_base.clone();
         let mimi_init = self.model.init_mimi_state(1)?;
-        let ldim = self.model.flow_lm.ldim;
 
         let (pcm_tx, pcm_rx) = std::sync::mpsc::channel::<Result<Vec<f32>>>();
         let (latent_tx, latent_rx) = std::sync::mpsc::channel::<Frame<Q>>();
@@ -891,7 +890,7 @@ impl<Q: BackendQ> SessionOf<Q> {
         let backbone_handle = std::thread::spawn(move || {
             // Dropped when this thread ends, which is after its last write.
             let _in_flight = in_flight;
-            let result = run_backbone(&model, chunks, base_state, cfg_base, rng, ldim, &latent_tx);
+            let result = run_backbone(&model, chunks, base_state, cfg_base, rng, &latent_tx);
             if let Err(e) = result {
                 let _ = pcm_tx.send(Err(e));
             }
@@ -957,10 +956,8 @@ fn run_backbone<Q: BackendQ>(
     base_state: TTSState<Q>,
     cfg_base: Option<(f32, TTSState<Q>)>,
     mut rng: Box<dyn crate::flow_lm::Rng + Send>,
-    ldim: usize,
     latent_tx: &std::sync::mpsc::Sender<Frame<Q>>,
 ) -> Result<()> {
-    let device = model.device().clone();
     for chunk in chunks.iter() {
         let mut state = base_state.clone();
         let mut cfg_state = cfg_base.clone();
@@ -969,18 +966,19 @@ fn run_backbone<Q: BackendQ>(
             model.prompt_text_null(null_state)?;
         }
 
-        // A NaN latent marks the start of the sequence.
-        let nan = vec![f32::NAN; ldim];
-        let mut prev: Tensor<Q::T, Q::B> =
-            Tensor::from_vec(nan, (1, 1, ldim), &device)?.to::<Q::T>()?;
+        let mut prev: Option<Tensor<Q::T, Q::B>> = None;
         let mut eos = EosPolicy::new(chunk.frames_after_eos);
 
         for _ in 0..chunk.frame_budget {
+            let input = match &prev {
+                None => StepInput::Bos { batch: 1 },
+                Some(t) => StepInput::Latent(t),
+            };
             let (next, is_eos) = match cfg_state.as_mut() {
                 Some((coef, null_state)) => {
-                    model.generate_step_cfg(&mut state, null_state, *coef, &prev, &mut rng)?
+                    model.generate_step_cfg(&mut state, null_state, *coef, input, &mut rng)?
                 }
-                None => model.generate_step(&mut state, &prev, &mut rng)?,
+                None => model.generate_step(&mut state, input, &mut rng)?,
             };
             // A closed channel means the consumer went away; stop quietly and
             // let the decoder thread report any error of its own.
@@ -990,7 +988,7 @@ fn run_backbone<Q: BackendQ>(
             if eos.should_stop(is_eos) {
                 break;
             }
-            prev = next;
+            prev = Some(next);
         }
         if latent_tx.send(Frame::ChunkEnd).is_err() {
             return Ok(());

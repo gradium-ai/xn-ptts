@@ -88,6 +88,14 @@ pub mod preprocess;
 pub mod resample;
 pub mod rope;
 pub mod seanet;
+// Not on wasm: `Synth` runs the flow LM and the Mimi decoder on two `std::thread`s, and
+// `wasm32-unknown-unknown` has none -- `spawn` there compiles and then panics. Browser
+// frontends drive `tts_model::TTSModel` directly instead.
+//
+// Deliberately `//` and not `///`: an outer doc comment here is concatenated ahead of
+// `synth.rs`'s own `//!` header, whose intra-doc links then resolve in this scope and all
+// come out unresolved.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod synth;
 #[cfg(feature = "hf")]
 pub mod tok;

@@ -10,7 +10,7 @@ macro_rules! console_log {
     ($($t:tt)*) => (log(&format!($($t)*)))
 }
 
-use ptts::flow_lm::{FlowLMState, NormalRng};
+use ptts::flow_lm::{FlowLMState, NormalRng, StepInput};
 use ptts::loader::remap_key;
 use ptts::mimi::MimiDecoderState;
 use ptts::plan::{self, EosPolicy};
@@ -111,7 +111,7 @@ macro_rules! dispatch {
 struct GenState {
     tts_state: StateInner,
     mimi_state: MimiDecoderState<f32, CpuDevice>,
-    prev_latent: Tensor<f32, CpuDevice>,
+    prev_latent: Option<Tensor<f32, CpuDevice>>,
     rng: NormalRng,
     max_frames: usize,
     eos: EosPolicy,
@@ -264,14 +264,10 @@ impl Model {
         });
         console_log!("[start_generation] prompt_text done, starting generation loop");
 
-        let ldim = self.cfg.flow_lm.ldim;
-        let nan_data: Vec<f32> = vec![f32::NAN; ldim];
-        let prev_latent = Tensor::from_vec(nan_data, (1, 1, ldim), &CPU)?;
-
         self.gen_state = Some(GenState {
             tts_state,
             mimi_state,
-            prev_latent,
+            prev_latent: None,
             rng,
             max_frames,
             eos: EosPolicy::new(frames_after_eos),
@@ -292,8 +288,13 @@ impl Model {
 
         let (next_latent, audio_chunk, is_eos) =
             dispatch!(&self.inner, &mut state.tts_state, |m, s| {
-                let (next_latent, is_eos) =
-                    m.generate_step(s, &state.prev_latent, &mut state.rng)?;
+                // Inside the dispatch: `StepInput` is generic over the quantization,
+                // so one built outside would pin this to a single arm.
+                let input = match &state.prev_latent {
+                    None => StepInput::Bos { batch: 1 },
+                    Some(t) => StepInput::Latent(t),
+                };
+                let (next_latent, is_eos) = m.generate_step(s, input, &mut state.rng)?;
                 let audio_chunk = m.decode_latent(&next_latent, &mut state.mimi_state)?;
                 (next_latent, audio_chunk, is_eos)
             });
@@ -302,7 +303,7 @@ impl Model {
         // itself is part of the output.
         let done = state.eos.should_stop(is_eos);
 
-        state.prev_latent = next_latent;
+        state.prev_latent = Some(next_latent);
         state.step += 1;
 
         let audio = audio_chunk.narrow(0, ..1)?.contiguous()?;

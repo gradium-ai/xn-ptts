@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ptts::flow_lm::NormalRng;
+use ptts::flow_lm::{NormalRng, StepInput};
 use ptts::plan::{EosPolicy, frame_budget};
 use ptts::preprocess::Normalize;
 use ptts::tok::Tok;
@@ -101,8 +101,6 @@ fn one<Q: BackendQ>(
     args: &Args,
     frame_rate: f64,
 ) -> Result<Run> {
-    let dev = model.device();
-    let ldim = model.flow_lm.ldim;
     let mut rng = NormalRng::new(args.temperature, args.seed)?;
     let mut frames = Vec::new();
     let mut sample_t = Vec::new();
@@ -116,14 +114,16 @@ fn one<Q: BackendQ>(
         model.prompt_text(&mut state, tokens)?;
         let mut mimi_state = model.init_mimi_state(1)?;
 
-        // BOS marker: an all-NaN latent.
-        let nan: Tensor<f32, Q::B> = Tensor::from_vec(vec![f32::NAN; ldim], (1, 1, ldim), dev)?;
-        let mut prev_latent = nan.to::<Q::T>()?;
+        let mut prev_latent: Option<Tensor<Q::T, Q::B>> = None;
         let mut eos = EosPolicy::new(*frames_after_eos);
 
         for _ in 0..frame_budget(tokens.len(), frame_rate) {
             let frame_start = Instant::now();
-            let (next_latent, is_eos) = model.generate_step(&mut state, &prev_latent, &mut rng)?;
+            let input = match &prev_latent {
+                None => StepInput::Bos { batch: 1 },
+                Some(t) => StepInput::Latent(t),
+            };
+            let (next_latent, is_eos) = model.generate_step(&mut state, input, &mut rng)?;
             let sampled = Instant::now();
             // Decoding on this thread rather than overlapped, so the measurement attributes
             // sampling and decoding to the frame that caused them.
@@ -140,7 +140,7 @@ fn one<Q: BackendQ>(
             if eos.should_stop(is_eos) {
                 break;
             }
-            prev_latent = next_latent;
+            prev_latent = Some(next_latent);
         }
     }
 

@@ -277,11 +277,28 @@ impl<Q: BackendQ> TTSModel<Q> {
         audio_conditioning: &Tensor<Q::T, Q::B>,
     ) -> Result<()> {
         let dev = audio_conditioning.device();
-        let empty_text = Tensor::zeros((1, 0, self.flow_lm.conditioner.dim), dev)?;
         let empty_latents = Tensor::zeros((1, 0, self.flow_lm.ldim), dev)?;
-        let text_embeddings = Tensor::cat(&[&empty_text, audio_conditioning], 1)?;
+        let text_embeddings = Tensor::cat(&[&self.empty_text()?, audio_conditioning], 1)?;
         self.run_backbone_and_increment(state, &text_embeddings, &empty_latents)?;
         Ok(())
+    }
+
+    /// One autoregressive step, returning the latent and the *raw* eos logit.
+    /// Reads nothing back, so this is the entry point a browser can drive.
+    #[allow(clippy::type_complexity)]
+    pub fn generate_step_parts(
+        &self,
+        state: &mut TTSState<Q>,
+        input: crate::flow_lm::StepInput<'_, Q>,
+        rng: &mut impl crate::flow_lm::Rng,
+    ) -> Result<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>)> {
+        self.flow_lm.sample_next_latent_parts(
+            input,
+            &self.empty_text()?,
+            &mut state.flow_lm_state,
+            self.lsd_decode_steps,
+            rng,
+        )
     }
 
     /// Run one autoregressive generation step.
@@ -290,39 +307,33 @@ impl<Q: BackendQ> TTSModel<Q> {
     pub fn generate_step(
         &self,
         state: &mut TTSState<Q>,
-        backbone_input: &Tensor<Q::T, Q::B>,
+        input: crate::flow_lm::StepInput<'_, Q>,
         rng: &mut impl crate::flow_lm::Rng,
     ) -> Result<(Tensor<Q::T, Q::B>, bool)> {
-        let dev = backbone_input.device();
-        let empty_text = Tensor::zeros((1, 0, self.flow_lm.conditioner.dim), dev)?;
-
-        let (latent, is_eos) = self.flow_lm.sample_next_latent(
-            backbone_input,
-            &empty_text,
-            &mut state.flow_lm_state,
-            self.lsd_decode_steps,
-            rng,
-            self.eos_threshold,
-        )?;
-
-        Ok((latent, is_eos))
+        let (latent, eos_logit) = self.generate_step_parts(state, input, rng)?;
+        Ok((latent, self.eos_from_logit(&eos_logit.to_vec()?)))
     }
 
+    /// Threshold an eos logit the caller has brought back to the host.
+    pub fn eos_from_logit(&self, eos_val: &[Q::T]) -> bool {
+        crate::flow_lm::FlowLM::<Q>::eos_from_logit(eos_val, self.eos_threshold)
+    }
+
+    /// As [`Self::generate_step`], with classifier-free guidance. Reads the eos
+    /// logit back every step, so unlike [`Self::generate_step_parts`] it is not
+    /// browser-safe.
     #[allow(clippy::type_complexity)]
     pub fn generate_step_cfg(
         &self,
         state: &mut TTSState<Q>,
         null_state: &mut TTSState<Q>,
         cfg_coef: f32,
-        backbone_input: &Tensor<Q::T, Q::B>,
+        input: crate::flow_lm::StepInput<'_, Q>,
         rng: &mut impl crate::flow_lm::Rng,
     ) -> Result<(Tensor<Q::T, Q::B>, bool)> {
-        let dev = backbone_input.device();
-        let empty_text = Tensor::zeros((1, 0, self.flow_lm.conditioner.dim), dev)?;
-
         let (latent, is_eos) = self.flow_lm.sample_next_latent_cfg(
-            backbone_input,
-            &empty_text,
+            input,
+            &self.empty_text()?,
             &mut state.flow_lm_state,
             &mut null_state.flow_lm_state,
             cfg_coef,
@@ -377,6 +388,11 @@ impl<Q: BackendQ> TTSModel<Q> {
 
     pub fn device(&self) -> &Q::B {
         self.flow_lm.input_linear.device()
+    }
+
+    /// The empty text prefix a step with no new tokens is conditioned on.
+    fn empty_text(&self) -> Result<Tensor<Q::T, Q::B>> {
+        Tensor::zeros((1, 0, self.flow_lm.conditioner.dim), self.device())
     }
 }
 
