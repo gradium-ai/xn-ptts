@@ -275,6 +275,8 @@ impl Model {
         let chunks = self.plan_chunks(text)?;
 
         // The KV budget has to hold the voice prompt plus the longest chunk's text and audio.
+        // This is `plan::seq_budget` with the voice's real length in place of its
+        // `PROMPT_SEQ_HEADROOM` guess, the same bound `ptts::synth` checks a session against.
         let voice_len = raw_len(voice);
         let seq_budget =
             chunks.iter().map(|c| voice_len + c.tokens.len() + c.frame_budget).max().unwrap_or(0);
@@ -373,6 +375,17 @@ impl Model {
     }
 }
 
+impl Model {
+    /// A failed step leaves a chunk half prompted or half generated. Dropping the generation
+    /// makes every later call report the end instead, so a caller that swallows the error
+    /// cannot go on and silently skip a sentence. `start_generation_` does the same.
+    fn drop_generation_on_error<T>(&mut self, result: &Result<T>) {
+        if result.is_err() {
+            self.gen_state = None;
+        }
+    }
+}
+
 fn kv_cache_name(layer: usize) -> String {
     format!("transformer.layers.{layer}.self_attn/cache")
 }
@@ -432,7 +445,9 @@ impl Model {
     /// Prompts the model with the next chunk's text and returns its token count, or
     /// `undefined` once every chunk has been generated.
     pub fn next_chunk(&mut self) -> std::result::Result<Option<usize>, JsError> {
-        self.next_chunk_().map_err(js_err)
+        let result = self.next_chunk_();
+        self.drop_generation_on_error(&result);
+        result.map_err(js_err)
     }
 
     /// Generates and decodes one frame of the current chunk: 80 ms of mono PCM at
@@ -440,7 +455,9 @@ impl Model {
     pub fn generation_step(
         &mut self,
     ) -> std::result::Result<Option<js_sys::Float32Array>, JsError> {
-        self.generation_step_().map_err(js_err)
+        let result = self.generation_step_();
+        self.drop_generation_on_error(&result);
+        result.map_err(js_err)
     }
 
     /// Drops the generation in progress, if any.
