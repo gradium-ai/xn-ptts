@@ -256,7 +256,10 @@ async function generate() {
   let firstChunkTime = null;
   const chunks = [];
 
-  // AudioContext must be created/resumed from a user gesture
+  // AudioContext must be created/resumed from a user gesture. Close the last ones first:
+  // browsers cap how many can be open at once.
+  audioCtx?.close();
+  replayAudioCtx?.close();
   replayAudioCtx = null;
   audioCtx = new AudioContext({ sampleRate });
   analyser = makeAnalyser(audioCtx);

@@ -23,6 +23,8 @@ export class PhononTTS {
   #voices;
   #defaultVoice;
   #disposed = false;
+  /** Why the instance stopped, when it was not `dispose()`: the worker's crash. */
+  #failure = null;
 
   /** Samples per second of the audio this model produces (24000 for Pocket TTS). */
   sampleRate;
@@ -54,7 +56,7 @@ export class PhononTTS {
     if (quant !== 'f32' && quant !== 'q8') {
       throw new TypeError(`quant must be 'f32' or 'q8', got '${quant}'`);
     }
-    const defaultVoice = model.defaultVoice ?? Object.keys(model.voices)[0];
+    const defaultVoice = model.defaultVoice ?? Object.keys(model.voices ?? {})[0];
     const preload = voices ?? (defaultVoice ? [defaultVoice] : []);
 
     // `new URL(..., import.meta.url)` inline, not through a variable: it is the pattern Vite,
@@ -90,7 +92,7 @@ export class PhononTTS {
   /** @private Use `PhononTTS.load`. */
   constructor(worker, model, defaultVoice) {
     this.#worker = worker;
-    this.#voices = new Set(Object.keys(model.voices));
+    this.#voices = new Set(Object.keys(model.voices ?? {}));
     this.#defaultVoice = defaultVoice;
     worker.onmessage = ({ data }) => this.#pending.get(data.id)?.[data.type]?.(data);
     worker.onerror = (e) => {
@@ -99,6 +101,7 @@ export class PhononTTS {
       // than leaving later requests waiting forever.
       const error = new Error(`phonon-tts worker failed: ${e.message ?? 'could not start'}`);
       this.#disposed = true;
+      this.#failure = error;
       worker.terminate();
       this.#failAll(error);
     };
@@ -116,7 +119,15 @@ export class PhononTTS {
    * @param {string} name
    * @param {string | URL | ArrayBuffer | Uint8Array | Blob} source
    */
-  async addVoice(name, source) {
+  addVoice(name, source) {
+    // Queued with the generations: a `stream` for this voice called right after, without an
+    // `await`, then waits for it, and adding a voice never stalls audio already being made.
+    const added = this.#queue.then(() => this.#addVoiceNow(name, source));
+    this.#queue = added.catch(() => {});
+    return added;
+  }
+
+  async #addVoiceNow(name, source) {
     let payload;
     const transfer = [];
     if (typeof source === 'string' || source instanceof URL) {
@@ -193,7 +204,7 @@ export class PhononTTS {
     const run = () =>
       new Promise((settled) => {
         done.then(settled, settled);
-        if (finished || this.#disposed) return finish(this.#disposed ? disposedError() : null, { cancelled: true });
+        if (finished || this.#disposed) return finish(this.#disposed ? this.#endError() : null, { cancelled: true });
         started = true;
         this.#pending.set(id, handlers);
         this.#worker.postMessage({ type: 'generate', id, text, voice, temperature, seed });
@@ -253,13 +264,17 @@ export class PhononTTS {
     this.#failAll(disposedError());
   }
 
+  #endError() {
+    return this.#failure ?? disposedError();
+  }
+
   #failAll(error) {
     for (const handlers of this.#pending.values()) handlers.error({ message: error.message });
     this.#pending.clear();
   }
 
   #request(message, { onProgress, transfer = [] } = {}) {
-    if (this.#disposed) return Promise.reject(disposedError());
+    if (this.#disposed) return Promise.reject(this.#endError());
     const id = this.#nextId++;
     return new Promise((resolve, reject) => {
       this.#pending.set(id, {

@@ -21,7 +21,10 @@ if (!existsSync(join(out, 'wasm', 'phonon_tts_bg.wasm'))) {
 }
 
 const cargo = readFileSync(join(repoDir, 'Cargo.toml'), 'utf8');
-const version = cargo.match(/\[workspace\.package\][^[]*?\nversion\s*=\s*"([^"]+)"/)?.[1];
+// Only inside `[workspace.package]`, up to the next section header, so an array value such as
+// `keywords = [...]` in between cannot end the search early.
+const section = cargo.match(/^\[workspace\.package\]\s*$([\s\S]*?)(?=^\[|(?![\s\S]))/m)?.[1] ?? '';
+const version = section.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
 if (!version) {
   console.error('could not find workspace.package.version in Cargo.toml');
   process.exit(1);

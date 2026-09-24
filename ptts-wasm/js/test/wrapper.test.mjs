@@ -17,12 +17,14 @@ class FakeWorker {
     this.cancelled = new Set();
     this.generations = [];
     this.terminated = false;
+    this.log = [];
   }
   reply(data) {
     queueMicrotask(() => !this.terminated && this.onmessage?.({ data }));
   }
   postMessage(msg) {
     const { type, id } = msg;
+    this.log.push(type);
     if (type === 'init') return this.reply({ type: 'result', id, value: { sampleRate: 24000, features: {} } });
     if (type === 'add_voice') return this.reply({ type: 'result', id });
     if (type === 'cancel') return this.cancelled.add(id);
@@ -137,6 +139,23 @@ test('addVoice copies bytes rather than detaching the caller\'s buffer', async (
   await tts.addVoice('mine', bytes);
   assert.equal(bytes.length, 3);
   assert.ok(tts.voices.includes('mine'));
+});
+
+test('a stream right after addVoice waits for the voice', async () => {
+  FakeWorker.script = { frames: 1, fail: null };
+  const tts = await load();
+  const added = tts.addVoice('mine', new Blob([new Uint8Array([1])]));
+  const pcm = await tts.synth('Hi.', { voice: 'mine' });
+  await added;
+  assert.equal(pcm.length, 4);
+  assert.deepEqual(FakeWorker.last.log.slice(-2), ['add_voice', 'generate']);
+});
+
+test('after a worker crash, later requests fail with the crash', async () => {
+  const tts = await load();
+  FakeWorker.last.onerror({ message: 'out of memory' });
+  await assert.rejects(tts.synth('After.'), /out of memory/);
+  await assert.rejects(tts.addVoice('x', 'https://x/v'), /out of memory/);
 });
 
 // ---- caching ----
