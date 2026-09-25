@@ -285,7 +285,7 @@ worker.onmessage = (e) => {
       const durationSec = totalSamples / sampleRate;
       const duration = durationSec.toFixed(2);
       const firstAudio = firstChunkTime != null ? (firstChunkTime / 1000).toFixed(2) : '?';
-      const rtf = totalMs > 0 ? (durationSec / (totalMs / 1000)).toFixed(3) : '?';
+      const rtf = durationSec > 0 ? (totalMs / 1000 / durationSec).toFixed(4) : '?';
       const promptMs = data.promptMs != null ? data.promptMs.toFixed(0) : '?';
       const avgMs = data.stepMsAvg != null ? data.stepMsAvg.toFixed(1) : '?';
       const minMs = data.stepMsMin != null ? data.stepMsMin.toFixed(1) : '?';
