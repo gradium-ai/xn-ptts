@@ -254,7 +254,7 @@ worker.onmessage = (e) => {
       break;
 
     case 'gen_start':
-      log(`Generating speech (${data.numTokens} tokens)...`);
+      log(`Generating speech (${data.numChunks} chunk(s), ${data.numTokens} tokens in the first)...`);
       break;
 
     case 'chunk': {

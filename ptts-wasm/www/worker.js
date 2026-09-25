@@ -74,7 +74,7 @@ async function handleLoad(quant) {
   const modelWeights = await fetchWithProgress(modelUrl(quant), 'Model weights');
 
   post('status', { message: `Initializing model (quant=${quant})...` });
-  model = new Model(modelWeights, tokenizerJson, quant, LANG);
+  model = new Model(modelWeights, tokenizerJson, undefined, quant, LANG);
 
   for (const name of VOICE_NAMES) {
     post('status', { message: `Loading voice: ${name}...` });
@@ -90,28 +90,37 @@ async function handleLoad(quant) {
 async function handleGenerate(text, voiceName, temperature) {
   const voiceIndex = voiceIndexMap[voiceName];
 
-  // Time the prompt step: `start_generation` prepares and tokenizes the text, then runs
-  // `prompt_text` on the transformer state, which is the bulk of the prefill cost.
-  const promptT0 = performance.now();
-  const numTokens = model.start_generation(voiceIndex, text, temperature);
-  const promptMs = performance.now() - promptT0;
+  // `start_generation` splits the text into sentence-aligned chunks. Each `next_chunk` runs
+  // `prompt_text` for one of them, which is the bulk of the prefill cost, so it is timed.
+  const numChunks = model.start_generation(voiceIndex, text, temperature, 42);
 
-  post('gen_start', { numTokens });
-
+  let numTokens = 0;
+  let promptMs = 0;
   let step = 0;
   let stepMsTotal = 0;
   let stepMsMin = Infinity;
   let stepMsMax = 0;
   while (true) {
-    const t0 = performance.now();
-    const chunk = model.generation_step();
-    const dt = performance.now() - t0;
-    if (!chunk) break;
-    stepMsTotal += dt;
-    if (dt < stepMsMin) stepMsMin = dt;
-    if (dt > stepMsMax) stepMsMax = dt;
-    post('chunk', { data: chunk, step }, [chunk.buffer]);
-    step++;
+    const promptT0 = performance.now();
+    const tokens = model.next_chunk();
+    if (tokens === undefined) break;
+    promptMs += performance.now() - promptT0;
+    numTokens += tokens;
+    // Only the first chunk's tokens are known at this point; the rest are counted as
+    // their chunks are prompted, so `numChunks` is what says how much is still to come.
+    if (step === 0) post('gen_start', { numTokens, numChunks });
+
+    while (true) {
+      const t0 = performance.now();
+      const chunk = model.generation_step();
+      const dt = performance.now() - t0;
+      if (!chunk) break;
+      stepMsTotal += dt;
+      if (dt < stepMsMin) stepMsMin = dt;
+      if (dt > stepMsMax) stepMsMax = dt;
+      post('chunk', { data: chunk, step }, [chunk.buffer]);
+      step++;
+    }
   }
 
   const stepMsAvg = step > 0 ? stepMsTotal / step : 0;
