@@ -1,0 +1,117 @@
+# Builds the `phonon-tts` npm package from `ptts-wasm/`, and publishes it on a `v*` tag --
+# the same tag that publishes the PyPI wheels, so every registry gets the same version.
+#
+# Publishing uses npm trusted publishing (OIDC), so no token is stored in the repo. It has to
+# be enabled once on npmjs.com: phonon-tts -> Settings -> Trusted publishing -> GitHub Actions,
+# repository gradium-ai/xn-ptts, workflow `npm-publish.yml`. npm records provenance for
+# packages published this way on its own.
+name: npm
+
+on:
+  push:
+    tags:
+      - 'v*'
+    # Only so the wasm build cache gets saved: setup-rust saves it on `main` alone, and
+    # without these runs every PR and every release would build from cold.
+    branches: [main]
+    paths:
+      - 'ptts-wasm/**'
+      - 'ptts/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'LICENSE-*'
+      - '.github/workflows/npm-publish.yml'
+      - '.github/actions/**'
+  pull_request:
+    paths:
+      - 'ptts-wasm/**'
+      - 'ptts/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'LICENSE-*'
+      - '.github/workflows/npm-publish.yml'
+      - '.github/actions/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Build phonon-tts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      # Pinned rather than whatever the runner image ships. Node 24 also brings npm 11.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: wasm32-unknown-unknown
+          cache-key: npm
+          audio-deps: "false"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      - name: Test the JS wrapper
+        run: node --test ptts-wasm/js/test/*.test.mjs
+
+      # The SIMD flags `.cargo/config.toml` sets for local builds, which setup-rust deleted.
+      # `relaxed-simd` is not optional: xn's quantized kernels call `f32x4_relaxed_madd`
+      # unconditionally, so the module needs it either way.
+      - name: Build the package
+        working-directory: ptts-wasm
+        env:
+          RUSTFLAGS: -C target-feature=+simd128,+relaxed-simd
+        run: make build
+
+      - name: Check the tag matches the package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: ptts-wasm/pkg
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $version"
+            exit 1
+          fi
+
+      - name: List the package contents
+        working-directory: ptts-wasm/pkg
+        run: npm pack --dry-run
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: phonon-tts
+          path: ptts-wasm/pkg
+
+  # A job of its own, so only this step can mint the OIDC token npm accepts, and what it
+  # publishes is exactly the artifact the build job listed.
+  publish:
+    name: Publish phonon-tts
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v8
+        with:
+          name: phonon-tts
+          path: pkg
+      # Trusted publishing needs npm 11.5.1 or later. npm also refuses to publish a
+      # prerelease without a dist-tag, so `-rc` and `-beta` versions go to `next`.
+      - name: Publish
+        working-directory: pkg
+        run: |
+          npm install --global npm@^11.5.1
+          tag=latest
+          case "$GITHUB_REF_NAME" in *-*) tag=next ;; esac
+          npm publish --access public --tag "$tag"

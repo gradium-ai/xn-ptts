@@ -49,9 +49,11 @@ The page downloads the q8 weights (about 146 MB) from Hugging Face the first tim
 
 The package version is not in `js/package.json`. `pack.mjs` stamps it from `workspace.package.version` in the top-level `Cargo.toml`, so npm, PyPI and crates.io stay on one version.
 
-## Before a release
+## Publishing
 
-Check the default checkpoint in `js/models.js`. Its URLs are pinned to Hugging Face revisions, and the files are cached by URL, so changing a revision makes every user download again.
+`.github/workflows/npm-publish.yml` builds the package on every PR that touches it. It publishes on a `v*` tag, the same tag that publishes the Python wheels. It uses npm trusted publishing, which has to be enabled once for `phonon-tts` on npmjs.com.
+
+Before a release, check the default checkpoint in `js/models.js`. Its URLs are pinned to Hugging Face revisions, and the files are cached by URL, so changing a revision makes every user download again.
 
 ## Known limits
 

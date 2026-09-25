@@ -86,7 +86,7 @@ make test         # node --test js/test/*.test.mjs -- the wrapper's logic, no br
 
 Requires `wasm-pack` (`cargo install wasm-pack`) and node. `scripts/pack.mjs` assembles the package and stamps its version from `workspace.package.version`, so `js/package.json` deliberately has no `version`. It also deletes the `.gitignore` wasm-pack writes into `pkg/wasm/`: npm reads a subdirectory `.gitignore` as that directory's `.npmignore`, which would silently publish a package without its wasm. The demo downloads the q8 weights (~146 MB) from HuggingFace once and keeps them in the Cache API. Wasm SIMD flags (`+simd128,+relaxed-simd`) and `getrandom_backend="wasm_js"` come from `.cargo/config.toml`. `relaxed-simd` is required rather than an optimization: `xn`'s quantized kernels call `f32x4_relaxed_madd` unconditionally, so browsers without Relaxed SIMD cannot compile the module at all.
 
-The default checkpoint's URLs, pinned to HF revisions, are in `js/models.js`. Files are cached by URL, so bump those revisions together with the package version.
+The default checkpoint's URLs, pinned to HF revisions, are in `js/models.js`. Files are cached by URL, so bump those revisions together with the package version. `.github/workflows/npm-publish.yml` builds the package on PRs that touch it and publishes it on a `v*` tag through npm trusted publishing (OIDC, no token).
 
 ## Python build
 
