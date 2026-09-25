@@ -61,9 +61,9 @@
 //! better, but the spoken forms are per-language, so guessing is worse than
 //! doing nothing.
 //!
-//! A server answering many requests for one voice wants
-//! [`synth::Synth::session`], which conditions on the voice prompt once
-//! instead of per request.
+//! A voice is conditioned on once per [`synth::Synth`], whichever entry point
+//! is used; [`synth::Synth::session`] additionally pins the KV budget for a
+//! stream of requests.
 //!
 //! Callers that need to drive the loop themselves — a browser build stepping
 //! from an event loop, with no threads to spawn — should use

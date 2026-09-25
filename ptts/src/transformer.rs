@@ -222,6 +222,53 @@ pub struct StreamingTransformerState<T: WithDTypeF, B: Backend> {
     pub layer_states: Vec<LayerAttentionState<T, B>>,
 }
 
+impl<T: WithDTypeF, B: Backend> StreamingTransformerState<T, B> {
+    /// A fresh state with room for `seq_budget` positions, holding a copy of the filled prefix.
+    ///
+    /// Not `Clone`: cloning an `xn` tensor shares its storage, so two generations started from
+    /// one clone would write into the same KV buffers. Mimi caches are fixed-context ring
+    /// buffers and are cloned as-is.
+    pub fn with_seq_budget(&self, seq_budget: usize) -> Result<Self> {
+        let mut layer_states = Vec::with_capacity(self.layer_states.len());
+        for layer in self.layer_states.iter() {
+            let copied = match layer {
+                LayerAttentionState::Mimi(kv) => LayerAttentionState::Mimi(kv.clone()),
+                LayerAttentionState::FlowLm(mha) => {
+                    let used = mha.current_end;
+                    if used > seq_budget {
+                        xn::bail!(
+                            "cannot fit {used} filled KV positions into a budget of {seq_budget}"
+                        )
+                    }
+                    let (b, _, h, d) = mha.k_cache.dims4()?;
+                    let dev = mha.device();
+                    let k_cache = Tensor::zeros((b, seq_budget, h, d), dev)?;
+                    let v_cache = Tensor::zeros((b, seq_budget, h, d), dev)?;
+                    if used > 0 {
+                        k_cache.slice_set(
+                            &mha.k_cache.narrow(1, 0..used)?.contiguous()?,
+                            1usize,
+                            0,
+                        )?;
+                        v_cache.slice_set(
+                            &mha.v_cache.narrow(1, 0..used)?.contiguous()?,
+                            1usize,
+                            0,
+                        )?;
+                    }
+                    LayerAttentionState::FlowLm(StreamingMHAState {
+                        k_cache,
+                        v_cache,
+                        current_end: used,
+                    })
+                }
+            };
+            layer_states.push(copied);
+        }
+        Ok(Self { layer_states })
+    }
+}
+
 // ---- MimiStreamingMultiheadAttention ----
 // Uses KV cache with context window.
 
@@ -609,5 +656,84 @@ impl<Q: BackendQ> ProjectedTransformer<Q> {
             ys.push(y.transpose(1, 2)?.contiguous()?);
         }
         Ok(ys)
+    }
+}
+
+#[cfg(test)]
+mod with_seq_budget_tests {
+    use super::*;
+    use xn::CpuDevice;
+
+    fn filled_state(seq: usize, used: usize) -> StreamingTransformerState<f32, CpuDevice> {
+        // k[b, s, h, d] = s + 100*h so a copied prefix is recognisable, and the
+        // never-written tail stays zero.
+        let (b, h, d) = (1, 2, 3);
+        let data: Vec<f32> = (0..b * seq * h * d)
+            .map(|i| {
+                let s_ = (i / (h * d)) % seq;
+                let h_ = (i / d) % h;
+                (s_ + 100 * h_) as f32
+            })
+            .collect();
+        let k = Tensor::from_vec(data.clone(), (b, seq, h, d), &CpuDevice).unwrap();
+        let v = Tensor::from_vec(data.iter().map(|x| -x).collect(), (b, seq, h, d), &CpuDevice)
+            .unwrap();
+        StreamingTransformerState {
+            layer_states: vec![LayerAttentionState::FlowLm(StreamingMHAState {
+                k_cache: k,
+                v_cache: v,
+                current_end: used,
+            })],
+        }
+    }
+
+    fn flat(t: &Tensor<f32, CpuDevice>) -> Vec<f32> {
+        t.flatten_all().unwrap().to_vec1().unwrap()
+    }
+
+    #[test]
+    fn copies_the_used_prefix_and_zero_fills_the_rest() {
+        let small = filled_state(4, 3);
+        let big = small.with_seq_budget(10).unwrap();
+        let LayerAttentionState::FlowLm(mha) = &big.layer_states[0] else { panic!() };
+        assert_eq!(mha.current_end, 3);
+        assert_eq!(mha.k_cache.dims(), &[1, 10, 2, 3]);
+        let k = flat(&mha.k_cache);
+        for pos in 0..3 {
+            for h in 0..2 {
+                for d in 0..3 {
+                    assert_eq!(k[(pos * 2 + h) * 3 + d], (pos + 100 * h) as f32, "pos {pos} h {h}");
+                }
+            }
+        }
+        assert!(k[3 * 6..].iter().all(|x| *x == 0.0));
+        assert_eq!(
+            flat(&mha.v_cache)[0..18],
+            flat(&{
+                let LayerAttentionState::FlowLm(m) = &small.layer_states[0] else { panic!() };
+                m.v_cache.narrow(1, 0..3).unwrap().contiguous().unwrap()
+            })[..]
+        );
+    }
+
+    #[test]
+    fn the_copy_does_not_share_storage_with_the_source() {
+        // The whole reason this exists rather than `Clone`.
+        let small = filled_state(4, 2);
+        let big = small.with_seq_budget(8).unwrap();
+        let LayerAttentionState::FlowLm(dst) = &big.layer_states[0] else { panic!() };
+        let LayerAttentionState::FlowLm(src) = &small.layer_states[0] else { panic!() };
+        let poison = Tensor::from_vec(vec![9e9f32; 6], (1, 1, 2, 3), &CpuDevice).unwrap();
+        dst.k_cache.slice_set(&poison, 1usize, 0).unwrap();
+        // Index 3 is (pos 0, head 1) = 100.0 in the pattern, so this also fails if the source
+        // were zeros all along.
+        assert_eq!(flat(&src.k_cache)[3], 100.0, "writing the copy must not reach the source");
+    }
+
+    #[test]
+    fn a_budget_smaller_than_the_prefix_is_refused() {
+        let err = filled_state(4, 3).with_seq_budget(2).unwrap_err().to_string();
+        assert!(err.contains("3") && err.contains("2"), "{err}");
+        assert!(filled_state(4, 3).with_seq_budget(3).is_ok());
     }
 }

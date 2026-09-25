@@ -35,40 +35,6 @@ fn wrap_state<Q: BackendQ<T = f32, B = CpuDevice>>(raw: RawState) -> TTSState<Q>
     TTSState { flow_lm_state: FlowLMState { transformer_state: raw } }
 }
 
-/// Creates a new transformer state with a larger seq_budget, copying the used KV entries
-/// from a cached state (which was allocated with a smaller budget).
-fn resize_state(cached: &RawState, new_seq_budget: usize) -> xn::Result<RawState> {
-    console_log!("[resize_state] resizing to seq_budget={new_seq_budget}");
-    let mut new_layer_states = Vec::new();
-    for layer_state in cached.layer_states.iter() {
-        match layer_state {
-            LayerAttentionState::FlowLm(mha_state) => {
-                let current_end = mha_state.current_end;
-                let b = mha_state.k_cache.dim(0usize)?;
-                let h = mha_state.k_cache.dim(2usize)?;
-                let d = mha_state.k_cache.dim(3usize)?;
-                let new_k = Tensor::zeros((b, new_seq_budget, h, d), &CPU)?;
-                let new_v = Tensor::zeros((b, new_seq_budget, h, d), &CPU)?;
-                if current_end > 0 {
-                    let k_used = mha_state.k_cache.narrow(1, 0..current_end)?.contiguous()?;
-                    let v_used = mha_state.v_cache.narrow(1, 0..current_end)?.contiguous()?;
-                    new_k.slice_set(&k_used, 1usize, 0)?;
-                    new_v.slice_set(&v_used, 1usize, 0)?;
-                }
-                new_layer_states.push(LayerAttentionState::FlowLm(StreamingMHAState {
-                    k_cache: new_k,
-                    v_cache: new_v,
-                    current_end,
-                }));
-            }
-            other => {
-                new_layer_states.push(other.clone());
-            }
-        }
-    }
-    Ok(StreamingTransformerState { layer_states: new_layer_states })
-}
-
 /// Quantization variants exposed to JS.
 #[derive(Clone, Copy, Debug)]
 enum Quant {
@@ -222,7 +188,7 @@ impl Model {
         // `generation_step` and quietly resuming the *previous* utterance.
         self.gen_state = None;
         // Built here rather than after the prompt pass: a temperature that cannot produce a
-        // distribution should be refused before `resize_state` allocates the KV cache and
+        // distribution should be refused before `with_seq_budget` allocates the KV cache and
         // `prompt_text` runs a forward pass, not after.
         let rng = NormalRng::new(temperature, SEED)?;
 
@@ -249,8 +215,7 @@ impl Model {
         if voice_index >= self.voice_states.len() {
             xn::bail!("invalid voice index: {voice_index}");
         }
-        let cached = &self.voice_states[voice_index];
-        let raw = resize_state(cached, seq_budget)?;
+        let raw = self.voice_states[voice_index].with_seq_budget(seq_budget)?;
 
         let mut tts_state = match &self.inner {
             ModelInner::F32(_) => StateInner::F32(wrap_state(raw)),
