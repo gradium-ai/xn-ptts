@@ -1,45 +1,17 @@
-# wasm-pocket-tts
+# ptts-wasm
 
-WebAssembly build of [Pocket TTS](../ptts/) — run text-to-speech directly in the browser.
+The browser build of [Pocket TTS](../ptts/), published to npm as [`phonon-tts`](https://www.npmjs.com/package/phonon-tts). This README is about building and changing it. For using the package, see [`js/README.md`](js/README.md), which is also the README on npm.
 
-Try it online [here](https://laurentmazare.github.io/pocket-tts).
+## Layout
 
-## Prerequisites
+- `src/lib.rs`: the raw `wasm-bindgen` surface. It takes bytes that are already fetched and generates one 80 ms frame per call, because the browser has no threads to hand generation to. Text is normalized, split into sentence-aligned chunks and tokenized in Rust, with the same rules as `ptts::synth`. Voices can be `emb` embeddings, which are run through the model once when they are added, or the precomputed KV caches of `embeddings_v2/`.
+- `js/`: the package's public API. `index.js` exports `PhononTTS`, which runs the model in a worker (`worker.js`), downloads and caches its files (`fetch.js`, via the Cache API), and turns requests into async iterators. `models.js` says where the default checkpoint lives. `index.d.ts` holds the types. `test/` holds node tests for the wrapper's own logic.
+- `scripts/pack.mjs`: assembles the npm package around the wasm-pack output.
+- `www/index.html`: the demo page, built on the package the way a consumer would use it.
 
-Install [wasm-pack](https://rustwasm.github.io/wasm-pack/installer/):
+### Driving `src/lib.rs` directly
 
-```bash
-cargo install wasm-pack
-```
-
-## Build
-
-From the `ptts-wasm/` directory:
-
-```bash
-make build
-```
-
-This runs `wasm-pack build` and copies `www/` into `pkg/`.
-
-## Run
-
-Serve the `pkg/` directory with any HTTP server, for example:
-
-```bash
-cd ptts-wasm/pkg
-python3 -m http.server 8080
-```
-
-Then open http://localhost:8080 in your browser. The page will download the
-model weights from HuggingFace on first use (~240 MB) and cache them for subsequent generations.
-
-## The JS API
-
-A browser has no threads to hand generation to, so the module generates one frame per call
-and the caller yields to the event loop between them. Long text is split into
-sentence-aligned chunks, and each chunk is prompted before its frames are generated, which
-makes the loop two levels deep:
+`js/worker.js` is the only caller, and this is the loop it runs. Text is split in Rust, so prompting is per chunk and generation is per frame, which makes it two levels deep:
 
 ```js
 const model = new Model(modelWeights, tokenizerJson, configJson, quant, lang, rewrites);
@@ -50,8 +22,7 @@ model.start_generation(voiceIndex, text, temperature, seed);
 
 while (true) {
   // Prompts the next chunk's text, or returns undefined once every chunk is done.
-  const numTokens = model.next_chunk();
-  if (numTokens === undefined) break;
+  if (model.next_chunk() === undefined) break;
 
   while (true) {
     // 80ms of mono PCM at model.sample_rate(), or undefined at the end of the chunk.
@@ -62,28 +33,28 @@ while (true) {
 }
 ```
 
-`model.stop_generation()` drops a generation in progress. An error thrown by `next_chunk` or
-`generation_step` also drops it, so a caller that swallows one cannot carry on and silently
-lose a sentence -- every later call reports the end instead.
+`stop_generation()` drops a generation in progress. An error thrown by `next_chunk` or `generation_step` also drops it, so a caller that swallows one cannot carry on and silently lose a sentence -- every later call reports the end instead. One noise source covers every chunk, so `seed` fixes the whole utterance. See the rustdoc on `Model::new` for `quant`, `lang` and what a supplied `config.json` does not change.
 
-`configJson` is a checkpoint's `config.json`, or `undefined` for the original Pocket TTS
-architecture; `rewrites` may be omitted. See `Model::new` in `src/lib.rs` for `quant`, `lang`
-and what a supplied config does not change.
+## Build
 
-### Incompatible with earlier builds
+Needs [wasm-pack](https://github.com/drager/wasm-pack) (`cargo install wasm-pack`) and node.
 
-`Model::new` and `start_generation` both took fewer arguments before, and the old positional
-calls now bind the wrong parameters at runtime rather than failing to build:
+```bash
+make build    # the npm package, in pkg/
+make test     # the wrapper's tests: no browser, no model
+make serve    # build, then serve the demo from site/ on http://localhost:8080
+```
 
-| Before | Now |
-| --- | --- |
-| `new Model(weights, tokenizer, quant, lang, rewrites)` | `new Model(weights, tokenizer, configJson, quant, lang, rewrites)` |
-| `start_generation(voice, text, temperature)` -> token count | `start_generation(voice, text, temperature, seed)` -> chunk count |
-| `generation_step()` until `undefined` | `next_chunk()` per chunk, `generation_step()` within it |
+The page downloads the q8 weights (about 146 MB) from Hugging Face the first time, then loads them from the browser's cache.
 
-The seed was a hardcoded 42 and is now the caller's; one noise source covers every chunk, so
-a seed fixes the whole utterance.
+The package version is not in `js/package.json`. `pack.mjs` stamps it from `workspace.package.version` in the top-level `Cargo.toml`, so npm, PyPI and crates.io stay on one version.
 
-## Todo
+## Before a release
 
-- Voice cloning.
+Check the default checkpoint in `js/models.js`. Its URLs are pinned to Hugging Face revisions, and the files are cached by URL, so changing a revision makes every user download again.
+
+## Known limits
+
+- The module needs WebAssembly Relaxed SIMD. `xn`'s quantized kernels call `f32x4_relaxed_madd` unconditionally, so a browser without it cannot compile the module, even for f32 weights.
+- No voice cloning: the Mimi encoder is not in the browser build.
+- The `webgpu` feature does not compile for `wasm32`. See the note in `.github/workflows/rust-ci.yml`.

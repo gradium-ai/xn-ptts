@@ -8,7 +8,7 @@ Cargo workspace (resolver "3", edition 2024) with four members:
 
 - `ptts/` — core TTS library. Pure Rust, depends on the `xn` tensor/nn crate. Examples live under `ptts/examples/`: `say` (shortest end-to-end call) and `bench` (benchmark harness) require the `hf` feature for the tokenizer, `pocket_tts` (full CLI) requires `hf` and `audio`, `create_voice` (voice embeddings from audio samples) requires `audio`, and `quantize` (safetensors → GGUF converter that selectively quantizes `flow_lm.transformer.layers.*` weights) requires nothing. `model_helpers.rs` is not an example — it is a shared module each example pulls in with `#[path = "..."] mod`, so `autoexamples = false` and every example is listed explicitly in `Cargo.toml`.
 - `ptts-pyo3/` — PyO3 bindings exposing `TTSModel` to Python. Built with maturin; the cdylib is named `ptts`. Has its own `pyproject.toml` and `uv.lock`.
-- `ptts-wasm/` — browser build via `wasm-bindgen` / `wasm-pack`. Ships a demo in `ptts-wasm/www/` (`index.html` + `worker.js`).
+- `ptts-wasm/` — browser build via `wasm-bindgen` / `wasm-pack`, published to npm as `phonon-tts`. `src/lib.rs` is the raw frame-at-a-time `Model`; `js/` is the package's public API around it (`PhononTTS`, which runs the model in a worker, downloads and caches the files, and speaks by voice name), with its own `package.json`, `README.md` and node tests. `www/index.html` is a demo page built on the package.
 - `ptts-ws-server/` — WebSocket streaming server (`axum` + `kaudio`). Needs a system libopus through `kaudio` → `libopus_sys`, which is why CI installs it on Linux and macOS and skips this crate on Windows.
 
 Shared dependency versions (notably `xn`) and the workspace version live in the top-level `Cargo.toml`. Bumping the release version means editing `workspace.package.version` and the `ptts` workspace dep.
@@ -25,7 +25,7 @@ required check called `CI`:
 | `test` | stable + nightly × Linux/macOS/Windows; default features, then `hf,audio`, then doctests; `metal` and `accelerate` type-checked on the macOS leg |
 | `features` | every combination of `hf`/`audio`, plus `vulkan` and `webgpu` |
 | `docs` | `cargo doc` on nightly with `--cfg docsrs` exactly as docs.rs builds it, then again on stable |
-| `wasm` | `ptts-wasm` for `wasm32-unknown-unknown` with the SIMD flags real builds use |
+| `wasm` | `ptts-wasm` for `wasm32-unknown-unknown` with the SIMD flags real builds use, and the `phonon-tts` JS wrapper's node tests |
 
 `.github/actions/setup-rust` is a composite action holding the parts every job shares: the
 toolchain, the cache, and the platform quirks below.
@@ -77,11 +77,16 @@ cargo run --release --features hf,accelerate --example bench -- \
 From `ptts-wasm/`:
 
 ```
-make build        # wasm-pack build --target web --release, then copies www/ into pkg/
+make build        # the phonon-tts npm package in pkg/: wasm-pack output in pkg/wasm/, plus js/
 make profiling    # same but --profiling (no wasm-opt)
+make demo         # pkg/ copied to site/phonon-tts/, plus www/index.html
+make serve        # make demo, then serve site/ on :8080
+make test         # node --test js/test/*.test.mjs -- the wrapper's logic, no browser or model needed
 ```
 
-Requires `wasm-pack` (`cargo install wasm-pack`). Serve `pkg/` with any static server (e.g. `python3 -m http.server 8080`). The demo downloads model weights (~240 MB) from HuggingFace and caches them. Wasm SIMD flags (`+simd128,+relaxed-simd`) and `getrandom_backend="wasm_js"` come from `.cargo/config.toml`.
+Requires `wasm-pack` (`cargo install wasm-pack`) and node. `scripts/pack.mjs` assembles the package and stamps its version from `workspace.package.version`, so `js/package.json` deliberately has no `version`. It also deletes the `.gitignore` wasm-pack writes into `pkg/wasm/`: npm reads a subdirectory `.gitignore` as that directory's `.npmignore`, which would silently publish a package without its wasm. The demo downloads the q8 weights (~146 MB) from HuggingFace once and keeps them in the Cache API. Wasm SIMD flags (`+simd128,+relaxed-simd`) and `getrandom_backend="wasm_js"` come from `.cargo/config.toml`. `relaxed-simd` is required rather than an optimization: `xn`'s quantized kernels call `f32x4_relaxed_madd` unconditionally, so browsers without Relaxed SIMD cannot compile the module at all.
+
+The default checkpoint's URLs, pinned to HF revisions, are in `js/models.js`. Files are cached by URL, so bump those revisions together with the package version.
 
 ## Python build
 
@@ -103,7 +108,7 @@ The library implements Pocket TTS: text → tokens → flow-matching language mo
 `ptts/src/lib.rs` exposes a single `Tokenizer` trait (`encode` / `decode`) so each binding plugs in its own implementation:
 
 - `say` / `pocket_tts` / `bench` examples, `ptts-pyo3` and `ptts-ws-server`: `ptts::tok::Tok` (the `hf` feature), a Hugging Face `tokenizers` wrapper. The examples find the file beside the weights and pass it to `SynthBuilder::tokenizer_file`.
-- `ptts-wasm`: the same `ptts::tok::Tok`, built from the `tokenizer.json` the demo fetches and handed to `Model::new`; the browser passes text, not token ids.
+- `ptts-wasm`: the same `ptts::tok::Tok`, built from the `tokenizer.json` the `phonon-tts` worker fetches and handed to `Model::new`; the browser passes text, not token ids.
 
 Every frontend loads a `tokenizer.json` and nothing else, and none is bundled or defaulted to: each checkpoint has its own vocabulary, and loading the wrong one yields plausible audio from the wrong ids, so `Tok::open` refuses to guess. `pocket_tts --tokenizer <path>` and `bench --tokenizer <path>` override where the examples look; otherwise they, `ptts-pyo3` and `ptts-ws-server` all expect `tokenizer.json` in the HF repo or beside the config. A checkpoint that carries only a `tokenizer.model` needs converting once with `scripts/convert-tokenizer.py`, which writes the equivalent json.
 
@@ -122,7 +127,7 @@ still drive `TTSModel` directly.
 
 Generation is streaming and stateful: callers `init_flow_lm_state(batch, seq_len)`, then `prompt_text*` / `prompt_audio` to seed the state, then step-decode latents and feed them into `MimiDecoderState`. `lsd_decode_steps` controls flow-matching solver steps; `eos_threshold` controls termination. The default `TTSConfig::v202601` configuration is the canonical one consumed by all three frontends.
 
-Text normalization (`ptts/src/preprocess.rs`) is mandatory to choose and has no default. `preprocess::Normalize` is either `For(lang)` or `Off`, and it is a required third argument to `SynthBuilder::new`, a required `--lang` flag on `pocket_tts`, `bench` and `ptts-ws-server`, a required keyword-only `lang=` on `ptts-pyo3`, and a required third argument to the `ptts-wasm` `Model` constructor. The reason it is not defaulted rather than defaulted to English: normalization makes the model noticeably better, but the spoken forms of `@`, `+` and `=` are per-language, so normalizing German as English says "at" where it should say "ät" -- guessing is worse than doing nothing. `Normalize::Off` (`--lang none`, `lang="none"`) hands text to the tokenizer as written.
+Text normalization (`ptts/src/preprocess.rs`) is mandatory to choose and has no default. `preprocess::Normalize` is either `For(lang)` or `Off`, and it is a required third argument to `SynthBuilder::new`, a required `--lang` flag on `pocket_tts`, `bench` and `ptts-ws-server`, a required keyword-only `lang=` on `ptts-pyo3`, and a required `lang` argument to the `ptts-wasm` `Model` constructor and to `PhononTTS.load` in `phonon-tts`. The reason it is not defaulted rather than defaulted to English: normalization makes the model noticeably better, but the spoken forms of `@`, `+` and `=` are per-language, so normalizing German as English says "at" where it should say "ät" -- guessing is worse than doing nothing. `Normalize::Off` (`--lang none`, `lang="none"`) hands text to the tokenizer as written.
 
 `Normalize::apply` is the one implementation, and it has to run before `prepare_text_prompt`, whose leading-space padding of short text it would otherwise collapse. `Synth::normalization` / `Session::normalization` hand it to callers that tokenize by hand (`ptts-ws-server`, `ptts-wasm`) rather than going through `say`/`stream`.
 

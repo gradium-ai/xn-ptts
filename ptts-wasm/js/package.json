@@ -1,0 +1,60 @@
+{
+  "name": "phonon-tts",
+  "description": "On-device text-to-speech in the browser: Pocket TTS compiled to WebAssembly, streaming 24 kHz speech from a worker.",
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./raw": {
+      "types": "./wasm/phonon_tts.d.ts",
+      "default": "./wasm/phonon_tts.js"
+    },
+    "./worker.js": "./worker.js",
+    "./wasm/phonon_tts_bg.wasm": "./wasm/phonon_tts_bg.wasm",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "worker.js",
+    "fetch.js",
+    "models.js",
+    "wav.js",
+    "wasm/phonon_tts.js",
+    "wasm/phonon_tts.d.ts",
+    "wasm/phonon_tts_bg.wasm",
+    "wasm/phonon_tts_bg.wasm.d.ts",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "sideEffects": [
+    "./worker.js"
+  ],
+  "keywords": [
+    "tts",
+    "text-to-speech",
+    "speech-synthesis",
+    "speech",
+    "voice",
+    "wasm",
+    "webassembly",
+    "on-device",
+    "offline",
+    "pocket-tts"
+  ],
+  "license": "MIT OR Apache-2.0",
+  "author": "Gradium",
+  "homepage": "https://github.com/gradium-ai/xn-ptts/tree/main/ptts-wasm#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gradium-ai/xn-ptts.git",
+    "directory": "ptts-wasm"
+  },
+  "bugs": {
+    "url": "https://github.com/gradium-ai/xn-ptts/issues"
+  }
+}

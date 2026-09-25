@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Pocket TTS - WebAssembly Demo</title>
+<title>Phonon TTS - WebAssembly Demo</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 20px; background: #111; color: #ddd; }
@@ -33,7 +33,7 @@
 </head>
 <body>
 
-<p class="subtitle"><a href="https://github.com/kyutai-labs/pocket-tts" target="_blank"> Pocket TTS</a> running in the browser via WebAssembly using <a href="https://github.com/LaurentMazare/xn/tree/main/wasm-pocket-tts#wasm-pocket-tts" target="_blank">xn</a> </p>
+<p class="subtitle"><a href="https://github.com/gradium-ai/xn-ptts" target="_blank">Phonon</a> running <a href="https://huggingface.co/kyutai/pocket-tts" target="_blank">Pocket TTS</a> in the browser via WebAssembly, with the <a href="https://www.npmjs.com/package/phonon-tts" target="_blank">phonon-tts</a> package</p>
 
 <div class="section">
   <label for="text">Text to speak</label>
@@ -43,15 +43,7 @@
 <div class="controls">
   <div class="section">
     <label for="voice">Voice</label>
-    <select id="voice">
-      <option value="alba" selected>Alba</option>
-      <option value="marius">Marius</option>
-      <option value="javert">Javert</option>
-      <option value="fantine">Fantine</option>
-      <option value="cosette">Cosette</option>
-      <option value="eponine">Eponine</option>
-      <option value="azelma">Azelma</option>
-    </select>
+    <select id="voice" disabled><option>alba</option></select>
   </div>
   <div class="section">
     <label for="quant">Quantization</label>
@@ -198,23 +190,17 @@ function startVisualizer() {
   drawBars();
 }
 
-function stopVisualizer() {
-  // The analyser naturally returns zeros when no audio is playing
-}
+// ---- TTS ----
+import { PhononTTS, encodeWav, concatPcm } from './phonon-tts/index.js';
 
-// ---- Worker setup ----
-const worker = new Worker('worker.js', { type: 'module' });
+// The language the demo normalizes its input as. The package requires one: the spoken forms
+// of `@`, `+` and `=` differ per language, so there is nothing safe to default to.
+const LANG = 'en';
 
-let sampleRate = 24000;
+let tts = null;
 let audioCtx = null;
-let nextStartTime = 0;
-let startTime = 0;
-let firstChunkTime = null;
-let allChunks = [];
-let generating = false;
 let replayAudioCtx = null;
-let replaySource = null;
-let cpuFeatures = {};
+let generating = false;
 
 function formatFeatures(f) {
   // Show every flag with a clear on/off marker. Wasm builds normally
@@ -224,48 +210,76 @@ function formatFeatures(f) {
   return 'CPU features: ' + flags.map(k => `${k}=${f[k] ? 'on' : 'off'}`).join(' ');
 }
 
-worker.onmessage = (e) => {
-  const { type, ...data } = e.data;
+function onProgress({ file, loaded, total, cached }) {
+  const mb = (n) => (n / 1e6).toFixed(1);
+  if (cached) {
+    log(`${file}: from cache (${mb(loaded)} MB)`);
+  } else if (total) {
+    log(`${file}: ${Math.round(loaded / total * 100)}% (${mb(loaded)} / ${mb(total)} MB)`);
+    showProgress(loaded / total * 100);
+  } else {
+    log(`${file}: ${mb(loaded)} MB`);
+  }
+}
 
-  switch (type) {
-    case 'status':
-      log(data.message);
-      break;
+async function loadWeights() {
+  loadBtn.disabled = true;
+  quantSelect.disabled = true;
+  try {
+    log('Downloading tokenizer and model...');
+    tts = await PhononTTS.load({ lang: LANG, quant: quantSelect.value, onProgress });
+  } catch (e) {
+    log('Error: ' + e.message);
+    loadBtn.disabled = false;
+    quantSelect.disabled = false;
+    return;
+  } finally {
+    hideProgress();
+  }
+  voiceSelect.innerHTML = tts.voices
+    .map(v => `<option value="${v}">${v[0].toUpperCase() + v.slice(1)}</option>`)
+    .join('');
+  voiceSelect.disabled = false;
+  loadBtn.style.display = 'none';
+  btn.style.display = '';
+  log(`Ready! Enter text and click Generate.\n${formatFeatures(tts.features)}`);
+}
 
-    case 'progress':
-      if (data.pct >= 0) {
-        log(`${data.label}: ${data.pct}% (${data.detail})`);
-        showProgress(data.pct);
-      } else {
-        log(`${data.label}: ${data.detail}`);
-      }
-      break;
+async function generate() {
+  const text = document.getElementById('text').value.trim();
+  if (!text || generating) return;
 
-    case 'progress_done':
-      hideProgress();
-      break;
+  generating = true;
+  btn.disabled = true;
+  const sampleRate = tts.sampleRate;
+  const startTime = performance.now();
+  let firstChunkTime = null;
+  const chunks = [];
 
-    case 'loaded':
-      sampleRate = data.sampleRate;
-      cpuFeatures = data.features || {};
-      loadBtn.style.display = 'none';
-      btn.style.display = '';
-      log(`Ready! Enter text and click Generate.\n${formatFeatures(cpuFeatures)}`);
-      break;
+  // AudioContext must be created/resumed from a user gesture. Close the last ones first:
+  // browsers cap how many can be open at once.
+  audioCtx?.close();
+  replayAudioCtx?.close();
+  replayAudioCtx = null;
+  audioCtx = new AudioContext({ sampleRate });
+  analyser = makeAnalyser(audioCtx);
+  analyser.connect(audioCtx.destination);
+  startVisualizer();
 
-    case 'gen_start':
-      log(`Generating speech (${data.numChunks} chunk(s), ${data.numTokens} tokens in the first)...`);
-      break;
-
-    case 'chunk': {
-      const chunk = new Float32Array(data.data);
-      if (!firstChunkTime) {
+  log(`Loading voice ${voiceSelect.value} and generating...`);
+  const speech = tts.stream(text, {
+    voice: voiceSelect.value,
+    temperature: parseFloat(tempSlider.value),
+  });
+  let nextStartTime = 0;
+  try {
+    for await (const chunk of speech) {
+      if (firstChunkTime === null) {
         firstChunkTime = performance.now() - startTime;
         nextStartTime = audioCtx.currentTime;
+        log('Generating speech...');
       }
-
       nextStartTime = Math.max(nextStartTime, audioCtx.currentTime);
-
       const buf = audioCtx.createBuffer(1, chunk.length, sampleRate);
       buf.getChannelData(0).set(chunk);
       const src = audioCtx.createBufferSource();
@@ -273,62 +287,44 @@ worker.onmessage = (e) => {
       src.connect(analyser);
       src.start(nextStartTime);
       nextStartTime += chunk.length / sampleRate;
-
-      allChunks.push(chunk);
-      break;
+      chunks.push(chunk);
     }
+    const stats = await speech.done;
 
-    case 'done': {
-      const totalMs = performance.now() - startTime;
-      const totalTime = (totalMs / 1000).toFixed(2);
-      const totalSamples = allChunks.reduce((sum, c) => sum + c.length, 0);
-      const durationSec = totalSamples / sampleRate;
-      const duration = durationSec.toFixed(2);
-      const firstAudio = firstChunkTime != null ? (firstChunkTime / 1000).toFixed(2) : '?';
-      const rtf = totalMs > 0 ? (durationSec / (totalMs / 1000)).toFixed(3) : '?';
-      const promptMs = data.promptMs != null ? data.promptMs.toFixed(0) : '?';
-      const avgMs = data.stepMsAvg != null ? data.stepMsAvg.toFixed(1) : '?';
-      const minMs = data.stepMsMin != null ? data.stepMsMin.toFixed(1) : '?';
-      const maxMs = data.stepMsMax != null ? data.stepMsMax.toFixed(1) : '?';
-      const stats = [
-        `Generated ${duration}s of audio in ${totalTime}s (RTF=${rtf}, first audio: ${firstAudio}s)`,
-        `Text prompt: ${promptMs}ms`,
-        `Decode steps: ${data.numSteps ?? 0}, avg ${avgMs}ms (min ${minMs}, max ${maxMs})`,
-        formatFeatures(cpuFeatures),
-      ].join('\n');
-      log(stats);
+    const totalMs = performance.now() - startTime;
+    const durationSec = stats.samples / sampleRate;
+    const f = (x, d = 1) => (x == null ? '?' : x.toFixed(d));
+    log([
+      `Generated ${f(durationSec, 2)}s of audio in ${f(totalMs / 1000, 2)}s ` +
+        `(RTF=${f(durationSec / (totalMs / 1000), 3)}, first audio: ${f(firstChunkTime / 1000, 2)}s)`,
+      `Text: ${stats.tokens} tokens in ${stats.chunks} chunk(s), prompted in ${f(stats.promptMs, 0)}ms`,
+      `Decode steps: ${stats.frames}, avg ${f(stats.stepMs.avg)}ms (min ${f(stats.stepMs.min)}, max ${f(stats.stepMs.max)})`,
+      formatFeatures(tts.features),
+    ].join('\n'));
 
-      // Create WAV download/replay element
-      const allPcm = concatenateChunks(allChunks);
-      const wavBlob = encodeWav(allPcm, sampleRate);
-      const url = URL.createObjectURL(wavBlob);
-      const container = document.getElementById('audio-container');
-      container.innerHTML = '';
-      const audio = document.createElement('audio');
-      audio.controls = true;
-      audio.src = url;
-      container.appendChild(audio);
-      hookAudioElement(audio);
-
-      btn.disabled = false;
-      generating = false;
-      break;
-    }
-
-    case 'error':
-      log('Error: ' + data.message);
-      console.error(data.message);
-      btn.disabled = false;
-      generating = false;
-      break;
+    // Create WAV download/replay element
+    const url = URL.createObjectURL(encodeWav(concatPcm(chunks), sampleRate));
+    const container = document.getElementById('audio-container');
+    container.innerHTML = '';
+    const audio = document.createElement('audio');
+    audio.controls = true;
+    audio.src = url;
+    container.appendChild(audio);
+    hookAudioElement(audio, sampleRate);
+  } catch (e) {
+    log('Error: ' + e.message);
+    console.error(e);
+  } finally {
+    btn.disabled = false;
+    generating = false;
   }
-};
+}
 
-function hookAudioElement(audio) {
+function hookAudioElement(audio, sampleRate) {
   // Set up the audio graph eagerly so it's ready when the user hits play
   replayAudioCtx = new AudioContext({ sampleRate });
   const replayAnalyser = makeAnalyser(replayAudioCtx);
-  replaySource = replayAudioCtx.createMediaElementSource(audio);
+  const replaySource = replayAudioCtx.createMediaElementSource(audio);
   replaySource.connect(replayAnalyser);
   replayAnalyser.connect(replayAudioCtx.destination);
 
@@ -337,89 +333,6 @@ function hookAudioElement(audio) {
     analyser = replayAnalyser;
     startVisualizer();
   });
-}
-
-function concatenateChunks(chunks) {
-  const totalLength = chunks.reduce((sum, c) => sum + c.length, 0);
-  const result = new Float32Array(totalLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return result;
-}
-
-function loadWeights() {
-  loadBtn.disabled = true;
-  quantSelect.disabled = true;
-  worker.postMessage({ type: 'load', voiceName: voiceSelect.value, quant: quantSelect.value });
-}
-
-function generate() {
-  const text = document.getElementById('text').value.trim();
-  if (!text || generating) return;
-
-  generating = true;
-  btn.disabled = true;
-  startTime = performance.now();
-  firstChunkTime = null;
-  allChunks = [];
-
-  // Reset replay state since we're creating a new AudioContext
-  replayAudioCtx = null;
-  replaySource = null;
-
-  // AudioContext must be created/resumed from a user gesture
-  audioCtx = new AudioContext({ sampleRate });
-  analyser = makeAnalyser(audioCtx);
-  analyser.connect(audioCtx.destination);
-  startVisualizer();
-
-  worker.postMessage({
-    type: 'generate',
-    text,
-    voiceName: voiceSelect.value,
-    temperature: parseFloat(tempSlider.value),
-  });
-}
-
-function encodeWav(samples, sampleRate) {
-  const numChannels = 1;
-  const bitsPerSample = 16;
-  const byteRate = sampleRate * numChannels * bitsPerSample / 8;
-  const blockAlign = numChannels * bitsPerSample / 8;
-  const dataSize = samples.length * blockAlign;
-  const buffer = new ArrayBuffer(44 + dataSize);
-  const view = new DataView(buffer);
-
-  function writeString(offset, str) {
-    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
-  }
-
-  writeString(0, 'RIFF');
-  view.setUint32(4, 36 + dataSize, true);
-  writeString(8, 'WAVE');
-  writeString(12, 'fmt ');
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true); // PCM
-  view.setUint16(22, numChannels, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, byteRate, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, bitsPerSample, true);
-  writeString(36, 'data');
-  view.setUint32(40, dataSize, true);
-
-  let offset = 44;
-  for (let i = 0; i < samples.length; i++) {
-    let s = Math.max(-1, Math.min(1, samples[i]));
-    s = s < 0 ? s * 0x8000 : s * 0x7FFF;
-    view.setInt16(offset, s, true);
-    offset += 2;
-  }
-
-  return new Blob([buffer], { type: 'audio/wav' });
 }
 
 loadBtn.addEventListener('click', loadWeights);
