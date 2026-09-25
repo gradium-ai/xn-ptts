@@ -2,9 +2,10 @@
 //!
 //! This is what `wasm-bindgen` exports, and it is deliberately low level: it takes bytes the
 //! caller has already fetched and it generates one frame per call, because a browser has no
-//! threads to hand generation to and must yield to its event loop between frames. The npm
-//! package `phonon-tts` wraps it (see `js/`), running it in a worker and handling downloads,
-//! caching and voices by name. Most callers want that, not this.
+//! threads to hand generation to and must yield to its event loop between frames. A
+//! JavaScript wrapper -- the `phonon-tts` npm package, added later in this stack -- runs it
+//! in a worker and handles downloads, caching and voices by name. Most callers want that,
+//! not this.
 
 use wasm_bindgen::prelude::*;
 
@@ -399,6 +400,13 @@ impl Model {
     /// `model_weights` is a safetensors or GGUF checkpoint, `tokenizer_json` the contents of
     /// the `tokenizer.json` for its vocabulary, and `config_json` its `config.json`, or
     /// `undefined` for the original Pocket TTS architecture.
+    ///
+    /// Two things a config cannot ask this build for. Its `temp` is not read: the sampling
+    /// temperature reaches the model through `start_generation`. And there is no
+    /// classifier-free guidance here -- guidance is a caller's option in `ptts::synth`
+    /// (`SynthOpts::cfg_coef`), not a field of the config, and the browser build never turns
+    /// it on, so `cfg_null_audio_empty` is inert. Everything else -- the flow LM and Mimi
+    /// shapes, `lsd_decode_steps`, `eos_threshold`, `model_id`, `speaker_mimi` -- is honored.
     ///
     /// `quant` is `"f32"` or `"q8"`.
     ///

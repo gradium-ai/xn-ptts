@@ -92,7 +92,7 @@ async function handleGenerate(text, voiceName, temperature) {
 
   // `start_generation` splits the text into sentence-aligned chunks. Each `next_chunk` runs
   // `prompt_text` for one of them, which is the bulk of the prefill cost, so it is timed.
-  model.start_generation(voiceIndex, text, temperature, 42);
+  const numChunks = model.start_generation(voiceIndex, text, temperature, 42);
 
   let numTokens = 0;
   let promptMs = 0;
@@ -106,7 +106,9 @@ async function handleGenerate(text, voiceName, temperature) {
     if (tokens === undefined) break;
     promptMs += performance.now() - promptT0;
     numTokens += tokens;
-    if (step === 0) post('gen_start', { numTokens });
+    // Only the first chunk's tokens are known at this point; the rest are counted as
+    // their chunks are prompted, so `numChunks` is what says how much is still to come.
+    if (step === 0) post('gen_start', { numTokens, numChunks });
 
     while (true) {
       const t0 = performance.now();
