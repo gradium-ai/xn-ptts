@@ -14,7 +14,7 @@ use ptts::flow_lm::{FlowLMState, NormalRng, StepInput};
 use ptts::loader::remap_key;
 use ptts::mimi::MimiDecoderState;
 use ptts::plan::{self, EosPolicy};
-use ptts::preprocess::Normalize;
+use ptts::preprocess::{Normalize, Rules};
 use ptts::tok::Tok;
 use ptts::transformer::{LayerAttentionState, StreamingMHAState, StreamingTransformerState};
 use ptts::tts_model::{TTSConfig, TTSModel, TTSState, prepare_text_prompt};
@@ -101,9 +101,14 @@ impl Model {
         tokenizer_json: &[u8],
         quant: &str,
         lang: &str,
+        rewrites: Option<&str>,
     ) -> xn::Result<Model> {
         let quant = Quant::parse(quant)?;
-        let normalize = Normalize::parse(lang)?;
+        let rules = match rewrites {
+            Some(rewrites) => Rules::parse(rewrites)?,
+            None => Rules::ALL,
+        };
+        let normalize = Normalize::parse(lang)?.with_rules(rules);
         console_log!("[new] loading model with quant={quant:?}");
         let cfg = TTSConfig::v202601(0.5);
 
@@ -291,14 +296,19 @@ impl Model {
     /// tokenized, one of `"en"`, `"fr"`, `"de"`, `"es"`, `"pt"`, or `"none"`
     /// to hand text to the tokenizer as written. The spoken forms of `@`, `+`
     /// and `=` differ per language, so there is nothing safe to default to.
+    ///
+    /// `rewrites` is optional and picks which word rewrites run on the
+    /// normalized text: `"all"` (the default), `"none"`, or a comma-separated
+    /// list of rule names, of which there is one today, `"numbers"`.
     #[wasm_bindgen(constructor)]
     pub fn new(
         model_weights: &[u8],
         tokenizer_json: &[u8],
         quant: &str,
         lang: &str,
+        rewrites: Option<String>,
     ) -> Result<Model, JsError> {
-        Self::new_(model_weights, tokenizer_json, quant, lang)
+        Self::new_(model_weights, tokenizer_json, quant, lang, rewrites.as_deref())
             .map_err(|e| JsError::new(&e.to_string()))
     }
 

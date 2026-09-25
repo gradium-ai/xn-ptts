@@ -5,14 +5,15 @@
 //! are read aloud (`@`, `+`, `=`) are best spelled out in the target language. [`normalize_text`]
 //! does both, driven by a [`Lang`].
 //!
-//! This is deliberately conservative: it does not expand numbers, dates or abbreviations, which
-//! the model handles natively.
-//!
 //! Every caller says which language, or says not to normalize: [`Normalize`] is a required
 //! argument to [`crate::synth::SynthBuilder::new`], and every frontend takes it as a required
 //! flag. There is no default, deliberately. Output is noticeably better with normalization than
 //! without, but normalizing German as English speaks `@` as "at" rather than "ät", so guessing
 //! the language is worse than doing nothing.
+
+mod rewrite;
+
+pub use rewrite::{Rules, rewrite_word};
 
 /// Spoken forms of the punctuation characters that are read aloud rather than dropped.
 #[derive(Debug, Clone)]
@@ -214,44 +215,67 @@ impl Lang {
     }
 }
 
-/// Whether to normalize, and in which language.
+/// Whether to normalize, in which language, and with which [`Rules`].
 ///
 /// There is no default and no "unset": [`crate::synth::SynthBuilder::new`] takes one of these,
-/// so choosing is not something a caller can forget. [`Normalize::Off`] is the way to say "hand
+/// so choosing is not something a caller can forget. [`Normalize::OFF`] is the way to say "hand
 /// the text to the tokenizer as written", which is for callers that normalize it themselves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Normalize {
-    For(Lang),
-    Off,
+pub struct Normalize {
+    lang: Option<Lang>,
+    rules: Rules,
 }
 
 impl Normalize {
-    /// Parse what the frontends' `--lang` flag accepts: a language code, or `none` / `off`.
+    /// Hand text to the tokenizer as written.
+    pub const OFF: Self = Self { lang: None, rules: Rules::NONE };
+
+    /// Normalize as `lang`, with every rewrite rule.
+    pub const fn for_lang(lang: Lang) -> Self {
+        Self { lang: Some(lang), rules: Rules::ALL }
+    }
+
+    /// This policy with `rules` instead. A no-op on [`Self::OFF`], which rewrites nothing.
+    pub const fn with_rules(self, rules: Rules) -> Self {
+        match self.lang {
+            Some(lang) => Self { lang: Some(lang), rules },
+            None => Self::OFF,
+        }
+    }
+
+    /// Which rewrites this policy applies.
+    pub const fn rules(self) -> Rules {
+        self.rules
+    }
+
+    /// Parse what the frontends' `--lang` flag accepts: a language code, or `none` / `off`. The
+    /// rules are a flag of their own, see [`Rules::parse`].
     pub fn parse(s: &str) -> crate::Result<Self> {
         match s.to_lowercase().as_str() {
-            "none" | "off" => Ok(Self::Off),
-            other => other.parse().map(Self::For),
+            "none" | "off" => Ok(Self::OFF),
+            other => other.parse().map(Self::for_lang),
         }
     }
 
-    /// How this policy spells itself back, round-tripping through [`Self::parse`].
+    /// The language half of this policy, round-tripping through [`Self::parse`]. The rules are
+    /// not part of it, since they parse from a flag of their own: see [`Rules::parse`].
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::For(lang) => lang.as_str(),
-            Self::Off => "none",
+        match self.lang {
+            Some(lang) => lang.as_str(),
+            None => "none",
         }
     }
 
-    /// Normalize `text`, or hand it back untouched when this is [`Self::Off`].
+    /// Normalize `text`, or hand it back untouched when this is [`Self::OFF`].
     ///
     /// Borrows when off, so opting out costs no allocation per request.
     ///
     /// This has to run before `prepare_text_prompt`, which pads short text with leading spaces
     /// that normalization would collapse away.
     pub fn apply<'a>(self, text: &'a str) -> std::borrow::Cow<'a, str> {
-        match self {
-            Self::Off => std::borrow::Cow::Borrowed(text),
-            Self::For(lang) => std::borrow::Cow::Owned(normalize_text(text, lang)),
+        match self.lang {
+            None => std::borrow::Cow::Borrowed(text),
+            Some(lang) => std::borrow::Cow::Owned(normalize_text(text, lang, self.rules)),
         }
     }
 }
@@ -320,9 +344,8 @@ impl StringAppender {
 ///
 /// Typographic quotes, dashes, bullets, arrows and emoji are dropped or folded to their ASCII
 /// equivalents; `@`, `+` and `=` are spelled out in `lang`; `;`, `:` and parentheses become
-/// commas, which is how the model is asked to pause. Numbers, dates and abbreviations are left
-/// alone -- the model reads those natively.
-pub fn normalize_text(input: &str, lang: Lang) -> String {
+/// commas, which is how the model is asked to pause.
+pub fn normalize_text(input: &str, lang: Lang, rules: Rules) -> String {
     let mut res = StringAppender::new();
     for c in input.chars() {
         match c {
@@ -364,7 +387,12 @@ pub fn normalize_text(input: &str, lang: Lang) -> String {
             }
         }
     }
-    res.into_string()
+    let text = res.into_string();
+    if rules == Rules::NONE {
+        return text;
+    }
+    let words = text.split(' ').map(|w| rewrite_word(w, lang, rules).unwrap_or_else(|| w.into()));
+    words.collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
@@ -408,17 +436,17 @@ mod tests {
             ),
         ];
         for (input, expected) in cases {
-            assert_eq!(&normalize_text(input, Lang::En), expected, "input: {input:?}");
+            assert_eq!(&normalize_text(input, Lang::En, Rules::ALL), expected, "input: {input:?}");
         }
     }
 
     #[test]
     fn spoken_symbols_follow_the_language() {
-        assert_eq!(normalize_text("a@b", Lang::En), "a at b");
-        assert_eq!(normalize_text("a@b", Lang::Fr), "a arobaze b");
-        assert_eq!(normalize_text("a@b", Lang::De), "a ät b");
-        assert_eq!(normalize_text("1+1=2", Lang::Es), "1 mas 1 igual 2");
-        assert_eq!(normalize_text("1+1=2", Lang::Pt), "1 mais 1 igual 2");
+        assert_eq!(normalize_text("a@b", Lang::En, Rules::ALL), "a at b");
+        assert_eq!(normalize_text("a@b", Lang::Fr, Rules::ALL), "a arobaze b");
+        assert_eq!(normalize_text("a@b", Lang::De, Rules::ALL), "a ät b");
+        assert_eq!(normalize_text("1+1=2", Lang::Es, Rules::ALL), "1 mas 1 igual 2");
+        assert_eq!(normalize_text("1+1=2", Lang::Pt, Rules::ALL), "1 mais 1 igual 2");
     }
 
     /// The frontends take one flag for the language and for turning
@@ -427,14 +455,14 @@ mod tests {
     #[test]
     fn normalize_parses_and_round_trips() {
         for lang in [Lang::En, Lang::Fr, Lang::De, Lang::Es, Lang::Pt] {
-            let norm = Normalize::For(lang);
+            let norm = Normalize::for_lang(lang);
             assert_eq!(Normalize::parse(lang.as_str()).unwrap(), norm);
             assert_eq!(Normalize::parse(norm.as_str()).unwrap(), norm);
         }
-        assert_eq!(Normalize::parse("EN").unwrap(), Normalize::For(Lang::En));
-        assert_eq!(Normalize::parse("none").unwrap(), Normalize::Off);
-        assert_eq!(Normalize::parse("off").unwrap(), Normalize::Off);
-        assert_eq!(Normalize::parse(Normalize::Off.as_str()).unwrap(), Normalize::Off);
+        assert_eq!(Normalize::parse("EN").unwrap(), Normalize::for_lang(Lang::En));
+        assert_eq!(Normalize::parse("none").unwrap(), Normalize::OFF);
+        assert_eq!(Normalize::parse("off").unwrap(), Normalize::OFF);
+        assert_eq!(Normalize::parse(Normalize::OFF.as_str()).unwrap(), Normalize::OFF);
         let err = Normalize::parse("klingon").unwrap_err();
         assert!(matches!(err, crate::Error::InvalidArgument(_)), "{err:?}");
         let msg = err.to_string();
@@ -447,10 +475,14 @@ mod tests {
     #[test]
     fn apply_follows_the_policy() {
         use std::borrow::Cow;
-        assert_eq!(Normalize::Off.apply("a@b (c)"), "a@b (c)");
-        assert_eq!(Normalize::For(Lang::En).apply("a@b (c)"), "a at b, c,");
-        assert_eq!(Normalize::For(Lang::Fr).apply("a@b"), "a arobaze b");
-        assert!(matches!(Normalize::Off.apply("text"), Cow::Borrowed(_)));
+        assert_eq!(Normalize::OFF.apply("a@b (c)"), "a@b (c)");
+        assert_eq!(Normalize::for_lang(Lang::En).apply("a@b (c)"), "a at b, c,");
+        assert_eq!(Normalize::for_lang(Lang::Fr).apply("a@b"), "a arobaze b");
+        assert!(matches!(Normalize::OFF.apply("text"), Cow::Borrowed(_)));
+        // The rules travel with the policy, so `apply` is all a caller needs.
+        let en = Normalize::for_lang(Lang::En);
+        assert_eq!(en.apply("I paid 1500."), "I paid 1 thousand 500.");
+        assert_eq!(en.with_rules(Rules::NONE).apply("I paid 1500."), "I paid 1500.");
     }
 
     #[test]

@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use ptts::flow_lm::{NormalRng, StepInput};
 use ptts::plan::{EosPolicy, frame_budget};
-use ptts::preprocess::Normalize;
+use ptts::preprocess::{Normalize, Rules};
 use ptts::tok::Tok;
 use ptts::tts_model::{TTSConfig, TTSModel, TTSState};
 use xn::{BackendQ, Tensor};
@@ -76,6 +76,11 @@ struct Args {
     /// `none` measures the unnormalized text, as runs that predate this flag did.
     #[arg(long)]
     lang: String,
+
+    /// Which word rewrites run on the normalized text: `all`, `none`, or a comma-separated list
+    /// of rule names, of which there is one today, `numbers`. Has no effect with `--lang none`.
+    #[arg(long, default_value = "all")]
+    rewrites: String,
 }
 
 /// One iteration's timings.
@@ -318,7 +323,7 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
     // Parsed before the weights are read, so a bad --lang does not cost a model load.
-    let normalize = Normalize::parse(&args.lang)?;
+    let normalize = Normalize::parse(&args.lang)?.with_rules(Rules::parse(&args.rewrites)?);
     if let Some(threads) = args.threads {
         // Must happen before the first tensor op, since it sets the size of rayon's global pool.
         xn::set_num_threads(threads);

@@ -9,7 +9,7 @@ use anyhow::Result;
 use axum::Router;
 use axum::routing::any;
 use clap::Parser;
-use ptts::preprocess::Normalize;
+use ptts::preprocess::{Normalize, Rules};
 use ptts::synth::{DeviceKind, Quant};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
@@ -62,6 +62,11 @@ struct Args {
     /// `none` serves the text as written, which the model reads less well.
     #[arg(long)]
     lang: String,
+
+    /// Which word rewrites run on the normalized text: `all`, `none`, or a comma-separated list
+    /// of rule names, of which there is one today, `numbers`. Has no effect with `--lang none`.
+    #[arg(long, default_value = "all")]
+    rewrites: String,
 }
 
 fn init_tracing() {
@@ -125,7 +130,7 @@ async fn build_app_state(args: &Args) -> Result<model::AppState> {
     // Both checks happen before `load_ptts` downloads anything: `SynthBuilder`
     // would catch them, but only after the checkpoint is on disk.
     quant.check_device(device)?;
-    let normalize = Normalize::parse(&args.lang)?;
+    let normalize = Normalize::parse(&args.lang)?.with_rules(Rules::parse(&args.rewrites)?);
     let unavailable = match device {
         DeviceKind::Cuda if !cfg!(feature = "cuda") => Some("cuda"),
         DeviceKind::Vulkan if !cfg!(feature = "vulkan") => Some("vulkan"),
