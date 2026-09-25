@@ -275,6 +275,10 @@ impl Bench<'_> {
             }
             runs.push(r);
         }
+        anyhow::ensure!(
+            runs.iter().all(|r| r.samples > 0),
+            "no audio generated, nothing to measure"
+        );
         let first = &runs[0];
         let audio_ms = |r: &Run| r.samples as f64 / model.sample_rate() as f64 * 1e3;
         let totals: Vec<f64> = runs.iter().map(|r| ms(r.total)).collect();
@@ -286,8 +290,8 @@ impl Bench<'_> {
             runs.iter().flat_map(|r| r.sample_t.iter().copied().map(ms)).collect();
         let decode_t: Vec<f64> =
             runs.iter().flat_map(|r| r.decode_t.iter().copied().map(ms)).collect();
-        // Audio produced per unit of wall time, so higher is faster than realtime.
-        let rtfs: Vec<f64> = runs.iter().map(|r| audio_ms(r) / ms(r.total)).collect();
+        // Wall time per unit of audio produced, so below 1.0 is faster than realtime.
+        let rtfs: Vec<f64> = runs.iter().map(|r| ms(r.total) / audio_ms(r)).collect();
 
         println!();
         println!(
@@ -310,7 +314,7 @@ impl Bench<'_> {
             ("per-frame", "ms", 3, &frames),
             ("  flow_lm sample", "ms", 3, &sample_t),
             ("  mimi decode", "ms", 3, &decode_t),
-            ("rtf (higher is better)", "x realtime", 2, &rtfs),
+            ("rtf (lower is better)", "ratio", 4, &rtfs),
         ] {
             row(label, unit, prec, &Stats::of(xs));
         }

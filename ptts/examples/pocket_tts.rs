@@ -204,9 +204,9 @@ fn main() -> Result<()> {
 
     let elapsed = start.elapsed().as_secs_f64();
     let duration = pcm.len() as f64 / sample_rate as f64;
+    let rtf = if duration > 0.0 { format!("{:.4}", elapsed / duration) } else { "?".to_string() };
     tracing::info!(
-        "generated {duration:.2}s in {elapsed:.2}s (RTF={:.3}, first chunk {:.0}ms)",
-        duration / elapsed,
+        "generated {duration:.2}s in {elapsed:.2}s (RTF={rtf}, first chunk {:.0}ms)",
         first_chunk_ms.unwrap_or(0.0),
     );
     // `getrusage` is unix-only, so this is absent on Windows.

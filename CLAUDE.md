@@ -70,7 +70,7 @@ cargo run --release --features hf,accelerate --example bench -- \
   --voice voices/freya.safetensors --threads 8 --iters 20
 ```
 
-`bench` takes explicit paths and a precomputed voice embedding, never downloads, and reports time-to-first-audio, per-frame time, total generate time and RTF over `--iters` runs, excluding the one-off model load and voice conditioning. It decodes each frame on the generating thread rather than overlapping Mimi with the next frame's sampling as `pocket_tts` does, so its RTF reads lower than `pocket_tts` for the same weights — don't compare the two directly. `--threads` defaults to xn's one-per-logical-core, usually too many for a single autoregressive stream. For profiling rather than measuring, `pocket_tts --chrome-tracing` writes a Chrome trace for https://ui.perfetto.dev.
+`bench` takes explicit paths and a precomputed voice embedding, never downloads, and reports time-to-first-audio, per-frame time, total generate time and RTF over `--iters` runs, excluding the one-off model load and voice conditioning. It decodes each frame on the generating thread rather than overlapping Mimi with the next frame's sampling as `pocket_tts` does, so its RTF reads higher than `pocket_tts` for the same weights — don't compare the two directly. `--threads` defaults to xn's one-per-logical-core, usually too many for a single autoregressive stream. For profiling rather than measuring, `pocket_tts --chrome-tracing` writes a Chrome trace for https://ui.perfetto.dev.
 
 ## WASM build
 
