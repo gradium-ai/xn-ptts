@@ -12,6 +12,8 @@ export { clearCache } from './fetch.js';
 export { encodeWav, concatPcm } from './wav.js';
 
 const LANGS = ['en', 'fr', 'de', 'es', 'pt', 'none'];
+/** Rewrite rules the Rust side knows, beyond `'all'` and `'none'`. */
+const RULES = ['numbers'];
 
 export class PhononTTS {
   #worker;
@@ -40,6 +42,7 @@ export class PhononTTS {
   static async load(options) {
     const {
       lang,
+      rewrites,
       quant = 'q8',
       model = DEFAULT_MODEL,
       voices,
@@ -56,6 +59,20 @@ export class PhononTTS {
     if (quant !== 'f32' && quant !== 'q8') {
       throw new TypeError(`quant must be 'f32' or 'q8', got '${quant}'`);
     }
+    // Checked here rather than left to Rust: `load` is async and the error would otherwise
+    // arrive after the weights had been downloaded.
+    if (rewrites !== undefined) {
+      const unknown = rewrites
+        .split(',')
+        .map((r) => r.trim())
+        .filter((r) => r !== 'all' && r !== 'none' && !RULES.includes(r));
+      if (unknown.length > 0) {
+        throw new TypeError(
+          `unknown rewrite rule(s) ${unknown.join(', ')}: expected 'all', 'none', or ` +
+            RULES.map((r) => `'${r}'`).join(', '),
+        );
+      }
+    }
     const defaultVoice = model.defaultVoice ?? Object.keys(model.voices ?? {})[0];
     const preload = voices ?? (defaultVoice ? [defaultVoice] : []);
 
@@ -71,6 +88,7 @@ export class PhononTTS {
           type: 'init',
           options: {
             lang,
+            rewrites,
             quant,
             model: resolveModel(model),
             preload,

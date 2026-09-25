@@ -51,7 +51,7 @@ async function handleInit(id, options) {
     fetchBytes(spec.tokenizer, { cache, onProgress: progress('tokenizer') }),
     spec.config ? fetchBytes(spec.config, { cache, onProgress: progress('config') }) : null,
   ]);
-  model = new Model(weights, tokenizer, config ?? undefined, quant, options.lang);
+  model = new Model(weights, tokenizer, config ?? undefined, quant, options.lang, options.rewrites);
 
   for (const name of options.preload) await voiceIndex(name, progress(`voice:${name}`));
   return { sampleRate: model.sample_rate(), features: cpu_features() };

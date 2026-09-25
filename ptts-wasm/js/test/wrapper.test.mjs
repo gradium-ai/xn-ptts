@@ -25,7 +25,10 @@ class FakeWorker {
   postMessage(msg) {
     const { type, id } = msg;
     this.log.push(type);
-    if (type === 'init') return this.reply({ type: 'result', id, value: { sampleRate: 24000, features: {} } });
+    if (type === 'init') {
+      this.init = msg.options;
+      return this.reply({ type: 'result', id, value: { sampleRate: 24000, features: {} } });
+    }
     if (type === 'add_voice') return this.reply({ type: 'result', id });
     if (type === 'cancel') return this.cancelled.add(id);
     if (type === 'generate') {
@@ -60,6 +63,24 @@ const load = () => PhononTTS.load({ lang: 'en', model: MODEL, workerUrl: 'worker
 test('lang is required', async () => {
   await assert.rejects(PhononTTS.load({ model: MODEL }), /lang is required/);
   await assert.rejects(PhononTTS.load({ lang: 'xx', model: MODEL }), /lang is required/);
+});
+
+test('rewrites is checked before anything is downloaded, then handed to the worker', async () => {
+  FakeWorker.last = null;
+  // Rejected here rather than in Rust: `load` would otherwise fetch the weights first and
+  // report the bad rule only once they had arrived.
+  await assert.rejects(
+    PhononTTS.load({ lang: 'en', rewrites: 'numbers,colours', model: MODEL }),
+    /unknown rewrite rule\(s\) colours/,
+  );
+  assert.equal(FakeWorker.last?.init, undefined, 'no worker should have been started');
+
+  await PhononTTS.load({ lang: 'en', rewrites: 'none', model: MODEL, workerUrl: 'worker.js' });
+  assert.equal(FakeWorker.last.init.rewrites, 'none');
+
+  // Left out, it stays undefined all the way to `Model::new`, whose own default is every rule.
+  await load();
+  assert.equal(FakeWorker.last.init.rewrites, undefined);
 });
 
 test('stream yields every frame in order, then its stats', async () => {

@@ -35,6 +35,12 @@ export interface LoadOptions {
    * noticeably better. The spoken forms differ per language, so there is no default.
    */
   lang: Lang;
+  /**
+   * Which word rewrites run on the normalized text: `'all'` (the default), `'none'`, or a
+   * comma-separated list of rule names, of which there is one today, `'numbers'`. Ignored
+   * when `lang` is `'none'`, which does not normalize at all.
+   */
+  rewrites?: string;
   /** Default `'q8'`. */
   quant?: Quant;
   /** Default {@link DEFAULT_MODEL}. */
