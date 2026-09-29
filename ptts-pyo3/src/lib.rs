@@ -21,6 +21,7 @@ use ptts::synth::{DeviceKind, Quant, SpeechOptions, SpeechStream, Synth, SynthBu
 use ptts::tts_model::TTSConfig;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 /// Voices the published checkpoint ships, used to name the files to fetch.
@@ -358,7 +359,11 @@ impl Tts {
     }
 
     /// Synthesize `text` and return the waveform as a 1-D float32 array.
-    #[pyo3(signature = (text, *, voice=None, temperature=None, seed=None, cfg_coef=None))]
+    ///
+    /// `conditions` sets the model's summed conditionings by name, e.g.
+    /// `{"duration_delta": -0.3}`; one left out gets the learnt padding.
+    #[pyo3(signature = (text, *, voice=None, temperature=None, seed=None, cfg_coef=None, conditions=None))]
+    #[allow(clippy::too_many_arguments)]
     fn synth<'py>(
         &self,
         py: Python<'py>,
@@ -367,8 +372,9 @@ impl Tts {
         temperature: Option<f32>,
         seed: Option<u64>,
         cfg_coef: Option<f32>,
+        conditions: Option<BTreeMap<String, Condition>>,
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
-        let opts = self.opts(voice, temperature, seed, cfg_coef);
+        let opts = self.opts(voice, temperature, seed, cfg_coef, conditions);
         let stream = self.start(py, text, &opts)?;
         let pcm = drain(py, stream)?;
         Ok(PyArray1::from_vec(py, pcm))
@@ -376,7 +382,7 @@ impl Tts {
 
     /// Synthesize `text` straight to a mono 16-bit WAV file, returning its
     /// duration in seconds.
-    #[pyo3(signature = (path, text, *, voice=None, temperature=None, seed=None, cfg_coef=None))]
+    #[pyo3(signature = (path, text, *, voice=None, temperature=None, seed=None, cfg_coef=None, conditions=None))]
     #[allow(clippy::too_many_arguments)]
     fn save(
         &self,
@@ -387,8 +393,9 @@ impl Tts {
         temperature: Option<f32>,
         seed: Option<u64>,
         cfg_coef: Option<f32>,
+        conditions: Option<BTreeMap<String, Condition>>,
     ) -> PyResult<f64> {
-        let opts = self.opts(voice, temperature, seed, cfg_coef);
+        let opts = self.opts(voice, temperature, seed, cfg_coef, conditions);
         let stream = self.start(py, text, &opts)?;
         let sample_rate = stream.sample_rate();
         let pcm = drain(py, stream)?;
@@ -400,7 +407,8 @@ impl Tts {
     /// Synthesize `text`, yielding float32 chunks as the decoder produces them.
     ///
     /// The returned object is an iterator; dropping it stops the generation.
-    #[pyo3(signature = (text, *, voice=None, temperature=None, seed=None, cfg_coef=None))]
+    #[pyo3(signature = (text, *, voice=None, temperature=None, seed=None, cfg_coef=None, conditions=None))]
+    #[allow(clippy::too_many_arguments)]
     fn stream(
         &self,
         py: Python<'_>,
@@ -409,8 +417,9 @@ impl Tts {
         temperature: Option<f32>,
         seed: Option<u64>,
         cfg_coef: Option<f32>,
+        conditions: Option<BTreeMap<String, Condition>>,
     ) -> PyResult<AudioStream> {
-        let opts = self.opts(voice, temperature, seed, cfg_coef);
+        let opts = self.opts(voice, temperature, seed, cfg_coef, conditions);
         let stream = self.start(py, text, &opts)?;
         Ok(AudioStream { inner: Mutex::new(Some(stream)) })
     }
@@ -466,6 +475,22 @@ impl Tts {
     }
 }
 
+/// A summed conditioning's value from Python: a LUT value, or a number for a continuous one.
+#[derive(FromPyObject)]
+enum Condition {
+    Str(String),
+    Num(f64),
+}
+
+impl Condition {
+    fn into_string(self) -> String {
+        match self {
+            Self::Str(s) => s,
+            Self::Num(x) => x.to_string(),
+        }
+    }
+}
+
 impl Tts {
     fn lock(&self) -> PyResult<std::sync::MutexGuard<'_, Synth>> {
         self.inner.lock().map_err(|_| poisoned())
@@ -478,13 +503,16 @@ impl Tts {
         temperature: Option<f32>,
         seed: Option<u64>,
         cfg_coef: Option<f32>,
+        conditions: Option<BTreeMap<String, Condition>>,
     ) -> SpeechOptions {
+        let conditions = conditions.unwrap_or_default().into_iter();
         SpeechOptions {
             voice: voice.or_else(|| self.default_voice.clone()),
             temperature,
             seed,
             cfg_coef,
             max_tokens_per_chunk: None,
+            conditions: conditions.map(|(k, v)| (k, v.into_string())).collect(),
         }
     }
 
