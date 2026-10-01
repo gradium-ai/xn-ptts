@@ -87,7 +87,7 @@ export class PhononTTS {
       throw new TypeError(
         "model is required: where the checkpoint's files are, e.g. " +
           "{ weights: { q8: '/model/model.q8.gguf' }, tokenizer: '/model/tokenizer.json', " +
-          "config: '/model/config.json', voices: { default: '/model/voices/default.safetensors' } }",
+          "config: '/model/config.json', voices: { Freya: '/model/voices/Freya.safetensors' } }",
       );
     }
     if (!isUrl(model.tokenizer)) {

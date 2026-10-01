@@ -2811,7 +2811,7 @@ dependencies = [
 
 [[package]]
 name = "ptts"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2838,7 +2838,7 @@ dependencies = [
 
 [[package]]
 name = "ptts-coreml"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "block2",
  "half",
@@ -2858,7 +2858,7 @@ dependencies = [
 
 [[package]]
 name = "ptts-coreml-ffi"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ptts",
  "ptts-coreml",
@@ -2867,7 +2867,7 @@ dependencies = [
 
 [[package]]
 name = "ptts-pyo3"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "hf-hub",
  "numpy",
@@ -2879,7 +2879,7 @@ dependencies = [
 
 [[package]]
 name = "ptts-wasm"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "getrandom 0.3.4",
  "js-sys",
@@ -2894,7 +2894,7 @@ dependencies = [
 
 [[package]]
 name = "ptts-ws-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",

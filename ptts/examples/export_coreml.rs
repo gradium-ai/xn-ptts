@@ -100,6 +100,23 @@ fn main() -> Result<()> {
     .map_err(anyhow::Error::msg)?
     .renamed(ptts::loader::remap_key);
 
+    // The supplied voices may hold speaker-Mimi latents rather than ready-to-use embeddings.
+    // Project them with the same checkpoint weight the Rust runtime uses when adding a voice.
+    let speaker_proj = match wt.get(ptts::loader::SPEAKER_PROJ_WEIGHT) {
+        Ok((shape, data)) => {
+            let expected = [dims.d, cfg.speaker_mimi_cfg().dimension];
+            anyhow::ensure!(
+                shape == expected,
+                "speaker projection has shape {shape:?}, expected {expected:?}"
+            );
+            let weight =
+                xn::Tensor::from_vec(data.to_vec(), (expected[0], expected[1]), &xn::CpuDevice)?;
+            Some(xn::nn::Linear::new(weight))
+        }
+        Err(_) => None,
+    };
+    let model_ext = cfg.model_ext();
+
     std::fs::create_dir_all(args.out.join("voices"))?;
     let voices: Vec<(String, PathBuf)> = match args.voices.as_deref() {
         Some(dir) => {
@@ -117,8 +134,13 @@ fn main() -> Result<()> {
     // Voices go in as the embedding the flow LM is prompted with, `emb` [1, T, D].
     let mut vlen = 0;
     for (name, path) in &voices {
-        let emb = ptts::loader::load_voice_emb(path, None, None, &xn::CpuDevice)
-            .with_context(|| format!("voice {name}"))?;
+        let emb = ptts::loader::load_voice_emb(
+            path,
+            model_ext.as_deref(),
+            speaker_proj.as_ref(),
+            &xn::CpuDevice,
+        )
+        .with_context(|| format!("voice {name}"))?;
         let shape = emb.dims().to_vec();
         anyhow::ensure!(
             shape[2] == dims.d,

@@ -8,13 +8,11 @@ Phonon is Gradium's on-device text-to-speech runtime, written in Rust, with Pyth
 
 You need [Rust](https://rustup.rs) for every path, and [uv](https://docs.astral.sh/uv/) for Python.
 
-Point `MODEL_DIR` at the model folder, the one holding `config.json`, `model.q8.gguf`, `tokenizer.json` and `voices/default.safetensors`:
+Point `MODEL_DIR` at the model folder, the one holding `config.json`, `model.q8.gguf`, `tokenizer.json` and `voices/`:
 
 ```bash
 export MODEL_DIR=/path/to/model
 ```
-
-The commands below read only the files in `MODEL_DIR` and download nothing.
 
 ## 2. Run it
 
@@ -33,6 +31,8 @@ uv run --project ptts-pyo3 --locked ptts --lang en \
 ```
 
 `--quant q8` runs the model in q8, the format `model.q8.gguf` is stored in. Without it the weights are expanded to f32, which is slower and uses more memory; the Rust and Python examples below set q8 too. `--lang` is required. It picks how numbers, symbols and abbreviations are spelled out before synthesis: `en`, `fr`, `de`, `es` or `pt`, or `none` to use the text as written.
+
+When no voice is specified, the Rust, Python and Swift frontends select the first voice by name, `Freya` in this package. For a fixed choice, pass `--voice Freya` to either CLI, `voice="Freya"` to Python, or call `tts.setVoice("Freya")` in Swift.
 
 ## 3. Use it from Rust
 
@@ -56,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tts = Synth::builder(config, dir.join("model.q8.gguf"), Normalize::for_lang(Lang::En))
         .tokenizer_file(dir.join("tokenizer.json"))
         .quant(Quant::Q80)
-        .add_voice("default", dir.join("voices/default.safetensors"))
+        .add_voice("Freya", dir.join("voices/Freya.safetensors"))
         .build()?;
 
     let pcm = tts.say("Hello world")?;
@@ -65,7 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Load the model once and reuse it. `tts.say` returns the whole waveform as mono `f32` samples at `tts.sample_rate()`. `tts.stream(text)?` is an iterator of `Result<Vec<f32>>` chunks, yielded as they are generated, for playback that starts before the sentence is finished. Build with `--release`: a debug build is far too slow for realtime.
+Load the model once and reuse it. `tts.say` returns the whole waveform as mono `f32` samples at `tts.sample_rate()`. `tts.stream(text)?` is an iterator of `Result<Vec<f32>>` chunks, yielded as they are generated, for playback that starts before the sentence is finished. Replace `Freya` with another supplied voice name and filename to select it. Build with `--release`: a debug build is far too slow for realtime.
 
 ## 4. Use it from Python
 
@@ -146,7 +146,13 @@ const tts = await PhononTTS.load({
     weights: { q8: '/model/model.q8.gguf' },
     tokenizer: '/model/tokenizer.json',
     config: '/model/config.json',
-    voices: { default: '/model/voices/default.safetensors' },
+    voices: {
+      Freya: '/model/voices/Freya.safetensors',
+      Harper: '/model/voices/Harper.safetensors',
+      Sterling: '/model/voices/Sterling.safetensors',
+      Toby: '/model/voices/Toby.safetensors',
+    },
+    defaultVoice: 'Freya',
   },
 });
 

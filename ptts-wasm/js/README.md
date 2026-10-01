@@ -15,7 +15,7 @@ const tts = await PhononTTS.load({
     weights: { q8: '/model/model.q8.gguf' },
     tokenizer: '/model/tokenizer.json',
     config: '/model/config.json',
-    voices: { default: '/model/voices/default.safetensors' },
+    voices: { Freya: '/model/voices/Freya.safetensors' },
   },
 });
 const wav = await tts.synthWav('Hello from your own browser.');
