@@ -77,6 +77,10 @@ const GPU_FRAMES_PER_STEP: usize = 8;
 #[cfg(feature = "webgpu")]
 const WARM_UP_SLACK: usize = 16;
 
+/// What the warm-up prompts, to build the text path's pipelines along with the frames'.
+#[cfg(feature = "webgpu")]
+const WARM_UP_TEXT: &str = "Hello.";
+
 /// How a device brings a tensor back to the host: the one thing the backends do differently.
 /// The CPU already has it. WebGPU has to wait for the GPU, which a browser reports only
 /// through its event loop, so nothing on that path may block.
@@ -147,9 +151,11 @@ struct GenState<Q: BackendQ<T = f32>> {
 
 /// Frames that have been generated and decoded on the device but not yet read back.
 struct Pending<B: Backend> {
-    pcm: Tensor<f32, B>,
-    /// One end-of-speech logit per frame.
-    eos: Tensor<f32, B>,
+    /// The frames' PCM followed by one end-of-speech logit per frame, in one tensor so that
+    /// a step costs a single readback however many frames it holds.
+    out: Tensor<f32, B>,
+    /// Where the PCM ends and the logits start.
+    pcm_len: usize,
     frames: usize,
 }
 
@@ -175,11 +181,11 @@ fn record_frames<Q: BackendQ<T = f32>>(
     let batched = Tensor::cat(&latents.iter().collect::<Vec<_>>(), 1)?;
     let pcm = model.decode_latent(&batched, &mut chunk.mimi_state)?;
     let pcm = pcm.narrow(0, ..1)?.contiguous()?;
-    // One tensor for every frame's eos logit, so a step costs two readbacks however many
-    // frames it holds.
+    let pcm_len = pcm.elem_count();
     let eos = Tensor::cat(&eos_logits.iter().collect::<Vec<_>>(), 0)?;
+    let out = Tensor::cat(&[&pcm.reshape(pcm_len)?, &eos.reshape(frames)?], 0)?;
     chunk.step += frames;
-    Ok(Pending { pcm, eos, frames })
+    Ok(Pending { out, pcm_len, frames })
 }
 
 /// A loaded model on one device, and the generation in progress on it.
@@ -341,8 +347,8 @@ where
             let frames = self.frames_per_step.min(chunk.frame_budget - chunk.step);
             record_frames(&self.model, chunk, &mut gen_state.rng, frames)?
         };
-        let eos = self.device.read(&pending.eos).await?;
-        let mut pcm = self.device.read(&pending.pcm).await?;
+        let mut pcm = self.device.read(&pending.out).await?;
+        let eos = pcm.split_off(pending.pcm_len);
 
         // Keep frames up to the one where the end-of-speech rule runs out. `should_stop` is
         // asked after each frame, so that frame itself is part of the output, and the next
@@ -363,14 +369,19 @@ where
         Ok(Some(pcm))
     }
 
-    /// Runs one throwaway step, so a GPU driver compiles its pipelines during the load rather
-    /// than inside the first real utterance, where they would hold up its first audio. The
-    /// step has the shape generation uses, so the vocoder's kernels are built at that shape.
+    /// Prompts a short text and runs one throwaway step after it, so a GPU driver compiles
+    /// its pipelines during the load rather than inside the first real utterance, where they
+    /// would hold up its first audio. The step has the shape generation uses, so the
+    /// vocoder's kernels are built at that shape.
     #[cfg(feature = "webgpu")]
     async fn warm_up(&self) -> Result<()> {
         let frames = self.frames_per_step;
+        let tokens = self.model.flow_lm.conditioner.tokenize(WARM_UP_TEXT)?;
+        let mut tts_state =
+            self.model.init_flow_lm_state(1, tokens.len() + frames + WARM_UP_SLACK)?;
+        self.model.prompt_text(&mut tts_state, &tokens)?;
         let mut chunk = ChunkState {
-            tts_state: self.model.init_flow_lm_state(1, frames + WARM_UP_SLACK)?,
+            tts_state,
             mimi_state: self.model.init_mimi_state(1)?,
             prev_latent: None,
             frame_budget: frames,
@@ -381,7 +392,7 @@ where
         let mut rng = NormalRng::new(0.3, 0)?;
         let pending = record_frames(&self.model, &mut chunk, &mut rng, frames)?;
         // Read something back, so this waits for the work rather than just queuing it.
-        self.device.read(&pending.pcm).await?;
+        self.device.read(&pending.out).await?;
         Ok(())
     }
 }

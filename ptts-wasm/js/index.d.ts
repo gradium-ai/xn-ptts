@@ -103,7 +103,11 @@ export interface SpeechStats {
    * only queued here and runs with the chunk's first step, so this reads near zero there.
    */
   promptMs?: number;
-  /** Per-frame generation time. */
+  /**
+   * Generation time per frame: each step's time divided by its frames. A step is one frame on
+   * the CPU and up to eight on WebGPU, so there `min` and `max` are averages over a step,
+   * and the first step of each chunk also runs that chunk's prompt.
+   */
   stepMs?: { avg: number; min: number; max: number };
   /** From the request starting in the worker to its first audio. */
   firstAudioMs?: number | null;

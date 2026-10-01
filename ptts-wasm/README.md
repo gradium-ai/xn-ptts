@@ -36,7 +36,7 @@ while (true) {
 }
 ```
 
-`stop_generation()` drops a generation in progress. An error thrown by `next_chunk` or `generation_step` also drops it, so a caller that swallows one cannot carry on and silently lose a sentence -- every later call reports the end instead. One noise source covers every chunk, so `seed` fixes the whole utterance. Calls must not overlap: `generation_step` holds the model while it waits for the GPU, and a call that arrives meanwhile is refused. See the rustdoc on `Model::load` for `quant`, `lang`, `device` and what a supplied `config.json` does not change.
+`stop_generation()` drops a generation in progress. An error thrown by `next_chunk` or `generation_step` also drops it, so a caller that swallows one cannot carry on and silently lose a sentence -- every later call reports the end instead. One noise source covers every chunk, so `seed` fixes the whole utterance. Calls must not overlap: `generation_step` holds the model while it waits for the GPU, and a call that arrives meanwhile is refused. This API changed in 0.4: `Model` used to be built with `new Model(...)`, with no `device`, and `generation_step` returned one frame directly rather than a promise of one or more. See the rustdoc on `Model::load` for `quant`, `lang`, `device` and what a supplied `config.json` does not change.
 
 ## Build
 

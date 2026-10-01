@@ -7,7 +7,7 @@
 // mid-utterance.
 
 import { fetchBytes } from './fetch.js';
-import { chooseDevice } from './device.js';
+import { chooseDevice, isGguf } from './device.js';
 import { chooseThreads } from './threads.js';
 
 let model = null;
@@ -87,21 +87,24 @@ async function loadSingleThreaded(options) {
   return wasm;
 }
 
-/** Whether the browser hands out a WebGPU adapter: the cheap check before loading weights. */
-async function hasWebGpuAdapter() {
+/** What WebGPU adapter the browser hands out, if any: the cheap check before loading weights. */
+async function webGpuAdapter() {
   try {
-    return Boolean(await navigator.gpu?.requestAdapter());
+    const adapter = await navigator.gpu?.requestAdapter();
+    if (!adapter) return { hasWebGpu: false };
+    // `info.isFallbackAdapter` in current browsers, `isFallbackAdapter` in older Chrome.
+    return { hasWebGpu: true, fallbackAdapter: Boolean(adapter.info?.isFallbackAdapter ?? adapter.isFallbackAdapter) };
   } catch {
-    return false;
+    return { hasWebGpu: false };
   }
 }
 
 async function handleInit(id, options) {
   settings = options;
   const { model: spec, quant, cache } = options;
-  const hasWebGpu = options.device !== 'cpu' && (await hasWebGpuAdapter());
-  const choice = chooseDevice({ requested: options.device, quant, hasWebGpu });
-  if (choice.device === 'webgpu' && !hasWebGpu) throw new Error('this browser offers no WebGPU adapter');
+  const adapter = options.device === 'cpu' ? { hasWebGpu: false } : await webGpuAdapter();
+  const choice = chooseDevice({ requested: options.device, quant, ...adapter });
+  if (choice.device === 'webgpu' && !adapter.hasWebGpu) throw new Error('this browser offers no WebGPU adapter');
   // The module first, so a browser that cannot compile it finds out before the download.
   let { wasm, threads, reason: threadsReason } =
     choice.device === 'webgpu'
@@ -123,11 +126,15 @@ async function handleInit(id, options) {
   let deviceReason = choice.reason;
   if (choice.device === 'webgpu') {
     try {
+      if (!isGguf(weights)) throw new Error('WebGPU needs q8 weights in a GGUF file');
       model = await load('webgpu');
     } catch (e) {
       if (options.device === 'webgpu') throw e;
       deviceReason = `WebGPU failed to start: ${e instanceof Error ? e.message : e}`;
-      ({ wasm, threads, reason: threadsReason } = await loadWasm(options));
+      // The CPU runs in the build already loaded, single threaded. Loading the threaded one
+      // would copy the weights into a second module's memory, and wasm memory never shrinks,
+      // so a device whose GPU failed would carry both copies.
+      threadsReason = 'WebGPU failed, and the CPU stays on the single-threaded build already loaded';
     }
   }
   model ??= await load('cpu');

@@ -137,9 +137,9 @@ How close to real time it gets depends on the device, on [WebGPU](#webgpu) and o
 
 ## WebGPU
 
-By default the model runs on the GPU when the browser hands out a WebGPU adapter and the weights are `q8`, and on the CPU otherwise. `q8` weights go to the GPU as they are; `f32` weights would have to be quantized there, which means reading each one back to the host, and a browser cannot wait for that. WebGPU needs no cross-origin isolation, and it works in the same secure contexts as the cache.
+By default the model runs on the GPU when the browser hands out a WebGPU adapter and the weights are `q8` in a GGUF file, and on the CPU otherwise. A software fallback adapter counts as none, since it would run slower than the CPU. `q8` weights go to the GPU as they are; other weights would have to be quantized there, which means reading each one back to the host, and a browser cannot wait for that. WebGPU needs no cross-origin isolation, and it works in the same secure contexts as the cache.
 
-On the GPU the model generates several frames per round trip to the GPU and hands them over together, so its chunks of audio are longer than the CPU's 80 ms. If WebGPU fails to start, `'auto'` falls back to the CPU and `tts.deviceReason` says why. Pass `device: 'webgpu'` to insist on the GPU, and `load` rejects instead; pass `device: 'cpu'` to never try it. The GPU computes in a different order from the CPU, so its audio is not bit-identical to the CPU's.
+On the GPU the model generates several frames per round trip to the GPU and hands them over together, so its chunks of audio are longer than the CPU's 80 ms. If WebGPU fails to start, `'auto'` falls back to the CPU and `tts.deviceReason` says why. That CPU run stays on one thread: it uses the build WebGPU was loaded in, rather than copying the weights into a second one. Pass `device: 'webgpu'` to insist on the GPU, and `load` rejects instead; pass `device: 'cpu'` to never try it. The GPU computes in a different order from the CPU, so its audio is not bit-identical to the CPU's.
 
 ## Threads
 
