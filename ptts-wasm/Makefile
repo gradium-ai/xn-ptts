@@ -1,6 +1,9 @@
 .PHONY: build profiling demo serve test clean check-wasm-opt check-model-dir check-threads-toolchain threads-toolchain
 
 WASM_PACK_ARGS = --target web --no-pack --out-dir pkg/wasm --out-name phonon_tts
+# Both builds can run on the GPU: the package uses WebGPU when the browser has it, and the
+# CPU, on one thread or several, when it does not.
+FEATURES = webgpu
 
 # The threaded build, in pkg/wasm-threads/. Wasm threads share memory, which needs std itself
 # rebuilt with atomics, so this one uses a pinned nightly with rust-src. Shared memory also
@@ -18,19 +21,19 @@ THREADS_RUSTFLAGS = -C target-feature=+atomics,+bulk-memory,+mutable-globals,+si
 THREADS_WASM_PACK = RUSTUP_TOOLCHAIN=$(THREADS_TOOLCHAIN) RUSTFLAGS='$(THREADS_RUSTFLAGS)' \
 	CARGO_TARGET_DIR=../target/wasm-threads \
 	wasm-pack build --target web --no-pack --out-dir pkg/wasm-threads --out-name phonon_tts --release \
-	-- --features threads -Z build-std=std,panic_abort
+	-- --features threads,$(FEATURES) -Z build-std=std,panic_abort
 
 # The `phonon-tts` npm package, ready to publish from pkg/: both builds, and the JS around them.
 build: check-wasm-opt check-threads-toolchain
 	rm -rf pkg
-	wasm-pack build $(WASM_PACK_ARGS) --release
+	wasm-pack build $(WASM_PACK_ARGS) --release -- --features $(FEATURES)
 	$(THREADS_WASM_PACK)
 	node scripts/pack.mjs pkg
 
 # Same, without wasm-opt, keeping names for the browser profiler. Single-threaded build only.
 profiling:
 	rm -rf pkg
-	wasm-pack build $(WASM_PACK_ARGS) --profiling
+	wasm-pack build $(WASM_PACK_ARGS) --profiling -- --features $(FEATURES)
 	node scripts/pack.mjs pkg
 
 # wasm-pack runs the first wasm-opt on PATH, and downloads binaryen 117 when there is none.

@@ -1,14 +1,18 @@
 // The worker that owns the wasm model. `index.js` starts it and talks to it; nothing else
 // should need to.
 //
-// Generation is synchronous inside wasm, one frame per `generation_step` call, so the loop
-// below yields to the event loop between frames. That is what lets a `cancel` message land
+// The model runs on WebGPU or on the CPU, through the same `Model` and the same loop: each
+// `generation_step` returns a few frames, one on the CPU and several on WebGPU, and the loop
+// below yields to the event loop between steps. That is what lets a `cancel` message land
 // mid-utterance.
 
 import { fetchBytes } from './fetch.js';
+import { chooseDevice } from './device.js';
 import { chooseThreads } from './threads.js';
 
 let model = null;
+/** Samples per frame: a generation step returns a whole number of them. */
+let frameSize = 0;
 let settings = null;
 /** Voice name -> index in `model`, or the pending load of that voice. */
 const voices = new Map();
@@ -29,7 +33,7 @@ const yieldToEventLoop = () =>
   });
 
 /**
- * Load the wasm build to run on, and start its threads.
+ * Load the wasm build to run on the CPU, and start its threads.
  *
  * There are two builds. `wasm-threads/` runs generation on several threads, but its memory
  * is shared, which a page can only create when it is cross-origin isolated; `wasm/` runs on
@@ -61,6 +65,14 @@ async function loadWasm(options) {
       reason = `threads failed to start: ${e instanceof Error ? e.message : e}`;
     }
   }
+  return { wasm: await loadSingleThreaded(options), threads: 1, reason };
+}
+
+/**
+ * The single-threaded build: the CPU build for pages that cannot have threads, and the one
+ * WebGPU runs in, since the GPU needs no CPU threads.
+ */
+async function loadSingleThreaded(options) {
   const wasm = await import('./wasm/phonon_tts.js');
   try {
     await wasm.default(options.wasmUrl ? { module_or_path: options.wasmUrl } : undefined);
@@ -72,14 +84,30 @@ async function loadWasm(options) {
     }
     throw e;
   }
-  return { wasm, threads: 1, reason };
+  return wasm;
+}
+
+/** Whether the browser hands out a WebGPU adapter: the cheap check before loading weights. */
+async function hasWebGpuAdapter() {
+  try {
+    return Boolean(await navigator.gpu?.requestAdapter());
+  } catch {
+    return false;
+  }
 }
 
 async function handleInit(id, options) {
   settings = options;
-  const { wasm, threads, reason } = await loadWasm(options);
-
   const { model: spec, quant, cache } = options;
+  const hasWebGpu = options.device !== 'cpu' && (await hasWebGpuAdapter());
+  const choice = chooseDevice({ requested: options.device, quant, hasWebGpu });
+  if (choice.device === 'webgpu' && !hasWebGpu) throw new Error('this browser offers no WebGPU adapter');
+  // The module first, so a browser that cannot compile it finds out before the download.
+  let { wasm, threads, reason: threadsReason } =
+    choice.device === 'webgpu'
+      ? { wasm: await loadSingleThreaded(options), threads: 1, reason: 'generation runs on the GPU' }
+      : await loadWasm(options);
+
   const weightsUrl = spec.weights[quant];
   if (!weightsUrl) throw new Error(`this model has no '${quant}' weights`);
   const progress = (file) => (p) => post({ type: 'progress', id, file, ...p });
@@ -89,10 +117,31 @@ async function handleInit(id, options) {
     fetchBytes(spec.tokenizer, { cache, onProgress: progress('tokenizer') }),
     spec.config ? fetchBytes(spec.config, { cache, onProgress: progress('config') }) : null,
   ]);
-  model = new wasm.Model(weights, tokenizer, config ?? undefined, quant, options.lang, options.rewrites);
+  const load = (device) =>
+    wasm.Model.load(weights, tokenizer, config ?? undefined, quant, options.lang, options.rewrites, device);
+
+  let deviceReason = choice.reason;
+  if (choice.device === 'webgpu') {
+    try {
+      model = await load('webgpu');
+    } catch (e) {
+      if (options.device === 'webgpu') throw e;
+      deviceReason = `WebGPU failed to start: ${e instanceof Error ? e.message : e}`;
+      ({ wasm, threads, reason: threadsReason } = await loadWasm(options));
+    }
+  }
+  model ??= await load('cpu');
+  frameSize = model.frame_size();
 
   for (const name of options.preload) await voiceIndex(name, progress(`voice:${name}`));
-  return { sampleRate: model.sample_rate(), features: wasm.cpu_features(), threads, threadsReason: reason };
+  return {
+    sampleRate: model.sample_rate(),
+    features: wasm.cpu_features(),
+    device: model.device(),
+    deviceReason,
+    threads,
+    threadsReason,
+  };
 }
 
 /** The index of voice `name`, fetching and registering it on first use. */
@@ -148,13 +197,15 @@ async function handleGenerate(id, { text, voice, temperature, seed }) {
           break outer;
         }
         const s0 = performance.now();
-        const pcm = model.generation_step();
+        // One frame on the CPU, several on WebGPU, which reads a step back in one go.
+        const pcm = await model.generation_step();
         if (pcm === undefined) break;
-        const dt = performance.now() - s0;
-        stepMsTotal += dt;
+        const frames = Math.max(1, Math.round(pcm.length / frameSize));
+        const dt = (performance.now() - s0) / frames;
+        stepMsTotal += dt * frames;
         stepMsMin = Math.min(stepMsMin, dt);
         stats.stepMs.max = Math.max(stats.stepMs.max, dt);
-        stats.frames++;
+        stats.frames += frames;
         stats.samples += pcm.length;
         stats.firstAudioMs ??= performance.now() - t0;
         post({ type: 'chunk', id, pcm }, [pcm.buffer]);

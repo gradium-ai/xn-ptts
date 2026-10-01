@@ -33,6 +33,10 @@ export class PhononTTS {
   sampleRate;
   /** SIMD features the wasm module was built with, e.g. `{ simd128: true }`. */
   features;
+  /** Where generation runs: `'webgpu'` or `'cpu'`. */
+  device;
+  /** Why `device` is what it is, e.g. `'default'` or `'this browser offers no WebGPU adapter'`. */
+  deviceReason;
   /** CPU threads generation runs on, counting the worker that owns the model. */
   threads;
   /** Why `threads` is what it is, e.g. `'default'` or `'the page is not cross-origin isolated'`. */
@@ -57,6 +61,7 @@ export class PhononTTS {
       wasmUrl,
       threadsWasmUrl,
       threads = 'auto',
+      device = 'auto',
     } = options ?? {};
     // Required, as in every other frontend: the spoken forms of `@`, `+` and `=` differ per
     // language, so normalizing German text as English is worse than not normalizing at all.
@@ -65,6 +70,12 @@ export class PhononTTS {
     }
     if (quant !== 'f32' && quant !== 'q8') {
       throw new TypeError(`quant must be 'f32' or 'q8', got '${quant}'`);
+    }
+    if (device !== 'auto' && device !== 'webgpu' && device !== 'cpu') {
+      throw new TypeError(`device must be 'auto', 'webgpu' or 'cpu', got ${JSON.stringify(device)}`);
+    }
+    if (device === 'webgpu' && quant !== 'q8') {
+      throw new TypeError("device 'webgpu' needs quant 'q8': f32 weights cannot be quantized on the GPU");
     }
     if (threads !== 'auto' && !(Number.isInteger(threads) && threads >= 1)) {
       throw new TypeError(`threads must be 'auto' or a positive integer, got ${JSON.stringify(threads)}`);
@@ -114,7 +125,7 @@ export class PhononTTS {
       : new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
     const tts = new PhononTTS(worker, model, defaultVoice);
     try {
-      const { sampleRate, features, threads: threadsUsed, threadsReason } = await tts.#request(
+      const reply = await tts.#request(
         {
           type: 'init',
           options: {
@@ -127,14 +138,17 @@ export class PhononTTS {
             wasmUrl: wasmUrl ? resolveUrl(wasmUrl) : undefined,
             threadsWasmUrl: threadsWasmUrl ? resolveUrl(threadsWasmUrl) : undefined,
             threads,
+            device,
           },
         },
         { onProgress },
       );
-      tts.sampleRate = sampleRate;
-      tts.features = features;
-      tts.threads = threadsUsed;
-      tts.threadsReason = threadsReason;
+      tts.sampleRate = reply.sampleRate;
+      tts.features = reply.features;
+      tts.device = reply.device;
+      tts.deviceReason = reply.deviceReason;
+      tts.threads = reply.threads;
+      tts.threadsReason = reply.threadsReason;
       return tts;
     } catch (e) {
       tts.dispose();

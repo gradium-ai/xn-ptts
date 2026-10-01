@@ -1,12 +1,19 @@
 //! The raw WebAssembly surface of the browser build.
 //!
 //! This is what `wasm-bindgen` exports, and it is deliberately low level: it takes bytes the
-//! caller has already fetched and it generates one frame per call, because the worker it runs
-//! in must yield to its event loop between frames to hear a cancel. The `threads` build
-//! splits the work inside a frame across Web Workers; see `start_cpu_pool`. A
-//! JavaScript wrapper -- the `phonon-tts` npm package, added later in this stack -- runs it
-//! in a worker and handles downloads, caching and voices by name. Most callers want that,
-//! not this.
+//! caller has already fetched and generates a few frames per call, because the worker it
+//! runs in must yield to its event loop between calls to hear a cancel. The `phonon-tts` npm
+//! package runs it in a worker and handles downloads, caching and voices by name. Most
+//! callers want that, not this.
+//!
+//! One engine serves every backend. Loading, voices, text normalization, sentence chunking
+//! and the end-of-speech rule are written once, generic over the device; what differs is how
+//! a result comes back to the host (see [`Readback`]) and how many frames a call produces
+//! (see [`CPU_FRAMES_PER_STEP`]). The CPU runs on one thread or, in the `threads` build, on
+//! several (see `start_cpu_pool`); the `webgpu` feature adds the GPU.
+
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use wasm_bindgen::prelude::*;
 
@@ -31,21 +38,19 @@ use ptts::tts_model::{
     MAX_TOKENS_PER_CHUNK, TTSConfig, TTSModel, TTSState, prepare_text_prompt,
     split_into_best_sentences,
 };
-use xn::nn::{Linear, VB};
+#[cfg(feature = "webgpu")]
+use xn::WebGpuDevice;
+use xn::nn::{Linear, Path, VB};
 use xn::quantized::Q80F32;
-use xn::{BackendQ, CPU, CpuDevice, Result, Tensor, TypedTensor, Unquantized};
+use xn::{Backend, BackendQ, CPU, CpuDevice, Result, Tensor, TypedTensor, Unquantized};
 
-/// Underlying type-erased transformer state, shared across all supported quantizations
-/// (all of them use `T = f32, B = CpuDevice`).
-type RawState = StreamingTransformerState<f32, CpuDevice>;
-
-fn wrap_state<Q: BackendQ<T = f32, B = CpuDevice>>(raw: RawState) -> TTSState<Q> {
-    TTSState { flow_lm_state: FlowLMState { transformer_state: raw } }
-}
+/// The flow LM's transformer state on device `B`: what a voice prompt leaves behind, and
+/// what every chunk of an utterance starts from.
+type RawState<B> = StreamingTransformerState<f32, B>;
 
 /// Slots a voice state already occupies: the voice prompt's frames. Every flow-LM layer
 /// advances together, so the first one says it for all of them.
-fn raw_len(state: &RawState) -> usize {
+fn raw_len<B: Backend>(state: &RawState<B>) -> usize {
     state
         .layer_states
         .iter()
@@ -56,8 +61,44 @@ fn raw_len(state: &RawState) -> usize {
         .unwrap_or(0)
 }
 
+/// Frames a `generation_step` produces on the CPU. One: reading a frame back costs nothing
+/// there, and one frame is the soonest audio can start.
+const CPU_FRAMES_PER_STEP: usize = 1;
+
+/// Frames a `generation_step` produces on WebGPU. A readback there is a round trip through
+/// the browser's GPU process, answered only through the event loop. A frame's next input is
+/// its latent, which never leaves the GPU, so several frames are sampled with no readback,
+/// decoded as one batch (which also gives the vocoder's matmuls more than one row), and read
+/// back together. The cost is up to this many frames past end-of-speech, which are dropped.
+#[cfg(feature = "webgpu")]
+const GPU_FRAMES_PER_STEP: usize = 8;
+
+/// Spare KV slots for the warm-up's throwaway chunk.
+#[cfg(feature = "webgpu")]
+const WARM_UP_SLACK: usize = 16;
+
+/// How a device brings a tensor back to the host: the one thing the backends do differently.
+/// The CPU already has it. WebGPU has to wait for the GPU, which a browser reports only
+/// through its event loop, so nothing on that path may block.
+trait Readback: Backend {
+    async fn read(&self, t: &Tensor<f32, Self>) -> Result<Vec<f32>>;
+}
+
+impl Readback for CpuDevice {
+    async fn read(&self, t: &Tensor<f32, Self>) -> Result<Vec<f32>> {
+        t.to_vec()
+    }
+}
+
+#[cfg(feature = "webgpu")]
+impl Readback for WebGpuDevice {
+    async fn read(&self, t: &Tensor<f32, Self>) -> Result<Vec<f32>> {
+        self.tensor_to_vec(t).await
+    }
+}
+
 /// Quantization variants exposed to JS.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Quant {
     F32,
     Q8,
@@ -73,38 +114,6 @@ impl Quant {
     }
 }
 
-enum ModelInner {
-    F32(TTSModel<Unquantized<f32, CpuDevice>>),
-    Q8(TTSModel<Q80F32>),
-}
-
-enum StateInner {
-    F32(TTSState<Unquantized<f32, CpuDevice>>),
-    Q8(TTSState<Q80F32>),
-}
-
-/// Run a block against the active model. Within the block, `$m` is `&TTSModel<Q>`.
-macro_rules! with_model {
-    ($inner:expr, |$m:ident| $body:expr) => {
-        match $inner {
-            ModelInner::F32($m) => $body,
-            ModelInner::Q8($m) => $body,
-        }
-    };
-}
-
-/// Dispatch a block of code over the currently active (model, state) pair. Within the
-/// block, `$m` is `&TTSModel<Q>` and `$s` is `&mut TTSState<Q>` for the matching `Q`.
-macro_rules! dispatch {
-    ($inner:expr, $state:expr, |$m:ident, $s:ident| $body:block) => {
-        match ($inner, $state) {
-            (ModelInner::F32($m), StateInner::F32($s)) => $body,
-            (ModelInner::Q8($m), StateInner::Q8($s)) => $body,
-            _ => xn::bail!("model/state quantization mismatch"),
-        }
-    };
-}
-
 /// One sentence-aligned piece of the text, ready to prompt.
 struct ChunkPlan {
     tokens: Vec<u32>,
@@ -113,10 +122,10 @@ struct ChunkPlan {
 }
 
 /// The chunk currently being generated.
-struct ChunkState {
-    tts_state: StateInner,
-    mimi_state: MimiDecoderState<f32, CpuDevice>,
-    prev_latent: Option<Tensor<f32, CpuDevice>>,
+struct ChunkState<Q: BackendQ<T = f32>> {
+    tts_state: TTSState<Q>,
+    mimi_state: MimiDecoderState<f32, Q::B>,
+    prev_latent: Option<Tensor<f32, Q::B>>,
     frame_budget: usize,
     eos: EosPolicy,
     step: usize,
@@ -125,38 +134,331 @@ struct ChunkState {
     done: bool,
 }
 
-struct GenState {
+struct GenState<Q: BackendQ<T = f32>> {
     /// The voice state, resized to fit the longest chunk. Every chunk starts from a clone of
     /// it, as `ptts::synth` does: chunks run one after the other, so sharing the KV storage
     /// is safe, and each overwrites only what lies past the voice prompt.
-    base: RawState,
+    base: RawState<Q::B>,
     chunks: std::vec::IntoIter<ChunkPlan>,
-    current: Option<ChunkState>,
+    current: Option<ChunkState<Q>>,
     /// One noise source for the whole text, so a seed fixes every chunk.
     rng: NormalRng,
 }
 
-#[wasm_bindgen]
-pub struct Model {
-    inner: ModelInner,
-    cfg: TTSConfig,
-    speaker_proj: Option<Linear<f32, CpuDevice>>,
-    gen_state: Option<GenState>,
-    voice_states: Vec<RawState>,
-    /// How `start_generation` normalizes, named by the page when it built the
-    /// model. See `Model::new`.
-    normalize: Normalize,
+/// Frames that have been generated and decoded on the device but not yet read back.
+struct Pending<B: Backend> {
+    pcm: Tensor<f32, B>,
+    /// One end-of-speech logit per frame.
+    eos: Tensor<f32, B>,
+    frames: usize,
 }
 
-impl Model {
-    fn new_(
-        model_weights: &[u8],
+/// Generates `frames` frames of `chunk` and decodes them as one batch, reading nothing back.
+fn record_frames<Q: BackendQ<T = f32>>(
+    model: &TTSModel<Q>,
+    chunk: &mut ChunkState<Q>,
+    rng: &mut NormalRng,
+    frames: usize,
+) -> Result<Pending<Q::B>> {
+    let mut latents = Vec::with_capacity(frames);
+    let mut eos_logits = Vec::with_capacity(frames);
+    for _ in 0..frames {
+        let input = match &chunk.prev_latent {
+            None => StepInput::Bos { batch: 1 },
+            Some(t) => StepInput::Latent(t),
+        };
+        let (latent, eos_logit) = model.generate_step_parts(&mut chunk.tts_state, input, rng)?;
+        chunk.prev_latent = Some(latent.clone());
+        latents.push(latent);
+        eos_logits.push(eos_logit);
+    }
+    let batched = Tensor::cat(&latents.iter().collect::<Vec<_>>(), 1)?;
+    let pcm = model.decode_latent(&batched, &mut chunk.mimi_state)?;
+    let pcm = pcm.narrow(0, ..1)?.contiguous()?;
+    // One tensor for every frame's eos logit, so a step costs two readbacks however many
+    // frames it holds.
+    let eos = Tensor::cat(&eos_logits.iter().collect::<Vec<_>>(), 0)?;
+    chunk.step += frames;
+    Ok(Pending { pcm, eos, frames })
+}
+
+/// A loaded model on one device, and the generation in progress on it.
+struct Engine<Q: BackendQ<T = f32>> {
+    model: TTSModel<Q>,
+    device: Q::B,
+    speaker_proj: Option<Linear<f32, Q::B>>,
+    voice_states: Vec<RawState<Q::B>>,
+    gen_state: Option<GenState<Q>>,
+    frames_per_step: usize,
+}
+
+impl<Q: BackendQ<T = f32>> Engine<Q>
+where
+    Q::B: Readback,
+{
+    fn load(
+        root: &Path<Q::B>,
+        tokenizer: Box<dyn ptts::Tokenizer + Send + Sync>,
+        cfg: &TTSConfig,
+        device: Q::B,
+        frames_per_step: usize,
+    ) -> Result<Self> {
+        let speaker_proj = load_speaker_proj(root, cfg)?;
+        let model = TTSModel::load(root, tokenizer, cfg)?;
+        Ok(Self {
+            model,
+            device,
+            speaker_proj,
+            voice_states: vec![],
+            gen_state: None,
+            frames_per_step,
+        })
+    }
+
+    fn add_voice(&mut self, bytes: &[u8], cfg: &TTSConfig) -> Result<usize> {
+        let tensors = xn::safetensors::load_from_buffer(bytes, &self.device)?;
+        let raw = if tensors.contains_key(&kv_cache_name(0)) {
+            voice_from_kv_cache(&tensors, cfg)?
+        } else {
+            self.voice_from_emb(bytes, cfg)?
+        };
+        self.voice_states.push(raw);
+        Ok(self.voice_states.len() - 1)
+    }
+
+    /// A voice stored as an embedding (`emb`, `audio_prompt`) or as speaker-Mimi latents
+    /// (`speaker_wavs`), the formats every other frontend reads. It is run through the flow
+    /// LM once, here, so generation can start from the resulting state.
+    fn voice_from_emb(&self, bytes: &[u8], cfg: &TTSConfig) -> Result<RawState<Q::B>> {
+        let model_ext = cfg.model_ext();
+        let emb = load_voice_emb_from_bytes(
+            bytes,
+            model_ext.as_deref(),
+            self.speaker_proj.as_ref(),
+            &self.device,
+        )?;
+        let frames = emb.dim(1usize)?;
+        let mut state = self.model.init_flow_lm_state(1, frames)?;
+        self.model.prompt_audio(&mut state, &emb)?;
+        Ok(state.flow_lm_state.transformer_state)
+    }
+
+    fn start_generation(
+        &mut self,
+        voice_index: usize,
+        text: &str,
+        temperature: f32,
+        seed: u32,
+        normalize: Normalize,
+        cfg: &TTSConfig,
+    ) -> Result<usize> {
+        // Dropped before anything else can fail, so a caller that swallows the error cannot
+        // go on stepping and quietly resume the *previous* utterance.
+        self.gen_state = None;
+        // Built here rather than after planning: a temperature that cannot produce a
+        // distribution should be refused before any work is done.
+        let rng = NormalRng::new(temperature, seed as u64)?;
+        let Some(voice) = self.voice_states.get(voice_index) else {
+            xn::bail!("invalid voice index: {voice_index}")
+        };
+        let chunks = self.plan_chunks(text, normalize, cfg)?;
+
+        // The KV budget has to hold the voice prompt plus the longest chunk's text and audio.
+        // This is `plan::seq_budget` with the voice's real length in place of its
+        // `PROMPT_SEQ_HEADROOM` guess, the same bound `ptts::synth` checks a session against.
+        // A step never runs past a chunk's frame budget, however many frames it holds.
+        let voice_len = raw_len(voice);
+        let seq_budget =
+            chunks.iter().map(|c| voice_len + c.tokens.len() + c.frame_budget).max().unwrap_or(0);
+        let base = voice.with_seq_budget(seq_budget)?;
+
+        let num_chunks = chunks.len();
+        self.gen_state = Some(GenState { base, chunks: chunks.into_iter(), current: None, rng });
+        Ok(num_chunks)
+    }
+
+    /// Normalize the whole text, split it into sentence-aligned chunks and tokenize each,
+    /// exactly as `ptts::synth` does: normalization first, because it rewrites the characters
+    /// the splitter looks for.
+    fn plan_chunks(
+        &self,
+        text: &str,
+        normalize: Normalize,
+        cfg: &TTSConfig,
+    ) -> Result<Vec<ChunkPlan>> {
+        let text = normalize.apply(text);
+        let conditioner = &self.model.flow_lm.conditioner;
+        let Some(tokenizer) = conditioner.tokenizer.as_deref() else {
+            xn::bail!("this model was loaded without a tokenizer")
+        };
+        let texts = split_into_best_sentences(tokenizer, &text, Some(MAX_TOKENS_PER_CHUNK))?;
+        let mut chunks = Vec::with_capacity(texts.len());
+        for text in texts {
+            let (prepared, frames_after_eos) = prepare_text_prompt(&text);
+            let tokens = conditioner.tokenize(&prepared)?;
+            let frame_budget = plan::frame_budget(tokens.len(), cfg.mimi.frame_rate);
+            chunks.push(ChunkPlan { tokens, frame_budget, frames_after_eos });
+        }
+        if chunks.is_empty() {
+            xn::bail!("nothing to synthesize: the text is empty")
+        }
+        Ok(chunks)
+    }
+
+    fn next_chunk(&mut self) -> Result<Option<usize>> {
+        let Some(gen_state) = self.gen_state.as_mut() else { return Ok(None) };
+        gen_state.current = None;
+        let Some(chunk) = gen_state.chunks.next() else {
+            self.gen_state = None;
+            return Ok(None);
+        };
+        let transformer_state = gen_state.base.clone();
+        let mut tts_state = TTSState { flow_lm_state: FlowLMState { transformer_state } };
+        self.model.prompt_text(&mut tts_state, &chunk.tokens)?;
+        let mimi_state = self.model.init_mimi_state(1)?;
+        gen_state.current = Some(ChunkState {
+            tts_state,
+            mimi_state,
+            prev_latent: None,
+            frame_budget: chunk.frame_budget,
+            eos: EosPolicy::new(chunk.frames_after_eos),
+            step: 0,
+            done: false,
+        });
+        Ok(Some(chunk.tokens.len()))
+    }
+
+    /// Up to `frames_per_step` frames of the current chunk as PCM, or `None` once the chunk
+    /// is finished.
+    async fn step(&mut self) -> Result<Option<Vec<f32>>> {
+        let pending = {
+            let Some(gen_state) = self.gen_state.as_mut() else { return Ok(None) };
+            let Some(chunk) = gen_state.current.as_mut() else { return Ok(None) };
+            if chunk.done || chunk.step >= chunk.frame_budget {
+                gen_state.current = None;
+                return Ok(None);
+            }
+            let frames = self.frames_per_step.min(chunk.frame_budget - chunk.step);
+            record_frames(&self.model, chunk, &mut gen_state.rng, frames)?
+        };
+        let eos = self.device.read(&pending.eos).await?;
+        let mut pcm = self.device.read(&pending.pcm).await?;
+
+        // Keep frames up to the one where the end-of-speech rule runs out. `should_stop` is
+        // asked after each frame, so that frame itself is part of the output, and the next
+        // call reports the end of the chunk.
+        let Some(chunk) = self.gen_state.as_mut().and_then(|g| g.current.as_mut()) else {
+            return Ok(None);
+        };
+        let per_frame = pcm.len() / pending.frames;
+        let mut keep = pending.frames;
+        for (i, logit) in eos.iter().enumerate().take(pending.frames) {
+            if chunk.eos.should_stop(self.model.eos_from_logit(std::slice::from_ref(logit))) {
+                chunk.done = true;
+                keep = i + 1;
+                break;
+            }
+        }
+        pcm.truncate(keep * per_frame);
+        Ok(Some(pcm))
+    }
+
+    /// Runs one throwaway step, so a GPU driver compiles its pipelines during the load rather
+    /// than inside the first real utterance, where they would hold up its first audio. The
+    /// step has the shape generation uses, so the vocoder's kernels are built at that shape.
+    #[cfg(feature = "webgpu")]
+    async fn warm_up(&self) -> Result<()> {
+        let frames = self.frames_per_step;
+        let mut chunk = ChunkState {
+            tts_state: self.model.init_flow_lm_state(1, frames + WARM_UP_SLACK)?,
+            mimi_state: self.model.init_mimi_state(1)?,
+            prev_latent: None,
+            frame_budget: frames,
+            eos: EosPolicy::new(0),
+            step: 0,
+            done: false,
+        };
+        let mut rng = NormalRng::new(0.3, 0)?;
+        let pending = record_frames(&self.model, &mut chunk, &mut rng, frames)?;
+        // Read something back, so this waits for the work rather than just queuing it.
+        self.device.read(&pending.pcm).await?;
+        Ok(())
+    }
+}
+
+/// A voice stored as the flow LM's KV cache after the voice prompt, the format the
+/// `embeddings_v2/` voices use: `transformer.layers.{i}.self_attn/cache`, shaped
+/// `[2, 1, seq, heads, head_dim]`, for each layer. Nothing to run.
+fn voice_from_kv_cache<B: Backend>(
+    tensors: &std::collections::HashMap<String, TypedTensor<B>>,
+    cfg: &TTSConfig,
+) -> Result<RawState<B>> {
+    let num_layers = cfg.flow_lm.num_layers;
+    let mut layer_states = Vec::with_capacity(num_layers);
+    for i in 0..num_layers {
+        let cache_name = kv_cache_name(i);
+        let cache = match tensors.get(&cache_name) {
+            Some(TypedTensor::F32(t)) => t,
+            _ => xn::bail!("expected f32 tensor: {cache_name}"),
+        };
+        let (two, batch, seq_len, num_heads, head_dim) = cache.dims5()?;
+        if two != 2 {
+            xn::bail!("{cache_name}: expected a first dim of size 2, got {two}");
+        }
+        let kv = |i: usize| -> Result<Tensor<f32, B>> {
+            cache.narrow(0, i..i + 1)?.contiguous()?.reshape((batch, seq_len, num_heads, head_dim))
+        };
+        layer_states.push(LayerAttentionState::FlowLm(StreamingMHAState {
+            k_cache: kv(0)?,
+            v_cache: kv(1)?,
+            current_end: seq_len,
+        }));
+    }
+    Ok(StreamingTransformerState { layer_states })
+}
+
+/// The engine for whichever backend and weight format was loaded.
+// There is one per loaded model and it never moves, so boxing the larger variants would
+// only add an indirection.
+#[allow(clippy::large_enum_variant)]
+enum AnyEngine {
+    CpuF32(Engine<Unquantized<f32, CpuDevice>>),
+    CpuQ8(Engine<Q80F32>),
+    #[cfg(feature = "webgpu")]
+    WebGpuQ8(Engine<xn::webgpu_backend::quantization::Q8F32>),
+}
+
+/// Run a block against the loaded engine. Within the block, `$e` is the `Engine<Q>`.
+macro_rules! with_engine {
+    ($engine:expr, |$e:ident| $body:expr) => {
+        match $engine {
+            AnyEngine::CpuF32($e) => $body,
+            AnyEngine::CpuQ8($e) => $body,
+            #[cfg(feature = "webgpu")]
+            AnyEngine::WebGpuQ8($e) => $body,
+        }
+    };
+}
+
+/// Everything a `Model` holds.
+struct Loaded {
+    engine: AnyEngine,
+    cfg: TTSConfig,
+    /// How `start_generation` normalizes, named by the page when it loaded the model.
+    normalize: Normalize,
+    device: &'static str,
+}
+
+impl Loaded {
+    async fn load(
+        model_weights: Vec<u8>,
         tokenizer_json: &[u8],
         config_json: Option<Vec<u8>>,
         quant: &str,
         lang: &str,
         rewrites: Option<&str>,
-    ) -> Result<Model> {
+        device: &str,
+    ) -> Result<Self> {
         let quant = Quant::parse(quant)?;
         let rules = match rewrites {
             Some(rewrites) => Rules::parse(rewrites)?,
@@ -172,219 +474,62 @@ impl Model {
             // through `start_generation`.
             None => TTSConfig::v202601(0.3),
         };
-        console_log!("[phonon] loading model with quant={quant:?}");
-
-        let is_gguf = model_weights.len() >= 4 && &model_weights[..4] == b"GGUF";
-        let vb = if is_gguf {
-            let cursor = std::io::Cursor::new(model_weights.to_vec());
-            VB::load_gguf_with_key_map(cursor, CPU, remap_key)?
-        } else {
-            VB::from_bytes_with_key_map(vec![model_weights.to_vec()], CPU, remap_key)?
-        };
-        let root = vb.root();
         let tokenizer: Box<dyn ptts::Tokenizer + Send + Sync> =
             Box::new(Tok::from_bytes(tokenizer_json)?);
-        let speaker_proj = load_speaker_proj(&root, &cfg)?;
+        let is_gguf = model_weights.len() >= 4 && &model_weights[..4] == b"GGUF";
+        console_log!("[phonon] loading model with quant={quant:?} on {device}");
 
-        let inner = match quant {
-            Quant::F32 => ModelInner::F32(TTSModel::load(&root, tokenizer, &cfg)?),
-            Quant::Q8 => ModelInner::Q8(TTSModel::load(&root, tokenizer, &cfg)?),
-        };
-
-        Ok(Model { inner, cfg, speaker_proj, gen_state: None, voice_states: Vec::new(), normalize })
-    }
-
-    fn add_voice_(&mut self, bytes: &[u8]) -> Result<usize> {
-        let tensors = xn::safetensors::load_from_buffer(bytes, &CPU)?;
-        let raw = if tensors.contains_key(&kv_cache_name(0)) {
-            self.voice_from_kv_cache(&tensors)?
-        } else {
-            self.voice_from_emb(bytes)?
-        };
-        self.voice_states.push(raw);
-        Ok(self.voice_states.len() - 1)
-    }
-
-    /// A voice stored as the flow LM's KV cache after the voice prompt, the format the
-    /// `embeddings_v2/` voices use: `transformer.layers.{i}.self_attn/cache`, shaped
-    /// `[2, 1, seq, heads, head_dim]`, for each layer. Nothing to run.
-    fn voice_from_kv_cache(
-        &self,
-        tensors: &std::collections::HashMap<String, TypedTensor<CpuDevice>>,
-    ) -> Result<RawState> {
-        let num_layers = self.cfg.flow_lm.num_layers;
-        let mut layer_states = Vec::with_capacity(num_layers);
-        for i in 0..num_layers {
-            let cache_name = kv_cache_name(i);
-            let cache = match tensors.get(&cache_name) {
-                Some(TypedTensor::F32(t)) => t,
-                _ => xn::bail!("expected f32 tensor: {cache_name}"),
-            };
-            let (two, batch, seq_len, num_heads, head_dim) = cache.dims5()?;
-            if two != 2 {
-                xn::bail!("{cache_name}: expected a first dim of size 2, got {two}");
-            }
-            let kv = |i: usize| -> Result<Tensor<f32, CpuDevice>> {
-                cache
-                    .narrow(0, i..i + 1)?
-                    .contiguous()?
-                    .reshape((batch, seq_len, num_heads, head_dim))
-            };
-            layer_states.push(LayerAttentionState::FlowLm(StreamingMHAState {
-                k_cache: kv(0)?,
-                v_cache: kv(1)?,
-                current_end: seq_len,
-            }));
-        }
-        Ok(StreamingTransformerState { layer_states })
-    }
-
-    /// A voice stored as an embedding (`emb`, `audio_prompt`) or as speaker-Mimi latents
-    /// (`speaker_wavs`), the formats every other frontend reads. It is run through the flow
-    /// LM once, here, so generation can start from the resulting state.
-    fn voice_from_emb(&self, bytes: &[u8]) -> Result<RawState> {
-        let model_ext = self.cfg.model_ext();
-        let emb = load_voice_emb_from_bytes(
-            bytes,
-            model_ext.as_deref(),
-            self.speaker_proj.as_ref(),
-            &CPU,
-        )?;
-        let frames = emb.dim(1usize)?;
-        with_model!(&self.inner, |m| {
-            let mut state = m.init_flow_lm_state(1, frames)?;
-            m.prompt_audio(&mut state, &emb)?;
-            Ok(state.flow_lm_state.transformer_state)
-        })
-    }
-
-    fn start_generation_(
-        &mut self,
-        voice_index: usize,
-        text: &str,
-        temperature: f32,
-        seed: u32,
-    ) -> Result<usize> {
-        // Dropped before anything else can fail, so a caller that swallows the error cannot
-        // go on stepping and quietly resume the *previous* utterance.
-        self.gen_state = None;
-        // Built here rather than after planning: a temperature that cannot produce a
-        // distribution should be refused before any work is done.
-        let rng = NormalRng::new(temperature, seed as u64)?;
-        let Some(voice) = self.voice_states.get(voice_index) else {
-            xn::bail!("invalid voice index: {voice_index}")
-        };
-        let chunks = self.plan_chunks(text)?;
-
-        // The KV budget has to hold the voice prompt plus the longest chunk's text and audio.
-        // This is `plan::seq_budget` with the voice's real length in place of its
-        // `PROMPT_SEQ_HEADROOM` guess, the same bound `ptts::synth` checks a session against.
-        let voice_len = raw_len(voice);
-        let seq_budget =
-            chunks.iter().map(|c| voice_len + c.tokens.len() + c.frame_budget).max().unwrap_or(0);
-        let base = voice.with_seq_budget(seq_budget)?;
-
-        let num_chunks = chunks.len();
-        self.gen_state = Some(GenState { base, chunks: chunks.into_iter(), current: None, rng });
-        Ok(num_chunks)
-    }
-
-    /// Normalize the whole text, split it into sentence-aligned chunks and tokenize each,
-    /// exactly as `ptts::synth` does: normalization first, because it rewrites the characters
-    /// the splitter looks for.
-    fn plan_chunks(&self, text: &str) -> Result<Vec<ChunkPlan>> {
-        let frame_rate = self.cfg.mimi.frame_rate;
-        let text = self.normalize.apply(text);
-        with_model!(&self.inner, |m| {
-            let conditioner = &m.flow_lm.conditioner;
-            let Some(tokenizer) = conditioner.tokenizer.as_deref() else {
-                xn::bail!("this model was loaded without a tokenizer")
-            };
-            let texts = split_into_best_sentences(tokenizer, &text, Some(MAX_TOKENS_PER_CHUNK))?;
-            let mut chunks = Vec::with_capacity(texts.len());
-            for text in texts {
-                let (prepared, frames_after_eos) = prepare_text_prompt(&text);
-                let tokens = conditioner.tokenize(&prepared)?;
-                let frame_budget = plan::frame_budget(tokens.len(), frame_rate);
-                chunks.push(ChunkPlan { tokens, frame_budget, frames_after_eos });
-            }
-            if chunks.is_empty() {
-                xn::bail!("nothing to synthesize: the text is empty")
-            }
-            Ok(chunks)
-        })
-    }
-
-    fn next_chunk_(&mut self) -> Result<Option<usize>> {
-        let Some(gen_state) = self.gen_state.as_mut() else { return Ok(None) };
-        gen_state.current = None;
-        let Some(chunk) = gen_state.chunks.next() else {
-            self.gen_state = None;
-            return Ok(None);
-        };
-        let raw = gen_state.base.clone();
-        let mut tts_state = match &self.inner {
-            ModelInner::F32(_) => StateInner::F32(wrap_state(raw)),
-            ModelInner::Q8(_) => StateInner::Q8(wrap_state(raw)),
-        };
-        let mimi_state = dispatch!(&self.inner, &mut tts_state, |m, s| {
-            m.prompt_text(s, &chunk.tokens)?;
-            m.init_mimi_state(1)?
-        });
-        gen_state.current = Some(ChunkState {
-            tts_state,
-            mimi_state,
-            prev_latent: None,
-            frame_budget: chunk.frame_budget,
-            eos: EosPolicy::new(chunk.frames_after_eos),
-            step: 0,
-            done: false,
-        });
-        Ok(Some(chunk.tokens.len()))
-    }
-
-    fn generation_step_(&mut self) -> Result<Option<js_sys::Float32Array>> {
-        let Some(gen_state) = self.gen_state.as_mut() else { return Ok(None) };
-        let Some(state) = gen_state.current.as_mut() else { return Ok(None) };
-        if state.done || state.step >= state.frame_budget {
-            gen_state.current = None;
-            return Ok(None);
-        }
-
-        let rng = &mut gen_state.rng;
-        let (next_latent, audio_chunk, is_eos) =
-            dispatch!(&self.inner, &mut state.tts_state, |m, s| {
-                // Inside the dispatch: `StepInput` is generic over the quantization,
-                // so one built outside would pin this to a single arm.
-                let input = match &state.prev_latent {
-                    None => StepInput::Bos { batch: 1 },
-                    Some(t) => StepInput::Latent(t),
+        let (engine, device) = match device {
+            "cpu" => {
+                let vb = if is_gguf {
+                    VB::load_gguf_with_key_map(std::io::Cursor::new(model_weights), CPU, remap_key)?
+                } else {
+                    VB::from_bytes_with_key_map(vec![model_weights], CPU, remap_key)?
                 };
-                let (next_latent, is_eos) = m.generate_step(s, input, rng)?;
-                let audio_chunk = m.decode_latent(&next_latent, &mut state.mimi_state)?;
-                (next_latent, audio_chunk, is_eos)
-            });
-
-        // `should_stop` is called after the frame has gone to the decoder: the EOS frame
-        // itself is part of the output. The frame is returned either way; the next call
-        // reports the end of the chunk.
-        state.done = state.eos.should_stop(is_eos);
-        state.prev_latent = Some(next_latent);
-        state.step += 1;
-
-        let pcm = audio_chunk.narrow(0, ..1)?.contiguous()?.to_vec()?;
-        Ok(Some(js_sys::Float32Array::from(pcm.as_slice())))
-    }
-}
-
-impl Model {
-    /// A failed step leaves a chunk half prompted or half generated. Dropping the generation
-    /// makes every later call report the end instead, so a caller that swallows the error
-    /// cannot go on and silently skip a sentence. `start_generation_` does the same.
-    fn drop_generation_on_error<T>(&mut self, result: &Result<T>) {
-        if result.is_err() {
-            self.gen_state = None;
-        }
+                let root = vb.root();
+                let engine = match quant {
+                    Quant::F32 => AnyEngine::CpuF32(Engine::load(
+                        &root,
+                        tokenizer,
+                        &cfg,
+                        CPU,
+                        CPU_FRAMES_PER_STEP,
+                    )?),
+                    Quant::Q8 => AnyEngine::CpuQ8(Engine::load(
+                        &root,
+                        tokenizer,
+                        &cfg,
+                        CPU,
+                        CPU_FRAMES_PER_STEP,
+                    )?),
+                };
+                (engine, "cpu")
+            }
+            #[cfg(feature = "webgpu")]
+            "webgpu" => {
+                // q8 weights go to the GPU as they are. Quantizing dense weights would read
+                // every one back to the host, which a browser cannot do.
+                if quant != Quant::Q8 || !is_gguf {
+                    xn::bail!("WebGPU needs q8 weights in a GGUF file")
+                }
+                let dev = WebGpuDevice::new_async(0).await?;
+                let vb = VB::load_gguf_with_key_map(
+                    std::io::Cursor::new(model_weights),
+                    dev.clone(),
+                    remap_key,
+                )?;
+                let engine =
+                    Engine::load(&vb.root(), tokenizer, &cfg, dev.clone(), GPU_FRAMES_PER_STEP)?;
+                // The weight upload is recorded, not yet executed.
+                dev.flush_async().await?;
+                engine.warm_up().await?;
+                (AnyEngine::WebGpuQ8(engine), "webgpu")
+            }
+            #[cfg(not(feature = "webgpu"))]
+            "webgpu" => xn::bail!("this build has no WebGPU support"),
+            other => xn::bail!("unknown device '{other}', expected 'cpu' or 'webgpu'"),
+        };
+        Ok(Self { engine, cfg, normalize, device })
     }
 }
 
@@ -396,11 +541,40 @@ fn js_err(e: xn::Error) -> JsError {
     JsError::new(&e.to_string())
 }
 
+/// A loaded model, on the CPU or on WebGPU.
+///
+/// The state sits behind an `Rc<RefCell<Option<_>>>` because `generation_step` is async and a
+/// `RefCell` borrow may not be held across an await: the step takes the state out for its
+/// duration and puts it back after. A call that arrives meanwhile finds it missing and is
+/// refused, so calls must not overlap; `phonon-tts`'s worker awaits each one.
+#[wasm_bindgen]
+pub struct Model {
+    loaded: Rc<RefCell<Option<Loaded>>>,
+}
+
+impl Model {
+    fn with<T>(&self, f: impl FnOnce(&mut Loaded) -> Result<T>) -> Result<T> {
+        match self.loaded.borrow_mut().as_mut() {
+            Some(loaded) => f(loaded),
+            None => xn::bail!("the model is busy: a generation step is still running"),
+        }
+    }
+
+    /// A failed step leaves a chunk half prompted or half generated. Dropping the generation
+    /// makes every later call report the end instead, so a caller that swallows the error
+    /// cannot go on and silently skip a sentence. `start_generation` does the same.
+    fn drop_generation_on_error<T>(loaded: &mut Loaded, result: &Result<T>) {
+        if result.is_err() {
+            with_engine!(&mut loaded.engine, |e| e.gen_state = None);
+        }
+    }
+}
+
 #[wasm_bindgen]
 impl Model {
-    /// `model_weights` is a safetensors or GGUF checkpoint, `tokenizer_json` the contents of
-    /// the `tokenizer.json` for its vocabulary, and `config_json` its `config.json`, or
-    /// `undefined` for the original Pocket TTS architecture.
+    /// Loads a model. `model_weights` is a safetensors or GGUF checkpoint, `tokenizer_json`
+    /// the contents of the `tokenizer.json` for its vocabulary, and `config_json` its
+    /// `config.json`, or `undefined` for the original Pocket TTS architecture.
     ///
     /// Two things a config cannot ask this build for. Its `temp` is not read: the sampling
     /// temperature reaches the model through `start_generation`. And there is no
@@ -416,66 +590,121 @@ impl Model {
     /// to hand text to the tokenizer as written. The spoken forms of `@`, `+`
     /// and `=` differ per language, so there is nothing safe to default to.
     ///
-    /// `rewrites` is optional and picks which word rewrites run on the
-    /// normalized text: `"all"` (the default), `"none"`, or a comma-separated
-    /// list of rule names, of which there is one today, `"numbers"`.
-    #[wasm_bindgen(constructor)]
-    pub fn new(
-        model_weights: &[u8],
-        tokenizer_json: &[u8],
+    /// `rewrites` picks which word rewrites run on the normalized text: `"all"`, `"none"`,
+    /// or a comma-separated list of rule names, of which there is one today, `"numbers"`.
+    /// `undefined` means `"all"`.
+    ///
+    /// `device` is `"cpu"` or `"webgpu"`. WebGPU needs `q8` weights in a GGUF file, and a
+    /// build with the `webgpu` feature.
+    pub async fn load(
+        model_weights: Vec<u8>,
+        tokenizer_json: Vec<u8>,
         config_json: Option<Vec<u8>>,
-        quant: &str,
-        lang: &str,
+        quant: String,
+        lang: String,
         rewrites: Option<String>,
+        device: String,
     ) -> std::result::Result<Model, JsError> {
-        Self::new_(model_weights, tokenizer_json, config_json, quant, lang, rewrites.as_deref())
-            .map_err(js_err)
+        let loaded = Loaded::load(
+            model_weights,
+            &tokenizer_json,
+            config_json,
+            &quant,
+            &lang,
+            rewrites.as_deref(),
+            &device,
+        )
+        .await
+        .map_err(js_err)?;
+        Ok(Model { loaded: Rc::new(RefCell::new(Some(loaded))) })
     }
 
     /// Registers a voice from a safetensors file and returns its index for
     /// `start_generation`. Either a precomputed KV cache (`embeddings_v2/`) or a voice
     /// embedding (`emb`, `audio_prompt` or `speaker_wavs`), told apart by tensor name.
-    pub fn add_voice(&mut self, voice: &[u8]) -> std::result::Result<usize, JsError> {
-        self.add_voice_(voice).map_err(js_err)
+    pub fn add_voice(&self, voice: &[u8]) -> std::result::Result<usize, JsError> {
+        self.with(|l| with_engine!(&mut l.engine, |e| e.add_voice(voice, &l.cfg))).map_err(js_err)
     }
 
     /// Normalizes `text`, splits it into sentence-aligned chunks and tokenizes them. Returns
     /// the number of chunks. Runs no model: call `next_chunk` to start the first one.
     pub fn start_generation(
-        &mut self,
+        &self,
         voice_index: usize,
         text: &str,
         temperature: f32,
         seed: u32,
     ) -> std::result::Result<usize, JsError> {
-        self.start_generation_(voice_index, text, temperature, seed).map_err(js_err)
+        self.with(|l| {
+            let (normalize, cfg) = (l.normalize, &l.cfg);
+            with_engine!(&mut l.engine, |e| e.start_generation(
+                voice_index,
+                text,
+                temperature,
+                seed,
+                normalize,
+                cfg
+            ))
+        })
+        .map_err(js_err)
     }
 
     /// Prompts the model with the next chunk's text and returns its token count, or
     /// `undefined` once every chunk has been generated.
-    pub fn next_chunk(&mut self) -> std::result::Result<Option<usize>, JsError> {
-        let result = self.next_chunk_();
-        self.drop_generation_on_error(&result);
-        result.map_err(js_err)
+    pub fn next_chunk(&self) -> std::result::Result<Option<usize>, JsError> {
+        self.with(|l| {
+            let result = with_engine!(&mut l.engine, |e| e.next_chunk());
+            Self::drop_generation_on_error(l, &result);
+            result
+        })
+        .map_err(js_err)
     }
 
-    /// Generates and decodes one frame of the current chunk: 80 ms of mono PCM at
-    /// `sample_rate`. Returns `undefined` when the chunk is finished.
-    pub fn generation_step(
-        &mut self,
-    ) -> std::result::Result<Option<js_sys::Float32Array>, JsError> {
-        let result = self.generation_step_();
-        self.drop_generation_on_error(&result);
-        result.map_err(js_err)
+    /// Generates and decodes the next frames of the current chunk: a promise of mono PCM at
+    /// `sample_rate`, a whole number of `frame_size`-sample frames, or of `undefined` when the
+    /// chunk is finished. One frame per call on the CPU, several on WebGPU.
+    pub fn generation_step(&self) -> js_sys::Promise {
+        let cell = Rc::clone(&self.loaded);
+        wasm_bindgen_futures::future_to_promise(async move {
+            let Some(mut loaded) = cell.borrow_mut().take() else {
+                return Err(
+                    JsError::new("the model is busy: a generation step is still running").into()
+                );
+            };
+            let result = with_engine!(&mut loaded.engine, |e| e.step().await);
+            Self::drop_generation_on_error(&mut loaded, &result);
+            *cell.borrow_mut() = Some(loaded);
+            match result {
+                Ok(Some(pcm)) => Ok(js_sys::Float32Array::from(pcm.as_slice()).into()),
+                Ok(None) => Ok(JsValue::UNDEFINED),
+                Err(e) => Err(js_err(e).into()),
+            }
+        })
     }
 
     /// Drops the generation in progress, if any.
-    pub fn stop_generation(&mut self) {
-        self.gen_state = None;
+    pub fn stop_generation(&self) {
+        if let Some(l) = self.loaded.borrow_mut().as_mut() {
+            with_engine!(&mut l.engine, |e| e.gen_state = None);
+        }
     }
 
-    pub fn sample_rate(&self) -> usize {
-        with_model!(&self.inner, |m| m.sample_rate())
+    pub fn sample_rate(&self) -> std::result::Result<usize, JsError> {
+        self.with(|l| Ok(with_engine!(&l.engine, |e| e.model.sample_rate()))).map_err(js_err)
+    }
+
+    /// Samples in one 80 ms frame: `generation_step` returns whole frames.
+    pub fn frame_size(&self) -> std::result::Result<usize, JsError> {
+        self.with(|l| {
+            let sample_rate = with_engine!(&l.engine, |e| e.model.sample_rate());
+            Ok((sample_rate as f64 / l.cfg.mimi.frame_rate).round() as usize)
+        })
+        .map_err(js_err)
+    }
+
+    /// `"cpu"` or `"webgpu"`: where this model runs.
+    pub fn device(&self) -> std::result::Result<String, JsError> {
+        self.with(|l| Ok(l.device.to_string())).map_err(js_err)
     }
 }
 
