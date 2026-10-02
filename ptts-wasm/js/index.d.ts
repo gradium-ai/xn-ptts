@@ -71,6 +71,13 @@ export interface LoadOptions {
    * thread whatever this says, and {@link PhononTTS.threadsReason} says why.
    */
   threads?: number | 'auto';
+  /**
+   * Where to generate. Default `'auto'`: on the GPU through WebGPU when the browser has it
+   * and `quant` is `'q8'`, falling back to the CPU if WebGPU fails to start. `'webgpu'`
+   * insists on the GPU and rejects if it cannot start; `'cpu'` never tries it.
+   * {@link PhononTTS.deviceReason} says why the model ended up where it did.
+   */
+  device?: 'auto' | 'webgpu' | 'cpu';
 }
 
 export interface SpeechOptions {
@@ -91,9 +98,16 @@ export interface SpeechStats {
   /** 80 ms frames generated. */
   frames?: number;
   samples?: number;
-  /** Time spent prompting the model with each chunk's text, summed. */
+  /**
+   * Time spent prompting the model with each chunk's text, summed. On WebGPU the prompt is
+   * only queued here and runs with the chunk's first step, so this reads near zero there.
+   */
   promptMs?: number;
-  /** Per-frame generation time. */
+  /**
+   * Generation time per frame: each step's time divided by its frames. A step is one frame on
+   * the CPU and up to eight on WebGPU, so there `min` and `max` are averages over a step,
+   * and the first step of each chunk also runs that chunk's prompt.
+   */
   stepMs?: { avg: number; min: number; max: number };
   /** From the request starting in the worker to its first audio. */
   firstAudioMs?: number | null;
@@ -120,7 +134,11 @@ export declare class PhononTTS {
   readonly sampleRate: number;
   /** SIMD features the wasm module was built with, e.g. `{ simd128: true }`. */
   readonly features: Record<string, boolean>;
-  /** CPU threads generation runs on, counting the worker that owns the model. */
+  /** Where generation runs. */
+  readonly device: 'webgpu' | 'cpu';
+  /** Why {@link PhononTTS.device} is what it is, e.g. `'this browser offers no WebGPU adapter'`. */
+  readonly deviceReason: string;
+  /** CPU threads generation runs on, counting the worker that owns the model. 1 on WebGPU. */
   readonly threads: number;
   /** Why {@link PhononTTS.threads} is what it is, e.g. `'the page is not cross-origin isolated'`. */
   readonly threadsReason: string;

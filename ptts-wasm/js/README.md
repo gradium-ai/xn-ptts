@@ -71,6 +71,7 @@ stopButton.onclick = () => controller.abort();
 | `voices` | the default voice | voices to fetch during `load`. Others are fetched the first time they are used. |
 | `cache` | `true` | keep downloads in the Cache API |
 | `onProgress` | | `({ file, loaded, total, cached }) => void`, for a progress bar |
+| `device` | `'auto'` | `'auto'`, `'webgpu'` or `'cpu'`: where to generate, see [WebGPU](#webgpu) |
 | `threads` | `'auto'` | CPU threads to generate on, or `'auto'` for 3. Needs a cross-origin isolated page, see [Threads](#threads) |
 | `workerUrl`, `wasmUrl`, `threadsWasmUrl` | beside `index.js` | for setups that serve the package's files from elsewhere |
 
@@ -82,6 +83,7 @@ stopButton.onclick = () => controller.abort();
 - `tts.voices`: the names you can pass as `voice`: the keys of `model.voices`, plus any added with `addVoice`.
 - `tts.addVoice(name, source)` registers a voice from a URL, `Blob` or bytes of a voice `.safetensors` file.
 - `tts.sampleRate`: 24000.
+- `tts.device`: `'webgpu'` or `'cpu'`, where generation runs, and `tts.deviceReason` why.
 - `tts.threads`: the CPU threads generation runs on, and `tts.threadsReason` why that many.
 - `tts.dispose()` stops the worker and frees the model's memory.
 
@@ -124,18 +126,24 @@ const tts = await PhononTTS.load({ lang: 'en', model: POCKET_TTS_MODEL });
 
 ## How it runs
 
-The model runs in a dedicated Web Worker. Generating never blocks the page, and the main thread only receives audio. The package is plain ES modules and needs no bundler. The worker is referenced with `new URL('./worker.js', import.meta.url)`, which Vite, webpack 5, Parcel and esbuild all recognise and bundle.
+The model runs in a dedicated Web Worker, on the GPU through WebGPU when the browser offers it and on the CPU otherwise. Generating never blocks the page, and the main thread only receives audio. The package is plain ES modules and needs no bundler. The worker is referenced with `new URL('./worker.js', import.meta.url)`, which Vite, webpack 5, Parcel and esbuild all recognise and bundle.
 
 Requirements:
 
 - A browser with WebAssembly SIMD and Relaxed SIMD, and module workers. Tested in Chrome and Firefox. A browser without Relaxed SIMD cannot load the module, and `load` rejects with an error saying so.
 - A secure context (`https://` or `localhost`) for caching. Elsewhere it still works, but downloads again on every load.
 
-How close to real time it gets depends on the device and on [threads](#threads), and `q8` is noticeably faster than `f32`.
+How close to real time it gets depends on the device, on [WebGPU](#webgpu) and on [threads](#threads), and `q8` is noticeably faster than `f32`.
+
+## WebGPU
+
+By default the model runs on the GPU when the browser hands out a WebGPU adapter and the weights are `q8` in a GGUF file, and on the CPU otherwise. A software fallback adapter counts as none, since it would run slower than the CPU. `q8` weights go to the GPU as they are; other weights would have to be quantized there, which means reading each one back to the host, and a browser cannot wait for that. WebGPU needs no cross-origin isolation, and it works in the same secure contexts as the cache.
+
+On the GPU the model generates several frames per round trip to the GPU and hands them over together, so its chunks of audio are longer than the CPU's 80 ms. If WebGPU fails to start, `'auto'` falls back to the CPU and `tts.deviceReason` says why. That CPU run stays on one thread: it uses the build WebGPU was loaded in, rather than copying the weights into a second one. Pass `device: 'webgpu'` to insist on the GPU, and `load` rejects instead; pass `device: 'cpu'` to never try it. The GPU computes in a different order from the CPU, so its audio is not bit-identical to the CPU's.
 
 ## Threads
 
-Generation runs on several CPU threads when the page is [cross-origin isolated](https://developer.mozilla.org/docs/Web/API/Window/crossOriginIsolated), and on one otherwise. Isolation is what makes the shared memory wasm threads need available, and a page gets it by being served with these two headers:
+On the CPU, generation runs on several threads when the page is [cross-origin isolated](https://developer.mozilla.org/docs/Web/API/Window/crossOriginIsolated), and on one otherwise. Isolation is what makes the shared memory wasm threads need available, and a page gets it by being served with these two headers:
 
 ```
 Cross-Origin-Opener-Policy: same-origin

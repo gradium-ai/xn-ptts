@@ -26,6 +26,7 @@
     "models.js",
     "wav.js",
     "threads.js",
+    "device.js",
     "wasm/phonon_tts.js",
     "wasm/phonon_tts.d.ts",
     "wasm/phonon_tts_bg.wasm",

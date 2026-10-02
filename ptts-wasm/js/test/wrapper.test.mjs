@@ -30,7 +30,14 @@ class FakeWorker {
       return this.reply({
         type: 'result',
         id,
-        value: { sampleRate: 24000, features: {}, threads: 4, threadsReason: 'default' },
+        value: {
+          sampleRate: 24000,
+          features: {},
+          device: 'cpu',
+          deviceReason: 'this browser offers no WebGPU adapter',
+          threads: 4,
+          threadsReason: 'default',
+        },
       });
     }
     if (type === 'add_voice') return this.reply({ type: 'result', id });
@@ -62,6 +69,25 @@ const { PhononTTS } = await import('../index.js');
 
 const MODEL = { weights: { q8: 'w' }, tokenizer: 't', voices: { alba: 'a', marius: 'm' } };
 const load = () => PhononTTS.load({ lang: 'en', model: MODEL, workerUrl: 'worker.js' });
+
+test('device is checked before the worker starts, handed to it, and reported back', async () => {
+  FakeWorker.last = null;
+  for (const device of ['gpu', '', null, 1]) {
+    await assert.rejects(PhononTTS.load({ lang: 'en', model: MODEL, device }), /device must be/);
+  }
+  // f32 weights cannot go to the GPU, so asking for both is refused up front.
+  const f32 = { ...MODEL, weights: { f32: 'w' } };
+  await assert.rejects(PhononTTS.load({ lang: 'en', model: f32, quant: 'f32', device: 'webgpu' }), /needs quant 'q8'/);
+  assert.equal(FakeWorker.last, null);
+  const tts = await PhononTTS.load({ lang: 'en', model: MODEL, device: 'webgpu', workerUrl: 'worker.js' });
+  assert.equal(FakeWorker.last.init.device, 'webgpu');
+  // What the worker says it got, not what was asked for.
+  assert.equal(tts.device, 'cpu');
+  assert.equal(tts.deviceReason, 'this browser offers no WebGPU adapter');
+  tts.dispose();
+  await PhononTTS.load({ lang: 'en', model: MODEL, workerUrl: 'worker.js' });
+  assert.equal(FakeWorker.last.init.device, 'auto');
+});
 
 test('threads is checked before the worker starts, handed to it, and reported back', async () => {
   FakeWorker.last = null;
