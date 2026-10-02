@@ -23,10 +23,25 @@ pub struct LutConditioner {
     pub default_value: Option<String>,
 }
 
+fn default_continuous_max_period() -> f32 {
+    10000.0
+}
+
+/// A float attribute embedded with audiocraft's `create_sin_embedding` at `scale_factor *
+/// value` (audiocraft `ContinuousAttributeConditioner`), e.g. `duration_delta`.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ContinuousConditioner {
+    pub scale_factor: f32,
+    pub dim: usize,
+    #[serde(default = "default_continuous_max_period")]
+    pub max_period: f32,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ConditionerInnerConfig {
     Lut { lut: LutConditioner },
+    Continuous { continuous: ContinuousConditioner },
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -178,6 +193,7 @@ pub struct TTSModel<Q: BackendQ> {
     pub mimi: MimiDecoder<Unquantized<f32, Q::B>>,
     speaker_proj: Option<Linear<f32, Q::B>>,
     sum_luts: Vec<SumLut<Q>>,
+    sum_continuous: Vec<SumContinuous<Q>>,
     lsd_decode_steps: usize,
     eos_threshold: f32,
 }
@@ -189,6 +205,61 @@ pub struct SumLut<Q: BackendQ> {
     pub name: String,
     pub values: Vec<String>,
     cond: LUTConditioner<Q::T, Q::B>,
+}
+
+/// A continuous conditioning summed into every audio frame whose value is chosen per state, e.g.
+/// `duration_delta` (audium's `config/conditioner/tts_pocket_duration_delta.yaml`).
+pub struct SumContinuous<Q: BackendQ> {
+    pub name: String,
+    cfg: ContinuousConditioner,
+    output_proj: Linear<Q::T, Q::B>,
+    learnt_padding: Option<Tensor<Q::T, Q::B>>,
+}
+
+impl<Q: BackendQ> SumContinuous<Q> {
+    fn load(
+        vb: &Path<Q::B>,
+        name: &str,
+        cfg: &ContinuousConditioner,
+        d_model: usize,
+    ) -> Result<Self> {
+        if cfg.dim < 4 || !cfg.dim.is_multiple_of(2) {
+            xn::bail!(
+                "continuous conditioning '{name}': dim must be even and >= 4, got {}",
+                cfg.dim
+            )
+        }
+        let output_proj = Linear::load(vb.pp("output_proj"), cfg.dim, d_model)?;
+        let learnt_padding = if vb.contains("learnt_padding") {
+            Some(vb.tensor("learnt_padding", (1, 1, d_model))?)
+        } else {
+            None
+        };
+        Ok(Self { name: name.to_string(), cfg: cfg.clone(), output_proj, learnt_padding })
+    }
+
+    /// The `[1, 1, d_model]` term for `value`, a float as a string as training reads it, or
+    /// `None` for a dropped attribute: the learnt padding, or nothing without one.
+    fn embed(&self, value: Option<&str>) -> Result<Option<Tensor<Q::T, Q::B>>> {
+        let Some(value) = value else { return Ok(self.learnt_padding.clone()) };
+        let x: f32 = match value.trim().parse() {
+            Ok(x) if f32::is_finite(x) => x,
+            _ => xn::bail!("'{}' takes a finite number, got '{value}'", self.name),
+        };
+        let emb = sin_embedding(self.cfg.scale_factor * x, self.cfg.dim, self.cfg.max_period);
+        let dev = self.output_proj.weight().device();
+        let emb = Tensor::<f32, Q::B>::from_vec(emb, (1, 1, self.cfg.dim), dev)?.to::<Q::T>()?;
+        Ok(Some(self.output_proj.forward(&emb)?))
+    }
+}
+
+/// audiocraft's `create_sin_embedding` for one position: `[cos(phase), sin(phase)]` with
+/// `phase_i = pos / max_period^(i / (dim/2 - 1))`.
+fn sin_embedding(pos: f32, dim: usize, max_period: f32) -> Vec<f32> {
+    let half = dim / 2;
+    let phases: Vec<f32> =
+        (0..half).map(|i| pos / max_period.powf(i as f32 / (half - 1) as f32)).collect();
+    phases.iter().map(|p| p.cos()).chain(phases.iter().map(|p| p.sin())).collect()
 }
 
 /// Refuse a summed LUT whose ids this crate would get wrong. Training's `noop` and `whitespace`
@@ -249,11 +320,21 @@ impl<Q: BackendQ> TTSModel<Q> {
         let mimi = MimiDecoder::load(&vb.pp("mimi"), &cfg.mimi)?;
         let speaker_proj = crate::loader::load_speaker_proj(vb, cfg)?;
         let mut sum_luts = vec![];
+        let mut sum_continuous = vec![];
         for cond in cfg.conditioners.iter() {
             if cond.name == "num_speakers" || !cfg.fuser.sum.contains(&cond.name) {
                 continue;
             }
-            let ConditionerInnerConfig::Lut { lut } = &cond.inner;
+            let lut = match &cond.inner {
+                ConditionerInnerConfig::Lut { lut } => lut,
+                ConditionerInnerConfig::Continuous { continuous } => {
+                    let vb =
+                        vb.pp(format!("flow_lm.condition_provider.conditioners.{}", cond.name));
+                    let d_model = cfg.flow_lm.d_model;
+                    sum_continuous.push(SumContinuous::load(&vb, &cond.name, continuous, d_model)?);
+                    continue;
+                }
+            };
             check_sum_lut(&cond.name, lut)?;
             let vb = vb.pp(format!("flow_lm.condition_provider.conditioners.{}", cond.name));
             let lut_cond =
@@ -277,6 +358,7 @@ impl<Q: BackendQ> TTSModel<Q> {
             mimi,
             speaker_proj,
             sum_luts,
+            sum_continuous,
             lsd_decode_steps: cfg.lsd_decode_steps,
             eos_threshold: cfg.eos_threshold,
         })
@@ -302,21 +384,30 @@ impl<Q: BackendQ> TTSModel<Q> {
         &self.sum_luts
     }
 
-    /// Choose the value of every per-state summed LUT for `state`. A name mapped to
-    /// `Some(value)` embeds that value; a name that is absent or mapped to `None` gets what
-    /// training feeds for a dropped attribute (the learnt padding, or nothing when the LUT has
-    /// none), which is what a CFG null state or a voice with no LUT value needs. Naming a LUT
-    /// the model does not have, or a value it does not know, is an error rather than a silent
-    /// fall back to padding.
+    /// The per-state summed continuous conditionings, see [`SumContinuous`].
+    pub fn sum_continuous(&self) -> &[SumContinuous<Q>] {
+        &self.sum_continuous
+    }
+
+    /// Choose the value of every per-state summed conditioning (LUT or continuous) for `state`.
+    /// A name mapped to `Some(value)` embeds that value, a float as a string for a continuous
+    /// one; a name that is absent or mapped to `None` gets what training feeds for a dropped
+    /// attribute (the learnt padding, or nothing when there is none), which is what a CFG null
+    /// state or a voice with no LUT value needs. Naming a conditioning the model does not have,
+    /// or a value it does not take, is an error rather than a silent fall back to padding.
     pub fn set_sum_conditions(
         &self,
         state: &mut TTSState<Q>,
         values: &std::collections::HashMap<String, Option<String>>,
     ) -> Result<()> {
+        let known = || {
+            let luts = self.sum_luts.iter().map(|lut| lut.name.as_str());
+            luts.chain(self.sum_continuous.iter().map(|c| c.name.as_str()))
+        };
         for name in values.keys() {
-            if !self.sum_luts.iter().any(|lut| &lut.name == name) {
-                let known: Vec<_> = self.sum_luts.iter().map(|lut| lut.name.as_str()).collect();
-                xn::bail!("the model has no summed LUT conditioning '{name}', it has {known:?}")
+            if !known().any(|known| known == name) {
+                let known: Vec<_> = known().collect();
+                xn::bail!("the model has no summed conditioning '{name}', it has {known:?}")
             }
         }
         let mut total: Option<Tensor<Q::T, Q::B>> = None;
@@ -327,6 +418,15 @@ impl<Q: BackendQ> TTSModel<Q> {
                 continue;
             };
             let emb = lut.cond.embed_tokens(&[id])?;
+            total = Some(match total {
+                Some(total) => total.broadcast_add(&emb)?,
+                None => emb,
+            });
+        }
+        for cond in self.sum_continuous.iter() {
+            let Some(emb) = cond.embed(values.get(&cond.name).and_then(|v| v.as_deref()))? else {
+                continue;
+            };
             total = Some(match total {
                 Some(total) => total.broadcast_add(&emb)?,
                 None => emb,
@@ -704,6 +804,32 @@ mod tests {
         let values = ["a".to_string()];
         let err = lut_id("v", &values, Some(2), Some("z")).unwrap_err().to_string();
         assert!(err.contains("unknown value 'z'"), "{err}");
+    }
+
+    #[test]
+    fn sin_embedding_matches_audiocraft() {
+        // torch: create_sin_embedding(torch.tensor([[[300.]]]), 8)
+        let emb = sin_embedding(300.0, 8, 10000.0);
+        let phases =
+            [300.0f32, 300.0 / 10000f32.powf(1.0 / 3.0), 300.0 / 10000f32.powf(2.0 / 3.0), 0.03];
+        let expected: Vec<f32> =
+            phases.iter().map(|p| p.cos()).chain(phases.iter().map(|p| p.sin())).collect();
+        for (a, b) in emb.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 1e-5, "{emb:?} vs {expected:?}");
+        }
+        assert_eq!(sin_embedding(0.0, 4, 10000.0), [1.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_continuous_config_reads_the_exported_block() {
+        let cfg: ConditionerConfig = serde_json::from_str(
+            r#"{"name":"duration_delta","type":"continuous",
+                "continuous":{"scale_factor":1000.0,"dim":128,"zero_init":true}}"#,
+        )
+        .unwrap();
+        let ConditionerInnerConfig::Continuous { continuous } = cfg.inner else { panic!() };
+        assert_eq!((continuous.scale_factor, continuous.dim), (1000.0, 128));
+        assert_eq!(continuous.max_period, 10000.0);
     }
 
     #[test]
