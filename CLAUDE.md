@@ -16,6 +16,8 @@ Cargo workspace (resolver "3", edition 2024) with seven members:
 
 Outside the workspace, `qnn/` runs Phonon on Qualcomm NPUs through QNN: `runner/` is the C++ engine and a `phonon` CLI, `text-ffi/` is a crate with its own `[workspace]` and `Cargo.lock` that gives the runner ptts's text preparation over C, and `android/` is the `ai.gradium:ptts` Android library over the runner. Building the engine needs Qualcomm's QAIRT SDK; `.github/workflows/android-qnn.yml` checks the parts that build without it, outside the `CI` gate.
 
+Also outside the workspace, `ptts-litert/` is a Python package (its own `pyproject.toml` and `uv.lock`) that exports a checkpoint to LiteRT for Android NPUs, compiles it per SoC, and checks it against `dump_reference` output; its README covers the bundle and the graphs. It is a PyTorch reimplementation of the model, because LiteRT's converter and the vendors' NPU compilers take PyTorch or `.tflite` input; `check` is what keeps it equal to `ptts`. There is no on-device runtime for it yet.
+
 Shared dependency versions (notably `xn`) and the workspace version live in the top-level `Cargo.toml`. Bumping the release version means editing `workspace.package.version` and the `ptts` workspace dep, then refreshing `Cargo.lock` and `qnn/text-ffi/Cargo.lock` (CI builds the latter with `--locked`).
 
 ## Build / test / lint
