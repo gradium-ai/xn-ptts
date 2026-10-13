@@ -80,8 +80,9 @@ struct Args {
 
     /// Run the Mimi decoder's transformer and its two widest convolutions in q8_0, at a small
     /// cost in audio fidelity. Faster with the `kai` feature or on xn's own kernels; slower
-    /// with `accelerate` alone, whose f32 matmuls beat xn's int8 ones. CPU only.
-    #[arg(long)]
+    /// with `accelerate` alone, whose f32 matmuls beat xn's int8 ones. CPU only. Hidden
+    /// from --help while it is experimental.
+    #[arg(long, hide = true)]
     quantize_mimi: bool,
 
     /// Classifier-free guidance coefficient. 1.0 disables it.
