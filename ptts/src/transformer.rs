@@ -4,9 +4,10 @@
 //! belongs to, as the two lay out their attention differently.
 
 use crate::layer_scale::LayerScale;
+use crate::q8::Q8Linear;
 use crate::rope::RotaryEmbedding;
 use xn::nn::{LayerNorm, Linear, var_builder::Path};
-use xn::{Backend, BackendQ, Result, Tensor, TensorView, WithDTypeF};
+use xn::{Backend, BackendQ, Result, Tensor, TensorView, Unquantized, WithDTypeF};
 
 /// State for StreamingMultiheadAttention.
 #[derive(Debug, Clone)]
@@ -274,6 +275,8 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformerState<T, B> {
 pub struct MimiStreamingMultiheadAttention<T: WithDTypeF, B: Backend> {
     in_proj: Linear<T, B>,
     out_proj: Linear<T, B>,
+    /// q8_0 versions of `in_proj` and `out_proj`, used instead when set.
+    q8: Option<(Q8Linear, Q8Linear)>,
     embed_dim: usize,
     num_heads: usize,
     context: usize,
@@ -284,7 +287,13 @@ impl<T: WithDTypeF, B: Backend> MimiStreamingMultiheadAttention<T, B> {
         let out_dim = 3 * embed_dim;
         let in_proj = Linear::load(vb.pp("in_proj"), embed_dim, out_dim)?;
         let out_proj = Linear::load(vb.pp("out_proj"), embed_dim, embed_dim)?;
-        Ok(Self { in_proj, out_proj, embed_dim, num_heads, context })
+        Ok(Self { in_proj, out_proj, q8: None, embed_dim, num_heads, context })
+    }
+
+    fn quantize_q8(&mut self) -> Result<()> {
+        self.q8 =
+            Some((Q8Linear::new(self.in_proj.weight())?, Q8Linear::new(self.out_proj.weight())?));
+        Ok(())
     }
 
     pub fn init_state(&self) -> Result<KvCache<T, B>> {
@@ -301,7 +310,10 @@ impl<T: WithDTypeF, B: Backend> MimiStreamingMultiheadAttention<T, B> {
         let (b, t, _) = query.dims3()?;
         let d = self.embed_dim / self.num_heads;
 
-        let projected = self.in_proj.forward(query)?;
+        let projected = match &self.q8 {
+            Some((in_proj, _)) => in_proj.forward(query)?,
+            None => self.in_proj.forward(query)?,
+        };
         let packed = projected.reshape((b, t, 3, self.num_heads, d))?;
         let q = packed.narrow(2, 0..1)?.contiguous()?.reshape((b, t, self.num_heads, d))?;
         let k = packed.narrow(2, 1..2)?.contiguous()?.reshape((b, t, self.num_heads, d))?;
@@ -331,7 +343,10 @@ impl<T: WithDTypeF, B: Backend> MimiStreamingMultiheadAttention<T, B> {
         state.trim()?;
 
         let x = x.transpose(1, 2)?.reshape((b, t, self.embed_dim))?;
-        self.out_proj.forward(&x)
+        match &self.q8 {
+            Some((_, out_proj)) => out_proj.forward(&x.contiguous()?),
+            None => self.out_proj.forward(&x),
+        }
     }
 }
 
@@ -354,6 +369,8 @@ pub struct StreamingTransformerLayer<Q: BackendQ> {
     norm2: LayerNorm<Q::T, Q::B>,
     linear1: Q::LinearQ,
     linear2: Q::LinearQ,
+    /// q8_0 versions of `linear1` and `linear2`, used instead when set.
+    q8: Option<(Q8Linear, Q8Linear)>,
     layer_scale_1: Option<LayerScale<Q::T, Q::B>>,
     layer_scale_2: Option<LayerScale<Q::T, Q::B>>,
 }
@@ -398,7 +415,16 @@ impl<Q: BackendQ> StreamingTransformerLayer<Q> {
             None
         };
 
-        Ok(Self { self_attn, norm1, norm2, linear1, linear2, layer_scale_1, layer_scale_2 })
+        Ok(Self {
+            self_attn,
+            norm1,
+            norm2,
+            linear1,
+            linear2,
+            q8: None,
+            layer_scale_1,
+            layer_scale_2,
+        })
     }
 
     pub fn init_state(
@@ -443,13 +469,29 @@ impl<Q: BackendQ> StreamingTransformerLayer<Q> {
 
         // FF block: x + layer_scale_2(ff(norm2(x)))
         let norm2 = self.norm2.forward(&x)?;
-        let mut ff_out = self.linear1.forward(&norm2)?;
-        ff_out = ff_out.gelu_erf()?;
-        ff_out = self.linear2.forward(&ff_out)?;
+        let mut ff_out = match &self.q8 {
+            Some((linear1, linear2)) => linear2.forward(&linear1.forward(&norm2)?.gelu_erf()?)?,
+            None => self.linear2.forward(&self.linear1.forward(&norm2)?.gelu_erf()?)?,
+        };
         if let Some(ls) = &self.layer_scale_2 {
             ff_out = ls.forward(&ff_out)?;
         }
         x.add(&ff_out)
+    }
+}
+
+impl<B: Backend> StreamingTransformerLayer<Unquantized<f32, B>> {
+    /// Run this Mimi layer's four matmuls in q8_0. CPU only.
+    fn quantize_q8(&mut self) -> Result<()> {
+        match &mut self.self_attn {
+            AttentionKind::Mimi(attn) => attn.quantize_q8()?,
+            AttentionKind::FlowLm(_) => {
+                xn::bail!("only a Mimi transformer can be quantized this way")
+            }
+        }
+        self.q8 =
+            Some((Q8Linear::new(self.linear1.weight())?, Q8Linear::new(self.linear2.weight())?));
+        Ok(())
     }
 }
 
@@ -577,6 +619,13 @@ pub struct ProjectedTransformer<Q: BackendQ> {
     pub transformer: StreamingTransformer<Q>,
     input_proj: Option<Linear<Q::T, Q::B>>,
     output_projs: Vec<Option<Linear<Q::T, Q::B>>>,
+}
+
+impl<B: Backend> ProjectedTransformer<Unquantized<f32, B>> {
+    /// Run every layer's matmuls in q8_0; the input and output projections stay f32. CPU only.
+    pub(crate) fn quantize_q8(&mut self) -> Result<()> {
+        self.transformer.layers.iter_mut().try_for_each(|l| l.quantize_q8())
+    }
 }
 
 impl<Q: BackendQ> ProjectedTransformer<Q> {

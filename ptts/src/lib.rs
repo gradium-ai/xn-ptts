@@ -88,6 +88,7 @@ pub mod mimi;
 mod mlp;
 pub mod plan;
 pub mod preprocess;
+mod q8;
 mod resample;
 mod rope;
 mod seanet;

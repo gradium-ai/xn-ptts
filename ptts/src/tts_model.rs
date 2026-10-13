@@ -127,6 +127,13 @@ impl<Q: BackendQ> TTSModel<Q> {
         })
     }
 
+    /// Run the Mimi decoder's transformer and its two widest convolutions in q8_0, quantized
+    /// in process from the loaded weights. The rest of the decoder stays f32. Faster on CPUs
+    /// with fast int8 matmuls, at a small cost in audio fidelity, so it is opt-in. CPU only.
+    pub fn quantize_mimi(&mut self) -> Result<()> {
+        self.mimi.quantize_q8()
+    }
+
     pub fn with_eos_threshold(mut self, eos_threshold: f32) -> Self {
         self.eos_threshold = eos_threshold;
         self
