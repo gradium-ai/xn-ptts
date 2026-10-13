@@ -6,6 +6,7 @@
 //! succeed exactly when the layer is an f32 layer on the CPU, so no data is copied.
 
 use std::any::Any;
+use xn::nn::Linear;
 use xn::quantized::{GgmlDType, QLinear};
 use xn::{Backend, CpuDevice, Result, Tensor, WithDTypeF};
 
@@ -19,10 +20,18 @@ fn as_cpu<T: WithDTypeF, B: Backend>(x: &Tensor<T, B>) -> Result<&Tensor<f32, Cp
 }
 
 impl Q8Linear {
-    /// `weight` is `[n, k]`, `k` a multiple of 32.
+    /// `weight` is `[n, k]`, `k` a multiple of 32. No bias.
     pub(crate) fn new<T: WithDTypeF, B: Backend>(weight: &Tensor<T, B>) -> Result<Self> {
-        let weight = as_cpu(weight)?.clone();
-        Ok(Self(Box::new(QLinear::from_linear(xn::nn::Linear::new(weight), GgmlDType::Q8_0)?)))
+        Self::from_linear(&Linear::new(weight.clone()))
+    }
+
+    /// A q8_0 copy of `linear`, its bias included.
+    pub(crate) fn from_linear<T: WithDTypeF, B: Backend>(linear: &Linear<T, B>) -> Result<Self> {
+        let mut cpu = Linear::new(as_cpu(linear.weight())?.clone());
+        if let Some(bias) = linear.bias() {
+            cpu = cpu.with_bias(as_cpu(bias)?.clone());
+        }
+        Ok(Self(Box::new(QLinear::from_linear(cpu, GgmlDType::Q8_0)?)))
     }
 
     /// `x` is `[..., k]`; returns `[..., n]`.
