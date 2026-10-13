@@ -103,6 +103,12 @@ impl Engine {
         self.phonon.set_voice(load_voice(&self.dir, name)?)
     }
 
+    /// Normalize text as `lang` from now on.
+    pub fn set_lang(&mut self, lang: &str) -> Result<(), String> {
+        self.normalize = lang.parse::<Normalize>().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     /// Split `text` into chunks the prefill graph takes.
     ///
     /// The chunks every frontend makes, from [`ptts::plan::chunks`], with one addition the graph
