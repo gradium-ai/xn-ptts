@@ -1348,6 +1348,7 @@ pub struct SynthBuilder {
     tokenizer_file: Option<PathBuf>,
     device: DeviceKind,
     quant: Quant,
+    quantize_mimi: bool,
     tokenizer: Option<Box<dyn crate::Tokenizer + Send + Sync>>,
     temperature: f32,
     seed: u64,
@@ -1401,6 +1402,7 @@ impl SynthBuilder {
             tokenizer_file: None,
             device: DeviceKind::Auto,
             quant: Quant::F32,
+            quantize_mimi: false,
             tokenizer: None,
             temperature: 0.3,
             seed: 4242424242424242,
@@ -1429,6 +1431,13 @@ impl SynthBuilder {
     /// Weight format for the flow-LM transformer linears. CPU only.
     pub fn quant(mut self, quant: Quant) -> Self {
         self.quant = quant;
+        self
+    }
+
+    /// Run the Mimi decoder's transformer and its two widest convolutions in q8_0; see
+    /// [`TTSModel::quantize_mimi`]. Off by default. CPU only.
+    pub fn quantize_mimi(mut self, on: bool) -> Self {
+        self.quantize_mimi = on;
         self
     }
 
@@ -1503,6 +1512,11 @@ impl SynthBuilder {
     pub fn build(self) -> Result<Synth> {
         let device = self.device.resolve();
         self.quant.check_device(device)?;
+        if self.quantize_mimi && device != DeviceKind::Cpu {
+            return Err(Error::unsupported(format!(
+                "Mimi quantization is CPU-only, but the selected device is {device:?}"
+            )));
+        }
         match device {
             DeviceKind::Cpu => self.build_cpu(),
             DeviceKind::Cuda => self.build_cuda(),
@@ -1605,7 +1619,10 @@ impl SynthBuilder {
                 conditions.entry(k.clone()).or_insert_with(|| v.clone());
             }
         }
-        let model = TTSModel::<Q>::load(&vb, tokenizer, &config, &conditions)?;
+        let mut model = TTSModel::<Q>::load(&vb, tokenizer, &config, &conditions)?;
+        if self.quantize_mimi {
+            model.quantize_mimi()?;
+        }
         let model = match self.eos_threshold {
             Some(threshold) => model.with_eos_threshold(threshold),
             None => model,

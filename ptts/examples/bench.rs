@@ -90,6 +90,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     breakdown: bool,
 
+    /// Run the Mimi decoder's transformer and its two widest convolutions in q8_0. CPU only.
+    #[arg(long)]
+    quantize_mimi: bool,
+
     /// Language the input is normalized as before tokenizing: `en`, `fr`, `de`, `es` or `pt`.
     /// Required, as everywhere else: there is nothing safe to guess.
     /// `none` measures the unnormalized text, as runs that predate this flag did.
@@ -274,7 +278,10 @@ impl Bench<'_> {
             conditions.insert(name.to_string(), value.to_string());
         }
         conditions.extend(baked.map(|v| v.conditions.clone()).unwrap_or_default());
-        let model: TTSModel<Q> = TTSModel::load(&vb, Box::new(tokenizer), &cfg, &conditions)?;
+        let mut model: TTSModel<Q> = TTSModel::load(&vb, Box::new(tokenizer), &cfg, &conditions)?;
+        if args.quantize_mimi {
+            model.quantize_mimi()?;
+        }
         let baked_voices = ptts::loader::load_config_voices(&vb, &cfg, model.speaker_proj())?;
         let speaker_prefix = format!("{}.", cfg.speaker_mimi_prefix());
         vb.check_all_used_with_ignore(|name| {
@@ -426,11 +433,16 @@ fn bench_synth(args: &Args, normalize: Normalize, quant: Quant) -> Result<()> {
     let t_load = Instant::now();
     // Quantized weights run only on the CPU, so a GPU build picks it for them, as `--breakdown`
     // does, rather than failing to build.
-    let device = if args.cpu || quant != Quant::F32 { DeviceKind::Cpu } else { DeviceKind::Auto };
+    let device = if args.cpu || quant != Quant::F32 || args.quantize_mimi {
+        DeviceKind::Cpu
+    } else {
+        DeviceKind::Auto
+    };
     let mut builder = SynthBuilder::new(cfg, &args.model, normalize)
         .tokenizer_file(tokenizer_path)
         .device(device)
         .quant(quant)
+        .quantize_mimi(args.quantize_mimi)
         .temperature(args.temperature)
         .seed(args.seed)
         .voice(&voice);

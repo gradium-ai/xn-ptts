@@ -67,6 +67,13 @@ struct Args {
     #[arg(long)]
     quant: Option<String>,
 
+    /// Run the Mimi decoder's transformer and its two widest convolutions in q8_0, at a small
+    /// cost in audio fidelity. Faster with the `kai` feature or on xn's own kernels; slower
+    /// with `accelerate` alone, whose f32 matmuls beat xn's int8 ones. CPU only. Hidden
+    /// from --help while it is experimental.
+    #[arg(long, hide = true)]
+    quantize_mimi: bool,
+
     /// Classifier-free guidance coefficient. 1.0 disables it.
     #[arg(long)]
     cfg_coef: Option<f32>,
@@ -129,8 +136,12 @@ fn main() -> Result<()> {
     if let Some(catalog) = args.voice_catalog.as_deref() {
         checkpoint.add_voice_catalog(catalog)?;
     }
-    let mut builder =
-        checkpoint.builder(normalize).device(device).temperature(args.temperature).seed(args.seed);
+    let mut builder = checkpoint
+        .builder(normalize)
+        .device(device)
+        .quantize_mimi(args.quantize_mimi)
+        .temperature(args.temperature)
+        .seed(args.seed);
     if let Some(tokenizer) = args.tokenizer.as_deref() {
         builder = builder.tokenizer_file(tokenizer);
     }

@@ -318,6 +318,18 @@ impl<T: WithDTypeF, B: Backend> SEANetDecoder<T, B> {
         Ok(Self { init_conv, layers, final_conv })
     }
 
+    /// Run the two widest convolutions, the first conv and the first upsampling, in q8_0. The
+    /// later ones stay f32: they are narrow and run at high sample rates, where the int8 matmul
+    /// is no faster, and the last residual block's 1x1 conv adds audible noise when its input is
+    /// quantized. CPU only.
+    pub(crate) fn quantize_q8(&mut self) -> Result<()> {
+        self.init_conv.quantize_q8()?;
+        if let Some(first) = self.layers.first_mut() {
+            first.upsample.quantize_q8()?;
+        }
+        Ok(())
+    }
+
     pub fn init_state(&self, batch_size: usize) -> Result<SEANetDecoderState<T, B>> {
         let init_conv_state = self.init_conv.init_state(batch_size)?;
         let layer_states = self
