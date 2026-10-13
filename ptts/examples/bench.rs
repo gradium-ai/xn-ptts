@@ -494,7 +494,9 @@ fn main() -> Result<()> {
         xn::with_f16c()
     );
     if args.breakdown {
-        xn::Runner::new().cpu_only(args.cpu).dtype(dtype).run(Bench(&args, normalize), 0)?;
+        // Mimi quantization is CPU-only, so it picks the CPU, as `bench_synth` does.
+        let cpu = args.cpu || args.quantize_mimi;
+        xn::Runner::new().cpu_only(cpu).dtype(dtype).run(Bench(&args, normalize), 0)?;
     } else {
         bench_synth(&args, normalize, Quant::from_str(args.quant.as_deref().unwrap_or("f32"))?)?;
     }

@@ -19,7 +19,7 @@ pub fn pad_for_conv1d<T: WithDTypeF, B: Backend>(
 pub struct Conv1d<T: WithDTypeF, B: Backend> {
     weight: Tensor<T, B>,
     /// The weight as `[out, in * kernel]` in q8_0, used instead when set.
-    q8: Option<Q8Linear>,
+    pub(crate) q8: Option<Q8Linear>,
     bias: Option<Tensor<T, B>>,
     pub stride: usize,
     pub dilation: usize,
@@ -45,8 +45,9 @@ impl<T: WithDTypeF, B: Backend> Conv1d<T, B> {
         Ok(Self { weight, q8: None, bias, stride, dilation, kernel_size, in_channels, groups })
     }
 
-    /// Run this convolution as a q8_0 matmul over its input windows. CPU only.
-    pub(crate) fn quantize_q8(&mut self) -> Result<()> {
+    /// The q8_0 weight that runs this convolution as a matmul over its input windows, for
+    /// `self.q8`. CPU only.
+    pub(crate) fn prepare_q8(&self) -> Result<Q8Linear> {
         let k = self.in_channels * self.kernel_size;
         if self.stride != 1 || self.groups != 1 || !k.is_multiple_of(32) {
             xn::bail!(
@@ -55,8 +56,7 @@ impl<T: WithDTypeF, B: Backend> Conv1d<T, B> {
                 self.groups
             )
         }
-        self.q8 = Some(Q8Linear::new(&self.weight.reshape(((), k))?)?);
-        Ok(())
+        Q8Linear::new(&self.weight.reshape(((), k))?)
     }
 
     pub fn forward(&self, x: &Tensor<T, B>) -> Result<Tensor<T, B>> {
@@ -87,7 +87,7 @@ impl<T: WithDTypeF, B: Backend> Conv1d<T, B> {
 pub struct ConvTranspose1d<T: WithDTypeF, B: Backend> {
     weight: Tensor<T, B>,
     /// The weight as `[out * kernel, in]` in q8_0, used instead when set.
-    q8: Option<Q8Linear>,
+    pub(crate) q8: Option<Q8Linear>,
     pub bias: Option<Tensor<T, B>>,
     pub stride: usize,
     pub kernel_size: usize,
@@ -110,9 +110,9 @@ impl<T: WithDTypeF, B: Backend> ConvTranspose1d<T, B> {
         Ok(Self { weight, q8: None, bias, stride, kernel_size, out_channels, groups })
     }
 
-    /// Run this transposed convolution as a q8_0 matmul and an overlap-add. Only the
-    /// `kernel == 2 * stride` shape SEANet uses is supported. CPU only.
-    pub(crate) fn quantize_q8(&mut self) -> Result<()> {
+    /// The q8_0 weight that runs this transposed convolution as a matmul and an overlap-add,
+    /// for `self.q8`. Only the `kernel == 2 * stride` shape SEANet uses is supported. CPU only.
+    pub(crate) fn prepare_q8(&self) -> Result<Q8Linear> {
         let c = self.weight.dims3()?.0;
         if self.groups != 1 || self.kernel_size != 2 * self.stride || !c.is_multiple_of(32) {
             xn::bail!(
@@ -122,9 +122,7 @@ impl<T: WithDTypeF, B: Backend> ConvTranspose1d<T, B> {
                 self.groups
             )
         }
-        let rows = self.weight.reshape((c, ()))?.transpose(0, 1)?.contiguous()?;
-        self.q8 = Some(Q8Linear::new(&rows)?);
-        Ok(())
+        Q8Linear::new(&self.weight.reshape((c, ()))?.transpose(0, 1)?.contiguous()?)
     }
 
     pub fn forward(&self, x: &Tensor<T, B>) -> Result<Tensor<T, B>> {
@@ -195,10 +193,6 @@ impl<T: WithDTypeF, B: Backend> StreamingConv1d<T, B> {
             bias,
         )?;
         Ok(Self { conv, pad_mode })
-    }
-
-    pub(crate) fn quantize_q8(&mut self) -> Result<()> {
-        self.conv.quantize_q8()
     }
 
     fn effective_kernel_size(&self) -> usize {
@@ -291,10 +285,6 @@ impl<T: WithDTypeF, B: Backend> StreamingConvTranspose1d<T, B> {
         Ok(Self { convtr })
     }
 
-    pub(crate) fn quantize_q8(&mut self) -> Result<()> {
-        self.convtr.quantize_q8()
-    }
-
     pub fn init_state(&self, batch_size: usize) -> Result<StreamingConvTr1dState<T, B>> {
         let pt = self.convtr.kernel_size - self.convtr.stride;
         let partial =
@@ -369,7 +359,7 @@ mod tests {
             };
             let x = tensor(&[1, c_in, 20 + (k - 1) * dil], 3);
             let want = conv.forward(&x).unwrap();
-            conv.quantize_q8().unwrap();
+            conv.q8 = Some(conv.prepare_q8().unwrap());
             let got = conv.forward(&x).unwrap();
             let err = rel_err(&got, &want);
             assert!(err < 0.02, "conv {c_in}->{c_out} k{k} d{dil}: {err}");
@@ -391,7 +381,7 @@ mod tests {
             };
             let x = tensor(&[1, c_in, 9], 6);
             let want = conv.forward(&x).unwrap();
-            conv.quantize_q8().unwrap();
+            conv.q8 = Some(conv.prepare_q8().unwrap());
             let got = conv.forward(&x).unwrap();
             let err = rel_err(&got, &want);
             assert!(err < 0.02, "convtr {c_in}->{c_out} s{stride}: {err}");
@@ -399,8 +389,39 @@ mod tests {
     }
 
     #[test]
+    fn a_streamed_q8_transposed_conv_matches_the_f32_one() {
+        // The overlap carried between calls is stored without the bias, so check that the q8
+        // output, whose bias is added at the end, splits across calls the same way.
+        let (c_in, c_out, stride) = (32, 16, 4);
+        let streaming = || StreamingConvTranspose1d {
+            convtr: ConvTranspose1d {
+                weight: tensor(&[c_in, c_out, 2 * stride], 8),
+                q8: None,
+                bias: Some(tensor(&[c_out], 9)),
+                stride,
+                kernel_size: 2 * stride,
+                out_channels: c_out,
+                groups: 1,
+            },
+        };
+        let (f32_conv, mut q8_conv) = (streaming(), streaming());
+        q8_conv.convtr.q8 = Some(q8_conv.convtr.prepare_q8().unwrap());
+        let run = |conv: &StreamingConvTranspose1d<f32, CpuDevice>| {
+            let mut state = conv.init_state(1).unwrap();
+            let chunks: Vec<_> = (0..3)
+                .map(|i| {
+                    conv.forward(&tensor(&[1, c_in, 2 + i], 10 + i as u64), &mut state).unwrap()
+                })
+                .collect();
+            Tensor::cat(&chunks.iter().collect::<Vec<_>>(), 2).unwrap()
+        };
+        let err = rel_err(&run(&q8_conv), &run(&f32_conv));
+        assert!(err < 0.02, "{err}");
+    }
+
+    #[test]
     fn shapes_the_q8_path_cannot_run_are_refused() {
-        let mut conv = ConvTranspose1d {
+        let conv = ConvTranspose1d {
             weight: tensor(&[32, 16, 6], 7),
             q8: None,
             bias: None,
@@ -409,6 +430,6 @@ mod tests {
             out_channels: 16,
             groups: 1,
         };
-        assert!(conv.quantize_q8().is_err());
+        assert!(conv.prepare_q8().is_err());
     }
 }

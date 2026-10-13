@@ -134,10 +134,14 @@ impl<Q: BackendQ> MimiEncoder<Q> {
 
 impl<B: Backend> MimiDecoder<Unquantized<f32, B>> {
     /// Run the decoder transformer and the two widest SEANet convolutions in q8_0; see
-    /// [`crate::tts_model::TTSModel::quantize_mimi`]. CPU only.
+    /// [`crate::tts_model::TTSModel::quantize_mimi`]. Every weight is quantized before any is
+    /// switched over, so on error the decoder is left as it was. CPU only.
     pub fn quantize_q8(&mut self) -> Result<()> {
-        self.decoder_transformer.quantize_q8()?;
-        self.decoder.quantize_q8()
+        let transformer = self.decoder_transformer.transformer.prepare_q8()?;
+        let convs = self.decoder.prepare_q8()?;
+        self.decoder_transformer.transformer.apply_q8(transformer);
+        self.decoder.apply_q8(convs);
+        Ok(())
     }
 }
 
