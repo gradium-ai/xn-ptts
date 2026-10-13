@@ -12,6 +12,9 @@ binding can serve both platforms.
 For native Android apps there is a ready-made Kotlin wrapper, [`PhononTTS.kt`](PhononTTS.kt).
 There is no Gradle package: you build the library and copy what you need into your app.
 
+To use Phonon as the phone's system voice, for TalkBack and any app that speaks through Android's
+`TextToSpeech`, build the engine app in [`tts-engine/`](tts-engine/README.md) instead.
+
 ## 1. Build the library
 
 You need Rust, [cargo-ndk](https://github.com/bbqsrc/cargo-ndk) and the Android NDK.

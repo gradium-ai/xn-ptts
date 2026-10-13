@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Phonon TTS</string>
+    <string name="import_folder">Import a checkpoint folder</string>
+    <string name="system_settings">Open the system text-to-speech settings</string>
+    <string name="import_help">Pick a folder holding config.json, tokenizer.json, model.q8.gguf (or model.safetensors) and, if it has them, voices/. The files are copied into the app. Then choose Phonon TTS as the preferred engine in the system settings.</string>
+    <string name="not_installed">No model installed.</string>
+    <string name="loading">Loading the model…</string>
+    <string name="importing">Importing…</string>
+    <string name="copying">Copying %1$s…</string>
+    <string name="ready">Ready.\nLanguages: %1$s\nVoices: %2$s</string>
+    <string name="load_failed">The model failed to load: %1$s</string>
+    <string name="import_failed">Import failed: %1$s</string>
+</resources>
