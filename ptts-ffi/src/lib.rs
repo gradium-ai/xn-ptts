@@ -192,6 +192,25 @@ pub unsafe extern "C" fn ptts_set_voice(h: *mut PttsHandle, name: *const c_char)
     }
 }
 
+/// Normalize text as `lang` (`en`, `fr`, `de`, `es`, `pt`, or `none`) from now on, in place of the
+/// `lang` given to `ptts_new`, so one loaded model can speak several languages. Returns false on
+/// failure; see `ptts_last_error`.
+///
+/// # Safety
+/// `h` must come from `ptts_new`; `lang` must be NUL-terminated UTF-8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ptts_set_lang(h: *mut PttsHandle, lang: *const c_char) -> bool {
+    let h = unsafe { &mut *h };
+    let lang = unsafe { CStr::from_ptr(lang) }.to_string_lossy().to_string();
+    match guarded(|| h.engine.set_lang(&lang)) {
+        Ok(()) => true,
+        Err(e) => {
+            h.last_error = Some(c_string(&e));
+            false
+        }
+    }
+}
+
 /// The last error on `h`, or, when `h` is null, the last `ptts_new` failure on this thread.
 /// Borrowed until the next failing call.
 ///

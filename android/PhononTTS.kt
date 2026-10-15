@@ -59,6 +59,9 @@ class PhononTTS(modelDir: String, lang: String) : AutoCloseable {
     /** Speak in [name], one of [voices], from now on. */
     fun setVoice(name: String) = check(lib.ptts_set_voice(open(), name))
 
+    /** Normalize text as [lang] from now on, in place of the one given when loading. */
+    fun setLanguage(lang: String) = check(lib.ptts_set_lang(open(), lang))
+
     /**
      * Speak [text], handing [onAudio] each piece of audio as soon as it is made: 24 kHz mono
      * floats in [-1, 1]. Return false from [onAudio] to stop early. Returns once all the audio
@@ -105,6 +108,7 @@ class PhononTTS(modelDir: String, lang: String) : AutoCloseable {
         fun ptts_speak(h: Pointer, text: String, cb: FrameFn, user: Pointer?, out: Result): Byte
         fun ptts_voices(h: Pointer): Pointer
         fun ptts_set_voice(h: Pointer, name: String): Byte
+        fun ptts_set_lang(h: Pointer, lang: String): Byte
         fun ptts_languages(h: Pointer): Pointer
         fun ptts_last_error(h: Pointer?): String?
         fun ptts_free(h: Pointer)
