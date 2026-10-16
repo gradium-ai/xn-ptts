@@ -47,7 +47,7 @@ with tts.stream("A longer sentence.", voice=voice) as audio:
 
 `tts.sample_rate` is the PCM sample rate; `save` writes a mono 16-bit WAV and returns its duration. Leaving the `with` block stops a stream early and waits for its workers to finish. Streaming keeps bounded audio and latent buffers: leaving a stream unread pauses generation once they fill, and consuming chunks lets it resume.
 
-`tts.voices` lists the voices that were found, and `tts.languages` the languages the checkpoint's config says it was trained for. When no voice is given, the checkpoint's configured default is used, then `default` if present, then the first by name. Pass `voice="name"` to any speech method to select one. With `voice_catalog=` naming a catalog, an `hf://owner/name[@revision]` repo or a local `voices.jsonl`, a name the checkpoint does not have is looked up there, by name in any case and with or without accents, or by its voice ID. Only that voice is downloaded, on first use, and then joins `tts.voices`. `ptts.catalog_voices(catalog)` lists a catalog without loading a model.
+`tts.voices` lists the voices that were found, and `tts.languages` the languages the checkpoint's config says it was trained for. When no voice is given, the checkpoint's configured default is used, then `default` if present, then the first by name. Pass `voice="name"` to any speech method to select one. A name the checkpoint does not have is looked up in the voice catalog, `ptts.DEFAULT_VOICES` unless `voice_catalog=` names another, by name in any case and with or without accents, or by its voice ID. Only that voice is downloaded, on first use, and then joins `tts.voices`. `ptts.catalog_voices()` lists the catalog without loading a model.
 
 ## Command line
 
@@ -57,7 +57,7 @@ The package also provides the `ptts` command:
 python -m ptts --lang en "Hello world" -o out.wav
 ```
 
-`--model` loads another model, as `TTS`'s first argument does. `--voice` selects a voice of the checkpoint or of `--voice-catalog`, and `--list-voices` prints the catalog's voices. Run with `--help` for the remaining options. The package ships type stubs and `py.typed`.
+`--model` loads another model, as `TTS`'s first argument does. `--voice` selects a voice of the checkpoint or the catalog, and `--list-voices` prints the catalog's voices. Run with `--help` for the remaining options. The package ships type stubs and `py.typed`.
 
 ## Wheels
 

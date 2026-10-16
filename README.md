@@ -103,7 +103,16 @@ Voice files may instead live in `voices/` or `embeddings/`. Use the files and vo
 
 ## Voices
 
-Each checkpoint comes with its own voices. You can also design a voice from a text description in [Gradium Studio](https://studio.gradium.ai/), or clone one from a short recording. Two scripts download these voices as voice files. They need [uv](https://docs.astral.sh/uv/) and a Gradium API key, which you can create in Gradium Studio. The voice files work with every Phonon checkpoint.
+Each checkpoint comes with its own voices, and there are ready-made voices in every supported language. `--list-voices` lists them, and `--voice NAME` speaks with one. Only the voices you use are downloaded, the first time you use them:
+
+```sh
+ptts --list-voices
+ptts --lang pt --voice Kauã "Olá do Phonon." -o speech.wav
+```
+
+A name matches in any case and with or without accents, so `--voice kaua` works too. In Python, pass the name as `voice=` to `TTS` or to any speech method, and `ptts.catalog_voices()` lists the voices.
+
+You can also design a voice from a text description in [Gradium Studio](https://studio.gradium.ai/), or clone one from a short recording. Two scripts download these voices as voice files. They need [uv](https://docs.astral.sh/uv/) and a Gradium API key, which you can create in Gradium Studio. The voice files work with every Phonon checkpoint.
 
 ```sh
 export GRADIUM_API_KEY=...
@@ -162,7 +171,7 @@ ptts --model hf://OWNER/MODEL@COMMIT_SHA --lang en --quant q8 \
   "Hello from Phonon." -o speech.wav
 ```
 
-Use `--voice NAME` to choose a voice; omitting it uses the model's default selection. Run `ptts --help` for the remaining options. [CLI guide →](docs/cli.md)
+Use `--voice NAME` to choose a voice, and `--list-voices` to see the [ready-made ones](#voices); omitting it uses the model's default selection. Run `ptts --help` for the remaining options. [CLI guide →](docs/cli.md)
 
 </details>
 

@@ -11,6 +11,7 @@ extension in this wheel. See https://github.com/gradium-ai/xn-ptts.
 
 from ._ptts import (
     DEFAULT_MODEL,
+    DEFAULT_VOICES,
     TTS,
     AudioStream,
     __version__,
@@ -24,6 +25,7 @@ from ._ptts import (
 
 __all__ = [
     "DEFAULT_MODEL",
+    "DEFAULT_VOICES",
     "TTS",
     "AudioStream",
     "__version__",

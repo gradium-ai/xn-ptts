@@ -15,9 +15,12 @@ from numpy.typing import NDArray
 __version__: str
 DEFAULT_MODEL: str
 """The model `TTS` loads when none is given, as `hf://owner/name@revision`."""
+DEFAULT_VOICES: str
+"""The voice catalog `TTS` looks up a voice in when the checkpoint does not have it."""
 
 __all__ = [
     "DEFAULT_MODEL",
+    "DEFAULT_VOICES",
     "TTS",
     "AudioStream",
     "__version__",
@@ -48,7 +51,7 @@ class TTS:
 
     `voice_catalog` is where a voice the checkpoint does not have is looked up: a Hugging Face
     repo as `"hf://owner/name[@revision]"`, or a local `voices.jsonl` or folder holding one.
-    A voice is matched by name, in any case and with or
+    Left out, it is `DEFAULT_VOICES`. A voice is matched by name, in any case and with or
     without accents, or by its catalog `voice_id`, and only the voices used are downloaded.
     """
 
@@ -218,9 +221,9 @@ def available_quants() -> list[str]:
 def build_info() -> dict[str, Any]:
     """The runtime's build configuration, for bug reports."""
 
-def catalog_voices(catalog: str | PathLike[str]) -> list[dict[str, str | None]]:
+def catalog_voices(catalog: str | PathLike[str] | None = None) -> list[dict[str, str | None]]:
     """The voices of a catalog, as dicts of `name`, `voice_id`, `language` and `description`.
 
-    `catalog` is as for `TTS`'s `voice_catalog`. Only the catalog is downloaded, no voice and
-    no model.
+    `catalog` is as for `TTS`'s `voice_catalog`; left out, it is `DEFAULT_VOICES`. Only the
+    catalog is downloaded, no voice and no model.
     """

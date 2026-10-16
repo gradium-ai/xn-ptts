@@ -54,11 +54,11 @@ struct Args {
     /// Voice catalog to look --voice up in when the checkpoint has no voice of that name: a
     /// Hugging Face repo as hf://owner/name[@revision], or a local JSONL file or folder holding
     /// voices.jsonl. Only the voice that is used is downloaded.
-    #[arg(long)]
-    voice_catalog: Option<String>,
+    #[arg(long, default_value = ptts::voice_catalog::DEFAULT_VOICES)]
+    voice_catalog: String,
 
-    /// List the voices of --voice-catalog, then exit.
-    #[arg(long, requires = "voice_catalog")]
+    /// List the voice catalog's voices, then exit.
+    #[arg(long)]
     list_voices: bool,
 
     /// Tokenizer to load, as a path to a `tokenizer.json`. Defaults to the one
@@ -119,10 +119,8 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let catalog = args.voice_catalog.as_deref().map(VoiceCatalog::new).transpose()?;
+    let catalog = VoiceCatalog::new(&args.voice_catalog)?;
     if args.list_voices {
-        // clap requires --voice-catalog with --list-voices.
-        let catalog = catalog.as_ref().context("--list-voices needs --voice-catalog")?;
         for voice in catalog.voices()? {
             let field = |f: &Option<String>| f.clone().unwrap_or_else(|| "-".to_string());
             println!(
@@ -185,18 +183,15 @@ fn main() -> Result<()> {
     let mut opts = SpeechOptions::default();
     match &voice {
         VoiceArg::Default => {}
-        VoiceArg::Bundled(name) => match &catalog {
-            None => opts = opts.voice(name.clone()),
-            Some(catalog) => {
-                let name = catalog.register(&mut tts, name)?;
-                anyhow::ensure!(
-                    tts.voices().contains(&name),
-                    "no voice '{name}': the model has {}, and --list-voices lists the catalog's",
-                    tts.voices().join(", ")
-                );
-                opts = opts.voice(name);
-            }
-        },
+        VoiceArg::Bundled(name) => {
+            let name = catalog.register(&mut tts, name)?;
+            anyhow::ensure!(
+                tts.voices().contains(&name),
+                "no voice '{name}': the model has {}, and --list-voices lists the voice catalog",
+                tts.voices().join(", ")
+            );
+            opts = opts.voice(name);
+        }
         VoiceArg::Embedding(_) => opts = opts.voice(VoiceArg::REGISTERED),
         VoiceArg::Audio(path) => {
             let pcm = ptts::audio::load_mono_at(path, tts.voice_prompt_sample_rate())?;
@@ -322,11 +317,9 @@ mod tests {
 
     #[test]
     fn list_voices_needs_no_text_or_lang() {
-        let args = Args::try_parse_from(["ptts", "--list-voices", "--voice-catalog", "c"]).unwrap();
+        let args = Args::try_parse_from(["ptts", "--list-voices"]).unwrap();
         assert!(args.list_voices);
-        assert_eq!(args.voice_catalog.as_deref(), Some("c"));
-        // There is no catalog to list without one.
-        assert!(Args::try_parse_from(["ptts", "--list-voices"]).is_err());
+        assert_eq!(args.voice_catalog, ptts::voice_catalog::DEFAULT_VOICES);
         assert!(Args::try_parse_from(["ptts", "hello"]).is_err());
         assert!(Args::try_parse_from(["ptts", "--lang", "en"]).is_err());
     }

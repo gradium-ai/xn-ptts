@@ -2,8 +2,8 @@
 //!
 //! A catalog is a `voices.jsonl` with one object per line: `name` and `filename`, the voice
 //! file's path relative to the catalog, and optionally `voice_id`, `language` and
-//! `description`. It lives in a local folder or a Hugging Face repo. Frontends given a catalog
-//! fall back to it for a voice their checkpoint does not have, through
+//! `description`. It lives in a local folder or a Hugging Face repo. Frontends fall back to
+//! [`DEFAULT_VOICES`] for a voice their checkpoint does not have, through
 //! [`VoiceCatalog::register`]: only the catalog itself and the one voice file are fetched.
 
 use crate::hub::HubSource;
@@ -11,6 +11,10 @@ use crate::synth::Synth;
 use crate::{Error, Result};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+/// The catalog frontends look a voice up in when their checkpoint has none of that name,
+/// pinned to a commit so a default install is reproducible. Loading it needs the `hub` feature.
+pub const DEFAULT_VOICES: &str = "hf://gr4d/phonon-voices@1c006b05c58b0206f6c8ef7c99a2a60213f22888";
 
 /// The catalog file in a catalog folder or repo.
 pub const CATALOG_FILE: &str = "voices.jsonl";
@@ -231,5 +235,11 @@ mod tests {
     fn a_missing_catalog_is_not_found() {
         let catalog = VoiceCatalog::new("/nonexistent/voices.jsonl").unwrap();
         assert!(matches!(catalog.voices(), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn the_default_catalog_is_a_pinned_hub_repo() {
+        let hub = HubSource::parse(DEFAULT_VOICES).unwrap().unwrap();
+        assert_eq!(hub.revision.map(|r| r.len()), Some(40));
     }
 }
