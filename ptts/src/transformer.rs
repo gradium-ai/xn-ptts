@@ -146,64 +146,67 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
 }
 // ---- KV Cache ----
 
-/// Simple append-based KV cache with optional context window trimming.
+/// KV cache with a context window over a preallocated buffer: `append` writes the new
+/// positions in place and attention reads a narrowed view of the buffer, so a streaming step
+/// copies only its own keys/values. When the buffer is full, the retained window moves to the
+/// front of a fresh one, once every `cap - context - t` positions rather than every step.
+///
+/// The window semantics are the previous cat-then-trim cache's: a step attends to the
+/// min(seen, context) positions kept by the previous step plus its own, in order, and keeps
+/// the last `context` afterwards (`trim`).
 #[derive(Clone, Debug)]
 pub struct KvCache<T: WithDTypeF, B: Backend> {
+    /// [b, h, cap, d] buffers, allocated on the first append.
     k: Option<Tensor<T, B>>,
     v: Option<Tensor<T, B>>,
+    /// The retained positions are `start..end` of the buffers.
+    start: usize,
+    end: usize,
     context: usize,
     absolute_offset: usize,
 }
 
 impl<T: WithDTypeF, B: Backend> KvCache<T, B> {
     pub fn new(context: usize) -> Self {
-        Self { k: None, v: None, context, absolute_offset: 0 }
+        Self { k: None, v: None, start: 0, end: 0, context, absolute_offset: 0 }
     }
 
     pub fn current_seq_len(&self) -> Result<usize> {
-        let l = match &self.k {
-            Some(k) => k.dim(2)?, // k shape: [b, h, seq, d]
-            None => 0,
-        };
-        Ok(l)
+        Ok(self.end - self.start)
     }
 
-    /// Append new k, v (shape [b, h, t, d]) and return full (k, v).
-    /// Trims to context if exceeded.
+    /// Append new k, v (shape [b, h, t, d]) and return views of the retained plus new positions.
     pub fn append(
         &mut self,
         new_k: &Tensor<T, B>,
         new_v: &Tensor<T, B>,
-    ) -> Result<(Tensor<T, B>, Tensor<T, B>)> {
-        let (k, v) = match (&self.k, &self.v) {
-            (Some(prev_k), Some(prev_v)) => {
-                let k = Tensor::cat(&[prev_k, new_k], 2)?;
-                let v = Tensor::cat(&[prev_v, new_v], 2)?;
-                (k, v)
+    ) -> Result<(TensorView<T, B>, TensorView<T, B>)> {
+        let (b, h, t, d) = new_k.dims4()?;
+        let cap = self.k.as_ref().map_or(0, |k| k.dims()[2]);
+        if self.end + t > cap {
+            let keep = self.end - self.start;
+            let cap = 2 * (self.context.max(keep) + t);
+            let dev = new_k.device();
+            let (k, v) = (Tensor::zeros((b, h, cap, d), dev)?, Tensor::zeros((b, h, cap, d), dev)?);
+            if let (Some(old_k), Some(old_v)) = (&self.k, &self.v)
+                && keep > 0
+            {
+                k.slice_set(&old_k.narrow(2, self.start..self.end)?.contiguous()?, 2, 0)?;
+                v.slice_set(&old_v.narrow(2, self.start..self.end)?.contiguous()?, 2, 0)?;
             }
-            _ => (new_k.clone(), new_v.clone()),
-        };
-
-        let new_tokens = new_k.dim(2)?;
-        self.absolute_offset += new_tokens;
-        self.k = Some(k.clone());
-        self.v = Some(v.clone());
-        Ok((k, v))
+            (self.k, self.v, self.start, self.end) = (Some(k), Some(v), 0, keep);
+        }
+        let (k, v) = (self.k.as_ref().unwrap(), self.v.as_ref().unwrap());
+        k.slice_set(new_k, 2, self.end)?;
+        v.slice_set(new_v, 2, self.end)?;
+        self.end += t;
+        self.absolute_offset += t;
+        Ok((k.narrow(2, self.start..self.end)?, v.narrow(2, self.start..self.end)?))
     }
 
+    /// Keep only the last `context` positions.
     pub fn trim(&mut self) -> Result<()> {
-        let (k, v) = match (&self.k, &self.v) {
-            (Some(k), Some(v)) => (k, v),
-            _ => return Ok(()),
-        };
-        let seq_len = k.dim(2)?;
-        if seq_len > self.context {
-            let trim = seq_len - self.context;
-            let k = k.narrow(2, trim..trim + self.context)?.contiguous()?;
-            let v = v.narrow(2, trim..trim + self.context)?.contiguous()?;
-            self.k = Some(k);
-            self.v = Some(v);
-        };
+        self.start = self.start.max(self.end.saturating_sub(self.context));
         Ok(())
     }
 }
@@ -301,19 +304,14 @@ impl<T: WithDTypeF, B: Backend> MimiStreamingMultiheadAttention<T, B> {
         let (b, t, _) = query.dims3()?;
         let d = self.embed_dim / self.num_heads;
 
-        let projected = self.in_proj.forward(query)?;
-        let packed = projected.reshape((b, t, 3, self.num_heads, d))?;
-        let q = packed.narrow(2, 0..1)?.contiguous()?.reshape((b, t, self.num_heads, d))?;
-        let k = packed.narrow(2, 1..2)?.contiguous()?.reshape((b, t, self.num_heads, d))?;
-        let v = packed.narrow(2, 2..3)?.contiguous()?.reshape((b, t, self.num_heads, d))?;
-
-        // RoPE on [b, t, h, d]
-        let (q, k) = rope.forward(&q, &k)?;
-
-        // To [b, h, t, d]
-        let q = q.transpose(1, 2)?.contiguous()?;
-        let k = k.transpose(1, 2)?.contiguous()?;
-        let v = v.transpose(1, 2)?.contiguous()?;
+        let h = self.num_heads;
+        let projected = self.in_proj.forward(query)?.reshape((b, t, 3 * h, d))?;
+        // q, k, v straight to [b, h, t, d], one strided copy each.
+        let bhtd =
+            |i: usize| projected.narrow(2, i * h..(i + 1) * h)?.transpose(1, 2)?.contiguous();
+        let q = rope.forward_bhtd(&bhtd(0)?)?;
+        let k = rope.forward_bhtd(&bhtd(1)?)?;
+        let v = bhtd(2)?;
 
         // KV cache with context trimming
         let (k, v) = state.append(&k, &v)?;
@@ -804,5 +802,51 @@ mod bad_config_tests {
             let err = load(8, heads).err().unwrap_or_else(|| panic!("{heads} heads for 8 wide"));
             assert!(err.to_string().contains("heads"), "{err}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KvCache;
+    use xn::{CpuDevice, Tensor};
+
+    /// The preallocated cache returns exactly the previous cat-then-trim cache's keys/values,
+    /// over a stream several times longer than the context, with uneven step sizes.
+    #[test]
+    fn kv_cache_matches_cat_trim() -> xn::Result<()> {
+        let (h, d, context) = (3, 4, 50);
+        let mut cache = KvCache::<f32, CpuDevice>::new(context);
+        let mut reference: Option<(Tensor<f32, CpuDevice>, Tensor<f32, CpuDevice>)> = None;
+        let mut seed = 0usize;
+        for step in 0..200 {
+            let t = [1, 16, 3, 2][step % 4];
+            let mut rand = |n: usize| -> Vec<f32> {
+                (0..n)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(6364136223).wrapping_add(1442695);
+                        (seed >> 40) as f32
+                    })
+                    .collect()
+            };
+            let k = Tensor::from_vec(rand(h * t * d), (1, h, t, d), &xn::CPU)?;
+            let v = Tensor::from_vec(rand(h * t * d), (1, h, t, d), &xn::CPU)?;
+            let (rk, rv) = match &reference {
+                Some((pk, pv)) => (Tensor::cat(&[pk, &k], 2)?, Tensor::cat(&[pv, &v], 2)?),
+                None => (k.clone(), v.clone()),
+            };
+            assert_eq!(cache.current_seq_len()?, rk.dim(2)? - t);
+            let (ck, cv) = cache.append(&k, &v)?;
+            assert_eq!(ck.contiguous()?.to_vec()?, rk.to_vec()?, "k at step {step}");
+            assert_eq!(cv.contiguous()?.to_vec()?, rv.to_vec()?, "v at step {step}");
+            cache.trim()?;
+            let n = rk.dim(2)?;
+            let keep = n.min(context);
+            reference = Some((
+                rk.narrow(2, n - keep..n)?.contiguous()?,
+                rv.narrow(2, n - keep..n)?.contiguous()?,
+            ));
+        }
+        assert_eq!(cache.absolute_offset, 200 / 4 * 22);
+        Ok(())
     }
 }
