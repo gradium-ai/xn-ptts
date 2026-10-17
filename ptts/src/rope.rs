@@ -37,6 +37,11 @@ impl<T: WithDTypeF, B: Backend> RotaryEmbedding<T, B> {
         Ok(Self { cos, sin })
     }
 
+    /// Apply RoPE to a contiguous [B, H, T, D] tensor.
+    pub fn forward_bhtd(&self, x: &Tensor<T, B>) -> Result<Tensor<T, B>> {
+        x.rope_i(&self.cos, &self.sin, 0)
+    }
+
     /// Apply RoPE to q and k tensors in [B, T, H, D] layout.
     /// Internally transposes to [B, H, T, D] for the `rope_i` primitive.
     pub fn forward(
