@@ -151,9 +151,10 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
 /// copies only its own keys/values. When the buffer is full, the retained window moves to the
 /// front of a fresh one, once every `cap - context - t` positions rather than every step.
 ///
-/// The window semantics are the previous cat-then-trim cache's: a step attends to the
-/// min(seen, context) positions kept by the previous step plus its own, in order, and keeps
-/// the last `context` afterwards (`trim`).
+/// A query attends to the `context` most recent positions, itself included (pocket-tts's
+/// `delta < context`): a step sees the min(seen, context - 1) positions kept by the previous
+/// step plus its own, in order (masked to each query's window when it has several), and keeps
+/// the last `context - 1` afterwards (`trim`).
 #[derive(Clone, Debug)]
 pub struct KvCache<T: WithDTypeF, B: Backend> {
     /// [b, h, cap, d] buffers, allocated on the first append.
@@ -204,9 +205,9 @@ impl<T: WithDTypeF, B: Backend> KvCache<T, B> {
         Ok((k.narrow(2, self.start..self.end)?, v.narrow(2, self.start..self.end)?))
     }
 
-    /// Keep only the last `context` positions.
+    /// Keep only the last `context - 1` positions: with the next query, a window of `context`.
     pub fn trim(&mut self) -> Result<()> {
-        self.start = self.start.max(self.end.saturating_sub(self.context));
+        self.start = self.start.max(self.end.saturating_sub(self.context.saturating_sub(1)));
         Ok(())
     }
 }
@@ -548,7 +549,7 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
         let (_, seq_len, _) = x.dims3()?;
         // At single-token decode every cached key is visible, so the causal mask is identically
         // zero: the FlowLm branch masks nothing at all, and the Mimi branch trims its cache to
-        // `context` before this point, which makes its window condition vacuous too. Building
+        // `context - 1` before this point, which makes its window condition vacuous too. Building
         // that mask means filling a Vec on the host, uploading it and adding it per layer, all
         // to add zero.
         let mask = if seq_len == 1 {
@@ -563,9 +564,8 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
                         .flat_map(|seq_idx| {
                             let seq_idx = seq_idx + kv_seq_len;
                             (0..kv_seq_len + seq_len).map(move |attn_idx| {
-                                if seq_idx.saturating_sub(context) <= attn_idx
-                                    && attn_idx <= seq_idx
-                                {
+                                // delta = seq_idx - attn_idx in 0..context
+                                if attn_idx <= seq_idx && seq_idx < attn_idx + context {
                                     Q::T::from_f32(0.0)
                                 } else {
                                     Q::T::from_f32(f32::NEG_INFINITY)
@@ -810,7 +810,7 @@ mod tests {
     use super::KvCache;
     use xn::{CpuDevice, Tensor};
 
-    /// The preallocated cache returns exactly the previous cat-then-trim cache's keys/values,
+    /// The preallocated cache returns exactly a cat-then-trim-to-(context - 1) cache's keys/values,
     /// over a stream several times longer than the context, with uneven step sizes.
     #[test]
     fn kv_cache_matches_cat_trim() -> xn::Result<()> {
@@ -840,7 +840,7 @@ mod tests {
             assert_eq!(cv.contiguous()?.to_vec()?, rv.to_vec()?, "v at step {step}");
             cache.trim()?;
             let n = rk.dim(2)?;
-            let keep = n.min(context);
+            let keep = n.min(context - 1);
             reference = Some((
                 rk.narrow(2, n - keep..n)?.contiguous()?,
                 rv.narrow(2, n - keep..n)?.contiguous()?,
