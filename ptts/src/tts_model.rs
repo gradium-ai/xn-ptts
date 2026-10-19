@@ -398,7 +398,7 @@ impl<Q: BackendQ> TTSModel<Q> {
 
     /// The empty text prefix a step with no new tokens is conditioned on.
     fn empty_text(&self) -> Result<Tensor<Q::T, Q::B>> {
-        Tensor::zeros((1, 0, self.flow_lm.conditioner.dim), self.device())
+        Tensor::zeros((1, 0, self.flow_lm.conditioner.output_dim), self.device())
     }
 }
 
@@ -427,7 +427,7 @@ impl<Q: BackendQ> MimiEnc<Q> {
         }
         let weights = vb.tensor(
             crate::loader::SPEAKER_PROJ_WEIGHT,
-            (cfg.flow_lm.d_model, mimi_cfg.dimension),
+            (cfg.flow_lm.d_model, mimi_cfg.encoder_latent_dim()),
         )?;
         Ok(Self { speaker_proj: Linear::new(weights), mimi })
     }
@@ -642,6 +642,36 @@ mod tests {
         assert_eq!(named.mimi_with_gelu(&named.mimi).gelu, Some(Gelu::Tanh));
         assert_eq!(serde_json::to_value(&named).unwrap()["mimi"]["gelu"], "tanh");
         assert_eq!(Gelu::default(), Gelu::Erf);
+    }
+
+    #[test]
+    fn architecture_keys_default_to_the_released_model() {
+        use crate::flow_lm::FlowType;
+        use serde_json::json;
+        let cfg = crate::test_config();
+        let f = &cfg.flow_lm;
+        assert_eq!(
+            (f.flow_type, f.z_dim, f.attn_dim, f.num_kv_heads),
+            (FlowType::Lsd, None, None, None)
+        );
+        assert_eq!(cfg.mimi.encoder_latent_dim(), cfg.mimi.dimension);
+
+        let mut json = serde_json::to_value(&cfg).unwrap();
+        json["flow_lm"]["flow_type"] = json!("pointwise");
+        json["flow_lm"]["z_dim"] = json!(64);
+        json["flow_lm"]["attn_dim"] = json!(192);
+        json["flow_lm"]["num_kv_heads"] = json!(1);
+        json["mimi"]["inner_dim"] = json!(32);
+        let small: TTSConfig = serde_json::from_value(json.clone()).unwrap();
+        let f = &small.flow_lm;
+        let keys = (f.flow_type, f.z_dim, f.attn_dim, f.num_kv_heads);
+        assert_eq!(keys, (FlowType::Pointwise, Some(64), Some(192), Some(1)));
+        assert_eq!(small.mimi.encoder_latent_dim(), 32);
+        assert_eq!(serde_json::to_value(&small).unwrap(), json);
+        assert_eq!(
+            serde_json::from_value::<FlowType>(json!("drifting")).unwrap(),
+            FlowType::Drifting
+        );
     }
 
     #[test]

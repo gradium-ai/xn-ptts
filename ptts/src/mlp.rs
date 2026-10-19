@@ -207,15 +207,19 @@ impl<T: WithDTypeF, B: Backend> SimpleMLPAdaLN<T, B> {
         x: &Tensor<T, B>,
     ) -> Result<Tensor<T, B>> {
         let mut x = self.input_proj.forward(x)?;
-        let mut t_combined = self.time_embeds[0].forward(ts[0])?;
-        for (embed, &t_input) in self.time_embeds[1..].iter().zip(ts[1..].iter()) {
-            t_combined = t_combined.add(&embed.forward(t_input)?)?;
-        }
-        let scale = T::from_f32(1.0 / self.num_time_conds as f32);
-        t_combined = t_combined.scale(scale)?;
-
         let c = self.cond_embed.forward(c)?;
-        let y = t_combined.add(&c)?;
+        // A head without time conditions (drifting, pointwise) is conditioned on `c` alone.
+        let y = match self.time_embeds.split_first() {
+            None => c,
+            Some((first, rest)) => {
+                let mut t_combined = first.forward(ts[0])?;
+                for (embed, &t_input) in rest.iter().zip(ts[1..].iter()) {
+                    t_combined = t_combined.add(&embed.forward(t_input)?)?;
+                }
+                let scale = T::from_f32(1.0 / self.num_time_conds as f32);
+                t_combined.scale(scale)?.add(&c)?
+            }
+        };
         for block in &self.res_blocks {
             x = block.forward(&x, &y)?;
         }

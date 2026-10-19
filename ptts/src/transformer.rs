@@ -65,16 +65,25 @@ pub struct StreamingMultiheadAttention<Q: BackendQ> {
     out_proj: Q::LinearQ,
     pub embed_dim: usize,
     pub num_heads: usize,
+    /// Width of the queries and of the attention output, see [`Kind::FlowLm`].
+    pub attn_dim: usize,
+    pub num_kv_heads: usize,
     device: Q::B,
 }
 
 impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
-    pub fn load(vb: &Path<Q::B>, embed_dim: usize, num_heads: usize) -> Result<Self> {
-        let out_dim = 3 * embed_dim;
-        let in_proj = Q::linear_load(vb.pp("in_proj"), embed_dim, out_dim)?;
-        let out_proj = Q::linear_load(vb.pp("out_proj"), embed_dim, embed_dim)?;
+    pub fn load(
+        vb: &Path<Q::B>,
+        embed_dim: usize,
+        num_heads: usize,
+        attn_dim: usize,
+        num_kv_heads: usize,
+    ) -> Result<Self> {
+        let kv_dim = attn_dim / num_heads * num_kv_heads;
+        let in_proj = Q::linear_load(vb.pp("in_proj"), embed_dim, attn_dim + 2 * kv_dim)?;
+        let out_proj = Q::linear_load(vb.pp("out_proj"), attn_dim, embed_dim)?;
         let device = vb.device().clone();
-        Ok(Self { in_proj, out_proj, embed_dim, num_heads, device })
+        Ok(Self { in_proj, out_proj, embed_dim, num_heads, attn_dim, num_kv_heads, device })
     }
 
     pub fn init_state(
@@ -82,7 +91,7 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
         batch_size: usize,
         sequence_length: usize,
     ) -> Result<StreamingMHAState<Q::T, Q::B>> {
-        let dim_per_head = self.embed_dim / self.num_heads;
+        let dim_per_head = self.attn_dim / self.num_heads;
         let shape = (batch_size, sequence_length, self.num_heads, dim_per_head);
         let dev = &self.device;
         let k_cache = Tensor::zeros(shape, dev)?;
@@ -100,19 +109,25 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
     ) -> Result<Tensor<Q::T, Q::B>> {
         use xn::ModuleT;
         let (b, t, _) = query.dims3()?;
-        let d = self.embed_dim / self.num_heads;
+        let (h, kvh) = (self.num_heads, self.num_kv_heads);
+        let d = self.attn_dim / h;
         let projected = self.in_proj.forward(query)?;
         // Split into q, k, v by narrowing on the last dimension
-        let ed = self.embed_dim;
-        let q = projected.narrow(2, 0..ed)?.contiguous()?.reshape((b, t, self.num_heads, d))?;
-        let k =
-            projected.narrow(2, ed..2 * ed)?.contiguous()?.reshape((b, t, self.num_heads, d))?;
-        let v = projected.narrow(2, 2 * ed..3 * ed)?.contiguous()?.reshape((
-            b,
-            t,
-            self.num_heads,
-            d,
-        ))?;
+        let (ad, kd) = (self.attn_dim, kvh * d);
+        let q = projected.narrow(2, 0..ad)?.contiguous()?.reshape((b, t, h, d))?;
+        // Each k/v head serves h / kvh consecutive query heads (torch's `repeat_interleave`). The
+        // cache holds them repeated, so attention below sees as many k/v heads as query heads.
+        let heads = |x: Tensor<Q::T, Q::B>| {
+            if kvh == h {
+                return x.reshape((b, t, h, d));
+            }
+            x.reshape((b, t, kvh, 1, d))?
+                .broadcast_as((b, t, kvh, h / kvh, d))?
+                .contiguous()?
+                .reshape((b, t, h, d))
+        };
+        let k = heads(projected.narrow(2, ad..ad + kd)?.contiguous()?)?;
+        let v = heads(projected.narrow(2, ad + kd..ad + 2 * kd)?.contiguous()?)?;
 
         // Apply RoPE: q, k are [b, t, h, d]
         let (q, k) = rope.forward(&q, &k)?;
@@ -139,7 +154,7 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
             let x = attn.matmul(&v)?;
 
             // Back to [b, t, h*d]
-            x.transpose(1, 2)?.reshape((b, t, self.embed_dim))?.contiguous()?
+            x.transpose(1, 2)?.reshape((b, t, self.attn_dim))?.contiguous()?
         };
         self.out_proj.forward(&x)
     }
@@ -348,7 +363,13 @@ enum AttentionKind<Q: BackendQ> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Mimi,
-    FlowLm,
+    /// Queries and the attention output are `attn_dim` wide, and keys and values have
+    /// `num_kv_heads` heads, each shared by `num_heads / num_kv_heads` query heads (grouped-query
+    /// attention). `d_model` and `num_heads` give the usual attention.
+    FlowLm {
+        attn_dim: usize,
+        num_kv_heads: usize,
+    },
 }
 
 /// FFN activation. `erf` is the exact GELU; Pocket TTS uses `gelu(approximate="tanh")`.
@@ -396,11 +417,15 @@ impl<Q: BackendQ> StreamingTransformerLayer<Q> {
                 num_heads,
                 context.unwrap_or(250),
             )?),
-            Kind::FlowLm => AttentionKind::FlowLm(StreamingMultiheadAttention::load(
-                &vb.pp("self_attn"),
-                d_model,
-                num_heads,
-            )?),
+            Kind::FlowLm { attn_dim, num_kv_heads } => {
+                AttentionKind::FlowLm(StreamingMultiheadAttention::load(
+                    &vb.pp("self_attn"),
+                    d_model,
+                    num_heads,
+                    attn_dim,
+                    num_kv_heads,
+                )?)
+            }
         };
 
         let norm1 = LayerNorm::load(vb.pp("norm1"), d_model, 1e-5)?;
@@ -511,10 +536,20 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
         max_period: f32,
         kind: Kind,
     ) -> Result<Self> {
-        if num_heads == 0 || !d_model.is_multiple_of(num_heads) {
-            xn::bail!("the config's {num_heads} attention heads do not divide its width {d_model}")
+        let (attn_dim, num_kv_heads) = match kind {
+            Kind::Mimi => (d_model, num_heads),
+            Kind::FlowLm { attn_dim, num_kv_heads } => (attn_dim, num_kv_heads),
+        };
+        if num_heads == 0 || !attn_dim.is_multiple_of(num_heads) {
+            xn::bail!("the config's {num_heads} attention heads do not divide its width {attn_dim}")
         }
-        let head_dim = d_model / num_heads;
+        if num_kv_heads == 0 || !num_heads.is_multiple_of(num_kv_heads) {
+            xn::bail!(
+                "the config's {num_kv_heads} key/value heads do not divide its {num_heads} \
+                 attention heads"
+            )
+        }
+        let head_dim = attn_dim / num_heads;
         let mut layers = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             layers.push(StreamingTransformerLayer::load(
@@ -777,12 +812,77 @@ mod with_seq_budget_tests {
 }
 
 #[cfg(test)]
+mod grouped_query_tests {
+    use super::*;
+    use xn::CpuDevice;
+
+    type Q = xn::Unquantized<f32, CpuDevice>;
+
+    /// Grouped-query attention, here also wider than the model, is the usual attention with each
+    /// k/v head's projection rows repeated for the query heads that share it: same outputs over
+    /// a prompt and then single steps.
+    #[test]
+    fn grouped_query_attention_is_attention_with_repeated_kv_heads() -> Result<()> {
+        let (embed, h, kvh, d) = (6, 4, 2, 2);
+        let (attn, group) = (h * d, h / kvh);
+        let mut seed = 1u64;
+        let mut rand = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+                })
+                .collect()
+        };
+        let (q_w, k_w, v_w) = (rand(attn * embed), rand(kvh * d * embed), rand(kvh * d * embed));
+        let (o_w, x) = (rand(embed * attn), rand(5 * embed));
+        let repeat = |w: &[f32]| -> Vec<f32> {
+            (0..h)
+                .flat_map(|j| w[j / group * d * embed..(j / group + 1) * d * embed].to_vec())
+                .collect()
+        };
+        let attention = |num_kv_heads, k: Vec<f32>, v: Vec<f32>| -> Result<_> {
+            let in_w = [q_w.clone(), k, v].concat();
+            let rows = in_w.len() / embed;
+            Ok(StreamingMultiheadAttention::<Q> {
+                in_proj: Linear::new(Tensor::from_vec(in_w, (rows, embed), &CpuDevice)?),
+                out_proj: Linear::new(Tensor::from_vec(o_w.clone(), (embed, attn), &CpuDevice)?),
+                embed_dim: embed,
+                num_heads: h,
+                attn_dim: attn,
+                num_kv_heads,
+                device: CpuDevice,
+            })
+        };
+        let run = |m: StreamingMultiheadAttention<Q>| -> Result<Vec<f32>> {
+            let mut state = m.init_state(1, 8)?;
+            let mut out = Vec::new();
+            for (start, len) in [(0, 3), (3, 1), (4, 1)] {
+                let xs = x[start * embed..(start + len) * embed].to_vec();
+                let xs = Tensor::from_vec(xs, (1, len, embed), &CpuDevice)?;
+                let mask = (len > 1).then(|| state.materialize_causal_mask(len)).transpose()?;
+                let rope = RotaryEmbedding::new(d, start, len, 10_000., &CpuDevice)?;
+                out.extend(m.forward(&xs, &rope, &mut state, mask.as_ref())?.to_vec()?);
+            }
+            Ok(out)
+        };
+        let grouped = run(attention(kvh, k_w.clone(), v_w.clone())?)?;
+        let full = run(attention(h, repeat(&k_w), repeat(&v_w))?)?;
+        assert_eq!(grouped.len(), 5 * embed);
+        for (a, b) in grouped.iter().zip(&full) {
+            assert!((a - b).abs() < 1e-6, "{grouped:?}\n{full:?}");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod bad_config_tests {
     use super::*;
     use xn::CpuDevice;
     use xn::nn::VB;
 
-    fn load(d_model: usize, num_heads: usize) -> Result<()> {
+    fn load(d_model: usize, num_heads: usize, num_kv_heads: usize) -> Result<()> {
         // An empty safetensors file: the check runs before any weight is read.
         let empty = [2u64.to_le_bytes().as_slice(), b"{}"].concat();
         let vb = VB::from_bytes(vec![empty], CpuDevice)?.root();
@@ -795,7 +895,7 @@ mod bad_config_tests {
             4,
             None,
             10_000.,
-            Kind::FlowLm,
+            Kind::FlowLm { attn_dim: d_model, num_kv_heads },
         )
         .map(drop)
     }
@@ -803,8 +903,16 @@ mod bad_config_tests {
     #[test]
     fn heads_that_do_not_divide_the_width_are_an_error() {
         for heads in [0, 3] {
-            let err = load(8, heads).err().unwrap_or_else(|| panic!("{heads} heads for 8 wide"));
+            let err = load(8, heads, 1).err().unwrap_or_else(|| panic!("{heads} heads for 8 wide"));
             assert!(err.to_string().contains("heads"), "{err}");
+        }
+    }
+
+    #[test]
+    fn kv_heads_that_do_not_divide_the_heads_are_an_error() {
+        for kv_heads in [0, 3] {
+            let err = load(8, 4, kv_heads).err().unwrap_or_else(|| panic!("{kv_heads} kv heads"));
+            assert!(err.to_string().contains("key/value heads"), "{err}");
         }
     }
 }

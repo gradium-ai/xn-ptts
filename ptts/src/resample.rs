@@ -10,12 +10,18 @@ pub struct ConvDownsample1d<T: WithDTypeF, B: Backend> {
 }
 
 impl<T: WithDTypeF, B: Backend> ConvDownsample1d<T, B> {
-    pub fn load(vb: &Path<B>, stride: usize, dimension: usize, depthwise: bool) -> Result<Self> {
+    pub fn load(
+        vb: &Path<B>,
+        stride: usize,
+        dimension: usize,
+        out_dimension: usize,
+        depthwise: bool,
+    ) -> Result<Self> {
         let groups = if depthwise { dimension } else { 1 };
         let conv = StreamingConv1d::load(
             &vb.pp("conv"),
             dimension,
-            dimension,
+            out_dimension,
             2 * stride,
             stride,
             1,

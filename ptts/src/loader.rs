@@ -159,8 +159,8 @@ pub const EMB_TENSOR: &str = "emb";
 pub const SPEAKER_WAVS_TENSOR: &str = "speaker_wavs";
 
 /// The checkpoint's speaker projection, when it has one: the linear map from speaker-Mimi
-/// latents (`speaker_mimi_cfg().dimension` wide) to the flow LM's `d_model`. It turns stored
-/// `speaker_wavs` latents into the voice embedding the flow LM is conditioned on, see
+/// latents (`speaker_mimi_cfg().encoder_latent_dim()` wide) to the flow LM's `d_model`. It turns
+/// stored `speaker_wavs` latents into the voice embedding the flow LM is conditioned on, see
 /// [`load_voice_emb`]. Kept in f32 like the embeddings it produces.
 pub fn load_speaker_proj<B: Backend>(
     vb: &Path<B>,
@@ -169,7 +169,7 @@ pub fn load_speaker_proj<B: Backend>(
     if !vb.contains(SPEAKER_PROJ_WEIGHT) {
         return Ok(None);
     }
-    let shape = (cfg.flow_lm.d_model, cfg.speaker_mimi_cfg().dimension);
+    let shape = (cfg.flow_lm.d_model, cfg.speaker_mimi_cfg().encoder_latent_dim());
     let weight = vb.tensor(SPEAKER_PROJ_WEIGHT, shape)?;
     Ok(Some(Linear::new(weight)))
 }

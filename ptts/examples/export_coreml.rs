@@ -87,6 +87,14 @@ fn main() -> Result<()> {
         "the Core ML graph takes one flow step; this checkpoint wants {}",
         cfg.lsd_decode_steps
     );
+    anyhow::ensure!(
+        f.flow_type == ptts::flow_lm::FlowType::Lsd
+            && f.z_dim.is_none()
+            && f.attn_dim.is_none_or(|a| a == f.d_model)
+            && f.num_kv_heads.is_none_or(|h| h == f.num_heads),
+        "the Core ML flow LM graph takes an LSD head and full multi-head attention, without \
+         z_dim, attn_dim or num_kv_heads"
+    );
     let time_norm = match f.time_rms_norm {
         ptts::flow_lm::TimeRmsNorm::Rms => fl::TimeNorm::Rms,
         ptts::flow_lm::TimeRmsNorm::RmsVar => fl::TimeNorm::RmsVar,
