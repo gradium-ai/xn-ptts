@@ -1,6 +1,6 @@
 #include "ptts_text.hpp"
 
-#include <dlfcn.h>
+#include "platform_dl.hpp"
 
 #include <stdexcept>
 #include <memory>

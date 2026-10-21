@@ -35,5 +35,14 @@ int main() {
     if (!rejects(invalid, "SM8750"))
       return 5;
   }
+#ifdef _WIN32
+  for (auto file : {R"(C:\outside.bin)", R"(C:outside.bin)", R"(\outside.bin)",
+                    R"(\\server\share\outside.bin)", R"(..\outside.bin)"}) {
+    auto invalid = binaries;
+    invalid["S25"]["file"] = file;
+    if (!rejects(invalid, "SM8750"))
+      return 7;
+  }
+#endif
   std::cout << "QNN bundle compatibility checks passed\n";
 }

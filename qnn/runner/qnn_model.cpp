@@ -1,6 +1,6 @@
 #include "qnn_model.hpp"
 
-#include <dlfcn.h>
+#include "platform_dl.hpp"
 
 #include <cstdarg>
 #include <cstdio>
@@ -122,6 +122,10 @@ QnnModel::QnnModel(const std::string& backend_lib, const std::string& system_lib
       }
     }
     if (!found) throw std::runtime_error("no compatible QNN interface in " + backend_lib);
+
+    // A requested HTP library must actually expose the HTP provider.
+    if ((backend_lib.find("QnnHtp.") != std::string::npos) && !is_htp_)
+      throw std::runtime_error("HTP required: refusing a non-HTP provider");
 
     using GetSysProviders = Qnn_ErrorHandle_t (*)(const QnnSystemInterface_t***, uint32_t*);
     auto get_sys = reinterpret_cast<GetSysProviders>(dlsym(system_lib_, "QnnSystemInterface_getProviders"));

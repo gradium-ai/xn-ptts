@@ -6,6 +6,19 @@ on:
 permissions:
   contents: read
 jobs:
+  windows-contracts:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Bundle paths and MSVC FP16 storage (no SDK or model required)
+        shell: pwsh
+        run: |
+          cmake -S qnn/runner/tests -B "$env:RUNNER_TEMP/qnn-tests"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build "$env:RUNNER_TEMP/qnn-tests" --config Release
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ctest --test-dir "$env:RUNNER_TEMP/qnn-tests" -C Release --output-on-failure
   contracts:
     runs-on: ubuntu-latest
     timeout-minutes: 20

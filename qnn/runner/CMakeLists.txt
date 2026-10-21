@@ -8,7 +8,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # The QNN headers come from the QAIRT SDK; its runtime libraries are loaded at
-# run time (dlopen), as is ptts's text front end, so nothing links against them.
+# run time (dlopen / LoadLibrary), as is ptts's text front end, so nothing links against them.
 set(QAIRT_ROOT "" CACHE PATH "QAIRT SDK root, e.g. .../qairt/2.50.0.260828")
 if(NOT QAIRT_ROOT)
   message(FATAL_ERROR "set -DQAIRT_ROOT=<QAIRT SDK root>")
@@ -26,3 +26,9 @@ target_link_libraries(phonon PUBLIC ${CMAKE_DL_LIBS} Threads::Threads nlohmann_j
 add_executable(phonon_cli main.cpp)
 set_target_properties(phonon_cli PROPERTIES OUTPUT_NAME phonon)
 target_link_libraries(phonon_cli PRIVATE phonon)
+
+option(PHONON_BUILD_BENCHMARK "Build the strict HTP profiling benchmark" OFF)
+if(PHONON_BUILD_BENCHMARK)
+  add_executable(phonon_benchmark benchmark.cpp)
+  target_link_libraries(phonon_benchmark PRIVATE phonon)
+endif()
