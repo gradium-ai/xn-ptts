@@ -1,16 +1,17 @@
 param(
     [Parameter(Mandatory=$true)][string]$QairtRoot,
-    [string]$BuildDir = "$PSScriptRoot/build-windows",
+    [string]$BuildDir = "$PSScriptRoot/build",
     [string]$CMake = 'cmake',
     [string]$Cargo = 'cargo'
 )
 $ErrorActionPreference = 'Stop'
+$runner = [System.IO.Path]::GetFullPath("$PSScriptRoot/../runner")
 $QairtRoot = (Resolve-Path -LiteralPath $QairtRoot).Path
 if (!(Test-Path -LiteralPath "$QairtRoot/include/QNN/QnnInterface.h")) {
     throw 'QairtRoot must contain the QAIRT include/QNN headers.'
 }
 
-& $CMake -S $PSScriptRoot -B $BuildDir -A ARM64 "-DQAIRT_ROOT=$QairtRoot" -DPHONON_BUILD_BENCHMARK=ON
+& $CMake -S $runner -B $BuildDir -A ARM64 "-DQAIRT_ROOT=$QairtRoot" -DPHONON_BUILD_BENCHMARK=ON
 if ($LASTEXITCODE) { throw 'CMake configuration failed.' }
 & $CMake --build $BuildDir --config Release
 if ($LASTEXITCODE) { throw 'C++ build failed.' }
@@ -18,7 +19,7 @@ if ($LASTEXITCODE) { throw 'C++ build failed.' }
 if ($LASTEXITCODE) { throw 'Rust text frontend build failed.' }
 Copy-Item -LiteralPath "$PSScriptRoot/../text-ffi/target/aarch64-pc-windows-msvc/release/ptts_text.dll" -Destination "$BuildDir/Release/ptts_text.dll"
 
-& $CMake -S "$PSScriptRoot/tests" -B "$BuildDir/tests" -A ARM64
+& $CMake -S "$runner/tests" -B "$BuildDir/tests" -A ARM64
 if ($LASTEXITCODE) { throw 'Test configuration failed.' }
 & $CMake --build "$BuildDir/tests" --config Release
 if ($LASTEXITCODE) { throw 'Test build failed.' }

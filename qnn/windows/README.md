@@ -1,6 +1,6 @@
 # QNN runner on Windows ARM64
 
-The shared C++ engine in this directory can run Phonon's prefill and step graphs
+The shared C++ engine in [`../runner`](../runner) can run Phonon's prefill and step graphs
 on a Snapdragon X Elite's Hexagon NPU through QNN HTP. It uses the existing
 Rust frontend in [`../text-ffi`](../text-ffi) for text preparation and tokenization.
 This is a native Windows build; it does not run the Android AAR.
@@ -12,7 +12,7 @@ build tools, and a QAIRT SDK with Windows ARM64 headers/runtime. From the reposi
 root in PowerShell:
 
 ```powershell
-.\qnn\runner\build-windows.ps1 -QairtRoot 'C:\Qualcomm\AIStack\QAIRT\2.45.0.260326'
+.\qnn\windows\build.ps1 -QairtRoot 'C:\Qualcomm\AIStack\QAIRT\2.45.0.260326'
 ```
 
 This builds `phonon.exe`, the opt-in `phonon_benchmark.exe`, and `ptts_text.dll`,
@@ -66,7 +66,7 @@ Replace the bundle and output paths with your own. Create the output folder firs
 ```powershell
 $qairt = 'C:\Qualcomm\AIStack\QAIRT\2.45.0.260326'
 $lib = "$qairt\lib\aarch64-windows-msvc"
-$build = (Resolve-Path '.\qnn\runner\build-windows\Release').Path
+$build = (Resolve-Path '.\qnn\windows\build\Release').Path
 $bundle = 'C:\models\phonon-31m-en-xelite'
 $out = 'C:\phonon-results'
 New-Item -ItemType Directory -Force $out | Out-Null
