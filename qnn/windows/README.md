@@ -1,5 +1,13 @@
 # QNN runner on Windows ARM64
 
+Embedding applications can install a process-wide `phonon::set_qnn_log_handler`
+from `qnn_log.hpp` before creating models. The callback receives a severity and
+a borrowed formatted message; clear it after all models are destroyed. QNN has
+no callback user-data parameter, so this sink is shared by the process. It is
+thread safe, runs outside the configuration mutex, and contains callback
+exceptions. With no sink, CLI stderr logging and `PHONON_QNN_LOG` retain their
+existing behavior. Model-free tests cover filtering and callback reconfiguration.
+
 The shared C++ engine in [`../runner`](../runner) can run Phonon's prefill and step graphs
 on a Snapdragon X Elite's Hexagon NPU through QNN HTP. It uses the existing
 Rust frontend in [`../text-ffi`](../text-ffi) for text preparation and tokenization.

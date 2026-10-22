@@ -1,4 +1,5 @@
 #include "qnn_model.hpp"
+#include "qnn_log.hpp"
 
 #include "platform_dl.hpp"
 
@@ -27,20 +28,26 @@ void check(Qnn_ErrorHandle_t status, const char* what) {
 
 // PHONON_QNN_LOG=verbose (or debug, info) shows more of QNN's own logging.
 QnnLog_Level_t log_level() {
-  const char* v = std::getenv("PHONON_QNN_LOG");
-  if (!v) return QNN_LOG_LEVEL_WARN;
-  std::string s = v;
-  if (s == "verbose") return QNN_LOG_LEVEL_VERBOSE;
-  if (s == "debug") return QNN_LOG_LEVEL_DEBUG;
-  if (s == "info") return QNN_LOG_LEVEL_INFO;
-  return QNN_LOG_LEVEL_WARN;
+  switch (qnn_log_level()) {
+    case LogLevel::error: return QNN_LOG_LEVEL_ERROR;
+    case LogLevel::warning: return QNN_LOG_LEVEL_WARN;
+    case LogLevel::info: return QNN_LOG_LEVEL_INFO;
+    case LogLevel::debug: return QNN_LOG_LEVEL_DEBUG;
+    case LogLevel::verbose: return QNN_LOG_LEVEL_VERBOSE;
+  }
+  return QNN_LOG_LEVEL_ERROR;
 }
 
 void log_callback(const char* fmt, QnnLog_Level_t level, uint64_t, va_list args) {
-  if (level > log_level()) return;
-  std::fprintf(stderr, "[qnn] ");
-  std::vfprintf(stderr, fmt, args);
-  std::fprintf(stderr, "\n");
+  LogLevel mapped = LogLevel::verbose;
+  switch (level) {
+    case QNN_LOG_LEVEL_ERROR: mapped = LogLevel::error; break;
+    case QNN_LOG_LEVEL_WARN: mapped = LogLevel::warning; break;
+    case QNN_LOG_LEVEL_INFO: mapped = LogLevel::info; break;
+    case QNN_LOG_LEVEL_DEBUG: mapped = LogLevel::debug; break;
+    default: break;
+  }
+  emit_qnn_log(mapped, fmt, args);
 }
 
 void* open_lib(const std::string& path) {

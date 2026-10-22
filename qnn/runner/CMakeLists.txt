@@ -19,7 +19,7 @@ endif()
 find_package(Threads REQUIRED)
 include(cmake/Json.cmake)
 
-add_library(phonon STATIC ptts_text.cpp qnn_model.cpp phonon.cpp)
+add_library(phonon STATIC ptts_text.cpp qnn_model.cpp qnn_log.cpp phonon.cpp)
 target_include_directories(phonon PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${QAIRT_ROOT}/include/QNN)
 target_link_libraries(phonon PUBLIC ${CMAKE_DL_LIBS} Threads::Threads nlohmann_json::nlohmann_json)
 
