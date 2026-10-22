@@ -87,11 +87,7 @@ impl VoiceCatalog {
     /// The local path of `voice`'s file, downloaded on first use.
     pub fn fetch(&self, voice: &CatalogVoice) -> Result<PathBuf> {
         let file = &voice.filename;
-        if file.is_empty()
-            || file.contains(['\\', ':'])
-            || file.starts_with('/')
-            || file.split('/').any(|p| p.is_empty() || p == "." || p == "..")
-        {
+        if !crate::loader::is_path_inside(file) {
             return Err(Error::invalid_data(format!(
                 "voice '{}' names the file '{file}', which is not a path inside the catalog",
                 voice.name

@@ -188,11 +188,7 @@ pub fn read_config(path: impl AsRef<Path>) -> Result<TTSConfig> {
 }
 
 pub(crate) fn validate_relative_path(path: &str) -> Result<()> {
-    if path.is_empty()
-        || path.contains(['\\', ':'])
-        || path.starts_with('/')
-        || path.split('/').any(|p| p.is_empty() || p == "." || p == "..")
-    {
+    if !crate::loader::is_path_inside(path) {
         return Err(Error::InvalidData(format!(
             "weights path '{path}' must be relative to the checkpoint root"
         )));

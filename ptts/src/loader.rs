@@ -111,13 +111,22 @@ pub fn voices_in(dir: &std::path::Path) -> Vec<(String, std::path::PathBuf)> {
     voices
 }
 
+/// Whether `path` is a plain relative path with `/` separators that stays inside the folder it
+/// is joined to: no root, drive, `.` or `..` component, and no empty one.
+pub(crate) fn is_path_inside(path: &str) -> bool {
+    !(path.is_empty()
+        || path.contains(['\\', ':'])
+        || path.starts_with('/')
+        || path.split('/').any(|p| p.is_empty() || p == "." || p == ".."))
+}
+
 /// The voices of a JSONL catalog, one `{"name", "filename"}` object per line, as (name, path)
-/// with `filename` resolved against the catalog's directory.
+/// with `filename` resolved against the catalog's directory, which it must stay inside.
 pub fn read_voice_catalog(path: &std::path::Path) -> Result<Vec<(String, std::path::PathBuf)>> {
     #[derive(serde::Deserialize)]
     struct Entry {
         name: String,
-        filename: std::path::PathBuf,
+        filename: String,
     }
     let dir = path.parent().unwrap_or(std::path::Path::new(""));
     let mut voices = vec![];
@@ -127,6 +136,15 @@ pub fn read_voice_catalog(path: &std::path::Path) -> Result<Vec<(String, std::pa
         }
         let entry: Entry = serde_json::from_str(line)
             .map_err(|e| Error::invalid_data(format!("{}:{}: {e}", path.display(), i + 1)))?;
+        if !is_path_inside(&entry.filename) {
+            return Err(Error::invalid_data(format!(
+                "{}:{}: voice '{}' names the file '{}', which is not a path inside the catalog",
+                path.display(),
+                i + 1,
+                entry.name,
+                entry.filename
+            )));
+        }
         voices.push((entry.name, dir.join(entry.filename)));
     }
     Ok(voices)
@@ -410,6 +428,25 @@ fn read_safetensors_header(path: &std::path::Path) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_files_stay_inside_the_catalog() {
+        let dir = std::env::temp_dir().join(format!("ptts-catalog-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let catalog = dir.join("voices.jsonl");
+        std::fs::write(&catalog, r#"{"name": "a", "filename": "voices/a.safetensors"}"#).unwrap();
+        assert_eq!(
+            read_voice_catalog(&catalog).unwrap(),
+            [("a".into(), dir.join("voices/a.safetensors"))]
+        );
+        for file in ["../a.safetensors", "/etc/a.safetensors", "voices/../../a.safetensors", "C:a"]
+        {
+            let line = format!(r#"{{"name": "a", "filename": "{file}"}}"#);
+            std::fs::write(&catalog, line).unwrap();
+            assert!(read_voice_catalog(&catalog).is_err(), "{file} was accepted");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn checkpoint_voices_follow_the_layout() {
