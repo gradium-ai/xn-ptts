@@ -4,8 +4,9 @@ updates:
   # The actions this repo pins went unmaintained once already -- `actions-rs/*` was archived in
   # 2023 and kept running on a deprecated Node runtime until it was noticed by hand. Monthly and
   # grouped, so it is one PR to glance at rather than a stream of them.
+  # `/` covers only `.github/workflows`; the composite actions are listed separately.
   - package-ecosystem: github-actions
-    directory: /
+    directories: ["/", "/.github/actions/*"]
     schedule:
       interval: monthly
     groups:
