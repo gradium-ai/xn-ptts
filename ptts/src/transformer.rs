@@ -224,9 +224,9 @@ pub struct StreamingTransformerState<T: WithDTypeF, B: Backend> {
 impl<T: WithDTypeF, B: Backend> StreamingTransformerState<T, B> {
     /// A fresh state with room for `seq_budget` positions, holding a copy of the filled prefix.
     ///
-    /// Not `Clone`: cloning an `xn` tensor shares its storage, so two generations started from
-    /// one clone would write into the same KV buffers. Mimi caches are fixed-context ring
-    /// buffers and are cloned as-is.
+    /// Use this rather than `Clone`: cloning an `xn` tensor shares its storage, so two
+    /// generations started from one clone would write into the same KV buffers. Mimi caches are
+    /// fixed-context ring buffers and are cloned as-is.
     pub fn with_seq_budget(&self, seq_budget: usize) -> Result<Self> {
         let mut layer_states = Vec::with_capacity(self.layer_states.len());
         for layer in self.layer_states.iter() {
