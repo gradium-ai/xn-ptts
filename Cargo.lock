@@ -2891,7 +2891,6 @@ dependencies = [
  "numpy",
  "ptts",
  "pyo3",
- "serde_json",
  "xn",
 ]
 
@@ -2918,11 +2917,9 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
- "bytemuck",
  "byteorder",
  "clap",
  "futures-util",
- "half",
  "kaudio",
  "ptts",
  "rubato",

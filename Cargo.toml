@@ -24,7 +24,6 @@ ptts = { path = "ptts", version = "0.4.1" }
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["ws", "tokio", "http1", "macros"] }
 base64 = "0.22"
-bytemuck = "1"
 byteorder = "1.5.0"
 clap = { version = "4", features = ["derive"] }
 ebur128 = "0.1"

@@ -12,11 +12,9 @@ license.workspace = true
 anyhow = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
-bytemuck = { workspace = true }
 byteorder = { workspace = true }
 clap = { workspace = true }
 futures-util = { workspace = true }
-half = { workspace = true }
 kaudio = { workspace = true }
 ptts = { workspace = true, features = ["hf", "hub"] }
 rubato = { workspace = true }

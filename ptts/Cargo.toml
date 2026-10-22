@@ -23,11 +23,10 @@ rand_distr = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
 rubato = { workspace = true, optional = true }
 symphonia = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
-safetensors = { workspace = true }
 thiserror = { workspace = true }
 half = { workspace = true, optional = true }
 
@@ -38,13 +37,12 @@ libc = { workspace = true, optional = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 half = { workspace = true }
-# For the `export_coreml` example: the Core ML graph builder, and hashing the files it writes.
+tracing-subscriber = { workspace = true }
+# For the `export_coreml` example: the Core ML graph builder, the safetensors it writes, and
+# hashing the files it writes.
 ptts-coreml = { path = "../ptts-coreml", features = ["gguf"] }
+safetensors = { workspace = true }
 sha2 = { workspace = true }
-tracing-chrome = { workspace = true }
-
-[target.'cfg(unix)'.dev-dependencies]
-libc = { workspace = true }
 
 # docs.rs builds with default features unless told otherwise, which would render the crate
 # without `tok` or `audio` and with no implementation of the `Tokenizer` trait in sight. Not
@@ -73,7 +71,7 @@ default = []
 # Downloads `hf://` checkpoints from the Hugging Face Hub in `Checkpoint::locate`.
 hub = ["dep:hf-hub"]
 # Installable command; the library stays free of download and CLI dependencies by default.
-cli = ["hf", "audio", "hub", "dep:anyhow", "dep:clap", "dep:tracing-chrome", "dep:libc"]
+cli = ["hf", "audio", "hub", "dep:anyhow", "dep:clap", "dep:tracing-chrome", "dep:tracing-subscriber", "dep:libc"]
 cuda = ["xn/cuda", "dep:half"]
 vulkan = ["xn/vulkan"]
 metal = ["xn/metal", "dep:half"]
