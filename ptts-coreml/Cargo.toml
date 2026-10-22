@@ -2,6 +2,7 @@
 name = "ptts-coreml"
 version.workspace = true
 edition = "2024"
+publish = false
 description = "Run Phonon through CoreML, on the Neural Engine, with graphs emitted from Rust"
 repository.workspace = true
 license.workspace = true
