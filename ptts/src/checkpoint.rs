@@ -129,7 +129,7 @@ impl Checkpoint {
     /// Add the voices of a JSONL catalog, see [`crate::loader::read_voice_catalog`],
     /// replacing any of the same name.
     pub fn add_voice_catalog(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        let mut voices = std::collections::BTreeMap::new();
+        let mut voices: std::collections::BTreeMap<_, _> = self.voices.drain(..).collect();
         for (name, path) in crate::loader::read_voice_catalog(path.as_ref())? {
             voices.insert(name, path);
         }
