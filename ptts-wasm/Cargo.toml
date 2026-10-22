@@ -36,5 +36,5 @@ wasm-opt = false
 default = []
 webgpu = ["xn/webgpu"]
 # Generation on several CPU threads. Needs a nightly toolchain with std rebuilt for atomics,
-# and a page that is cross-origin isolated: see the `build-threads` target in the Makefile.
+# and a page that is cross-origin isolated: see the `threads-toolchain` target in the Makefile.
 threads = ["dep:rayon", "dep:wasm-bindgen-rayon"]

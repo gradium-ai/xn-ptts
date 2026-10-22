@@ -7,7 +7,6 @@
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 20px; background: #111; color: #ddd; }
-  h1 { margin-bottom: 8px; color: #eee; }
   .subtitle { color: #888; margin-bottom: 24px; }
   .subtitle a { color: #60a5fa; }
   .section { margin-bottom: 20px; }
@@ -86,7 +85,7 @@ tempSlider.addEventListener('input', () => {
   tempValue.textContent = tempSlider.value;
 });
 
-// `make demo MODEL_DIR=...` serves a model folder as `model/` and describes it in `model.json`:
+// `make demo MODEL_DIR=...` links a model folder as `model/` and describes it in `model.json`:
 // a static server cannot list a directory, so the page cannot find the weights and voices
 // itself. Without `model.json` the page loads the package's default model. Fetched before the
 // module script below runs anything else, so the load button only enables once the page knows
