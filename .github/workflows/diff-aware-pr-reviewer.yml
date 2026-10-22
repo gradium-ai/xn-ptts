@@ -5,8 +5,6 @@ name: Claude - Diff-Aware PR Reviewer
 # - Trigger: Automatically when a PR is opened or reopened, plus manual
 #   workflow_dispatch to re-review any PR on demand.
 # - Outputs: reports/pr-<PR>-review.md and optional PR comment linking to it.
-# - Copy/Paste Ready: You can drop this file into other repos and adjust:
-#   - inputs, prompt, claude_args, and permissions for your stack.
 #
 # REQUIRED SECRETS
 # - ANTHROPIC_API_KEY: Anthropic API key for Claude.  (Alternatively
@@ -17,16 +15,12 @@ name: Claude - Diff-Aware PR Reviewer
 # - id-token: write is required by the action runtime.
 # - actions: read lets Claude read CI results on PRs if you include that in additional_permissions.
 #
-# CUSTOMIZATION TIPS
-# - Adjust --allowedTools to restrict/enable commands. Keep the scope tight. Remove gh comment tool if you don't want comments.
-# - Update the prompt sections (checks, formatting, tone) to match your review style.
-# - If you want sticky comments, change logic to maintain a single comment (see docs).
-# - If you prefer different output paths, change reports/ to your desired directory.
-#
 # SAFETY
 # - This workflow does not change code. It only writes a report file and can optionally post a comment.
 # - Automatic runs are limited to PRs from branches in this repo; fork PRs
 #   are skipped (no secrets there) and need a manual dispatch.
+# - A manual run on a fork PR hands that PR's text to an agent holding the API
+#   key and a token that can comment on PRs. Read the PR before dispatching.
 
 on:
   pull_request:
@@ -68,19 +62,14 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
 
       - name: Diff-aware PR Review with Plan
-        uses: anthropics/claude-code-action@v1
+        # Pinned to a commit: this step holds ANTHROPIC_API_KEY. Dependabot updates it.
+        uses: anthropics/claude-code-action@6b6870e649b5ff408753befeaee5fc7989d4e6a9 # v1.0.258
         env:
           GH_TOKEN: ${{ github.token }}
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          # Allow a bot actor through, so that another workflow can
-          # dispatch this one via `gh workflow run` (the actor is then
-          # github-actions[bot]). Harmless for manual dispatch.
-          allowed_bots: "github-actions"
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ env.PR_NUMBER }}
