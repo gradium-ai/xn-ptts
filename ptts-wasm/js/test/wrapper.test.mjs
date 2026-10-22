@@ -239,6 +239,17 @@ test('the rewrites check accepts exactly what the Rust Rules parser accepts', as
   );
 });
 
+test('every rule in the Rust RULES table is accepted', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const rust = await readFile(new URL('../../../ptts/src/preprocess/rewrite.rs', import.meta.url), 'utf8');
+  const names = [...rust.matchAll(/Rule \{ name: "([^"]+)"/g)].map((m) => m[1]);
+  assert.ok(names.length > 0, 'the RULES table was found');
+  for (const name of names) {
+    await PhononTTS.load({ lang: 'en', rewrites: name, model: MODEL, workerUrl: 'worker.js' });
+    assert.equal(FakeWorker.last.init.rewrites, name);
+  }
+});
+
 test('conditions are handed to the worker as NAME=VALUE, their shape checked first', async () => {
   FakeWorker.last = null;
   for (const conditions of [['padding_bonus=0.5'], 'padding_bonus=0.5', null, { padding_bonus: NaN }, { n: true }]) {
