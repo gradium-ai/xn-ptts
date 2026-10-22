@@ -10,7 +10,7 @@
 //! It also writes the ptts reference in the format `examples/dump.c` prints, to
 //! `target/expected.txt`, for `test.sh` to diff the C program's output against on each platform.
 //!
-//! The tokenizer defaults to the 7e71a02d checkpoint's; `PTTS_TOKENIZER` overrides it.
+//! The tokenizer is the `tokenizer.json` that `PTTS_TOKENIZER` names; any checkpoint's will do.
 
 use ptts::Tokenizer as _;
 use ptts::preprocess::{Lang, Normalize};
@@ -18,9 +18,6 @@ use ptts::tts_model::{MAX_TOKENS_PER_CHUNK, prepare_text_prompt, split_into_best
 use ptts_text::*;
 use std::ffi::{CStr, CString, c_char};
 use std::fmt::Write as _;
-
-const DEFAULT_TOKENIZER: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../../model/phonon-7e71a02d.200/tokenizer.json");
 
 #[derive(Debug, PartialEq)]
 struct Row {
@@ -33,7 +30,7 @@ struct Row {
 }
 
 fn tokenizer_path() -> String {
-    std::env::var("PTTS_TOKENIZER").unwrap_or_else(|_| DEFAULT_TOKENIZER.into())
+    std::env::var("PTTS_TOKENIZER").expect("set PTTS_TOKENIZER to a checkpoint's tokenizer.json")
 }
 
 fn inputs() -> Vec<String> {
