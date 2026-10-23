@@ -2,6 +2,7 @@ use crate::conv::{
     PadMode, StreamingConv1d, StreamingConv1dState, StreamingConvTr1dState,
     StreamingConvTranspose1d,
 };
+use crate::q8::Q8Linear;
 use xn::nn::var_builder::Path;
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
@@ -316,6 +317,22 @@ impl<T: WithDTypeF, B: Backend> SEANetDecoder<T, B> {
         )?;
 
         Ok(Self { init_conv, layers, final_conv })
+    }
+
+    /// The q8_0 weights of the two widest convolutions, the first conv and the first
+    /// upsampling, for [`Self::apply_q8`]. The later ones stay f32: they are narrow and run at
+    /// high sample rates, where the int8 matmul is no faster, and the last residual block's 1x1
+    /// conv adds audible noise when its input is quantized. CPU only.
+    pub(crate) fn prepare_q8(&self) -> Result<(Q8Linear, Option<Q8Linear>)> {
+        let upsample = self.layers.first().map(|l| l.upsample.convtr.prepare_q8()).transpose()?;
+        Ok((self.init_conv.conv.prepare_q8()?, upsample))
+    }
+
+    pub(crate) fn apply_q8(&mut self, (init, upsample): (Q8Linear, Option<Q8Linear>)) {
+        self.init_conv.conv.q8 = Some(init);
+        if let Some(layer) = self.layers.first_mut() {
+            layer.upsample.convtr.q8 = upsample;
+        }
     }
 
     pub fn init_state(&self, batch_size: usize) -> Result<SEANetDecoderState<T, B>> {

@@ -11,7 +11,7 @@ use crate::resample::{ConvDownsample1d, ConvTrUpsample1d};
 use crate::seanet::{SEANetDecoder, SEANetDecoderState, SEANetEncoder};
 use crate::transformer::{ProjectedTransformer, StreamingTransformerState};
 use xn::nn::var_builder::Path;
-use xn::{Backend, BackendQ, Result, Tensor, WithDTypeF};
+use xn::{Backend, BackendQ, Result, Tensor, Unquantized, WithDTypeF};
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MimiConfig {
@@ -133,6 +133,19 @@ impl<Q: BackendQ> MimiEncoder<Q> {
             Some(ds) => ds.forward_no_state(&emb),
             None => Ok(emb),
         }
+    }
+}
+
+impl<B: Backend> MimiDecoder<Unquantized<f32, B>> {
+    /// Run the decoder transformer and the two widest SEANet convolutions in q8_0; see
+    /// [`crate::tts_model::TTSModel::quantize_mimi`]. Every weight is quantized before any is
+    /// switched over, so on error the decoder is left as it was. CPU only.
+    pub fn quantize_q8(&mut self) -> Result<()> {
+        let transformer = self.decoder_transformer.transformer.prepare_q8()?;
+        let convs = self.decoder.prepare_q8()?;
+        self.decoder_transformer.transformer.apply_q8(transformer);
+        self.decoder.apply_q8(convs);
+        Ok(())
     }
 }
 
