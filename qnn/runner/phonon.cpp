@@ -79,7 +79,9 @@ Phonon::Phonon(const Options& o) : rng_(o.seed) {
   std::string library = o.text_library;
   if (library.empty()) {
     // The standalone CLI can load the text frontend from its supplied bundle.
-#if defined(__ANDROID__)
+#if defined(_WIN32)
+    const char* platform = "windows-arm64";
+#elif defined(__ANDROID__)
     const char* platform = "android-arm64";
 #else
     const char* platform = "linux-arm64";
@@ -103,7 +105,13 @@ Phonon::Phonon(const Options& o) : rng_(o.seed) {
   } else {
     throw std::runtime_error("unknown backend " + o.backend + " (htp, cpu or gpu)");
   }
-  model_ = std::make_unique<QnnModel>(lib(o, backend_lib), lib(o, "libQnnSystem.so"), files);
+#ifdef _WIN32
+  backend_lib = o.backend == "htp" ? "QnnHtp.dll" : o.backend == "cpu" ? "QnnCpu.dll" : "QnnGpu.dll";
+  const char* system_lib = "QnnSystem.dll";
+#else
+  const char* system_lib = "libQnnSystem.so";
+#endif
+  model_ = std::make_unique<QnnModel>(lib(o, backend_lib), lib(o, system_lib), files);
   alloc_buffers();
 }
 
