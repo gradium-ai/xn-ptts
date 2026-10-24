@@ -65,16 +65,25 @@ pub struct StreamingMultiheadAttention<Q: BackendQ> {
     out_proj: Q::LinearQ,
     pub embed_dim: usize,
     pub num_heads: usize,
+    /// Width of the queries and of the attention output, see [`Kind::FlowLm`].
+    pub attn_dim: usize,
+    pub num_kv_heads: usize,
     device: Q::B,
 }
 
 impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
-    pub fn load(vb: &Path<Q::B>, embed_dim: usize, num_heads: usize) -> Result<Self> {
-        let out_dim = 3 * embed_dim;
-        let in_proj = Q::linear_load(vb.pp("in_proj"), embed_dim, out_dim)?;
-        let out_proj = Q::linear_load(vb.pp("out_proj"), embed_dim, embed_dim)?;
+    pub fn load(
+        vb: &Path<Q::B>,
+        embed_dim: usize,
+        num_heads: usize,
+        attn_dim: usize,
+        num_kv_heads: usize,
+    ) -> Result<Self> {
+        let kv_dim = attn_dim / num_heads * num_kv_heads;
+        let in_proj = Q::linear_load(vb.pp("in_proj"), embed_dim, attn_dim + 2 * kv_dim)?;
+        let out_proj = Q::linear_load(vb.pp("out_proj"), attn_dim, embed_dim)?;
         let device = vb.device().clone();
-        Ok(Self { in_proj, out_proj, embed_dim, num_heads, device })
+        Ok(Self { in_proj, out_proj, embed_dim, num_heads, attn_dim, num_kv_heads, device })
     }
 
     pub fn init_state(
@@ -82,7 +91,7 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
         batch_size: usize,
         sequence_length: usize,
     ) -> Result<StreamingMHAState<Q::T, Q::B>> {
-        let dim_per_head = self.embed_dim / self.num_heads;
+        let dim_per_head = self.attn_dim / self.num_heads;
         let shape = (batch_size, sequence_length, self.num_heads, dim_per_head);
         let dev = &self.device;
         let k_cache = Tensor::zeros(shape, dev)?;
@@ -100,19 +109,25 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
     ) -> Result<Tensor<Q::T, Q::B>> {
         use xn::ModuleT;
         let (b, t, _) = query.dims3()?;
-        let d = self.embed_dim / self.num_heads;
+        let (h, kvh) = (self.num_heads, self.num_kv_heads);
+        let d = self.attn_dim / h;
         let projected = self.in_proj.forward(query)?;
         // Split into q, k, v by narrowing on the last dimension
-        let ed = self.embed_dim;
-        let q = projected.narrow(2, 0..ed)?.contiguous()?.reshape((b, t, self.num_heads, d))?;
-        let k =
-            projected.narrow(2, ed..2 * ed)?.contiguous()?.reshape((b, t, self.num_heads, d))?;
-        let v = projected.narrow(2, 2 * ed..3 * ed)?.contiguous()?.reshape((
-            b,
-            t,
-            self.num_heads,
-            d,
-        ))?;
+        let (ad, kd) = (self.attn_dim, kvh * d);
+        let q = projected.narrow(2, 0..ad)?.contiguous()?.reshape((b, t, h, d))?;
+        // Each k/v head serves h / kvh consecutive query heads (torch's `repeat_interleave`). The
+        // cache holds them repeated, so attention below sees as many k/v heads as query heads.
+        let heads = |x: Tensor<Q::T, Q::B>| {
+            if kvh == h {
+                return x.reshape((b, t, h, d));
+            }
+            x.reshape((b, t, kvh, 1, d))?
+                .broadcast_as((b, t, kvh, h / kvh, d))?
+                .contiguous()?
+                .reshape((b, t, h, d))
+        };
+        let k = heads(projected.narrow(2, ad..ad + kd)?.contiguous()?)?;
+        let v = heads(projected.narrow(2, ad + kd..ad + 2 * kd)?.contiguous()?)?;
 
         // Apply RoPE: q, k are [b, t, h, d]
         let (q, k) = rope.forward(&q, &k)?;
@@ -139,71 +154,75 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
             let x = attn.matmul(&v)?;
 
             // Back to [b, t, h*d]
-            x.transpose(1, 2)?.reshape((b, t, self.embed_dim))?.contiguous()?
+            x.transpose(1, 2)?.reshape((b, t, self.attn_dim))?.contiguous()?
         };
         self.out_proj.forward(&x)
     }
 }
 // ---- KV Cache ----
 
-/// Simple append-based KV cache with optional context window trimming.
+/// KV cache with a context window over a preallocated buffer: `append` writes the new
+/// positions in place and attention reads a narrowed view of the buffer, so a streaming step
+/// copies only its own keys/values. When the buffer is full, the retained window moves to the
+/// front of a fresh one, once every `cap - context - t` positions rather than every step.
+///
+/// A query attends to the `context` most recent positions, itself included (pocket-tts's
+/// `delta < context`): a step sees the min(seen, context - 1) positions kept by the previous
+/// step plus its own, in order (masked to each query's window when it has several), and keeps
+/// the last `context - 1` afterwards (`trim`).
 #[derive(Clone, Debug)]
 pub struct KvCache<T: WithDTypeF, B: Backend> {
+    /// [b, h, cap, d] buffers, allocated on the first append.
     k: Option<Tensor<T, B>>,
     v: Option<Tensor<T, B>>,
+    /// The retained positions are `start..end` of the buffers.
+    start: usize,
+    end: usize,
     context: usize,
     absolute_offset: usize,
 }
 
 impl<T: WithDTypeF, B: Backend> KvCache<T, B> {
     pub fn new(context: usize) -> Self {
-        Self { k: None, v: None, context, absolute_offset: 0 }
+        Self { k: None, v: None, start: 0, end: 0, context, absolute_offset: 0 }
     }
 
     pub fn current_seq_len(&self) -> Result<usize> {
-        let l = match &self.k {
-            Some(k) => k.dim(2)?, // k shape: [b, h, seq, d]
-            None => 0,
-        };
-        Ok(l)
+        Ok(self.end - self.start)
     }
 
-    /// Append new k, v (shape [b, h, t, d]) and return full (k, v).
-    /// Trims to context if exceeded.
+    /// Append new k, v (shape [b, h, t, d]) and return views of the retained plus new positions.
     pub fn append(
         &mut self,
         new_k: &Tensor<T, B>,
         new_v: &Tensor<T, B>,
-    ) -> Result<(Tensor<T, B>, Tensor<T, B>)> {
-        let (k, v) = match (&self.k, &self.v) {
-            (Some(prev_k), Some(prev_v)) => {
-                let k = Tensor::cat(&[prev_k, new_k], 2)?;
-                let v = Tensor::cat(&[prev_v, new_v], 2)?;
-                (k, v)
+    ) -> Result<(TensorView<T, B>, TensorView<T, B>)> {
+        let (b, h, t, d) = new_k.dims4()?;
+        let cap = self.k.as_ref().map_or(0, |k| k.dims()[2]);
+        if self.end + t > cap {
+            let keep = self.end - self.start;
+            let cap = 2 * (self.context.max(keep) + t);
+            let dev = new_k.device();
+            let (k, v) = (Tensor::zeros((b, h, cap, d), dev)?, Tensor::zeros((b, h, cap, d), dev)?);
+            if let (Some(old_k), Some(old_v)) = (&self.k, &self.v)
+                && keep > 0
+            {
+                k.slice_set(&old_k.narrow(2, self.start..self.end)?.contiguous()?, 2, 0)?;
+                v.slice_set(&old_v.narrow(2, self.start..self.end)?.contiguous()?, 2, 0)?;
             }
-            _ => (new_k.clone(), new_v.clone()),
-        };
-
-        let new_tokens = new_k.dim(2)?;
-        self.absolute_offset += new_tokens;
-        self.k = Some(k.clone());
-        self.v = Some(v.clone());
-        Ok((k, v))
+            (self.k, self.v, self.start, self.end) = (Some(k), Some(v), 0, keep);
+        }
+        let (k, v) = (self.k.as_ref().unwrap(), self.v.as_ref().unwrap());
+        k.slice_set(new_k, 2, self.end)?;
+        v.slice_set(new_v, 2, self.end)?;
+        self.end += t;
+        self.absolute_offset += t;
+        Ok((k.narrow(2, self.start..self.end)?, v.narrow(2, self.start..self.end)?))
     }
 
+    /// Keep only the last `context - 1` positions: with the next query, a window of `context`.
     pub fn trim(&mut self) -> Result<()> {
-        let (k, v) = match (&self.k, &self.v) {
-            (Some(k), Some(v)) => (k, v),
-            _ => return Ok(()),
-        };
-        let seq_len = k.dim(2)?;
-        if seq_len > self.context {
-            let trim = seq_len - self.context;
-            let k = k.narrow(2, trim..trim + self.context)?.contiguous()?;
-            let v = v.narrow(2, trim..trim + self.context)?.contiguous()?;
-            self.k = Some(k);
-            self.v = Some(v);
-        };
+        self.start = self.start.max(self.end.saturating_sub(self.context.saturating_sub(1)));
         Ok(())
     }
 }
@@ -301,19 +320,14 @@ impl<T: WithDTypeF, B: Backend> MimiStreamingMultiheadAttention<T, B> {
         let (b, t, _) = query.dims3()?;
         let d = self.embed_dim / self.num_heads;
 
-        let projected = self.in_proj.forward(query)?;
-        let packed = projected.reshape((b, t, 3, self.num_heads, d))?;
-        let q = packed.narrow(2, 0..1)?.contiguous()?.reshape((b, t, self.num_heads, d))?;
-        let k = packed.narrow(2, 1..2)?.contiguous()?.reshape((b, t, self.num_heads, d))?;
-        let v = packed.narrow(2, 2..3)?.contiguous()?.reshape((b, t, self.num_heads, d))?;
-
-        // RoPE on [b, t, h, d]
-        let (q, k) = rope.forward(&q, &k)?;
-
-        // To [b, h, t, d]
-        let q = q.transpose(1, 2)?.contiguous()?;
-        let k = k.transpose(1, 2)?.contiguous()?;
-        let v = v.transpose(1, 2)?.contiguous()?;
+        let h = self.num_heads;
+        let projected = self.in_proj.forward(query)?.reshape((b, t, 3 * h, d))?;
+        // q, k, v straight to [b, h, t, d], one strided copy each.
+        let bhtd =
+            |i: usize| projected.narrow(2, i * h..(i + 1) * h)?.transpose(1, 2)?.contiguous();
+        let q = rope.forward_bhtd(&bhtd(0)?)?;
+        let k = rope.forward_bhtd(&bhtd(1)?)?;
+        let v = bhtd(2)?;
 
         // KV cache with context trimming
         let (k, v) = state.append(&k, &v)?;
@@ -345,7 +359,13 @@ enum AttentionKind<Q: BackendQ> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Mimi,
-    FlowLm,
+    /// Queries and the attention output are `attn_dim` wide, and keys and values have
+    /// `num_kv_heads` heads, each shared by `num_heads / num_kv_heads` query heads (grouped-query
+    /// attention). `d_model` and `num_heads` give the usual attention.
+    FlowLm {
+        attn_dim: usize,
+        num_kv_heads: usize,
+    },
 }
 
 /// FFN activation. `erf` is the exact GELU; Pocket TTS uses `gelu(approximate="tanh")`.
@@ -393,11 +413,15 @@ impl<Q: BackendQ> StreamingTransformerLayer<Q> {
                 num_heads,
                 context.unwrap_or(250),
             )?),
-            Kind::FlowLm => AttentionKind::FlowLm(StreamingMultiheadAttention::load(
-                &vb.pp("self_attn"),
-                d_model,
-                num_heads,
-            )?),
+            Kind::FlowLm { attn_dim, num_kv_heads } => {
+                AttentionKind::FlowLm(StreamingMultiheadAttention::load(
+                    &vb.pp("self_attn"),
+                    d_model,
+                    num_heads,
+                    attn_dim,
+                    num_kv_heads,
+                )?)
+            }
         };
 
         let norm1 = LayerNorm::load(vb.pp("norm1"), d_model, 1e-5)?;
@@ -508,10 +532,20 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
         max_period: f32,
         kind: Kind,
     ) -> Result<Self> {
-        if num_heads == 0 || !d_model.is_multiple_of(num_heads) {
-            xn::bail!("the config's {num_heads} attention heads do not divide its width {d_model}")
+        let (attn_dim, num_kv_heads) = match kind {
+            Kind::Mimi => (d_model, num_heads),
+            Kind::FlowLm { attn_dim, num_kv_heads } => (attn_dim, num_kv_heads),
+        };
+        if num_heads == 0 || !attn_dim.is_multiple_of(num_heads) {
+            xn::bail!("the config's {num_heads} attention heads do not divide its width {attn_dim}")
         }
-        let head_dim = d_model / num_heads;
+        if num_kv_heads == 0 || !num_heads.is_multiple_of(num_kv_heads) {
+            xn::bail!(
+                "the config's {num_kv_heads} key/value heads do not divide its {num_heads} \
+                 attention heads"
+            )
+        }
+        let head_dim = attn_dim / num_heads;
         let mut layers = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             layers.push(StreamingTransformerLayer::load(
@@ -550,7 +584,7 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
         let (_, seq_len, _) = x.dims3()?;
         // At single-token decode every cached key is visible, so the causal mask is identically
         // zero: the FlowLm branch masks nothing at all, and the Mimi branch trims its cache to
-        // `context` before this point, which makes its window condition vacuous too. Building
+        // `context - 1` before this point, which makes its window condition vacuous too. Building
         // that mask means filling a Vec on the host, uploading it and adding it per layer, all
         // to add zero.
         let mask = if seq_len == 1 {
@@ -565,9 +599,8 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
                         .flat_map(|seq_idx| {
                             let seq_idx = seq_idx + kv_seq_len;
                             (0..kv_seq_len + seq_len).map(move |attn_idx| {
-                                if seq_idx.saturating_sub(context) <= attn_idx
-                                    && attn_idx <= seq_idx
-                                {
+                                // delta = seq_idx - attn_idx in 0..context
+                                if attn_idx <= seq_idx && seq_idx < attn_idx + context {
                                     Q::T::from_f32(0.0)
                                 } else {
                                     Q::T::from_f32(f32::NEG_INFINITY)
@@ -775,12 +808,77 @@ mod with_seq_budget_tests {
 }
 
 #[cfg(test)]
+mod grouped_query_tests {
+    use super::*;
+    use xn::CpuDevice;
+
+    type Q = xn::Unquantized<f32, CpuDevice>;
+
+    /// Grouped-query attention, here also wider than the model, is the usual attention with each
+    /// k/v head's projection rows repeated for the query heads that share it: same outputs over
+    /// a prompt and then single steps.
+    #[test]
+    fn grouped_query_attention_is_attention_with_repeated_kv_heads() -> Result<()> {
+        let (embed, h, kvh, d) = (6, 4, 2, 2);
+        let (attn, group) = (h * d, h / kvh);
+        let mut seed = 1u64;
+        let mut rand = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+                })
+                .collect()
+        };
+        let (q_w, k_w, v_w) = (rand(attn * embed), rand(kvh * d * embed), rand(kvh * d * embed));
+        let (o_w, x) = (rand(embed * attn), rand(5 * embed));
+        let repeat = |w: &[f32]| -> Vec<f32> {
+            (0..h)
+                .flat_map(|j| w[j / group * d * embed..(j / group + 1) * d * embed].to_vec())
+                .collect()
+        };
+        let attention = |num_kv_heads, k: Vec<f32>, v: Vec<f32>| -> Result<_> {
+            let in_w = [q_w.clone(), k, v].concat();
+            let rows = in_w.len() / embed;
+            Ok(StreamingMultiheadAttention::<Q> {
+                in_proj: Linear::new(Tensor::from_vec(in_w, (rows, embed), &CpuDevice)?),
+                out_proj: Linear::new(Tensor::from_vec(o_w.clone(), (embed, attn), &CpuDevice)?),
+                embed_dim: embed,
+                num_heads: h,
+                attn_dim: attn,
+                num_kv_heads,
+                device: CpuDevice,
+            })
+        };
+        let run = |m: StreamingMultiheadAttention<Q>| -> Result<Vec<f32>> {
+            let mut state = m.init_state(1, 8)?;
+            let mut out = Vec::new();
+            for (start, len) in [(0, 3), (3, 1), (4, 1)] {
+                let xs = x[start * embed..(start + len) * embed].to_vec();
+                let xs = Tensor::from_vec(xs, (1, len, embed), &CpuDevice)?;
+                let mask = (len > 1).then(|| state.materialize_causal_mask(len)).transpose()?;
+                let rope = RotaryEmbedding::new(d, start, len, 10_000., &CpuDevice)?;
+                out.extend(m.forward(&xs, &rope, &mut state, mask.as_ref())?.to_vec()?);
+            }
+            Ok(out)
+        };
+        let grouped = run(attention(kvh, k_w.clone(), v_w.clone())?)?;
+        let full = run(attention(h, repeat(&k_w), repeat(&v_w))?)?;
+        assert_eq!(grouped.len(), 5 * embed);
+        for (a, b) in grouped.iter().zip(&full) {
+            assert!((a - b).abs() < 1e-6, "{grouped:?}\n{full:?}");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod bad_config_tests {
     use super::*;
     use xn::CpuDevice;
     use xn::nn::VB;
 
-    fn load(d_model: usize, num_heads: usize) -> Result<()> {
+    fn load(d_model: usize, num_heads: usize, num_kv_heads: usize) -> Result<()> {
         // An empty safetensors file: the check runs before any weight is read.
         let empty = [2u64.to_le_bytes().as_slice(), b"{}"].concat();
         let vb = VB::from_bytes(vec![empty], CpuDevice)?.root();
@@ -793,7 +891,7 @@ mod bad_config_tests {
             4,
             None,
             10_000.,
-            Kind::FlowLm,
+            Kind::FlowLm { attn_dim: d_model, num_kv_heads },
         )
         .map(drop)
     }
@@ -801,8 +899,62 @@ mod bad_config_tests {
     #[test]
     fn heads_that_do_not_divide_the_width_are_an_error() {
         for heads in [0, 3] {
-            let err = load(8, heads).err().unwrap_or_else(|| panic!("{heads} heads for 8 wide"));
+            let err = load(8, heads, 1).err().unwrap_or_else(|| panic!("{heads} heads for 8 wide"));
             assert!(err.to_string().contains("heads"), "{err}");
         }
+    }
+
+    #[test]
+    fn kv_heads_that_do_not_divide_the_heads_are_an_error() {
+        for kv_heads in [0, 3] {
+            let err = load(8, 4, kv_heads).err().unwrap_or_else(|| panic!("{kv_heads} kv heads"));
+            assert!(err.to_string().contains("key/value heads"), "{err}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KvCache;
+    use xn::{CpuDevice, Tensor};
+
+    /// The preallocated cache returns exactly a cat-then-trim-to-(context - 1) cache's keys/values,
+    /// over a stream several times longer than the context, with uneven step sizes.
+    #[test]
+    fn kv_cache_matches_cat_trim() -> xn::Result<()> {
+        let (h, d, context) = (3, 4, 50);
+        let mut cache = KvCache::<f32, CpuDevice>::new(context);
+        let mut reference: Option<(Tensor<f32, CpuDevice>, Tensor<f32, CpuDevice>)> = None;
+        let mut seed = 0usize;
+        for step in 0..200 {
+            let t = [1, 16, 3, 2][step % 4];
+            let mut rand = |n: usize| -> Vec<f32> {
+                (0..n)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(6364136223).wrapping_add(1442695);
+                        (seed >> 40) as f32
+                    })
+                    .collect()
+            };
+            let k = Tensor::from_vec(rand(h * t * d), (1, h, t, d), &xn::CPU)?;
+            let v = Tensor::from_vec(rand(h * t * d), (1, h, t, d), &xn::CPU)?;
+            let (rk, rv) = match &reference {
+                Some((pk, pv)) => (Tensor::cat(&[pk, &k], 2)?, Tensor::cat(&[pv, &v], 2)?),
+                None => (k.clone(), v.clone()),
+            };
+            assert_eq!(cache.current_seq_len()?, rk.dim(2)? - t);
+            let (ck, cv) = cache.append(&k, &v)?;
+            assert_eq!(ck.contiguous()?.to_vec()?, rk.to_vec()?, "k at step {step}");
+            assert_eq!(cv.contiguous()?.to_vec()?, rv.to_vec()?, "v at step {step}");
+            cache.trim()?;
+            let n = rk.dim(2)?;
+            let keep = n.min(context - 1);
+            reference = Some((
+                rk.narrow(2, n - keep..n)?.contiguous()?,
+                rv.narrow(2, n - keep..n)?.contiguous()?,
+            ));
+        }
+        assert_eq!(cache.absolute_offset, 200 / 4 * 22);
+        Ok(())
     }
 }

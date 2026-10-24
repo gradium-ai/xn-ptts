@@ -199,6 +199,15 @@ Prefix sinks: `prefix_sinks` in `config.json` lists the `speaker_wavs` and
 `sink_dropped` one when they are empty (`dropped_token`). A checkpoint with sinks must set
 `cfg_null_audio_empty: true`.
 
+Smaller Pocket TTS checkpoints use optional `flow_lm` keys: `flow_type` (`lsd`, the default;
+`drifting`, whose one flow-net evaluation is the latent; `pointwise`, noise plus that
+evaluation; the last two take no time conditions), `z_dim` (a `z_proj` in front of the flow net
+and the EOS head), and `attn_dim` / `num_kv_heads` (attention width and grouped-query k/v heads,
+repeated to `num_heads` in the KV cache). A low-rank text table is `lut_dim` wide with a
+`conditioner.output_proj`. Their small Mimi decoder is `mimi`, and the released encoder that
+clones voices is `speaker_mimi` with `prefix: "mimi"` and `inner_dim`, the width of its latents.
+The Core ML export supports none of these.
+
 ## Conventions to be aware of
 
 - `target-cpu=native` is on by default for host builds and `apple-m1` on the macOS CI release lane; do not assume binaries are portable.
