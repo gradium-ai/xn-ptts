@@ -68,6 +68,18 @@ def test_the_stubs_cover_everything_the_extension_exports():
     assert not missing, f"exported but not in the stubs: {sorted(missing)}"
 
 
+def test_the_stubs_all_matches_the_package_all():
+    # Type checkers read `__all__` from the stub, not from `__init__.py`.
+    tree = ast.parse((Path(ptts.__file__).parent / "__init__.pyi").read_text())
+    (stub_all,) = [
+        ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "__all__" for t in node.targets)
+    ]
+    assert sorted(stub_all) == sorted(ptts.__all__)
+
+
 def _stub_parameters(fn: ast.FunctionDef) -> list[tuple[str, str, object]]:
     args = fn.args
     positional = args.posonlyargs + args.args
