@@ -23,7 +23,6 @@ numpy = "0.28"
 # matrix of platforms times interpreters -- and a new CPython release needing a rebuild
 # before anyone on it can install at all.
 pyo3 = { version = "0.28", features = ["extension-module", "abi3-py39"] }
-serde_json = { workspace = true }
 
 [features]
 default = []
