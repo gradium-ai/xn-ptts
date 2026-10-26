@@ -197,10 +197,13 @@ impl<T: WithDTypeF, B: Backend> KvCache<T, B> {
             _ => return Ok(()),
         };
         let seq_len = k.dim(2)?;
-        if seq_len > self.context {
-            let trim = seq_len - self.context;
-            let k = k.narrow(2, trim..trim + self.context)?.contiguous()?;
-            let v = v.narrow(2, trim..trim + self.context)?.contiguous()?;
+        // Keep `context - 1` positions: with the next query, a window of `context` (pocket-tts's
+        // `delta < context`).
+        let keep = self.context.saturating_sub(1);
+        if seq_len > keep {
+            let trim = seq_len - keep;
+            let k = k.narrow(2, trim..trim + keep)?.contiguous()?;
+            let v = v.narrow(2, trim..trim + keep)?.contiguous()?;
             self.k = Some(k);
             self.v = Some(v);
         };
@@ -550,7 +553,7 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
         let (_, seq_len, _) = x.dims3()?;
         // At single-token decode every cached key is visible, so the causal mask is identically
         // zero: the FlowLm branch masks nothing at all, and the Mimi branch trims its cache to
-        // `context` before this point, which makes its window condition vacuous too. Building
+        // `context - 1` before this point, which makes its window condition vacuous too. Building
         // that mask means filling a Vec on the host, uploading it and adding it per layer, all
         // to add zero.
         let mask = if seq_len == 1 {
@@ -565,9 +568,8 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
                         .flat_map(|seq_idx| {
                             let seq_idx = seq_idx + kv_seq_len;
                             (0..kv_seq_len + seq_len).map(move |attn_idx| {
-                                if seq_idx.saturating_sub(context) <= attn_idx
-                                    && attn_idx <= seq_idx
-                                {
+                                // delta = seq_idx - attn_idx in 0..context
+                                if attn_idx <= seq_idx && seq_idx < attn_idx + context {
                                     Q::T::from_f32(0.0)
                                 } else {
                                     Q::T::from_f32(f32::NEG_INFINITY)
