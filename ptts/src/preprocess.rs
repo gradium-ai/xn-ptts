@@ -960,8 +960,8 @@ mod tests {
     #[test]
     fn symbols_are_spelled_after_the_rules() {
         let cases = [
-            ("Write to laurent.mazare@gmail.com!", "Write to laurent dot mazare at gmail dot com!"),
-            ("Mail (laurent+tag@gmail.com)", "Mail, laurent plus tag at gmail dot com,"),
+            ("Write to jane.smith@gmail.com!", "Write to jane dot smith at gmail dot com!"),
+            ("Mail (jane+tag@gmail.com)", "Mail, jane plus tag at gmail dot com,"),
             ("user@host @home", "user at host at home"),
             ("a@.", "a at."),
             ("x @, y", "x at, y"),

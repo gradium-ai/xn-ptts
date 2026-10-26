@@ -7,13 +7,13 @@
 #    natively, and on Linux arm64 inside the ubuntu:20.04 runner image.
 # 3. The Android library must need only system libraries.
 #
-# PTTS_TOKENIZER is the checkpoint's tokenizer.json (default: model/phonon-7e71a02d.200/ at the
-# repository root). RUNNER_IMAGE is the Linux image (default: phonon-runner, built with
+# PTTS_TOKENIZER, required, is a checkpoint's tokenizer.json. RUNNER_IMAGE is the Linux image
+# (default: phonon-runner, built with
 # `docker build -f ../runner/Dockerfile.linux -t phonon-runner ../runner`).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-TOK="${PTTS_TOKENIZER:-$HERE/../../model/phonon-7e71a02d.200/tokenizer.json}"
+TOK="${PTTS_TOKENIZER:?set PTTS_TOKENIZER to the tokenizer.json of a checkpoint}"
 RUNNER_IMAGE="${RUNNER_IMAGE:-phonon-runner}"
 NDK="${ANDROID_NDK_HOME:-/opt/homebrew/share/android-ndk}"
 export PTTS_TOKENIZER="$TOK"
