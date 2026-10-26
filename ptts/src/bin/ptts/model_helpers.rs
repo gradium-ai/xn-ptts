@@ -4,9 +4,7 @@
 #![allow(dead_code, unused_imports)]
 
 pub use ptts::checkpoint::{Checkpoint, DEFAULT_MODEL, ResolveOptions};
-pub use ptts::loader::{is_unused_by_tts_model, load_voice_emb, load_weights, remap_key};
-#[cfg(feature = "hf")]
-pub use ptts::tok::Tok;
+pub use ptts::loader::{is_unused_by_tts_model, load_voice_emb, load_weights};
 
 /// Default tracing directives. `RUST_LOG` overrides these.
 pub const LOG_DIRECTIVES: &str =

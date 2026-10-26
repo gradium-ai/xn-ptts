@@ -83,8 +83,4 @@ impl Weights {
     pub fn data(&self, name: &str) -> Result<&[f32], String> {
         Ok(self.get(name)?.1)
     }
-
-    pub fn names(&self) -> Vec<String> {
-        self.tensors.keys().cloned().collect()
-    }
 }

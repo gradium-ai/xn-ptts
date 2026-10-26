@@ -21,10 +21,16 @@ pub enum BlobDType {
 
 const ALIGN: usize = 64;
 
-#[derive(Default)]
 pub struct BlobWriter {
     buf: Vec<u8>,
     count: u32,
+}
+
+impl Default for BlobWriter {
+    // Not derived: an empty buffer lacks the header `finish` writes into.
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BlobWriter {
