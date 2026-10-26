@@ -2,6 +2,7 @@
 name = "ptts-openai-server"
 version.workspace = true
 edition = "2024"
+publish = false
 description.workspace = true
 repository.workspace = true
 keywords.workspace = true
