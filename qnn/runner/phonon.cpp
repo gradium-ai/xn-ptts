@@ -38,6 +38,15 @@ std::string lib(const Options& o, const std::string& name) {
   return o.lib_dir.empty() ? name : o.lib_dir + "/" + name;
 }
 
+// One of QNN's runtime libraries: libQnnHtp.so for "QnnHtp", or QnnHtp.dll on Windows.
+std::string qnn_lib(const Options& o, const std::string& name) {
+#ifdef _WIN32
+  return lib(o, name + ".dll");
+#else
+  return lib(o, "lib" + name + ".so");
+#endif
+}
+
 }  // namespace
 
 Phonon::Phonon(const Options& o) : rng_(o.seed) {
@@ -95,15 +104,15 @@ Phonon::Phonon(const Options& o) : rng_(o.seed) {
   std::vector<std::pair<std::string, std::string>> files;
   std::string backend_lib;
   if (o.backend == "htp") {
-    backend_lib = "libQnnHtp.so";
+    backend_lib = "QnnHtp";
     files.push_back({"", dir + std::string(select_context_binary(rt.at("context_binaries"), o.soc_model))});
   } else if (o.backend == "cpu" || o.backend == "gpu") {
-    backend_lib = o.backend == "cpu" ? "libQnnCpu.so" : "libQnnGpu.so";
+    backend_lib = o.backend == "cpu" ? "QnnCpu" : "QnnGpu";
     for (const auto& [graph, file] : rt.at("dlcs").items()) files.push_back({graph, dir + std::string(file)});
   } else {
     throw std::runtime_error("unknown backend " + o.backend + " (htp, cpu or gpu)");
   }
-  model_ = std::make_unique<QnnModel>(lib(o, backend_lib), lib(o, "libQnnSystem.so"), files);
+  model_ = std::make_unique<QnnModel>(qnn_lib(o, backend_lib), qnn_lib(o, "QnnSystem"), files);
   alloc_buffers();
 }
 
