@@ -17,7 +17,7 @@ jobs:
           audio-deps: 'false'
       - name: Rust text frontend and lockfile
         run: cargo check --manifest-path qnn/text-ffi/Cargo.toml --locked
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '21'
