@@ -31,7 +31,7 @@ if (Object.keys(weights).length === 0) {
   process.exit(1);
 }
 
-// Both voice layouts are in circulation, as in the Rust examples' `Checkpoint::from_dir`.
+// Both voice layouts are in circulation, as in `VOICE_DIRS` in `ptts/src/loader.rs`.
 const voices = {};
 for (const sub of ['voices', 'embeddings']) {
   if (!existsSync(join(dir, sub))) continue;

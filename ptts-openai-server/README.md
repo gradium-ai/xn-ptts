@@ -89,7 +89,7 @@ Errors use OpenAI's shape, `{"error": {"message", "type", "param", "code"}}`, so
 
 ## OpenAI clients
 
-Some clients only offer OpenAI's own voice names, such as `alloy` or `nova`, and some always send a `speed`. By default the server rejects both, so a mistake is not hidden. Two settings make such clients work, and both are off unless set:
+Some clients only offer OpenAI's own voice names, such as `alloy` or `nova`, and some always send a `speed`. By default the server rejects both, so a mistake is not hidden. Three settings make such clients work, and all are off unless set:
 
 - `--openai-voices VOICE` (`PTTS_OPENAI_VOICES`) accepts every OpenAI voice name as `VOICE`, a voice of this server or `default`. A checkpoint voice with the same name as an OpenAI voice keeps its own name.
 - `--voice-alias ALIAS=VOICE` (`PTTS_VOICE_ALIAS`, comma-separated) adds one name; repeatable. It wins over `--openai-voices` for the same name. An alias cannot be the name of a voice, and a voice it names must exist, or the server does not start.

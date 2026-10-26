@@ -1,8 +1,8 @@
 .PHONY: build profiling demo serve test clean check-wasm-opt check-cargo-about check-model-dir check-threads-toolchain threads-toolchain
 
 WASM_PACK_ARGS = --target web --no-pack --out-dir pkg/wasm --out-name phonon_tts
-# Both builds can run on the GPU: the package uses WebGPU when the browser has it, and the
-# CPU, on one thread or several, when it does not.
+# Both builds can run on the GPU: the package uses WebGPU when asked to, and otherwise the CPU,
+# on one thread or several.
 FEATURES = webgpu
 
 # The threaded build, in pkg/wasm-threads/. Wasm threads share memory, which needs std itself
