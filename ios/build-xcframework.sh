@@ -11,6 +11,13 @@ TARGETS=(aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin aarch64-ap
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 PROFILE=release
 
+# Each target's default CPU, as in CI. .cargo/config.toml asks for target-cpu=native, the build
+# machine's CPU, and xn picks its kernels at compile time, so a framework built on a recent Mac
+# could use instructions older iPhones lack. An empty RUSTFLAGS takes precedence over that file
+# (an empty CARGO_TARGET_<triple>_RUSTFLAGS does not); CARGO_ENCODED_RUSTFLAGS would win over both.
+export RUSTFLAGS=""
+unset CARGO_ENCODED_RUSTFLAGS
+
 rustup target add "${TARGETS[@]}" >/dev/null
 for t in "${TARGETS[@]}"; do
   echo "building $t"
