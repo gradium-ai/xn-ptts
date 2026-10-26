@@ -468,8 +468,6 @@ impl<Q: BackendQ> SynthOf<Q> {
         Ok((state, cfg_state))
     }
 
-    /// Run the voice prompt, and with guidance on the null branch, into states just large
-    /// enough to hold them.
     fn check_no_baked_voices(&self) -> Result<()> {
         if self.cfg.voices.is_empty() {
             Ok(())
@@ -486,6 +484,8 @@ impl<Q: BackendQ> SynthOf<Q> {
         Ok(state)
     }
 
+    /// Run the voice prompt, and with guidance on the null branch, into states just large
+    /// enough to hold them.
     fn prime(&self, voice: &Voice<Q>, cfg_on: bool, frames: usize) -> Result<Primed<Q>> {
         let conditions = voice.conditions.clone().or_else(|| self.conditions.clone());
         let mut state = self.model.init_flow_lm_state(1, frames)?;

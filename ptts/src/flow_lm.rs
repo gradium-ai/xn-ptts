@@ -122,7 +122,7 @@ pub struct FlowLMConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gelu: Option<crate::transformer::Gelu>,
     /// The flow net's time-embedding RMS norm, see [`TimeRmsNorm`]: `rms_var` (the default) for
-    /// pocket-tts checkpoints, `rms` for audiocraft (audium, phonon) ones.
+    /// pocket-tts checkpoints, `rms` for audiocraft (phonon) ones.
     #[serde(default)]
     pub time_rms_norm: TimeRmsNorm,
 }

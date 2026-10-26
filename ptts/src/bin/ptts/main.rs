@@ -6,7 +6,7 @@
 //!
 //! Everything between the text and the WAV file is [`ptts::synth::Synth`]; what
 //! is left here is argument parsing, locating the published checkpoint (see
-//! `model_helpers`), audio file decoding for `--voice <file>`, and the timing
+//! `ptts::checkpoint`), audio file decoding for `--voice <file>`, and the timing
 //! report.
 
 mod model_helpers;

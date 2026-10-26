@@ -276,11 +276,7 @@ mod limiter {
                     self.gain = target + self.release_coef * (self.gain - target);
                 }
 
-                let y = delayed * self.gain;
-                // Soft clip: tanh-shaped saturation that approaches ±ceiling
-                // asymptotically. Unity small-signal gain (tanh'(0) = 1), so
-                // material well under the ceiling is untouched.
-                *sample = y;
+                *sample = delayed * self.gain;
             }
         }
 

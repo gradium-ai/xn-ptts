@@ -13,9 +13,6 @@ use ptts::voice_catalog::{DEFAULT_VOICE_CATALOG, VoiceCatalog};
 use std::sync::Arc;
 
 /// The loaded model and the request defaults, shared by every connection.
-///
-/// `Synth` erases the weight format, so this is one struct rather than the
-/// fourteen-variant enum the handlers used to match on.
 #[derive(Clone)]
 pub struct AppState(Arc<Inner>);
 

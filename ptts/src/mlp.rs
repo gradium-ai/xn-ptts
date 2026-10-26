@@ -16,8 +16,8 @@ fn modulate<T: WithDTypeF, B: Backend>(
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TimeRmsNorm {
-    /// `x * a / sqrt(mean(x^2) + eps)`, uncentred, as audiocraft (audium, every phonon model)
-    /// computes it. Phonon exports set it in their config.
+    /// `x * a / sqrt(mean(x^2) + eps)`, uncentred, as audiocraft (every phonon model) computes
+    /// it. Phonon exports set it in their config.
     Rms,
     /// `x * a / sqrt(var(x) + eps)`, the variance centred and unbiased, as pocket-tts computes it
     /// (`torch.var`). The default, so pocket-tts checkpoints load unchanged. Before the choice
@@ -197,8 +197,7 @@ impl<T: WithDTypeF, B: Backend> SimpleMLPAdaLN<T, B> {
 
     /// Forward pass.
     /// c: conditioning from AR transformer
-    /// s: start time tensor
-    /// t: target time tensor
+    /// ts: one time tensor per time embedding, e.g. the start and target times
     /// x: input tensor [N, C]
     #[tracing::instrument(name = "mlp-adaln", skip_all)]
     pub fn forward(

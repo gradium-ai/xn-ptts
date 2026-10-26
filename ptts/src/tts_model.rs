@@ -519,7 +519,8 @@ pub fn split_into_best_sentences(
     Ok(chunks)
 }
 
-/// Prepare text for generation: capitalize, add punctuation, pad short text.
+/// Prepare text for generation: collapse whitespace, capitalize and end with punctuation. Also
+/// returns how many frames to generate after end of speech, more for short text.
 pub fn prepare_text_prompt(text: &str) -> (String, usize) {
     let text = text.trim().to_string();
     if text.is_empty() {
@@ -574,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn prefix_sinks_read_audium_conditioner_names() {
+    fn prefix_sinks_read_phonon_conditioner_names() {
         let mut json = serde_json::to_value(crate::test_config()).unwrap();
         assert!(json.get("prefix_sinks").is_none(), "no sinks, no key");
         json["prefix_sinks"] = serde_json::json!({
@@ -625,13 +626,13 @@ mod tests {
         assert_eq!(pocket.default_gelu(), Gelu::Tanh);
         assert_eq!(pocket.mimi_with_gelu(&pocket.mimi).gelu, Some(Gelu::Tanh));
 
-        // An audium export without the key (written before it existed) was trained with erf.
+        // A phonon export without the key (written before it existed) was trained with erf.
         let mut json = serde_json::to_value(crate::test_config()).unwrap();
         let id = serde_json::json!({"sig": "78217628", "epoch": 200});
         json.as_object_mut().unwrap().insert("model_id".into(), id);
-        let audium: TTSConfig = serde_json::from_value(json.clone()).unwrap();
-        assert_eq!(audium.default_gelu(), Gelu::Erf);
-        assert_eq!(audium.mimi_with_gelu(&audium.mimi).gelu, Some(Gelu::Erf));
+        let phonon: TTSConfig = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(phonon.default_gelu(), Gelu::Erf);
+        assert_eq!(phonon.mimi_with_gelu(&phonon.mimi).gelu, Some(Gelu::Erf));
 
         // A key in the config wins either way, and round-trips.
         json["flow_lm"]["gelu"] = serde_json::json!("tanh");

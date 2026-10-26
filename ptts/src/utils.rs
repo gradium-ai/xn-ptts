@@ -4,14 +4,12 @@
 use xn::Result;
 
 /// Target loudness (in dB LUFS) used when normalizing voice-embedding input.
-/// Mirrors `loudness_headroom_db` in `compute-engine/worker/src/voice.py`.
 pub const LOUDNESS_HEADROOM_DB: f64 = 18.0;
 /// RMS level below which the signal is considered too quiet to rescale.
 pub const LOUDNESS_ENERGY_FLOOR: f32 = 2e-3;
 
 /// Normalize `pcm` to a target loudness (in dB LUFS) following ITU-R BS.1770-4.
 ///
-/// This mirrors `normalize_loudness` in `compute-engine/worker/src/voice.py`.
 /// The signal is first centered (DC removed), then skipped entirely if its RMS
 /// is below [`LOUDNESS_ENERGY_FLOOR`], otherwise rescaled so that its
 /// integrated loudness equals `-LOUDNESS_HEADROOM_DB` LUFS.
