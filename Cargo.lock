@@ -2811,7 +2811,7 @@ dependencies = [
 
 [[package]]
 name = "ptts"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2838,7 +2838,7 @@ dependencies = [
 
 [[package]]
 name = "ptts-coreml"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "block2",
  "half",
@@ -2858,7 +2858,7 @@ dependencies = [
 
 [[package]]
 name = "ptts-ffi"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "ptts",
  "ptts-coreml",
@@ -2867,7 +2867,7 @@ dependencies = [
 
 [[package]]
 name = "ptts-openai-server"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2886,7 +2886,7 @@ dependencies = [
 
 [[package]]
 name = "ptts-pyo3"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "numpy",
  "ptts",
@@ -2896,7 +2896,7 @@ dependencies = [
 
 [[package]]
 name = "ptts-wasm"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "futures-util",
  "getrandom 0.3.4",
@@ -2912,7 +2912,7 @@ dependencies = [
 
 [[package]]
 name = "ptts-ws-server"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
