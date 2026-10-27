@@ -14,7 +14,10 @@ export { encodeWav, concatPcm } from './wav.js';
 
 const LANGS = ['en', 'fr', 'de', 'es', 'pt', 'none'];
 /** Rewrite rules the Rust side knows, beyond the whole-string values below. */
-const RULES = ['numbers', 'currency', 'dashed-digits', 'emails', 'urls', 'phones', 'times', 'dates'];
+const RULES = [
+  'numbers', 'currency', 'dashed-digits', 'emails', 'urls', 'abbreviations', 'elongations',
+  'phones', 'times', 'dates',
+];
 /** Values `Rules`'s `FromStr` accepts only as the entire string, never inside a list. */
 const WHOLE_RULES = ['default', 'all', 'none', 'off'];
 
