@@ -16,7 +16,7 @@ import torch
 from tokenizers import Tokenizer
 
 from host import frame_budget, noise_source, prepare_text_prompt, run, voice_cache
-from load import CHECKPOINT, load, voice_embedding, voice_latents
+from load import CHECKPOINT, load, voice_embedding
 import reference
 
 TEXT = "Hello world. I am Phonon, running on a Snapdragon."
@@ -56,7 +56,7 @@ def main():
     args = ap.parse_args()
 
     ph = load(io_half=args.half, overlap_add=args.overlap_add)
-    emb = voice_embedding(ph.weights, voice_latents(args.voice))
+    emb = voice_embedding(ph.weights, args.voice)
     tokens, frames_after_eos = tokenize(args.text)
     frames = args.frames or frame_budget(tokens.shape[1], ph.dims.frame_rate)
     nxt = noise_source(ph.dims.ldim, seed=args.seed)

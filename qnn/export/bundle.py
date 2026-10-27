@@ -36,7 +36,7 @@ import qai_hub as hub
 import torch
 
 from host import CACHE, PREFILL, TEMPERATURE, voice_cache
-from load import CHECKPOINT, VOICES, load, voice_embedding, voice_latents
+from load import CHECKPOINT, VOICES, load, voice_embedding
 
 TEXT_FFI = Path(__file__).resolve().parent.parent / "text-ffi/dist"  # qnn/text-ffi/build.sh
 LANGUAGE_NAMES = {"en": "English", "fr": "French", "de": "German", "es": "Spanish", "pt": "Portuguese"}
@@ -96,10 +96,12 @@ def main():
             if line.strip():
                 row = json.loads(line)
                 catalog[row["name"]] = row
-    names = sorted({p.stem for p in VOICES.glob("*.safetensors")} | {"default"})
+    names = {p.stem for p in VOICES.glob("*.safetensors")}
+    if (CHECKPOINT / "default-voice.safetensors").exists():
+        names.add("default")
     voices = []
-    for name in names:
-        emb = voice_embedding(phonon.weights, voice_latents(name))
+    for name in sorted(names):
+        emb = voice_embedding(phonon.weights, name)
         kv, n = voice_cache(phonon, emb, torch.float16)
         np.ascontiguousarray(kv[:, :, :n].numpy()).tofile(out / "voices" / f"{name}.bin")
         row = catalog.get(name, {})
@@ -153,7 +155,7 @@ def main():
             "conditions": {**conditions, "note": "baked into step as a per-frame bias"},
             "layout": {"kv_cache": "[2 * layers, heads, slots, head_dim]; layer l keys at 2l, values at 2l + 1",
                        "layers": fl["num_layers"], "heads": fl["num_heads"],
-                       "head_dim": fl["d_model"] // fl["num_heads"]},
+                       "head_dim": phonon.dims.head_dim},
         },
         "text": {
             "frontend": "ptts_text",

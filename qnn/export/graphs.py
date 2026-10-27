@@ -1,4 +1,4 @@
-"""Fixed-shape, stateless graphs over Phonon, for AI Hub.
+"""Fixed-shape, stateless graphs over Phonon (and Pocket TTS's smaller checkpoints), for AI Hub.
 
 The same design as the pocket-tts export this was first built for:
 
@@ -17,24 +17,32 @@ the attention scores unchanged; the cached keys are in that order.
 
 What differs from pocket-tts, all read off `xn-ptts/ptts/src`:
 
-- The weights are read straight from the checkpoint, no pocket-tts modules.
-- GELU is the exact (erf) one in the flow LM (F.gelu), and in Mimi the config's
-  (`gelu_approximate`). QAIRT converts F.gelu to QNN's Gelu op whatever
-  `approximate` says (and rejects torch.erf); on the S25 HTP that op is within
-  1.5e-4 of the exact GELU, fp16 level (diag_gelu.py), so it needs no rewrite.
+- The weights are read straight from the checkpoint, no pocket-tts modules,
+  under the names `ptts` gives them (`loader::remap_key`).
+- GELU is the config's, in each transformer (`gelu_approximate`). QAIRT converts
+  F.gelu to QNN's Gelu op whatever `approximate` says (and rejects torch.erf); on
+  the S25 HTP that op is within 1.5e-4 of the exact GELU, fp16 level
+  (diag_gelu.py), so it needs no rewrite.
 - The flow LM transformer has no layer scale; Mimi's has.
 - Every generated frame's input gets a constant bias: the summed conditioners
   (`num_speakers`, a lut, at its default "1"). Text and voice positions do not.
-- The voice prompt is `speaker_wavs` latents through `speaker_wavs.output_proj`.
+- The voice prompt is a voice file's `emb`, or its `speaker_wavs` latents
+  through the speaker projection (`loader::load_voice_emb`).
 - The flow net's time conditioning is a constant for a fixed number of LSD steps,
   so it is computed once at load (no sin/cos in the graph). `flow.w_s_t` is not
   used: `ptts` drops it on load (`loader::remap_key`), and its LSD decode feeds
-  s and t straight to the two time embedders.
+  s and t straight to the two time embedders. The one-step flow types
+  (`drifting`, `pointwise`) have no time conditioning.
+- The optional `flow_lm` keys of the smaller checkpoints: `z_dim` (a `z_proj`
+  after `out_norm`, which the EOS head and the flow net read), `attn_dim` and
+  `num_kv_heads` (grouped-query attention; the k/v heads are repeated to
+  `num_heads` at load, so the KV cache holds `num_heads` heads, as in `ptts`),
+  and a low-rank text table, projected to `d_model` at load.
 - Mimi's attention window: query i sees the cached slots after i, plus the new
   keys up to itself, so w keys (the Rust mask allows
   `key <= seq_idx < key + context`, pocket-tts's `delta < context`). The cache
   keeps w slots, so its oldest slot is never read.
-- The EOS logit is compared against a positive threshold (4.0) on the host.
+- The EOS logit is compared against the config's `eos_threshold` on the host.
 """
 
 import math
@@ -132,13 +140,18 @@ class Layer(nn.Module):
         self.gelu = gelu
         w = W[f"{prefix}.self_attn.in_proj.weight"]
         e = w.shape[1]
-        self.h, self.d = heads, e // heads
-        w = w.clone().view(3, self.h, self.d, e)
+        a = W[f"{prefix}.self_attn.out_proj.weight"].shape[1]  # attn_dim: queries and attention output
+        self.h, self.d = heads, a // heads
+        # Each k/v head serves h / kv_heads consecutive query heads (torch's `repeat_interleave`):
+        # they are repeated to h heads here, the layout ptts's KV cache holds them in.
+        q, k, v = w.split([a, (w.shape[0] - a) // 2, (w.shape[0] - a) // 2])
+        k, v = (t.view(-1, self.d, e).repeat_interleave(a // t.shape[0], 0) for t in (k, v))
+        w = torch.stack([q.view(self.h, self.d, e), k, v])
         perm = head_perm(self.d)
         w[0] = w[0][:, perm]
         w[1] = w[1][:, perm]
-        self.in_proj = nn.Linear(e, 3 * e, bias=False)
-        self.in_proj.weight.data = w.reshape(3 * e, e)
+        self.in_proj = nn.Linear(e, 3 * a, bias=False)
+        self.in_proj.weight.data = w.reshape(3 * a, e)
         self.out_proj = linear(W, f"{prefix}.self_attn.out_proj", bias=False)
         self.norm1 = layer_norm(W, f"{prefix}.norm1", 1e-5)
         self.norm2 = layer_norm(W, f"{prefix}.norm2", 1e-5)
@@ -168,9 +181,9 @@ class Layer(nn.Module):
 
 
 class Backbone(nn.Module):
-    def __init__(self, W, prefix: str, layers: int, heads: int):
+    def __init__(self, W, prefix: str, layers: int, heads: int, gelu: str = "none"):
         super().__init__()
-        self.layers = nn.ModuleList(Layer(W, f"{prefix}.layers.{i}", heads, False) for i in range(layers))
+        self.layers = nn.ModuleList(Layer(W, f"{prefix}.layers.{i}", heads, False, gelu) for i in range(layers))
 
     def forward(self, x, kv_cache, cos, sin, mask):
         # kv_cache [2L, H, T, D]: keys of layer l at 2l, values at 2l + 1.
@@ -251,11 +264,14 @@ def lsd_times(W, prefix, steps: int, norm: str) -> torch.Tensor:
 
 
 class FlowNet(nn.Module):
-    """SimpleMLPAdaLN (`mlp.rs`) with its time conditioning precomputed."""
+    """SimpleMLPAdaLN (`mlp.rs`) with its time conditioning precomputed, for the config's `flow_type`."""
 
-    def __init__(self, W, prefix: str, depth: int, steps: int, norm: str = "rms_var"):
+    def __init__(self, W, prefix: str, depth: int, steps: int, norm: str = "rms_var", flow_type: str = "lsd"):
         super().__init__()
-        self.register_buffer("times", lsd_times(W, prefix, steps, norm))
+        assert flow_type in ("lsd", "drifting", "pointwise"), f"unknown flow_type {flow_type!r}"
+        self.flow_type = flow_type
+        if flow_type == "lsd":
+            self.register_buffer("times", lsd_times(W, prefix, steps, norm))
         self.steps = steps
         self.cond_embed = linear(W, f"{prefix}.cond_embed")
         self.input_proj = linear(W, f"{prefix}.input_proj")
@@ -267,9 +283,9 @@ class FlowNet(nn.Module):
         self.final_linear = linear(W, f"{prefix}.final_layer.linear")
         self.channels = self.input_proj.out_features
 
-    def velocity(self, c, x, time):
+    def velocity(self, c, x, time=None):
         x = self.input_proj(x)
-        y = time + self.cond_embed(c)
+        y = self.cond_embed(c) if time is None else time + self.cond_embed(c)
         sy = F.silu(y)
         ch = self.channels
         for ln, m1, m2, ada in zip(self.in_ln, self.mlp1, self.mlp2, self.ada):
@@ -283,7 +299,12 @@ class FlowNet(nn.Module):
         return self.final_linear(x)
 
     def forward(self, c, noise):
-        """LSD decode from x_0 = noise."""
+        """LSD decode from x_0 = noise; or one evaluation without time conditioning, which is the
+        latent (`drifting`) or is added to the noise (`pointwise`), as `FlowLM::sample_from`."""
+        if self.flow_type == "drifting":
+            return self.velocity(c, noise)
+        if self.flow_type == "pointwise":
+            return noise + self.velocity(c, noise)
         x = noise
         for i in range(self.steps):
             x = x + self.velocity(c, x, self.times[i]) * (1.0 / self.steps)
@@ -302,14 +323,17 @@ class FlowHead(nn.Module):
         super().__init__()
         fl = config["flow_lm"]
         self.out_norm = layer_norm(W, "flow_lm.out_norm", 1e-5)
+        # With `z_dim`, the EOS head and the flow net read a bias-free projection of the normed output.
+        self.z_proj = linear(W, "flow_lm.z_proj", bias=False) if fl.get("z_dim") else nn.Identity()
         self.out_eos = linear(W, "flow_lm.out_eos")
         self.flow_net = FlowNet(
-            W, "flow_lm.flow_net", fl["flow_depth"], config["lsd_decode_steps"], fl.get("time_rms_norm", "rms_var")
+            W, "flow_lm.flow_net", fl["flow_depth"], config["lsd_decode_steps"], fl.get("time_rms_norm", "rms_var"),
+            fl.get("flow_type", "lsd"),
         )
         self.input_linear = linear(W, "flow_lm.input_linear", bias=False)
 
     def forward(self, x, noise):
-        h = self.out_norm(x)[:, -1]
+        h = self.z_proj(self.out_norm(x)[:, -1])
         eos = self.out_eos(h)
         latent = self.flow_net(h, noise)
         return latent, eos, self.input_linear(latent)[:, None]
@@ -523,7 +547,10 @@ class Prefill(nn.Module):
         super().__init__()
         self.io_half = io_half
         # n_bins + 1 rows; the learnt padding row `ptts` appends is never looked up.
-        embed = W["flow_lm.condition_provider.conditioners.transcript_in_segment.embed.weight"].clone()
+        # A low-rank table goes through its output_proj once, here, as `LUTConditioner::load` does.
+        embed = W["flow_lm.conditioner.embed.weight"].clone()
+        if "flow_lm.conditioner.output_proj.weight" in W:
+            embed = embed @ W["flow_lm.conditioner.output_proj.weight"].T
         self.register_buffer("embed", embed)
         self.register_buffer("vocab", torch.arange(embed.shape[0], dtype=torch.int32))
         self.backbone = backbone

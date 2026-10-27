@@ -18,7 +18,7 @@ import torch
 
 from check import graph_call, rel, snr_db
 from host import run, voice_cache
-from load import load, voice_embedding, voice_latents
+from load import load, voice_embedding
 
 REF = Path(__file__).parent / "ref"
 
@@ -33,14 +33,14 @@ def compare(ph, case: Path, dtype, tag: str, teacher: bool = False):
     m = json.loads((case / "manifest.json").read_text())
     W = ph.weights
     tokens = torch.tensor([m["text"]["token_ids"]], dtype=torch.int32)
-    emb = voice_embedding(W, voice_latents(m["voice"]["path"]))
+    emb = voice_embedding(W, m["voice"]["path"])
     noise = read(case, "noise.bin", m)
-    text_rows = W["flow_lm.condition_provider.conditioners.transcript_in_segment.embed.weight"][tokens[0].long()]
+    text_rows = ph.graphs["prefill"].embed[tokens[0].long()]
     prefix = torch.cat([emb[0], text_rows])
     ref = {k: read(case, f"{k}.bin", m) for k in ["prefix_embeddings", "frame_bias", "step_inputs", "latents", "eos_logits", "audio"]}
 
     print(f"== {case.name} [{tag}{', teacher-forced' if teacher else ''}]: {m['text']['n_tokens']} tokens, voice {m['voice']['name']}, {m['frames']} frames")
-    print(f"  prefix embeddings rel err {rel(prefix, ref['prefix_embeddings']):.2e}   frame bias rel err {rel(ph.frame_bias, ref['frame_bias']):.2e}")
+    print(f"  prefix embeddings rel err {rel(prefix, ref['prefix_embeddings']):.2e}   frame bias max |diff| {float((ph.frame_bias - ref['frame_bias']).abs().max()):.2e}")
 
     kv, pos = voice_cache(ph, emb, dtype)
     max_frames = min(m["eos"]["max_frames_used"], len(noise))

@@ -27,9 +27,12 @@ def rope_i(x, offset, max_period):
 
 
 class TransformerRef:
-    def __init__(self, W, prefix, layers, heads, max_period, layer_scale, context=None, gelu="none"):
+    def __init__(self, W, prefix, layers, heads, max_period, layer_scale, context=None, gelu="none",
+                 attn_dim=None, kv_heads=None):
         self.W, self.p, self.n, self.h, self.mp = W, prefix, layers, heads, max_period
         self.ls, self.context, self.gelu = layer_scale, context, gelu
+        # Flow LM only (`Kind::FlowLm`): query and output width, and grouped k/v heads.
+        self.attn_dim, self.kvh = attn_dim, kv_heads or heads
         # Flow LM: (k [B, T, H, D], v) growing; Mimi: (k [B, H, T, D], v) trimmed to context - 1.
         self.k = [None] * layers
         self.v = [None] * layers
@@ -38,7 +41,8 @@ class TransformerRef:
     def forward(self, x):
         W = self.W
         b, t, e = x.shape
-        d = e // self.h
+        a = self.attn_dim or e
+        d = a // self.h
         kv_len = 0 if self.k[0] is None else self.k[0].shape[1 if self.context is None else 2]
         mask = None
         if t > 1:
@@ -54,7 +58,11 @@ class TransformerRef:
             h = F.layer_norm(x, (e,), W[f"{p}.norm1.weight"], W[f"{p}.norm1.bias"], 1e-5)
             proj = h @ W[f"{p}.self_attn.in_proj.weight"].T
             if self.context is None:
-                q, k, v = (proj[..., j * e : (j + 1) * e].reshape(b, t, self.h, d) for j in range(3))
+                kd = self.kvh * d
+                q = proj[..., :a].reshape(b, t, self.h, d)
+                # Each k/v head serves h / kvh consecutive query heads; the cache holds them repeated.
+                k, v = (proj[..., a + j * kd : a + (j + 1) * kd].reshape(b, t, self.kvh, d)
+                        .repeat_interleave(self.h // self.kvh, 2) for j in range(2))
             else:
                 pk = proj.reshape(b, t, 3, self.h, d)
                 q, k, v = pk[:, :, 0], pk[:, :, 1], pk[:, :, 2]
@@ -74,7 +82,7 @@ class TransformerRef:
             att = qq @ K.transpose(-1, -2) / math.sqrt(d)
             if mask is not None:
                 att = att + mask
-            y = (att.softmax(-1) @ V).transpose(1, 2).reshape(b, t, e)
+            y = (att.softmax(-1) @ V).transpose(1, 2).reshape(b, t, a)
             y = y @ W[f"{p}.self_attn.out_proj.weight"].T
             if self.ls:
                 y = y * W[f"{p}.layer_scale_1.scale"]
@@ -162,24 +170,33 @@ class FlowLMRef:
     def __init__(self, W, config):
         self.W, self.cfg = W, config
         fl = config["flow_lm"]
-        self.tr = TransformerRef(W, "flow_lm.transformer", fl["num_layers"], fl["num_heads"], fl["max_period"], False)
+        self.tr = TransformerRef(W, "flow_lm.transformer", fl["num_layers"], fl["num_heads"], fl["max_period"], False,
+                                 gelu=gelu_approximate(config, "flow_lm"), attn_dim=fl.get("attn_dim"),
+                                 kv_heads=fl.get("num_kv_heads"))
         self.cond = summed_conditions(W, config, {})
         self.steps = config["lsd_decode_steps"]
-        self.times = lsd_times(W, "flow_lm.flow_net", self.steps, fl.get("time_rms_norm", "rms_var"))
+        self.flow_type = fl.get("flow_type", "lsd")
+        if self.flow_type == "lsd":
+            self.times = lsd_times(W, "flow_lm.flow_net", self.steps, fl.get("time_rms_norm", "rms_var"))
         self.depth = fl["flow_depth"]
+        self.z_dim = fl.get("z_dim")
+        # `LUTConditioner::load`: a low-rank table is projected whole, once.
+        self.text_table = W["flow_lm.conditioner.embed.weight"]
+        if "flow_lm.conditioner.output_proj.weight" in W:
+            self.text_table = self.text_table @ W["flow_lm.conditioner.output_proj.weight"].T
 
     def prompt(self, emb):
         """Text or voice embeddings [1, T, E], no frame bias (`run_backbone_and_increment`)."""
         self.tr.forward(emb)
 
     def text_embeddings(self, tokens):
-        return self.W["flow_lm.condition_provider.conditioners.transcript_in_segment.embed.weight"][tokens][None]
+        return self.text_table[tokens][None]
 
     def flow(self, c, x, time):
         W, p = self.W, "flow_lm.flow_net"
         lin = lambda x, n: x @ W[f"{p}.{n}.weight"].T + W[f"{p}.{n}.bias"]
         x = lin(x, "input_proj")
-        y = time + lin(c, "cond_embed")
+        y = lin(c, "cond_embed") if time is None else time + lin(c, "cond_embed")
         ch = x.shape[-1]
         for i in range(self.depth):
             a = lin(F.silu(y), f"res_blocks.{i}.adaLN_modulation.1")
@@ -200,10 +217,17 @@ class FlowLMRef:
         inp = seq @ W["flow_lm.input_linear.weight"].T
         x = self.tr.forward((inp + self.cond)[:, None])
         h = F.layer_norm(x[:, -1], (x.shape[-1],), W["flow_lm.out_norm.weight"], W["flow_lm.out_norm.bias"], 1e-5)
+        if self.z_dim:
+            h = h @ W["flow_lm.z_proj.weight"].T
         eos = h @ W["flow_lm.out_eos.weight"].T + W["flow_lm.out_eos.bias"]
-        cur = noise
-        for i in range(self.steps):
-            cur = cur + self.flow(h, cur, self.times[i]) * (1.0 / self.steps)
+        if self.flow_type == "drifting":
+            cur = self.flow(h, noise, None)
+        elif self.flow_type == "pointwise":
+            cur = noise + self.flow(h, noise, None)
+        else:
+            cur = noise
+            for i in range(self.steps):
+                cur = cur + self.flow(h, cur, self.times[i]) * (1.0 / self.steps)
         return cur, float(eos), inp.reshape(-1)
 
 
