@@ -277,7 +277,8 @@ fn init_tracing(chrome_tracing: bool) -> Option<tracing_chrome::FlushGuard> {
 
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(model_helpers::LOG_DIRECTIVES));
-    let fmt = tracing_subscriber::fmt::Layer::new().with_target(false);
+    // Logs go to stderr, so `-o /dev/stdout` writes nothing but the WAV.
+    let fmt = tracing_subscriber::fmt::Layer::new().with_target(false).with_writer(std::io::stderr);
     if chrome_tracing {
         let (chrome_layer, guard) = tracing_chrome::ChromeLayerBuilder::new().build();
         tracing_subscriber::registry().with(fmt).with(chrome_layer).with(filter).init();
