@@ -9,7 +9,9 @@ use crate::conv::pad_for_conv1d;
 use crate::dummy_quantizer::DummyQuantizer;
 use crate::resample::{ConvDownsample1d, ConvTrUpsample1d};
 use crate::seanet::{SEANetDecoder, SEANetDecoderState, SEANetEncoder};
-use crate::transformer::{ProjectedTransformer, StreamingTransformerState};
+use crate::transformer::{
+    KvCache, LayerAttentionState, ProjectedTransformer, StreamingTransformerState,
+};
 use xn::nn::var_builder::Path;
 use xn::{Backend, BackendQ, Result, Tensor, WithDTypeF};
 
@@ -79,6 +81,72 @@ pub struct MimiDecoderState<T: WithDTypeF, B: Backend> {
     decoder_state: SEANetDecoderState<T, B>,
     decoder_transformer_state: StreamingTransformerState<T, B>,
     upsample_state: Option<StreamingConvTr1dState<T, B>>,
+    /// The RoPE table and attention mask the next step's transformer uses rather than build,
+    /// see [`crate::transformer::StreamingTransformer::forward_with`].
+    rope: Option<crate::rope::RotaryEmbedding<T, B>>,
+    mask: Option<Tensor<T, B>>,
+}
+
+impl<T: WithDTypeF, B: Backend> MimiDecoderState<T, B> {
+    fn kv_caches(&self) -> impl Iterator<Item = &KvCache<T, B>> {
+        self.decoder_transformer_state.layer_states.iter().filter_map(|l| match l {
+            LayerAttentionState::Mimi(kv) => Some(kv),
+            LayerAttentionState::FlowLm(_) => None,
+        })
+    }
+
+    fn kv_caches_mut(&mut self) -> impl Iterator<Item = &mut KvCache<T, B>> {
+        self.decoder_transformer_state.layer_states.iter_mut().filter_map(|l| match l {
+            LayerAttentionState::Mimi(kv) => Some(kv),
+            LayerAttentionState::FlowLm(_) => None,
+        })
+    }
+
+    /// Back to the state [`MimiDecoder::init_state_in_place`] gives, in the same buffers.
+    pub fn reset_in_place(&mut self) -> Result<()> {
+        self.decoder_state.reset()?;
+        self.kv_caches_mut().try_for_each(|kv| kv.reset())?;
+        match self.upsample_state.as_mut() {
+            Some(s) => s.reset(),
+            None => Ok(()),
+        }
+    }
+
+    /// Leading slots of the transformer's window that hold no position yet.
+    pub fn padding(&self) -> usize {
+        self.kv_caches().next().map_or(0, |kv| kv.padding())
+    }
+
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    /// The attention mask the next step of `seq_len` positions needs, see
+    /// [`crate::transformer::mimi_mask`], with its shape.
+    pub(crate) fn next_mask(&self, seq_len: usize) -> (Vec<T>, (usize, usize, usize, usize)) {
+        let Some(kv) = self.kv_caches().next() else { return (vec![], (1, 1, seq_len, seq_len)) };
+        let kv_len = kv.current_seq_len().unwrap_or(0);
+        let mask = crate::transformer::mimi_mask(seq_len, kv_len, kv.context(), kv.padding());
+        (mask, (1, 1, seq_len, kv_len + seq_len))
+    }
+
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    /// Use `mask` for the next step's attention rather than building one.
+    pub(crate) fn set_mask(&mut self, mask: Tensor<T, B>) {
+        self.mask = Some(mask);
+    }
+
+    /// The transformer's position, which the step after this one starts from.
+    pub fn position(&self) -> usize {
+        self.kv_caches().next().map_or(0, |kv| kv.absolute_offset())
+    }
+
+    pub fn set_position(&mut self, offset: usize) {
+        self.kv_caches_mut().for_each(|kv| kv.set_absolute_offset(offset));
+    }
+
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    /// Use `rope` for the next step's transformer rather than building a table for it.
+    pub(crate) fn set_rope(&mut self, rope: crate::rope::RotaryEmbedding<T, B>) {
+        self.rope = Some(rope);
+    }
 }
 
 impl<Q: BackendQ> MimiEncoder<Q> {
@@ -210,6 +278,25 @@ impl<Q: BackendQ> MimiDecoder<Q> {
         })
     }
 
+    /// A state updated in place whose shapes never change, so that a decode step can be
+    /// recorded once and replayed (see [`crate::transformer::KvCache::zeros_in_place`]).
+    pub fn init_state_in_place(&self, batch_size: usize) -> Result<MimiDecoderState<Q::T, Q::B>> {
+        let upsample_state = match &self.upsample {
+            Some(us) => Some(us.init_state(batch_size)?.into_in_place()),
+            None => None,
+        };
+        Ok(MimiDecoderState {
+            decoder_state: self.decoder.init_state(batch_size)?.into_in_place(),
+            decoder_transformer_state: self
+                .decoder_transformer
+                .transformer
+                .init_state_in_place(batch_size)?,
+            upsample_state,
+            rope: None,
+            mask: None,
+        })
+    }
+
     pub fn init_state(
         &self,
         batch_size: usize,
@@ -225,8 +312,29 @@ impl<Q: BackendQ> MimiDecoder<Q> {
                 .decoder_transformer
                 .init_state(batch_size, sequence_length)?,
             upsample_state,
+            rope: None,
+            mask: None,
         };
         Ok(s)
+    }
+
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    /// The decoder transformer's RoPE table for positions `offset..offset + len`.
+    pub(crate) fn rope_at(
+        &self,
+        offset: usize,
+        len: usize,
+        device: &Q::B,
+    ) -> Result<crate::rope::RotaryEmbedding<Q::T, Q::B>> {
+        self.decoder_transformer.transformer.rope_at(offset, len, device)
+    }
+
+    /// Transformer positions one latent frame advances by.
+    pub fn positions_per_frame(&self) -> usize {
+        match &self.upsample {
+            Some(us) => us.stride(),
+            None => 1,
+        }
     }
 
     /// Decode from latent to audio (streaming). Input: [B, C, T'].
@@ -241,7 +349,13 @@ impl<Q: BackendQ> MimiDecoder<Q> {
             _ => latent.clone(),
         };
 
-        let outs = self.decoder_transformer.forward(&emb, &mut state.decoder_transformer_state)?;
+        let (rope, mask) = (state.rope.take(), state.mask.take());
+        let outs = self.decoder_transformer.forward_with(
+            &emb,
+            &mut state.decoder_transformer_state,
+            rope,
+            mask,
+        )?;
         self.decoder.forward(&outs[0], &mut state.decoder_state)
     }
 }

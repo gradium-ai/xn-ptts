@@ -66,6 +66,11 @@ impl<T: WithDTypeF, B: Backend> ConvTrUpsample1d<T, B> {
         self.convtr.init_state(batch_size)
     }
 
+    /// Output positions per input position.
+    pub fn stride(&self) -> usize {
+        self.convtr.convtr.stride
+    }
+
     pub fn forward(
         &self,
         x: &Tensor<T, B>,

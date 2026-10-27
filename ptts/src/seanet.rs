@@ -16,6 +16,16 @@ pub struct SEANetResnetBlockState<T: WithDTypeF, B: Backend> {
     conv_states: Vec<StreamingConv1dState<T, B>>,
 }
 
+impl<T: WithDTypeF, B: Backend> SEANetResnetBlockState<T, B> {
+    fn into_in_place(self) -> Self {
+        Self { conv_states: self.conv_states.into_iter().map(|s| s.into_in_place()).collect() }
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.conv_states.iter_mut().try_for_each(|s| s.reset())
+    }
+}
+
 impl<T: WithDTypeF, B: Backend> SEANetResnetBlock<T, B> {
     pub fn load(
         vb: &Path<B>,
@@ -235,6 +245,34 @@ pub struct SEANetDecoderState<T: WithDTypeF, B: Backend> {
     init_conv_state: StreamingConv1dState<T, B>,
     layer_states: Vec<DecoderLayerState<T, B>>,
     final_conv_state: StreamingConv1dState<T, B>,
+}
+
+impl<T: WithDTypeF, B: Backend> SEANetDecoderState<T, B> {
+    /// Update every state in place from now on.
+    pub fn into_in_place(self) -> Self {
+        let layer_states = self
+            .layer_states
+            .into_iter()
+            .map(|(up, res)| {
+                (up.into_in_place(), res.into_iter().map(|r| r.into_in_place()).collect())
+            })
+            .collect();
+        Self {
+            init_conv_state: self.init_conv_state.into_in_place(),
+            layer_states,
+            final_conv_state: self.final_conv_state.into_in_place(),
+        }
+    }
+
+    /// Back to the state [`SEANetDecoder::init_state`] gives, in the same buffers.
+    pub fn reset(&mut self) -> Result<()> {
+        self.init_conv_state.reset()?;
+        for (up, res) in self.layer_states.iter_mut() {
+            up.reset()?;
+            res.iter_mut().try_for_each(|r| r.reset())?;
+        }
+        self.final_conv_state.reset()
+    }
 }
 
 impl<T: WithDTypeF, B: Backend> SEANetDecoder<T, B> {

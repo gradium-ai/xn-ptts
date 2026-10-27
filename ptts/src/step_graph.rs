@@ -1,4 +1,4 @@
-//! The flow LM's per-frame step, replayed as a CUDA graph.
+//! The flow LM's per-frame step and Mimi's per-frame decode, replayed as CUDA graphs.
 //!
 //! Launching a step's few hundred small kernels one at a time costs the host more than the GPU
 //! takes to run them. A graph records the step once, against buffers of its own, and from then
@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use xn::{BackendQ, Result, Tensor};
 
 #[cfg(feature = "cuda")]
-pub use cuda::StepGraph;
+pub use cuda::{MimiGraph, StepGraph};
 
 /// Most step graphs a pool keeps: one per sequence budget and conditioning in use.
 const MAX_STEP_GRAPHS: usize = 4;
@@ -20,11 +20,12 @@ const MAX_STEP_GRAPHS: usize = 4;
 /// Recorded steps, taken by a generation and given back when it ends.
 pub struct GraphPool<Q: BackendQ> {
     steps: Mutex<Vec<StepGraph<Q>>>,
+    mimi: Mutex<Vec<MimiGraph<Q>>>,
 }
 
 impl<Q: BackendQ> Default for GraphPool<Q> {
     fn default() -> Self {
-        Self { steps: Mutex::new(Vec::new()) }
+        Self { steps: Mutex::new(Vec::new()), mimi: Mutex::new(Vec::new()) }
     }
 }
 
@@ -49,6 +50,46 @@ impl<Q: BackendQ> GraphPool<Q> {
             steps.remove(0);
         }
         steps.push(graph);
+    }
+
+    /// A Mimi graph, recorded before if there is one free. `None` where there are no graphs.
+    pub fn mimi(&self, model: &TTSModel<Q>) -> Result<Option<MimiGraph<Q>>> {
+        let reused = self.mimi.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop();
+        match reused {
+            Some(mut graph) => {
+                graph.reset()?;
+                Ok(Some(graph))
+            }
+            None => MimiGraph::new(model),
+        }
+    }
+
+    /// As [`Self::put_step`].
+    pub fn put_mimi(&self, graph: MimiGraph<Q>) {
+        self.mimi.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(graph);
+    }
+}
+
+/// Never built without the `cuda` feature.
+#[cfg(not(feature = "cuda"))]
+pub struct MimiGraph<Q: BackendQ>(std::convert::Infallible, std::marker::PhantomData<fn() -> Q>);
+
+#[cfg(not(feature = "cuda"))]
+impl<Q: BackendQ> MimiGraph<Q> {
+    fn new(_: &TTSModel<Q>) -> Result<Option<Self>> {
+        Ok(None)
+    }
+
+    pub fn reset(&mut self) -> Result<()> {
+        match self.0 {}
+    }
+
+    pub fn decode(&mut self, _: &TTSModel<Q>, _: &Tensor<Q::T, Q::B>) -> Result<Tensor<f32, Q::B>> {
+        match self.0 {}
+    }
+
+    pub fn state_mut(&mut self) -> &mut crate::mimi::MimiDecoderState<f32, Q::B> {
+        match self.0 {}
     }
 }
 
@@ -84,6 +125,7 @@ impl<Q: BackendQ> StepGraph<Q> {
 #[cfg(feature = "cuda")]
 mod cuda {
     use super::*;
+    use crate::mimi::MimiDecoderState;
     use crate::rope::RotaryEmbedding;
     use crate::transformer::{DeviceStep, LayerAttentionState, StreamingTransformerState};
     use xn::WithDTypeF;
@@ -282,5 +324,97 @@ mod cuda {
             d.current_end = used;
         }
         Ok(())
+    }
+
+    /// Mimi's recorded per-frame decode, with a state of its own whose shapes never change
+    /// (see [`crate::mimi::MimiDecoder::init_state_in_place`]), and the buffers the decode
+    /// reads and writes.
+    pub struct MimiGraph<Q: BackendQ> {
+        dev: Device,
+        state: MimiDecoderState<f32, Q::B>,
+        latent_in: Tensor<Q::T, Q::B>,
+        pcm_out: Tensor<f32, Q::B>,
+        /// The transformer's RoPE rows and attention mask for the frame, refreshed before each
+        /// replay. The mask changes only while the transformer's window fills.
+        rope: RotaryEmbedding<f32, Q::B>,
+        mask: Tensor<f32, Q::B>,
+        mask_pad: Option<usize>,
+        rows: usize,
+        graph: Option<CaptureGraph>,
+    }
+
+    impl<Q: BackendQ> MimiGraph<Q> {
+        /// `None` off CUDA or when disabled.
+        pub(super) fn new(model: &TTSModel<Q>) -> Result<Option<Self>> {
+            let any: &dyn std::any::Any = model.mimi_device();
+            let Some(dev) = any.downcast_ref::<Device>() else { return Ok(None) };
+            if !enabled() {
+                return Ok(None);
+            }
+            let d = model.mimi_device();
+            let frame = (model.mimi.sample_rate as f64 / model.mimi.frame_rate).round() as usize;
+            let rows = model.mimi.positions_per_frame();
+            let state = model.mimi.init_state_in_place(1)?;
+            let (_, mask_shape) = state.next_mask(rows);
+            Ok(Some(Self {
+                dev: dev.clone(),
+                state,
+                latent_in: Tensor::zeros((1, 1, model.flow_lm.ldim), d)?,
+                pcm_out: Tensor::zeros((1, 1, frame), d)?,
+                rope: model.mimi.rope_at(0, rows, d)?,
+                mask: Tensor::zeros(mask_shape, d)?,
+                mask_pad: None,
+                rows,
+                graph: None,
+            }))
+        }
+
+        /// Start a new stream, or a new chunk of one.
+        pub fn reset(&mut self) -> Result<()> {
+            self.state.reset_in_place()
+        }
+
+        /// The state the replays decode in, for decoding several frames in one ordinary call
+        /// between them: the next replay takes the position from it.
+        pub fn state_mut(&mut self) -> &mut MimiDecoderState<f32, Q::B> {
+            &mut self.state
+        }
+
+        /// One frame's latent, `[1, 1, ldim]`, to audio, as [`TTSModel::decode_latent`] would
+        /// decode it.
+        pub fn decode(
+            &mut self,
+            model: &TTSModel<Q>,
+            latent: &Tensor<Q::T, Q::B>,
+        ) -> Result<Tensor<f32, Q::B>> {
+            let d = model.mimi_device();
+            let pos = self.state.position();
+            self.rope.copy_from(&model.mimi.rope_at(pos, self.rows, d)?)?;
+            let pad = self.state.padding();
+            if self.mask_pad != Some(pad) {
+                let (mask, shape) = self.state.next_mask(self.rows);
+                self.mask.copy_(&Tensor::from_vec(mask, shape, d)?)?;
+                self.mask_pad = Some(pad);
+            }
+            self.latent_in.copy_(latent)?;
+            match &self.graph {
+                Some(graph) => graph.launch()?,
+                None => {
+                    let (rope, mask) = (self.rope.clone(), self.mask.clone());
+                    let (latent_in, pcm_out) = (&self.latent_in, &self.pcm_out);
+                    let state = &mut self.state;
+                    let graph = record(&self.dev, || {
+                        // The host side of each pass moves the position: start both from here.
+                        state.set_position(pos);
+                        state.set_rope(rope.clone());
+                        state.set_mask(mask.clone());
+                        pcm_out.copy_(&model.decode_latent(latent_in, state)?)
+                    })?;
+                    self.graph = Some(graph);
+                }
+            }
+            self.state.set_position(pos + self.rows);
+            self.pcm_out.copy()
+        }
     }
 }
