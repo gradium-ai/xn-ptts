@@ -19,7 +19,8 @@ pub struct Config {
     /// Rows of the batched text prefill graph; a shorter prompt is padded and the padding
     /// masked out of every later step.
     pub prefill_len: usize,
-    /// Mimi's attention window in past positions, the reference's `transformer_context` (250).
+    /// Mimi's attention window, the reference's `transformer_context`: the positions each query
+    /// sees, itself included.
     pub mimi_window: usize,
     pub max_frames: usize,
     pub eos_threshold: f32,
@@ -206,15 +207,15 @@ fn ring_mask(valid: &[bool], t: usize, ctx: usize) -> Vec<f32> {
 }
 
 /// Mimi's sliding window, as the reference applies it: the query at absolute position `p` sees
-/// positions `p - window ..= p` and nothing older. The cache holds `window` past positions and
-/// this call's `STEPS` rows, so slot `j` holds position `start - window + j`, and is empty while
-/// that is negative.
+/// positions `p - window + 1 ..= p` and nothing older. The cache holds `window` past positions
+/// and this call's `STEPS` rows, so slot `j` holds position `start - window + j`, and is empty
+/// while that is negative.
 fn mimi_mask(step: usize, window: usize) -> Vec<f32> {
     let (t, n) = (mimi::STEPS, mimi::cache_len(window));
     let start = step * t;
     let mut m = vec![-1e4f32; t * n];
     for q in 0..t {
-        for j in q..=window + q {
+        for j in q + 1..=window + q {
             if start + j >= window {
                 m[q * n + j] = 0.0;
             }
@@ -500,5 +501,30 @@ impl Phonon {
             samples,
             stopped: stopped.get(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mimi_mask_shows_each_query_the_window_ending_at_itself() {
+        for window in [5, 50, 250] {
+            let n = mimi::cache_len(window);
+            for step in 0..window / mimi::STEPS + 3 {
+                let start = step * mimi::STEPS;
+                let mask = mimi_mask(step, window);
+                for q in 0..mimi::STEPS {
+                    let p = start + q;
+                    let seen: Vec<usize> = (0..n)
+                        .filter(|&j| mask[q * n + j] == 0.0)
+                        .map(|j| start + j - window)
+                        .collect();
+                    let want: Vec<usize> = (p.saturating_sub(window - 1)..=p).collect();
+                    assert_eq!(seen, want, "window {window}, step {step}, query {q}");
+                }
+            }
+        }
     }
 }
