@@ -156,6 +156,8 @@ pub(crate) fn resolve(source: &HubSource, options: ResolveOptions<'_>) -> Result
 struct Repo<'a> {
     repo: hf_hub::HFRepositorySync<hf_hub::repository::RepoTypeModel>,
     source: &'a HubSource,
+    /// The cache folder the client uses, from `HF_HUB_CACHE` or `HF_HOME`, named in errors.
+    cache_dir: std::path::PathBuf,
 }
 
 #[cfg(feature = "hub")]
@@ -163,11 +165,14 @@ impl<'a> Repo<'a> {
     fn open(source: &'a HubSource) -> Result<Self> {
         // Not `NotFound`: a client that will not start is an environment failure, not a name
         // that failed to resolve.
-        let client = hf_hub::HFClientSync::new().map_err(|e| {
+        let failed = |e: hf_hub::HFError| {
             Error::Io(std::io::Error::other(format!("cannot reach the Hugging Face Hub: {e}")))
-        })?;
+        };
+        let client = hf_hub::HFClient::new().map_err(failed)?;
+        let cache_dir = client.cache_dir().to_path_buf();
+        let client = hf_hub::HFClientSync::from_inner(client).map_err(failed)?;
         let (owner, name) = hf_hub::split_id(&source.repo);
-        Ok(Self { repo: client.model(owner, name), source })
+        Ok(Self { repo: client.model(owner, name), source, cache_dir })
     }
 
     /// Download `filename`, or find it in the local cache.
@@ -186,6 +191,18 @@ impl<'a> Repo<'a> {
                 | hf_hub::HFError::LocalEntryNotFound { .. } => {
                     Error::NotFound(format!("`{filename}` is not in {}: {e}", self.source))
                 }
+                // A file error comes from the cache, not the Hub. Naming the folder shows a bad
+                // `HF_HOME` or `HF_HUB_CACHE`, such as one with a trailing space, which the bare
+                // OS error does not.
+                hf_hub::HFError::Io(e) => Error::Io(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "cannot fetch `{filename}` from {}: cannot use the Hugging Face cache at \
+                         `{}`: {e}. HF_HOME or HF_HUB_CACHE sets where it is.",
+                        self.source,
+                        self.cache_dir.display()
+                    ),
+                )),
                 other => Error::Io(std::io::Error::other(format!(
                     "cannot fetch `{filename}` from {}: {other}. If the repo is gated, accept \
                      its terms on huggingface.co and run `hf auth login` or set HF_TOKEN.",
