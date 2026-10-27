@@ -127,7 +127,8 @@ impl std::str::FromStr for DeviceKind {
     }
 }
 
-/// Weight format for the flow-LM transformer linears. Quantization is CPU-only.
+/// Weight format for the flow-LM transformer linears. Quantization runs on the CPU, and q8_0 on
+/// CUDA too.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Quant {
     #[default]
@@ -154,9 +155,11 @@ impl Quant {
     /// megabytes.
     pub fn check_device(self, device: DeviceKind) -> Result<()> {
         let device = device.resolve_for(self);
-        if device != DeviceKind::Cpu && self != Self::F32 {
+        let cuda_q8 = device == DeviceKind::Cuda && self == Self::Q80;
+        if device != DeviceKind::Cpu && self != Self::F32 && !cuda_q8 {
             return Err(Error::unsupported(format!(
-                "quantization ({}) is CPU-only, but the selected device is {device:?}",
+                "quantization ({}) runs on the CPU, and q8_0 on CUDA too, but the selected device \
+                 is {device:?}",
                 self.as_str()
             )));
         }
@@ -1616,8 +1619,6 @@ impl SynthBuilder {
 
     #[cfg(feature = "cuda")]
     fn build_cuda(self) -> Result<Synth> {
-        // `quant()` reports `self.quant`, which `check_device` keeps at F32 here.
-        debug_assert_eq!(self.quant, Quant::F32);
         let dev = match xn::cuda_backend::Device::new(0) {
             Ok(dev) => dev,
             Err(err) => return self.fall_back_to_cpu("cuda", err),
@@ -1628,8 +1629,13 @@ impl SynthBuilder {
         // them on separate threads does not overlap GPU work the way it does on the CPU's
         // separate cores -- it only adds cross-thread contention for that shared stream. Decode
         // inline on the flow LM's thread instead; see `inline_decode`.
-        let synth = self.load::<xn::Unquantized<half::bf16, _>>(dev, true)?;
-        Ok(Synth(Box::new(synth)))
+        //
+        // `check_device` lets only these two through to CUDA.
+        let synth: Box<dyn SynthApi> = match self.quant {
+            Quant::Q80 => Box::new(self.load::<xn::cuda_backend::q8::Q8<half::bf16>>(dev, true)?),
+            _ => Box::new(self.load::<xn::Unquantized<half::bf16, _>>(dev, true)?),
+        };
+        Ok(Synth(synth))
     }
 
     #[cfg(feature = "vulkan")]
