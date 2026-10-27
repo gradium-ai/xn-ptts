@@ -1,7 +1,7 @@
 /** Text-normalization language. `'none'` hands text to the tokenizer as written. */
 export type Lang = 'en' | 'fr' | 'de' | 'es' | 'pt' | 'none';
 
-/** Weight format. `q8` is smaller (~146 MB against ~240 MB) and faster on CPU. */
+/** Weight format. `q8` is smaller and faster on CPU. */
 export type Quant = 'f32' | 'q8';
 
 /** Where a checkpoint's files are. Relative URLs resolve against the page. */
@@ -40,7 +40,7 @@ export interface LoadOptions {
   lang: Lang;
   /**
    * Which word rewrites run on the normalized text: `'default'` (the default: numbers,
-   * currency, dashed-digits, emails, urls), `'all'` (those and phones, times, dates), `'none'`
+   * currency, dashed-digits, emails, urls, abbreviations, elongations), `'all'` (those and phones, times, dates), `'none'`
    * (or `'off'`), or a comma-separated list of rule names. Case and surrounding space do not
    * matter, and `'default'` / `'all'` / `'none'` / `'off'` count only on their own, not inside a
    * list. Ignored when `lang` is `'none'`, which does
@@ -49,17 +49,18 @@ export interface LoadOptions {
   rewrites?: string;
   /**
    * Values for the conditioners the checkpoint's `config.json` lists, by name, e.g.
-   * `{ padding_bonus: 0.5 }`. Those left out take their defaults. A name the checkpoint does not
+   * `{ duration_delta: 0.5 }`. Those left out take their defaults. A name the checkpoint does not
    * have is an error once its config is loaded.
    */
   conditions?: Record<string, string | number>;
   /** Default `'q8'`. */
   quant?: Quant;
   /**
-   * Required. Where the checkpoint's files are. There is no default: pass the model you
-   * mean.
+   * Where the checkpoint's files are, or a public Hugging Face repo as `'hf://owner/name'` or
+   * `'hf://owner/name@revision'`, whose files are picked as the native frontends pick them.
+   * Default: {@link DEFAULT_MODEL}.
    */
-  model: ModelSpec;
+  model?: ModelSpec | string;
   /** Voices to fetch up front. Default: just the default voice; others load on first use. */
   voices?: string[];
   /** Keep downloads in the Cache API, so the model is fetched once per browser. Default `true`. */
@@ -71,6 +72,12 @@ export interface LoadOptions {
   wasmUrl?: string | URL;
   /** The same for the threaded build, `wasm-threads/phonon_tts_bg.wasm`. */
   threadsWasmUrl?: string | URL;
+  /**
+   * The same for the modules browsers without WebAssembly Relaxed SIMD load, such as Safari:
+   * `wasm/phonon_tts_simd_bg.wasm` and `wasm-threads/phonon_tts_simd_bg.wasm`.
+   */
+  simdWasmUrl?: string | URL;
+  threadsSimdWasmUrl?: string | URL;
   /**
    * CPU threads to generate on, counting the worker that owns the model. Default `'auto'`:
    * 3, or fewer if the device has fewer cores. Threads
@@ -99,7 +106,7 @@ export interface SpeechOptions {
    * `Number.MAX_SAFE_INTEGER`, pass a `bigint`.
    */
   seed?: number | bigint;
-  /** Aborting stops the generation; the stream ends with what was produced so far. */
+  /** Aborting stops generation and discards unread chunks. Stop scheduled playback separately. */
   signal?: AbortSignal;
 }
 
@@ -117,7 +124,7 @@ export interface SpeechStats {
   promptMs?: number;
   /**
    * Generation time per frame: each step's time divided by its frames. A step is one frame on
-   * the CPU and up to eight on WebGPU, so there `min` and `max` are averages over a step,
+   * the CPU and up to four on WebGPU, so there `min` and `max` are averages over a step,
    * and the first step of each chunk also runs that chunk's prompt.
    */
   stepMs?: { avg: number; min: number; max: number };
@@ -133,7 +140,7 @@ export interface SpeechStream extends AsyncIterable<Float32Array> {
   readonly sampleRate: number;
   /** Resolves with timing stats once generation ends, or rejects if it failed. */
   readonly done: Promise<SpeechStats>;
-  /** Stop generating. Breaking out of a `for await` loop does the same. */
+  /** Stop generating and discard unread chunks. Await `done` for cleanup. Breaking out of a `for await` loop does the same. */
   cancel(): void;
 }
 
@@ -156,6 +163,8 @@ export declare class PhononTTS {
   readonly threadsReason: string;
   /** Voices this model can speak with: bundled ones and any added. */
   readonly voices: string[];
+  /** The languages the model was trained for, as listed in its config. */
+  readonly languages: string[];
 
   /**
    * Register a voice from a voice `.safetensors` file: a precomputed embedding (`emb`) or
@@ -177,6 +186,9 @@ export declare class PhononTTS {
 
 /** Delete every file this package has cached. Resolves to whether there was anything. */
 export declare function clearCache(): Promise<boolean>;
+
+/** The model `PhononTTS.load` uses when none is given, as `hf://owner/name@revision`. */
+export declare const DEFAULT_MODEL: string;
 
 /** Encode mono float PCM as a 16-bit WAV file. */
 export declare function encodeWav(pcm: Float32Array, sampleRate: number): Blob;

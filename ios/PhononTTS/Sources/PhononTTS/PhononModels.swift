@@ -5,7 +5,7 @@ import Foundation
 ///
 /// A model bundle is a directory written by the `export_coreml` example in `ptts`: three Core ML
 /// packages, the host tensors, the tokenizer, the voices and a `bundle.json` listing every
-/// file with its size and SHA-256. About 400 MB.
+/// file with its size and SHA-256.
 ///
 /// Two ways to deliver it:
 /// - **Download it** on first run from any static file host with `download(from:)`. This keeps

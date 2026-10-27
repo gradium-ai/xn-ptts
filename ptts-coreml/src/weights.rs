@@ -40,6 +40,12 @@ impl Weights {
         Ok(Self { tensors })
     }
 
+    /// From named `(shape, data)` tensors, for tests.
+    #[cfg(test)]
+    pub(crate) fn from_tensors(tensors: HashMap<String, (Vec<usize>, Vec<f32>)>) -> Self {
+        Self { tensors }
+    }
+
     /// Load from a GGUF, dequantising every tensor to f32.
     ///
     /// The f32 checkpoint is not always around, and CoreML wants plain floats to quantise its
@@ -76,9 +82,5 @@ impl Weights {
 
     pub fn data(&self, name: &str) -> Result<&[f32], String> {
         Ok(self.get(name)?.1)
-    }
-
-    pub fn names(&self) -> Vec<String> {
-        self.tensors.keys().cloned().collect()
     }
 }

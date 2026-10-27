@@ -1,35 +1,36 @@
 //! Generate speech from text on the command line.
 //!
 //! ```text
-//! cargo run --release --example ptts --features hf,audio -- "hello world" -o out.wav
+//! ptts --model /path/to/model --lang en "hello world" -o out.wav
 //! ```
 //!
 //! Everything between the text and the WAV file is [`ptts::synth::Synth`]; what
 //! is left here is argument parsing, locating the published checkpoint (see
-//! `model_helpers`), audio file decoding for `--voice <file>`, and the timing
+//! `ptts::checkpoint`), audio file decoding for `--voice <file>`, and the timing
 //! report.
 
-#[path = "model_helpers.rs"]
 mod model_helpers;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use ptts::preprocess::{Normalize, Rules};
 use ptts::synth::{DeviceKind, Quant, SpeechOptions};
+use ptts::voice_catalog::VoiceCatalog;
 
 #[derive(Parser, Debug)]
-#[command(name = "ptts", about = "Generate speech from text")]
+#[command(name = "ptts", version, about = "Generate speech with Phonon")]
 struct Args {
     /// Text to synthesize.
-    text: String,
+    #[arg(required_unless_present = "list_voices")]
+    text: Option<String>,
 
     /// Output WAV file path.
     #[arg(short, long, default_value = "out.wav")]
     output: std::path::PathBuf,
 
-    /// Voice: a bundled voice id, a path to a voice `.safetensors`, or a path to
-    /// a ~10s audio file to clone. Defaults to the checkpoint's `default` voice,
-    /// or its first bundled voice by name.
+    /// Voice: a voice of the checkpoint or of the voice catalog, by name or catalog voice ID, a
+    /// path to a voice `.safetensors`, or a path to a ~10s audio file to clone. Defaults to the
+    /// checkpoint's `default` voice, or its first bundled voice by name.
     #[arg(short, long)]
     voice: Option<String>,
 
@@ -41,19 +42,24 @@ struct Args {
     #[arg(short, long, default_value_t = 4242424242424242)]
     seed: u64,
 
-    /// Hugging Face model repo to download the checkpoint from: config.json,
-    /// weights, tokenizer and voices.
-    #[arg(long, required_unless_present = "dir", conflicts_with = "dir")]
-    repo: Option<String>,
+    #[arg(
+        short,
+        long,
+        alias = "dir",
+        default_value = model_helpers::DEFAULT_MODEL,
+        help = model_helpers::MODEL_HELP
+    )]
+    model: String,
 
-    /// Hugging Face branch, tag, or commit. Use a commit to reproduce a release.
-    #[arg(long, conflicts_with = "dir")]
-    revision: Option<String>,
+    /// Voice catalog to look --voice up in when the checkpoint has no voice of that name: a
+    /// Hugging Face repo as hf://owner/name[@revision], or a local JSONL file or folder holding
+    /// voices.jsonl. Only the voice that is used is downloaded.
+    #[arg(long, default_value = ptts::voice_catalog::DEFAULT_VOICE_CATALOG)]
+    voice_catalog: String,
 
-    /// Load from a local directory holding config.json, weights, tokenizer and
-    /// voices/ instead of downloading from the Hugging Face Hub.
+    /// List the voices of --voice-catalog, then exit.
     #[arg(long)]
-    dir: Option<std::path::PathBuf>,
+    list_voices: bool,
 
     /// Tokenizer to load, as a path to a `tokenizer.json`. Defaults to the one
     /// the checkpoint ships.
@@ -81,7 +87,7 @@ struct Args {
     #[arg(
         long = "condition",
         value_name = "NAME=VALUE",
-        help = "Set a conditioner, e.g. padding_bonus=0.5; repeatable"
+        help = "Set a conditioner, e.g. duration_delta=0.5; repeatable"
     )]
     conditions: Vec<String>,
 
@@ -101,20 +107,37 @@ struct Args {
     /// Language the text is normalized as before tokenizing: `en`, `fr`, `de`, `es` or `pt`.
     /// Required: the spoken forms differ per language, so there is nothing safe to guess.
     /// `none` hands the text to the tokenizer as written, which the model reads less well.
-    #[arg(long)]
-    lang: String,
+    #[arg(long, required_unless_present = "list_voices")]
+    lang: Option<String>,
 
     /// Which word rewrites run on the normalized text: `default` (numbers, currency,
-    /// dashed-digits, emails, urls), `all` (those and phones, times, dates), `none`, or a
-    /// comma-separated list of rule names. Has no effect with `--lang none`.
+    /// dashed-digits, emails, urls, abbreviations, elongations), `all` (those and phones, times,
+    /// dates), `none`, or a comma-separated list of rule names. Has no effect with `--lang none`.
     #[arg(long, default_value = "default")]
     rewrites: String,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let catalog = VoiceCatalog::new(&args.voice_catalog)?;
+    if args.list_voices {
+        for voice in catalog.voices()? {
+            let field = |f: &Option<String>| f.clone().unwrap_or_else(|| "-".to_string());
+            println!(
+                "{}\t{}\t{}\t{}",
+                voice.name,
+                field(&voice.language),
+                field(&voice.voice_id),
+                field(&voice.description)
+            );
+        }
+        return Ok(());
+    }
+    // clap requires both unless --list-voices is given.
+    let text = args.text.as_deref().context("nothing to say")?;
+    let lang = args.lang.as_deref().context("--lang is required")?;
     // Parsed before anything is downloaded, so a bad --lang fails in milliseconds.
-    let normalize = args.lang.parse::<Normalize>()?.with_rules(args.rewrites.parse::<Rules>()?);
+    let normalize = lang.parse::<Normalize>()?.with_rules(args.rewrites.parse::<Rules>()?);
     if let Some(threads) = args.threads {
         // Must happen before the first tensor op, since it sets the size of rayon's global pool.
         xn::set_num_threads(threads);
@@ -128,17 +151,11 @@ fn main() -> Result<()> {
         xn::with_f16c()
     );
 
-    let source = match args.dir.as_deref() {
-        Some(dir) => model_helpers::Source::Dir(dir),
-        None => model_helpers::Source::Hub {
-            repo: args.repo.as_deref().context("--repo or --dir is required")?,
-            revision: args.revision.as_deref(),
-        },
-    };
     let quant = args.quant.as_deref().unwrap_or("f32").parse::<Quant>()?;
     let device = args.device.parse::<DeviceKind>()?;
     quant.check_device(device)?;
-    let checkpoint = model_helpers::locate(source, args.weights.as_deref(), quant)?;
+    let options = model_helpers::ResolveOptions { quant, weights: args.weights.as_deref() };
+    let checkpoint = model_helpers::Checkpoint::locate(&args.model, options)?;
     let mut builder =
         checkpoint.builder(normalize).device(device).temperature(args.temperature).seed(args.seed);
     if let Some(tokenizer) = args.tokenizer.as_deref() {
@@ -161,12 +178,20 @@ fn main() -> Result<()> {
     tracing::info!("loading model");
     let mut tts = builder.build()?;
     checkpoint.register_voices(&mut tts);
-    tracing::info!(device = %tts.device_name(), voices = ?tts.voices(), "model loaded");
+    tracing::info!(device = %tts.device_name(), voices = ?tts.voices(), languages = ?tts.languages(), "model loaded");
 
     let mut opts = SpeechOptions::default();
     match &voice {
         VoiceArg::Default => {}
-        VoiceArg::Bundled(name) => opts = opts.voice(name.clone()),
+        VoiceArg::Bundled(name) => {
+            let name = catalog.register(&mut tts, name)?;
+            anyhow::ensure!(
+                tts.voices().contains(&name),
+                "no voice '{name}': the model has {}, and --list-voices lists the catalog's",
+                tts.voices().join(", ")
+            );
+            opts = opts.voice(name);
+        }
         VoiceArg::Embedding(_) => opts = opts.voice(VoiceArg::REGISTERED),
         VoiceArg::Audio(path) => {
             let pcm = ptts::audio::load_mono_at(path, tts.voice_prompt_sample_rate())?;
@@ -176,7 +201,6 @@ fn main() -> Result<()> {
     }
 
     // `Synth` normalizes the text itself; log what it will see.
-    let text = args.text.as_str();
     if normalize != Normalize::OFF {
         tracing::info!(
             lang = normalize.as_str(),
@@ -226,7 +250,7 @@ fn main() -> Result<()> {
 enum VoiceArg {
     /// Not given: use whichever voice the model defaults to.
     Default,
-    /// A voice id shipped with the checkpoint, e.g. `alba`.
+    /// A voice of the checkpoint or the catalog, e.g. `Zoey`.
     Bundled(String),
     /// A precomputed voice embedding, e.g. from the `create_voice` example.
     Embedding(std::path::PathBuf),
@@ -253,7 +277,8 @@ fn init_tracing(chrome_tracing: bool) -> Option<tracing_chrome::FlushGuard> {
 
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(model_helpers::LOG_DIRECTIVES));
-    let fmt = tracing_subscriber::fmt::Layer::new().with_target(false);
+    // Logs go to stderr, so `-o /dev/stdout` writes nothing but the WAV.
+    let fmt = tracing_subscriber::fmt::Layer::new().with_target(false).with_writer(std::io::stderr);
     if chrome_tracing {
         let (chrome_layer, guard) = tracing_chrome::ChromeLayerBuilder::new().build();
         tracing_subscriber::registry().with(fmt).with(chrome_layer).with(filter).init();
@@ -286,25 +311,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_model_source_is_required_before_loading() {
-        let err = Args::try_parse_from(["ptts", "--lang", "en", "hello"]).unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
-        assert!(err.to_string().contains("--repo"));
+    fn without_a_model_the_default_loads() {
+        let args = Args::try_parse_from(["ptts", "--lang", "en", "hello"]).unwrap();
+        assert_eq!(args.model, model_helpers::DEFAULT_MODEL);
     }
 
     #[test]
-    fn a_local_directory_rejects_a_hub_revision_before_loading() {
-        let err = Args::try_parse_from([
-            "ptts",
-            "--dir",
-            "./missing",
-            "--revision",
-            "test-commit",
-            "--lang",
-            "en",
-            "Hello",
-        ])
-        .unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    fn list_voices_needs_no_text_or_lang() {
+        let args = Args::try_parse_from(["ptts", "--list-voices", "--voice-catalog", "c"]).unwrap();
+        assert!(args.list_voices);
+        assert_eq!(args.voice_catalog, "c");
+        let args = Args::try_parse_from(["ptts", "--list-voices"]).unwrap();
+        assert_eq!(args.voice_catalog, ptts::voice_catalog::DEFAULT_VOICE_CATALOG);
+        assert!(Args::try_parse_from(["ptts", "hello"]).is_err());
+        assert!(Args::try_parse_from(["ptts", "--lang", "en"]).is_err());
+    }
+
+    #[test]
+    fn dir_still_names_a_local_model() {
+        let args = Args::try_parse_from(["ptts", "--dir", "m", "--lang", "en", "hi"]).unwrap();
+        assert_eq!(args.model, "m");
     }
 }

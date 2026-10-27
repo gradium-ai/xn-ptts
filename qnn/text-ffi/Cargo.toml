@@ -1,0 +1,26 @@
+[package]
+name = "ptts-text"
+version = "0.1.0"
+edition = "2024"
+description = "C interface to ptts's text normalization, chunking and tokenization"
+publish = false
+
+# Not part of any outer workspace.
+[workspace]
+
+[lib]
+name = "ptts_text"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ptts = { path = "../../ptts", features = ["hf"] }
+
+[dev-dependencies]
+# For the independent cross-check in tests/parity.rs; same version and features ptts uses.
+tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

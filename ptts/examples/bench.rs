@@ -9,7 +9,7 @@
 //! up in one call. `--breakdown` instead runs both on this thread, one frame at a time, which
 //! is slower overall but times each stage on its own.
 
-#[path = "model_helpers.rs"]
+#[path = "../src/bin/ptts/model_helpers.rs"]
 mod model_helpers;
 
 use std::time::{Duration, Instant};
@@ -59,7 +59,7 @@ struct Args {
     #[arg(
         long = "condition",
         value_name = "NAME=VALUE",
-        help = "Set a conditioner, e.g. padding_bonus=0.5; repeatable"
+        help = "Set a conditioner, e.g. duration_delta=0.5; repeatable"
     )]
     conditions: Vec<String>,
 
@@ -97,8 +97,8 @@ struct Args {
     lang: String,
 
     /// Which word rewrites run on the normalized text: `default` (numbers, currency,
-    /// dashed-digits, emails, urls), `all` (those and phones, times, dates), `none`, or a
-    /// comma-separated list of rule names. Has no effect with `--lang none`.
+    /// dashed-digits, emails, urls, abbreviations, elongations), `all` (those and phones, times,
+    /// dates), `none`, or a comma-separated list of rule names. Has no effect with `--lang none`.
     #[arg(long, default_value = "default")]
     rewrites: String,
 }
@@ -288,7 +288,7 @@ impl Bench<'_> {
                 .context("baked-in voice not loaded")?,
             None => model_helpers::load_voice_emb(
                 &args.voice,
-                cfg.model_ext().as_deref(),
+                cfg.embeddings_ext.as_deref(),
                 model.speaker_proj(),
                 &dev,
             )?,

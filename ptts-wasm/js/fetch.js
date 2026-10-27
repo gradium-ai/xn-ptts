@@ -5,7 +5,7 @@
 /** Bump to orphan everything cached by an older, incompatible version of this package. */
 export const CACHE_NAME = 'phonon-tts-v1';
 
-async function openCache() {
+export async function openCache() {
   // Absent outside secure contexts (plain http other than localhost), and it can throw
   // where storage is blocked. Either way the download still works, it just is not kept.
   if (typeof caches === 'undefined') return null;
@@ -17,13 +17,15 @@ async function openCache() {
 }
 
 /**
- * Fetch `url` as bytes, from the cache when it is there.
+ * Fetch `url` as bytes, from the cache when it is there. With `write: false` the cache is
+ * still read, but a download is left out of it, for a caller that stores it elsewhere: the
+ * worker, whose own writes do not last in WebKit (see `storeBytes`).
  *
  * @param {string} url
- * @param {{ cache?: boolean, onProgress?: (p: { loaded: number, total: number | null, cached: boolean }) => void }} [options]
+ * @param {{ cache?: boolean, write?: boolean, onProgress?: (p: { loaded: number, total: number | null, cached: boolean }) => void }} [options]
  * @returns {Promise<Uint8Array>}
  */
-export async function fetchBytes(url, { cache = true, onProgress } = {}) {
+export async function fetchBytes(url, { cache = true, write = true, onProgress } = {}) {
   const store = cache ? await openCache() : null;
   if (store) {
     const hit = await store.match(url).catch(() => undefined);
@@ -39,7 +41,7 @@ export async function fetchBytes(url, { cache = true, onProgress } = {}) {
 
   // Stored from a clone, streamed alongside the read below, rather than from the finished
   // buffer: `new Response(bytes)` would copy the whole checkpoint once more.
-  const stored = store
+  const stored = store && write
     ? store.put(url, response.clone()).catch((e) => {
         // Usually the storage quota. Not fatal: the next load downloads again.
         console.warn(`[phonon-tts] could not cache ${url}: ${e}`);
@@ -75,6 +77,33 @@ async function readBody(response, total, onChunk) {
     onChunk(loaded);
   }
   return loaded === buffer.length ? buffer : buffer.slice(0, loaded);
+}
+
+/**
+ * Keep `bytes` in the cache as the response for `url`.
+ *
+ * This is how the worker's downloads are cached: it hands them to the page, which stores them
+ * here. WebKit (Safari, and so every browser on iOS) drops the Cache API writes of a worker
+ * once the worker is terminated, which this package's is on `dispose()` and whenever the page
+ * goes, so a checkpoint the worker cached for itself was downloaded again on every load there.
+ * The page's writes last in every browser. A whole buffer rather than a stream, so the write
+ * never waits on the page's main thread.
+ *
+ * @param {string} url
+ * @param {ArrayBuffer | Uint8Array} bytes
+ * @returns {Promise<boolean>} whether it was stored.
+ */
+export async function storeBytes(url, bytes) {
+  const store = await openCache();
+  if (!store) return false;
+  try {
+    await store.put(url, new Response(bytes, { headers: { 'content-length': String(bytes.byteLength) } }));
+    return true;
+  } catch (e) {
+    // Usually the storage quota. Not fatal: the next load downloads again.
+    console.warn(`[phonon-tts] could not cache ${url}: ${e}`);
+    return false;
+  }
 }
 
 /**

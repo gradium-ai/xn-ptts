@@ -19,7 +19,10 @@ pub struct Config {
     /// Rows of the batched text prefill graph; a shorter prompt is padded and the padding
     /// masked out of every later step.
     pub prefill_len: usize,
-    /// Mimi's attention window in past positions, the reference's `transformer_context` (250).
+    /// The Mimi decoder's sizes, from the checkpoint's config.
+    pub mimi: mimi::Dims,
+    /// Mimi's attention window, the reference's `transformer_context`: the positions each query
+    /// sees, itself included.
     pub mimi_window: usize,
     pub max_frames: usize,
     pub eos_threshold: f32,
@@ -169,8 +172,8 @@ fn rope(start: usize, n: usize, hd: usize) -> (Vec<f32>, Vec<f32>) {
 
 /// Mimi rotates adjacent channel pairs rather than halves, so it needs one entry per channel
 /// with each angle repeated across its pair.
-fn rope_mimi(step: usize) -> (Vec<f32>, Vec<f32>) {
-    let (hd, n, start) = (mimi::HD, mimi::STEPS, step * mimi::STEPS);
+fn rope_mimi(dm: &mimi::Dims, step: usize) -> (Vec<f32>, Vec<f32>) {
+    let (hd, n, start) = (dm.hd(), dm.steps, step * dm.steps);
     let half = hd / 2;
     let (mut c, mut s) = (vec![0f32; n * hd], vec![0f32; n * hd]);
     for t in 0..n {
@@ -206,15 +209,15 @@ fn ring_mask(valid: &[bool], t: usize, ctx: usize) -> Vec<f32> {
 }
 
 /// Mimi's sliding window, as the reference applies it: the query at absolute position `p` sees
-/// positions `p - window ..= p` and nothing older. The cache holds `window` past positions and
-/// this call's `STEPS` rows, so slot `j` holds position `start - window + j`, and is empty while
-/// that is negative.
-fn mimi_mask(step: usize, window: usize) -> Vec<f32> {
-    let (t, n) = (mimi::STEPS, mimi::cache_len(window));
+/// positions `p - window + 1 ..= p` and nothing older. The cache holds `window` past positions
+/// and this call's `steps` rows, so slot `j` holds position `start - window + j`, and is empty
+/// while that is negative.
+fn mimi_mask(dm: &mimi::Dims, step: usize, window: usize) -> Vec<f32> {
+    let (t, n) = (dm.steps, dm.cache_len(window));
     let start = step * t;
     let mut m = vec![-1e4f32; t * n];
     for q in 0..t {
-        for j in q..=window + q {
+        for j in q + 1..=window + q {
             if start + j >= window {
                 m[q * n + j] = 0.0;
             }
@@ -255,31 +258,30 @@ struct MimiStream<'a> {
     session: Session,
     spec: Vec<(String, Vec<usize>)>,
     state: Vec<Vec<f32>>,
+    dims: mimi::Dims,
     window: usize,
 }
 
 impl<'a> MimiStream<'a> {
-    fn new(model: &'a Model, window: usize, ldim: usize) -> Result<Self, String> {
-        let n = mimi::cache_len(window);
-        let spec = mimi::state_spec(n);
-        let latent_shape = [1, 1, ldim];
-        let mut small: Vec<(&str, &[usize])> = vec![
-            ("latent", &latent_shape),
-            ("cos", &[1, 1, mimi::STEPS, mimi::HD]),
-            ("sin", &[1, 1, mimi::STEPS, mimi::HD]),
-        ];
-        let mask_shape = [1, 1, mimi::STEPS, n];
+    fn new(model: &'a Model, dims: &mimi::Dims, window: usize) -> Result<Self, String> {
+        let n = dims.cache_len(window);
+        let spec = dims.state_spec(n);
+        let latent_shape = [1, 1, dims.ldim];
+        let rope_shape = [1, 1, dims.steps, dims.hd()];
+        let mut small: Vec<(&str, &[usize])> =
+            vec![("latent", &latent_shape), ("cos", &rope_shape), ("sin", &rope_shape)];
+        let mask_shape = [1, 1, dims.steps, n];
         small.push(("mask", &mask_shape));
         small.extend(spec.iter().map(|(name, sh)| (name.as_str(), sh.as_slice())));
         let session = model.session(&small, &[])?;
         let state = spec.iter().map(|(_, sh)| vec![0f32; sh.iter().product()]).collect();
-        Ok(MimiStream { model, session, spec, state, window })
+        Ok(MimiStream { model, session, spec, state, dims: dims.clone(), window })
     }
 
-    /// Frame `i`: latent in, 1920 samples of PCM out, streaming state advanced.
+    /// Frame `i`: latent in, one frame of PCM out, streaming state advanced.
     fn decode(&mut self, i: usize, latent: &[f32]) -> Result<Vec<f32>, String> {
-        let (rc, rs) = rope_mimi(i);
-        let mask = mimi_mask(i, self.window);
+        let (rc, rs) = rope_mimi(&self.dims, i);
+        let mask = mimi_mask(&self.dims, i, self.window);
         let mut ins: Vec<(&str, &[f32])> =
             vec![("latent", latent), ("cos", &rc), ("sin", &rs), ("mask", &mask)];
         ins.extend(self.spec.iter().zip(&self.state).map(|((n, _), s)| (n.as_str(), s.as_slice())));
@@ -302,7 +304,7 @@ impl Phonon {
         let decode = Flow::new(decode, dm, 1, cfg.ctx, &ring)?;
         let prefill = load(dir, &fl::package_name(cfg.ctx, cfg.prefill_len), cfg.flow_unit)?;
         let prefill = Flow::new(prefill, dm, cfg.prefill_len, cfg.ctx, &ring)?;
-        let mimi = load(dir, &mimi::package_name(cfg.mimi_window), Compute::CpuOnly)?;
+        let mimi = load(dir, &cfg.mimi.package_name(cfg.mimi_window), Compute::CpuOnly)?;
 
         // Bundles exported before the conditioners came from the config call it `num_speakers`,
         // the one conditioner they knew.
@@ -337,7 +339,7 @@ impl Phonon {
         let zero = vec![0f32; dm.ldim];
         let (plen, vlen) = (me.cfg.prefill_len, me.voice.len);
         me.prefill.step(&mut me.ring, vlen, &vec![0f32; plen * dm.d], &zero, &vec![false; plen])?;
-        MimiStream::new(&me.mimi, me.cfg.mimi_window, dm.ldim)?.decode(0, &zero)?;
+        MimiStream::new(&me.mimi, &me.cfg.mimi, me.cfg.mimi_window)?.decode(0, &zero)?;
         Ok(me)
     }
 
@@ -423,7 +425,7 @@ impl Phonon {
         let distr = rand_distr::Normal::new(0f32, self.cfg.temperature.max(0.0).sqrt())
             .map_err(|e| format!("noise distribution: {e}"))?;
 
-        let mut stream = MimiStream::new(&self.mimi, self.cfg.mimi_window, self.cfg.dims.ldim)?;
+        let mut stream = MimiStream::new(&self.mimi, &self.cfg.mimi, self.cfg.mimi_window)?;
         let (decode, ring) = (&self.decode, &mut self.ring);
         let conditions = self.voice.conditions.as_ref().unwrap_or(&self.conditions);
         let (il, cfg) = (&self.il, &self.cfg);
@@ -500,5 +502,31 @@ impl Phonon {
             samples,
             stopped: stopped.get(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mimi_mask_shows_each_query_the_window_ending_at_itself() {
+        let dm = mimi::Dims::default();
+        for window in [5, 50, 250] {
+            let n = dm.cache_len(window);
+            for step in 0..window / dm.steps + 3 {
+                let start = step * dm.steps;
+                let mask = mimi_mask(&dm, step, window);
+                for q in 0..dm.steps {
+                    let p = start + q;
+                    let seen: Vec<usize> = (0..n)
+                        .filter(|&j| mask[q * n + j] == 0.0)
+                        .map(|j| start + j - window)
+                        .collect();
+                    let want: Vec<usize> = (p.saturating_sub(window - 1)..=p).collect();
+                    assert_eq!(seen, want, "window {window}, step {step}, query {q}");
+                }
+            }
+        }
     }
 }

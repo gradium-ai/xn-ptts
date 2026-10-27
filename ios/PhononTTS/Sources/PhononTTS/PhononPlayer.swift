@@ -44,14 +44,16 @@ public final class PhononPlayer: @unchecked Sendable {
     }
 
     /// Play a stream as it is generated. Returns when the stream ends; the last chunks may
-    /// still be playing.
+    /// still be playing. Keep this player alive until playback finishes.
+    /// Cancel the calling task to stop the stream, and call `stop()` to clear scheduled audio.
     public func play(_ stream: AsyncThrowingStream<[Float], Error>) async throws {
         for try await chunk in stream {
             enqueue(chunk)
         }
     }
 
-    /// Drop everything queued and go quiet. Playing again after this works as before.
+    /// Drop everything queued and go quiet. Also cancel the playback task to stop generation;
+    /// otherwise it can enqueue more audio. Playing again after this works as before.
     public func stop() {
         node.stop()
         node.play()

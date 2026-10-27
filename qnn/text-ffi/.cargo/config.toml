@@ -1,0 +1,8 @@
+# No target-cpu here, unlike xn-ptts's own config: the Android and Linux libraries must run on
+# any arm64 device, so they are built for each target's baseline. The SONAME lets the loader
+# and NDK identify the library by name. Android builds also use 16 KB page alignment.
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-soname,libptts_text.so", "-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,-soname,libptts_text.so"]

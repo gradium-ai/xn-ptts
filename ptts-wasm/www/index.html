@@ -7,7 +7,6 @@
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 20px; background: #111; color: #ddd; }
-  h1 { margin-bottom: 8px; color: #eee; }
   .subtitle { color: #888; margin-bottom: 24px; }
   .subtitle a { color: #60a5fa; }
   .section { margin-bottom: 20px; }
@@ -22,7 +21,7 @@
   .progress-bar { width: 100%; height: 6px; background: #333; border-radius: 3px; margin-top: 6px; overflow: hidden; }
   .progress-bar .fill { height: 100%; background: #2563eb; transition: width 0.2s; }
   audio { width: 100%; margin-top: 12px; }
-  .controls { display: flex; gap: 10px; align-items: end; }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
   .controls .section { margin-bottom: 0; }
   #visualizer { width: 100%; height: 140px; margin-top: 16px; display: block; }
   .slider-section { margin-bottom: 0; margin-left: auto; }
@@ -55,6 +54,7 @@
   </div>
   <button id="load-btn" disabled>Load Weights</button>
   <button id="generate-btn" style="display:none">Generate</button>
+  <button id="stop-btn" style="display:none" disabled>Stop</button>
   <div class="slider-section">
     <label for="temperature">Temperature <span id="temp-value" class="slider-value">0.3</span></label>
     <input type="range" id="temperature" min="0.1" max="1.0" step="0.1" value="0.3">
@@ -70,6 +70,7 @@
 const statusEl = document.getElementById('status');
 const loadBtn = document.getElementById('load-btn');
 const btn = document.getElementById('generate-btn');
+const stopBtn = document.getElementById('stop-btn');
 const voiceSelect = document.getElementById('voice');
 const quantSelect = document.getElementById('quant');
 const deviceSelect = document.getElementById('device');
@@ -84,10 +85,11 @@ tempSlider.addEventListener('input', () => {
   tempValue.textContent = tempSlider.value;
 });
 
-// `make demo` serves a model folder as `model/` and describes it in `model.json`: a static
-// server cannot list a directory, so the page cannot find the weights and voices itself.
-// Fetched before the module script below runs anything else, so the load button only
-// enables once the page knows what it would download.
+// `make demo MODEL_DIR=...` links a model folder as `model/` and describes it in `model.json`:
+// a static server cannot list a directory, so the page cannot find the weights and voices
+// itself. Without `model.json` the page loads the package's default model. Fetched before the
+// module script below runs anything else, so the load button only enables once the page knows
+// what it would download.
 let demoModel = null;
 function updateLoadBtnLabel() {
   const bytes = demoModel?.sizes[quantSelect.value];
@@ -103,9 +105,12 @@ try {
   quantSelect.value = quants.includes('q8') ? 'q8' : quants[0];
   loadBtn.disabled = false;
   updateLoadBtnLabel();
-} catch (e) {
-  statusEl.textContent =
-    `No model to load (${e.message}). Serve the page with: make serve MODEL_DIR=/path/to/model`;
+} catch {
+  demoModel = null;
+  quantSelect.innerHTML = ['q8', 'f32'].map((q) => `<option value="${q}">${q}</option>`).join('');
+  quantSelect.value = 'q8';
+  loadBtn.disabled = false;
+  statusEl.textContent = 'Loads the default model from the Hugging Face Hub.';
 }
 
 function log(msg) {
@@ -219,6 +224,10 @@ let tts = null;
 let audioCtx = null;
 let replayAudioCtx = null;
 let generating = false;
+let activeSpeech = null;
+let stopped = false;
+let audioUrl = null;
+let playbackTimer = null;
 
 function formatFeatures(f) {
   // Show every flag with a clear on/off marker. Wasm builds normally
@@ -250,7 +259,7 @@ async function loadWeights() {
       lang: LANG,
       quant: quantSelect.value,
       device: deviceSelect.value,
-      model: demoModel.model,
+      model: demoModel?.model,
       onProgress,
     });
   } catch (e) {
@@ -268,6 +277,7 @@ async function loadWeights() {
   voiceSelect.disabled = false;
   loadBtn.style.display = 'none';
   btn.style.display = '';
+  stopBtn.style.display = '';
   log(`Ready! Enter text and click Generate.\n${formatFeatures(tts.features)}\nDevice: ${tts.device} (${tts.deviceReason}), threads: ${tts.threads} (${tts.threadsReason})`);
 }
 
@@ -276,7 +286,13 @@ async function generate() {
   if (!text || generating) return;
 
   generating = true;
+  stopped = false;
+  clearTimeout(playbackTimer);
   btn.disabled = true;
+  stopBtn.disabled = false;
+  if (audioUrl) URL.revokeObjectURL(audioUrl);
+  audioUrl = null;
+  document.getElementById('audio-container').replaceChildren();
   const sampleRate = tts.sampleRate;
   const startTime = performance.now();
   let firstChunkTime = null;
@@ -284,8 +300,8 @@ async function generate() {
 
   // AudioContext must be created/resumed from a user gesture. Close the last ones first:
   // browsers cap how many can be open at once.
-  audioCtx?.close();
-  replayAudioCtx?.close();
+  closeAudioContext(audioCtx);
+  closeAudioContext(replayAudioCtx);
   replayAudioCtx = null;
   audioCtx = new AudioContext({ sampleRate });
   analyser = makeAnalyser(audioCtx);
@@ -293,13 +309,14 @@ async function generate() {
   startVisualizer();
 
   log(`Loading voice ${voiceSelect.value} and generating...`);
-  const speech = tts.stream(text, {
+  const speech = activeSpeech = tts.stream(text, {
     voice: voiceSelect.value,
     temperature: parseFloat(tempSlider.value),
   });
   let nextStartTime = 0;
   try {
     for await (const chunk of speech) {
+      if (stopped) break;
       if (firstChunkTime === null) {
         firstChunkTime = performance.now() - startTime;
         nextStartTime = audioCtx.currentTime;
@@ -316,6 +333,10 @@ async function generate() {
       chunks.push(chunk);
     }
     const stats = await speech.done;
+    if (stopped || stats.cancelled) {
+      log('Stopped. Enter text and click Generate to speak again.');
+      return;
+    }
 
     const totalMs = performance.now() - startTime;
     const durationSec = stats.samples / sampleRate;
@@ -330,7 +351,7 @@ async function generate() {
     ].join('\n'));
 
     // Create WAV download/replay element
-    const url = URL.createObjectURL(encodeWav(concatPcm(chunks), sampleRate));
+    const url = audioUrl = URL.createObjectURL(encodeWav(concatPcm(chunks), sampleRate));
     const container = document.getElementById('audio-container');
     container.innerHTML = '';
     const audio = document.createElement('audio');
@@ -343,8 +364,31 @@ async function generate() {
     console.error(e);
   } finally {
     btn.disabled = false;
+    activeSpeech = null;
     generating = false;
+    // Partial audio can still be playing after completion or a generation error.
+    if (stopped || nextStartTime <= audioCtx.currentTime) {
+      stopBtn.disabled = true;
+    } else {
+      playbackTimer = setTimeout(() => {
+        stopBtn.disabled = true;
+      }, (nextStartTime - audioCtx.currentTime) * 1000);
+    }
   }
+}
+
+function closeAudioContext(context) {
+  if (context && context.state !== 'closed') context.close().catch(() => {});
+}
+
+function stopSpeech() {
+  stopped = true;
+  clearTimeout(playbackTimer);
+  activeSpeech?.cancel();
+  closeAudioContext(audioCtx);
+  document.querySelector('#audio-container audio')?.pause();
+  stopBtn.disabled = true;
+  log(generating ? 'Stopping...' : 'Stopped. Enter text and click Generate to speak again.');
 }
 
 function hookAudioElement(audio, sampleRate) {
@@ -356,14 +400,22 @@ function hookAudioElement(audio, sampleRate) {
   replayAnalyser.connect(replayAudioCtx.destination);
 
   audio.addEventListener('play', () => {
+    clearTimeout(playbackTimer);
+    closeAudioContext(audioCtx);
+    stopBtn.disabled = false;
     if (replayAudioCtx.state === 'suspended') replayAudioCtx.resume();
     analyser = replayAnalyser;
     startVisualizer();
+  });
+  // Pausing manually and reaching the end both fire this event.
+  audio.addEventListener('pause', () => {
+    if (!generating) stopBtn.disabled = true;
   });
 }
 
 loadBtn.addEventListener('click', loadWeights);
 btn.addEventListener('click', generate);
+stopBtn.addEventListener('click', stopSpeech);
 
 // Start the render loop (draws empty bars until audio plays)
 startVisualizer();

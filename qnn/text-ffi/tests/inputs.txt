@@ -1,0 +1,40 @@
+Hello world
+hi
+I paid $1,234.56 for it.
+It costs €20 or £15.50, not ¥3000.
+The meeting is on 2024-03-15 at 14:30.
+Call me at +1 (555) 123-4567.
+Email john.doe@example.com for details.
+Visit https://www.example.com/path?q=1&x=2 now.
+Go to example.org or Kyutai.ORG today
+3.14159 is pi, and 1/2 is a half.
+He said, "Don't stop!" and left...
+Wait... what?! Really?
+100% of 42 people -- yes, 42 -- agreed.
+a + b = c
+Numbers: 1st, 2nd, 3rd, 21st.
+1,000,000 and -5 and -$500.
+Café crème, naïve résumé, jalapeño.
+日本語のテキスト。
+Emoji 😀 test 🎉!
+multiple     spaces\nand\nnewlines\r\nhere
+ok
+.
+"Quoted" 'single' «guillemets» “curly” ‘quotes’ — dash – en dash
+Tabs\tand\tother whitespace.
+The year 1999 was before 2000.
+Dial 555-1234 or 1-800-FLOWERS.
+At 9am or 5:45 pm, on Jan 3rd 2025.
+The quick brown fox jumps over the lazy dog. On March 3rd, 2021, the company reported revenue of $4.2 million, up 15% from the year before. Its CEO, Dr. Jane Smith, said the results were "better than expected"! Analysts at example.com disagreed; they wrote to investors@example.com within the hour. Will the trend continue? Nobody knows... but the stock rose 3.5 points by 4:30 pm. Meanwhile, in Paris, the weather was 21 degrees and sunny, which pleased the 12,000 tourists. Finally, the board approved a dividend of 0.25 per share, payable on 2021-04-15.
+This is a single very long sentence without any terminal punctuation that keeps going on and on with many clauses and words, including numbers like 12345 and 678, so that it is clearly longer than fifty tokens and has to stay in one chunk because the splitter never cuts inside a sentence
+Mixed: ID AB-1234-XYZ, version 2.0.1, temp 25°C, 5km/h.
+What's up? Not much. You?
+I have 2 cats & 3 dogs; they're #1.
+
+   
+The quick brown fox jumps over the lazy dog. On March 3rd, 2021, the company reported revenue of $4.2 million, up 15% from the year before. Its CEO, Dr. Jane Smith, said the results were "better than expected"! Analysts at example.com disagreed; they wrote to investors@example.com within the hour. Will the trend continue? Nobody knows... but the stock rose 3.5 points by 4:30 pm. Meanwhile, in Paris, the weather was 21 degrees and sunny, which pleased the 12,000 tourists. Finally, the board approved a dividend of 0.25 per share, payable on 2021-04-15. The quick brown fox jumps over the lazy dog. On March 3rd, 2021, the company reported revenue of $4.2 million, up 15% from the year before. Its CEO, Dr. Jane Smith, said the results were "better than expected"! Analysts at example.com disagreed; they wrote to investors@example.com within the hour. Will the trend continue? Nobody knows... but the stock rose 3.5 points by 4:30 pm. Meanwhile, in Paris, the weather was 21 degrees and sunny, which pleased the 12,000 tourists. Finally, the board approved a dividend of 0.25 per share, payable on 2021-04-15. The quick brown fox jumps over the lazy dog. On March 3rd, 2021, the company reported revenue of $4.2 million, up 15% from the year before. Its CEO, Dr. Jane Smith, said the results were "better than expected"! Analysts at example.com disagreed; they wrote to investors@example.com within the hour. Will the trend continue? Nobody knows... but the stock rose 3.5 points by 4:30 pm. Meanwhile, in Paris, the weather was 21 degrees and sunny, which pleased the 12,000 tourists. Finally, the board approved a dividend of 0.25 per share, payable on 2021-04-15. The quick brown fox jumps over the lazy dog. On March 3rd, 2021, the company reported revenue of $4.2 million, up 15% from the year before. Its CEO, Dr. Jane Smith, said the results were "better than expected"! Analysts at example.com disagreed; they wrote to investors@example.com within the hour. Will the trend continue? Nobody knows... but the stock rose 3.5 points by 4:30 pm. Meanwhile, in Paris, the weather was 21 degrees and sunny, which pleased the 12,000 tourists. Finally, the board approved a dividend of 0.25 per share, payable on 2021-04-15. The quick brown fox jumps over the lazy dog. On March 3rd, 2021, the company reported revenue of $4.2 million, up 15% from the year before. Its CEO, Dr. Jane Smith, said the results were "better than expected"! Analysts at example.com disagreed; they wrote to investors@example.com within the hour. Will the trend continue? Nobody knows... but the stock rose 3.5 points by 4:30 pm. Meanwhile, in Paris, the weather was 21 degrees and sunny, which pleased the 12,000 tourists. Finally, the board approved a dividend of 0.25 per share, payable on 2021-04-15. The quick brown fox jumps over the lazy dog. On March 3rd, 2021, the company reported revenue of $4.2 million, up 15% from the year before. Its CEO, Dr. Jane Smith, said the results were "better than expected"! Analysts at example.com disagreed; they wrote to investors@example.com within the hour. Will the trend continue? Nobody knows... but the stock rose 3.5 points by 4:30 pm. Meanwhile, in Paris, the weather was 21 degrees and sunny, which pleased the 12,000 tourists. Finally, the board approved a dividend of 0.25 per share, payable on 2021-04-15.
+Ünïcödé ÀÉÎÕÜ ß œ æ ø Ω π ∑ √ ∞ ≠ ≤
+email@x.io, +33 6 12 34 56 78, 10:00, 01/02/2023, $0.99, 7.5%
+UPPER CASE SHOUTING HERE
+lowercase start and no period
+Mr. Smith vs. Mrs. Jones, i.e. e.g. etc.

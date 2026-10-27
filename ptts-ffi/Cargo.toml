@@ -2,6 +2,7 @@
 name = "ptts-ffi"
 version.workspace = true
 edition = "2024"
+publish = false
 description = "C interface to Phonon: Core ML on Apple, which the PhononTTS Swift package wraps, and the CPU elsewhere"
 repository.workspace = true
 license.workspace = true

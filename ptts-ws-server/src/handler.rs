@@ -18,6 +18,8 @@ const REQUEST_QUEUE: usize = 16;
 const MAX_INPUT_CHARS: usize = 4096;
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a session may wait for its next message before it is closed and its slot freed.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub async fn ws_handler(
     State(app): State<AppState>,
@@ -161,6 +163,13 @@ async fn run_session(
                 Some(msg) => msg,
                 None => break,
             },
+            // Only waits between requests: generation and its audio run inside the arms below.
+            _ = tokio::time::sleep(IDLE_TIMEOUT) => {
+                let message = format!("no message for {} seconds; closing the session", IDLE_TIMEOUT.as_secs());
+                tracing::info!("{message}");
+                send_error(reply_tx, error_codes::TIMEOUT, message).await?;
+                return Ok(());
+            }
         };
         let text = match msg {
             Message::Text(t) => t,
@@ -469,9 +478,7 @@ mod tests {
     #[ignore = "requires PTTS_TEST_MODEL pointing to a q8 checkpoint"]
     async fn session_limit_covers_idle_connections_and_releases_after_close() {
         use ptts::synth::{DeviceKind, Quant};
-        let path = std::path::PathBuf::from(
-            std::env::var("PTTS_TEST_MODEL").expect("set PTTS_TEST_MODEL"),
-        );
+        let path = std::env::var("PTTS_TEST_MODEL").expect("set PTTS_TEST_MODEL");
         let app = crate::model::load_ptts(
             &path,
             None,

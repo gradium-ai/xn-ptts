@@ -146,12 +146,6 @@ impl<T: WithDTypeF, B: Backend> StreamingConv1d<T, B> {
         // On first call with replicate padding, fill previous with first sample
         if tp > 0 && matches!(self.pad_mode, PadMode::Replicate) && state.first {
             let init = x.narrow(2, 0..1)?.contiguous()?;
-            // Broadcast init to fill previous
-            let mut fills = Vec::with_capacity(tp);
-            for _ in 0..tp {
-                fills.push(&init);
-            }
-            // Actually just repeat using cat
             state.previous = if tp == 1 {
                 init
             } else {

@@ -55,7 +55,8 @@ def hub(tmp_path, monkeypatch):
 
 
 def load(hub):
-    return ptts.TTS(config=hub.repo, revision=hub.revision, device="cpu", quant="q8", lang="en")
+    model = f"hf://{hub.repo}@{hub.revision}"
+    return ptts.TTS(model, device="cpu", quant="q8", lang="en")
 
 
 def test_phonon_hub_requires_config_before_fetching_weights(hub):
@@ -78,10 +79,30 @@ def test_config_authentication_errors_remain_io_errors(hub):
     assert not any(p.endswith((".gguf", ".safetensors")) for p in hub.requests)
 
 
-def test_missing_model_source_never_selects_a_hub_repo(hub):
-    with pytest.raises(ValueError, match="config is required"):
-        ptts.TTS(lang="en")
+def test_the_deprecated_config_still_names_a_hub_repo(hub):
+    with pytest.warns(DeprecationWarning), pytest.raises(LookupError, match="config.json"):
+        ptts.TTS(config=hub.repo, revision=hub.revision, quant="q8", lang="en")
+    assert hub.requests
+
+
+def test_a_bare_repo_id_is_a_local_path(hub):
+    with pytest.raises(LookupError, match=f"hf://{hub.repo}"):
+        ptts.TTS(hub.repo, lang="en")
     assert hub.requests == []
+
+
+def test_without_a_model_the_default_is_fetched(hub):
+    repo, revision = ptts.DEFAULT_MODEL.removeprefix("hf://").split("@")
+    with pytest.raises(LookupError, match="config.json"):
+        ptts.TTS(lang="en", quant="q8")
+    assert f"/{repo}/resolve/{revision}/config.json" in hub.requests
+
+
+def test_without_a_catalog_the_default_is_fetched(hub):
+    repo, revision = ptts.DEFAULT_VOICE_CATALOG.removeprefix("hf://").split("@")
+    with pytest.raises(LookupError, match="voices.jsonl"):
+        ptts.catalog_voices()
+    assert hub.requests == [f"/{repo}/resolve/{revision}/voices.jsonl"]
 
 
 @pytest.mark.parametrize("device", ["cuda", "vulkan", "metal"])
@@ -89,12 +110,12 @@ def test_unavailable_device_is_rejected_before_hub_access(hub, device):
     if device in ptts.available_devices():
         pytest.skip("backend is included in this wheel")
     with pytest.raises(NotImplementedError, match=f"device '{device}' is not available") as exc:
-        ptts.TTS(config=hub.repo, revision=hub.revision, device=device, quant="f32", lang="en")
+        ptts.TTS(f"hf://{hub.repo}", device=device, quant="f32", lang="en")
     assert f"available devices: {', '.join(ptts.available_devices())}" in str(exc.value)
     assert hub.requests == []
 
 
 def test_quantized_gpu_is_rejected_before_hub_access(hub):
     with pytest.raises(NotImplementedError, match="CPU-only"):
-        ptts.TTS(config=hub.repo, revision=hub.revision, device="cuda", quant="q8", lang="en")
+        ptts.TTS(f"hf://{hub.repo}", device="cuda", quant="q8", lang="en")
     assert hub.requests == []

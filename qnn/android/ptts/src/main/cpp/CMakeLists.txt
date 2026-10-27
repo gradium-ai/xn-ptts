@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.22.1)
+project(ptts_android CXX)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../../../../../runner" runner)
+add_library(ptts_qnn SHARED jni.cpp)
+target_link_libraries(ptts_qnn PRIVATE phonon)
+target_link_options(ptts_qnn PRIVATE "-Wl,-z,max-page-size=16384")

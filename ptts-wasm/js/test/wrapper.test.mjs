@@ -37,6 +37,7 @@ class FakeWorker {
           deviceReason: 'this browser offers no WebGPU adapter',
           threads: 4,
           threadsReason: 'default',
+          languages: ['en', 'fr'],
         },
       });
     }
@@ -84,10 +85,23 @@ test('device is checked before the worker starts, handed to it, and reported bac
   // What the worker says it got, not what was asked for.
   assert.equal(tts.device, 'cpu');
   assert.equal(tts.deviceReason, 'this browser offers no WebGPU adapter');
+  assert.deepEqual(tts.languages, ['en', 'fr']);
   tts.dispose();
   // Left out, it stays out, so the worker can tell the CPU default from a request for it.
   await PhononTTS.load({ lang: 'en', model: MODEL, workerUrl: 'worker.js' });
   assert.equal(FakeWorker.last.init.device, undefined);
+});
+
+test('a language the model was not trained for is warned about', async (t) => {
+  const warn = t.mock.method(console, 'warn', () => {});
+  for (const lang of ['en', 'fr', 'none']) {
+    (await PhononTTS.load({ lang, model: MODEL, workerUrl: 'worker.js' })).dispose();
+  }
+  assert.equal(warn.mock.callCount(), 0);
+  (await PhononTTS.load({ lang: 'de', model: MODEL, workerUrl: 'worker.js' })).dispose();
+  assert.deepEqual(warn.mock.calls.map((c) => c.arguments[0]), [
+    '[phonon-tts] text is normalized as de, but the model was trained for en, fr',
+  ]);
 });
 
 test('threads is checked before the worker starts, handed to it, and reported back', async () => {
@@ -106,14 +120,57 @@ test('threads is checked before the worker starts, handed to it, and reported ba
   assert.equal(FakeWorker.last.init.threads, 'auto');
 });
 
-test('model is required, with weights for the quant being loaded', async () => {
+test('a model needs its files, with weights for the quant being loaded', async () => {
   FakeWorker.last = null;
-  await assert.rejects(PhononTTS.load({ lang: 'en' }), /model is required/);
-  await assert.rejects(PhononTTS.load({ lang: 'en', model: [] }), /model is required/);
+  await assert.rejects(PhononTTS.load({ lang: 'en', model: null }), /model must say where/);
+  await assert.rejects(PhononTTS.load({ lang: 'en', model: [] }), /model must say where/);
   await assert.rejects(PhononTTS.load({ lang: 'en', model: { weights: { q8: 'w' } } }), /model\.tokenizer is required/);
   await assert.rejects(PhononTTS.load({ lang: 'en', model: MODEL, quant: 'f32' }), /no 'f32' weights/);
   // All of them fail before a worker exists, so nothing has been downloaded.
   assert.equal(FakeWorker.last, null);
+});
+
+test('an hf:// model is resolved to URLs at its commit, after the other options are checked', async () => {
+  const sha = 'abc123';
+  const requests = [];
+  globalThis.fetch = async (url) => {
+    requests.push(url);
+    const files = ['config.json', 'tokenizer.json', 'model.q8.gguf', 'voices/anna.safetensors'];
+    return Response.json({ sha, siblings: files.map((rfilename) => ({ rfilename })) });
+  };
+  FakeWorker.last = null;
+  await assert.rejects(PhononTTS.load({ lang: 'en', model: 'hf://acme/speech', rewrites: 'nope' }), /unknown rewrite/);
+  await assert.rejects(PhononTTS.load({ lang: 'en', model: '/model/' }), /hf:\/\/owner\/name/);
+  assert.deepEqual(requests, []);
+  assert.equal(FakeWorker.last, null);
+
+  const tts = await PhononTTS.load({ lang: 'en', model: 'hf://acme/speech@v1', workerUrl: 'worker.js' });
+  const base = `https://huggingface.co/acme/speech/resolve/${sha}`;
+  assert.deepEqual(requests, ['https://huggingface.co/api/models/acme/speech/revision/v1']);
+  assert.deepEqual(FakeWorker.last.init.model, {
+    weights: { q8: `${base}/model.q8.gguf`, f32: `${base}/model.q8.gguf` },
+    tokenizer: `${base}/tokenizer.json`,
+    config: `${base}/config.json`,
+    voices: { anna: `${base}/voices/anna.safetensors` },
+  });
+  assert.deepEqual(FakeWorker.last.init.preload, ['anna']);
+  assert.deepEqual(tts.voices, ['anna']);
+  tts.dispose();
+});
+
+test('without a model, the default one is loaded from the Hub', async () => {
+  const { DEFAULT_MODEL } = await import('../index.js');
+  const [repo, revision] = DEFAULT_MODEL.slice('hf://'.length).split('@');
+  const requests = [];
+  globalThis.fetch = async (url) => {
+    requests.push(url);
+    const files = ['config.json', 'tokenizer.json', 'model.q8.gguf', 'embeddings/alba.safetensors'];
+    return Response.json({ sha: revision, siblings: files.map((rfilename) => ({ rfilename })) });
+  };
+  const tts = await PhononTTS.load({ lang: 'en', workerUrl: 'worker.js' });
+  assert.deepEqual(requests, [`https://huggingface.co/api/models/${repo}/revision/${revision}`]);
+  assert.equal(FakeWorker.last.init.model.config, `https://huggingface.co/${repo}/resolve/${revision}/config.json`);
+  tts.dispose();
 });
 
 test('model files may be URL objects, as workerUrl and wasmUrl may', async () => {
@@ -126,6 +183,17 @@ test('model files may be URL objects, as workerUrl and wasmUrl may', async () =>
   await PhononTTS.load({ lang: 'en', model, workerUrl: 'worker.js' });
   assert.equal(FakeWorker.last.init.model.tokenizer, 'https://example.com/m/tokenizer.json');
   assert.equal(FakeWorker.last.init.model.weights.q8, 'https://example.com/m/model.q8.gguf');
+});
+
+test('every module URL reaches the worker resolved, the SIMD-only ones too', async () => {
+  const urls = {
+    wasmUrl: 'https://example.com/w/phonon_tts_bg.wasm',
+    threadsWasmUrl: 'https://example.com/t/phonon_tts_bg.wasm',
+    simdWasmUrl: new URL('https://example.com/w/phonon_tts_simd_bg.wasm'),
+    threadsSimdWasmUrl: 'https://example.com/t/phonon_tts_simd_bg.wasm',
+  };
+  await PhononTTS.load({ lang: 'en', model: MODEL, workerUrl: 'worker.js', ...urls });
+  for (const [key, value] of Object.entries(urls)) assert.equal(FakeWorker.last.init[key], String(value));
 });
 
 test('lang is required', async () => {
@@ -169,6 +237,17 @@ test('the rewrites check accepts exactly what the Rust Rules parser accepts', as
     PhononTTS.load({ lang: 'en', rewrites: ['numbers'], model: MODEL }),
     /rewrites must be a string/,
   );
+});
+
+test('every rule in the Rust RULES table is accepted', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const rust = await readFile(new URL('../../../ptts/src/preprocess/rewrite.rs', import.meta.url), 'utf8');
+  const names = [...rust.matchAll(/Rule \{ name: "([^"]+)"/g)].map((m) => m[1]);
+  assert.ok(names.length > 0, 'the RULES table was found');
+  for (const name of names) {
+    await PhononTTS.load({ lang: 'en', rewrites: name, model: MODEL, workerUrl: 'worker.js' });
+    assert.equal(FakeWorker.last.init.rewrites, name);
+  }
 });
 
 test('conditions are handed to the worker as NAME=VALUE, their shape checked first', async () => {
@@ -300,4 +379,54 @@ test('config is required before a worker or download starts', async () => {
     await assert.rejects(PhononTTS.load({ lang: 'en', model: { ...MODEL, config } }), /model.config is required/);
   }
   assert.equal(FakeWorker.last, null);
+});
+
+test('cancel discards unread audio and the model can speak again', async () => {
+  FakeWorker.script = { frames: 20, fail: null };
+  const tts = await load();
+  const worker = FakeWorker.last;
+  let resolveBuffered;
+  const buffered = new Promise((resolve) => { resolveBuffered = resolve; });
+  const reply = worker.reply.bind(worker);
+  let chunks = 0;
+  worker.reply = (data) => {
+    reply(data);
+    if (data.type === 'chunk' && ++chunks === 3) queueMicrotask(resolveBuffered);
+  };
+  const speech = tts.stream('A longer sentence.');
+  await buffered;
+  speech.cancel();
+  const iterator = speech[Symbol.asyncIterator]();
+  assert.equal((await iterator.next()).done, true, 'cancelled audio must not reach playback');
+  assert.equal((await speech.done).cancelled, true);
+  FakeWorker.script = { frames: 2, fail: null };
+  assert.equal((await tts.synth('Speak again.')).length, 8);
+  tts.dispose();
+});
+
+test('cancel also discards audio still buffered after generation completed', async () => {
+  FakeWorker.script = { frames: 3, fail: null };
+  const tts = await load();
+  const speech = tts.stream('Hello.');
+  await speech.done;
+  speech.cancel();
+  assert.equal((await speech[Symbol.asyncIterator]().next()).done, true);
+  tts.dispose();
+});
+
+test('a file the worker hands back is cached by the page, not taken for a reply', async () => {
+  const stored = new Map();
+  globalThis.caches = {
+    async open() {
+      return { put: async (url, res) => void stored.set(url, new Uint8Array(await res.arrayBuffer())) };
+    },
+  };
+  try {
+    await load();
+    FakeWorker.last.onmessage({ data: { type: 'store', url: 'https://x/w', bytes: new Uint8Array([4, 5]).buffer } });
+    await new Promise((r) => setTimeout(r, 0));
+    assert.deepEqual(stored.get('https://x/w'), new Uint8Array([4, 5]));
+  } finally {
+    delete globalThis.caches;
+  }
 });

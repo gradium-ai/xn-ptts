@@ -2,9 +2,9 @@
 //!
 //! [`crate::synth::SynthApi::add_voice_from_pcm`] wants mono `f32` at the
 //! speaker codec's sample rate, which means decoding a file and resampling it.
-//! Both examples that clone a voice need exactly that, and so does anything
-//! outside this repo, so it lives here rather than in a private example module
-//! no dependent can reach.
+//! The `ptts` command and the `create_voice` example need exactly that, and so
+//! does anything outside this repo, so it lives here rather than in a private
+//! example module no dependent can reach.
 //!
 //! Behind the `audio` feature: `symphonia` and `rubato` are large and neither
 //! belongs in the wasm build.

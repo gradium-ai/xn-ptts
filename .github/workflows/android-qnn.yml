@@ -1,0 +1,33 @@
+name: Android QNN
+on:
+  pull_request:
+    paths: ['qnn/**', 'ptts/**', 'Cargo.toml', '.github/actions/setup-rust/**', '.github/workflows/android-qnn.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: android-qnn-text
+          audio-deps: 'false'
+      - name: Rust text frontend and lockfile
+        run: cargo check --manifest-path qnn/text-ffi/Cargo.toml --locked
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install Android platform
+        run: '"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36"'
+      - name: Kotlin lifecycle and cancellation
+        working-directory: qnn/android
+        run: ./gradlew :ptts:testDebugUnitTest -PpttsUnitTestsOnly=true --console=plain
+      - name: Compiled model selection
+        run: |
+          cmake -S qnn/runner/tests -B "$RUNNER_TEMP/qnn-bundle-tests"
+          cmake --build "$RUNNER_TEMP/qnn-bundle-tests"
+          ctest --test-dir "$RUNNER_TEMP/qnn-bundle-tests" --output-on-failure

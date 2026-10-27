@@ -20,7 +20,7 @@
 //!     Lang::En,
 //! )
 //! .tokenizer_file("model/tokenizer.json")
-//! .add_voice("alba", "model/voices/alba.safetensors")
+//! .add_voice("default", "model/default-voice.safetensors")
 //! .build()?;
 //! let pcm = tts.say("Hello world")?;
 //! ptts::wav::write_wav_file("out.wav", &pcm, tts.sample_rate())?;
@@ -33,7 +33,8 @@
 //! | Module | Role |
 //! |---|---|
 //! | [`synth`] | The one-call API: load, prime, generate, decode. Start here. |
-//! | [`checkpoint`] | Resolving explicitly supplied local model directories. |
+//! | [`checkpoint`] | Resolving a model: a local directory, an `hf://` repo, or the default. |
+//! | [`voice_catalog`] | Voices listed in a catalog, downloaded when first used. |
 //! | [`loader`] | Reading weights and voice files, and the checkpoint key mapping. |
 //! | [`error`] | [`Error`], what those two return. |
 //! | [`plan`] | Frame and KV budgets, the end-of-speech policy. |
@@ -52,8 +53,10 @@
 //! compiling. The variants are failure classes, so a binding maps them onto its host language's
 //! exceptions in one match.
 //!
-//! [`checkpoint`] resolves explicitly supplied local model directories for native callers.
-//! The lower-level builder still accepts explicit files. The library never downloads weights.
+//! [`checkpoint`] resolves a model for native callers: a local directory, or with the `hub`
+//! feature an `hf://owner/name` repo on the Hugging Face Hub, which is the only time the library
+//! downloads anything. Frontends load [`checkpoint::DEFAULT_MODEL`] when none is given. The
+//! lower-level builder still accepts explicit files.
 //!
 //! Text is normalized before it is tokenized — see [`preprocess`]. Which
 //! language, or [`preprocess::Normalize::OFF`], is a required argument to
@@ -82,6 +85,8 @@ mod conv;
 mod dummy_quantizer;
 pub mod error;
 pub mod flow_lm;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod hub;
 mod layer_scale;
 pub mod loader;
 pub mod mimi;
@@ -105,6 +110,8 @@ pub mod tok;
 pub mod transformer;
 pub mod tts_model;
 pub mod utils;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod voice_catalog;
 pub mod wav;
 
 pub use error::{Error, Result};

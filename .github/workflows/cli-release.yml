@@ -1,0 +1,240 @@
+name: Native packages
+
+on:
+  push:
+    tags: ['v*']
+    branches: [main]
+    paths:
+      - 'ptts/**'
+      - 'ptts-ffi/**'
+      - 'ptts-coreml/**'
+      - 'ios/**'
+      - 'scripts/package-swift.py'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'LICENSE-*'
+      - 'scripts/package-cli.py'
+      - 'scripts/homebrew-cli.py'
+      - 'scripts/upload-release.py'
+      - '.github/workflows/cli-release.yml'
+      - '.github/actions/setup-rust/**'
+  pull_request:
+    paths:
+      - 'ptts/**'
+      - 'ptts-ffi/**'
+      - 'ptts-coreml/**'
+      - 'ios/**'
+      - 'scripts/package-swift.py'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'LICENSE-*'
+      - 'scripts/package-cli.py'
+      - 'scripts/homebrew-cli.py'
+      - 'scripts/upload-release.py'
+      - '.github/workflows/cli-release.yml'
+      - '.github/actions/setup-rust/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cli-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: CLI / ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            rustflags: '-C target-cpu=x86-64-v3'
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            rustflags: '-C target-cpu=generic'
+          # Apple silicon gets its fast paths, all system frameworks or compiled in: Accelerate for
+          # the f32 matmuls, Metal (what `--device auto` picks for f32 weights; quantized weights
+          # stay on the CPU), and Arm's KleidiAI kernels for q8, which do nothing without SME2.
+          # Intel Macs get Accelerate only: Metal on their GPUs is unmeasured.
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            rustflags: '-C target-cpu=apple-m1'
+            features: ',accelerate,kai,metal'
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            rustflags: '-C target-cpu=x86-64-v3'
+            features: ',accelerate'
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            rustflags: '-C target-cpu=x86-64-v3 -C target-feature=+crt-static'
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      # macOS 15 is the oldest Mac runner used to verify these downloads.
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-rust
+        with:
+          targets: ${{ matrix.target }}
+          cache-key: cli-${{ matrix.target }}
+          audio-deps: 'false'
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      # setup-rust removes target-cpu=native. These binaries use fixed baselines, with no GPU
+      # SDKs or server audio libraries needed at runtime (macOS adds only system frameworks).
+      - name: Build the command
+        run: cargo build --release --locked -p ptts --features cli${{ matrix.features }} --bin ptts --target ${{ matrix.target }}
+      # xn's build script prints `cargo:rustc-cfg=xn_kai` only when the KleidiAI kernels compiled.
+      # A toolchain too old for them turns the feature off with a warning, which cargo hides for a
+      # crates.io dependency, so check the recorded output of the build that ships instead.
+      - name: Check that the KleidiAI kernels are in the build
+        if: contains(matrix.features, 'kai')
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! grep -qs "cargo:rustc-cfg=xn_kai" target/${{ matrix.target }}/release/build/xn-*/output; then
+            echo "::error::the KleidiAI kernels did not build with this toolchain"
+            exit 1
+          fi
+      - name: Package and check the installed command
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          binary="target/$TARGET/release/ptts"
+          if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
+          tag_args=()
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then tag_args=(--tag "$GITHUB_REF_NAME"); fi
+          python scripts/package-cli.py --binary "$binary" --target "$TARGET" ${tag_args[@]+"${tag_args[@]}"}
+          mkdir unpacked
+          if [ "$RUNNER_OS" = Windows ]; then
+            python -m zipfile -e dist/*.zip unpacked
+            installed=$(find unpacked -name ptts.exe -type f)
+          else
+            tar xzf dist/*.tar.gz -C unpacked
+            installed=$(find unpacked -name ptts -type f)
+          fi
+          "$installed" --version
+          "$installed" --help
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  swift:
+    name: Swift release package
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      # A tag run downloads the framework from the main run that built it.
+      actions: read
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+      IPHONEOS_DEPLOYMENT_TARGET: '18.0'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-rust
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        with:
+          targets: aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-ios-macabi
+          cache-key: swift-release
+          audio-deps: 'false'
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Build the framework and wrapper
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          ./ios/build-xcframework.sh
+          swift build --package-path ios/PhononTTS
+      # The root Package.swift pins the framework by checksum, and two builds of one commit do
+      # not give the same archive. So a tag does not rebuild it: it takes the one a main run
+      # built from the same inputs, which `package-swift.py pin` wrote into Package.swift before
+      # tagging (docs/development.md, "Releasing the Swift package").
+      - name: Take the framework the root Package.swift pins
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: python scripts/package-swift.py fetch --tag "$GITHUB_REF_NAME" --output pinned
+      - name: Package the release
+        shell: bash
+        run: |
+          set -euo pipefail
+          framework=ios/PhononTTS/PhononCore.xcframework.zip
+          tag_args=()
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            framework=pinned/PhononCore.xcframework.zip
+            tag_args=(--tag "$GITHUB_REF_NAME")
+          fi
+          python scripts/package-swift.py package --framework "$framework" ${tag_args[@]+"${tag_args[@]}"}
+          unzip -q dist/ptts-swift-*.zip -d unpacked
+          package=$(find unpacked -name Package.swift -type f)
+          swift package --package-path "$(dirname "$package")" dump-package
+          (cd dist && shasum -a 256 -c SHA256SUMS-apple)
+          # Check the packaged wrapper against the exact staged framework. The public
+          # URL can only be checked after publication; the release zip stays unchanged.
+          package_dir=$(dirname "$package")
+          unzip -q dist/PhononCore.xcframework.zip -d "$package_dir"
+          python - "$package" <<'PY'
+          import pathlib, sys
+          path = pathlib.Path(sys.argv[1])
+          text = path.read_text()
+          start = text.index('        .binaryTarget(')
+          end = text.index('\n        .target(', start)
+          text = text[:start] + '        .binaryTarget(name: "PhononCore", path: "PhononCore.xcframework"),' + text[end:]
+          path.write_text(text)
+          PY
+          swift build --package-path "$package_dir"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: swift-package
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Attach native packages
+    needs: [build, swift]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: '{cli-*,swift-package}'
+          merge-multiple: true
+          path: dist
+      - name: Attach archives and checksums
+        shell: bash
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cat ./*.sha256 SHA256SUMS-apple > SHA256SUMS
+          sha256sum --check SHA256SUMS
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            release_args=()
+            case "$TAG" in *-*) release_args=(--prerelease) ;; esac
+            gh release create "$TAG" --verify-tag --draft "${release_args[@]}" --title "$TAG" \
+              --notes 'Release artifacts are being prepared. Review the release notes before publishing.'
+          fi
+          python ../scripts/homebrew-cli.py .
+          python ../scripts/upload-release.py "$TAG" ./*.tar.gz ./*.zip SHA256SUMS ptts.rb

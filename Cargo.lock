@@ -2811,7 +2811,7 @@ dependencies = [
 
 [[package]]
 name = "ptts"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2838,7 +2838,7 @@ dependencies = [
 
 [[package]]
 name = "ptts-coreml"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "block2",
  "half",
@@ -2858,7 +2858,7 @@ dependencies = [
 
 [[package]]
 name = "ptts-ffi"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ptts",
  "ptts-coreml",
@@ -2867,13 +2867,12 @@ dependencies = [
 
 [[package]]
 name = "ptts-openai-server"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
  "clap",
  "futures-util",
- "hf-hub",
  "kaudio",
  "ptts",
  "serde",
@@ -2887,20 +2886,19 @@ dependencies = [
 
 [[package]]
 name = "ptts-pyo3"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
- "hf-hub",
  "numpy",
  "ptts",
  "pyo3",
- "serde_json",
  "xn",
 ]
 
 [[package]]
 name = "ptts-wasm"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
+ "futures-util",
  "getrandom 0.3.4",
  "js-sys",
  "ptts",
@@ -2914,17 +2912,14 @@ dependencies = [
 
 [[package]]
 name = "ptts-ws-server"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
- "bytemuck",
  "byteorder",
  "clap",
  "futures-util",
- "half",
- "hf-hub",
  "kaudio",
  "ptts",
  "rubato",
@@ -5626,9 +5621,9 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xn"
-version = "0.2.10"
+version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebefe8131b0d4d40eae5f9371bc3085ded1df0f788fd42b1015f1023e587c27f"
+checksum = "0f0498e2301d24e347fd391df00eda2d33b2529e9b32e1ba9ce215cfc5f1fd36"
 dependencies = [
  "ash",
  "bindgen_cuda",

@@ -11,7 +11,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 description = "Phonon text-to-speech inference and serving"
 repository = "https://github.com/gradium-ai/xn-ptts"
 keywords = ["tts", "text-to-speech", "speech-synthesis", "voice-cloning", "on-device"]
@@ -19,12 +19,11 @@ categories = ["multimedia::audio"]
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-ptts = { path = "ptts", version = "0.4.0" }
+ptts = { path = "ptts", version = "0.5.0" }
 
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["ws", "tokio", "http1", "macros"] }
 base64 = "0.22"
-bytemuck = "1"
 byteorder = "1.5.0"
 clap = { version = "4", features = ["derive"] }
 ebur128 = "0.1"
@@ -53,7 +52,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-xn = "0.2.10"
+xn = "0.2.11"
 
 # `release` stays lean: it is what the wheels, the xcframework and `cargo install --path` ship.
 # For a profiler, build with `--profile profiling`, which is release plus debug info.

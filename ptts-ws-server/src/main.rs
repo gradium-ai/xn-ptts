@@ -2,7 +2,6 @@ mod encoder;
 mod handler;
 mod model;
 mod protocol;
-mod utils;
 
 use anyhow::{Context, Result};
 use axum::Router;
@@ -24,19 +23,25 @@ struct Args {
     #[arg(long, default_value = "1", value_parser = parse_request_limit)]
     max_concurrent_requests: std::num::NonZeroUsize,
 
-    /// Required local model directory, config.json, or Hugging Face repo ID.
-    #[arg(long, required = true)]
-    config: std::path::PathBuf,
-
-    /// Hugging Face branch, tag, or commit. Use a commit to reproduce a release.
-    #[arg(long)]
-    revision: Option<String>,
+    /// Model to load: a local checkpoint folder or a `config.json` in one, or a Hugging Face repo as
+    /// `hf://owner/name` or `hf://owner/name@revision`. Use a commit as the revision to reproduce a
+    /// release. Defaults to the default model, downloaded from the Hub and cached on first use.
+    #[arg(long, alias = "config", default_value = ptts::checkpoint::DEFAULT_MODEL)]
+    model: String,
 
     /// Optional directory of additional voice safetensors to load. Each
     /// `*.safetensors` file is loaded as a voice keyed by its file stem; load
     /// errors are logged and skipped rather than fatal.
     #[arg(long)]
     voice_dir: Option<std::path::PathBuf>,
+
+    /// Voice catalog whose voices in --lang are served besides the checkpoint's: a Hugging Face
+    /// repo as hf://owner/name[@revision], or a local JSONL file or folder holding voices.jsonl,
+    /// one `{"name", "filename"}` object per line with `filename` relative to the catalog.
+    /// Defaults to the default voice catalog; empty for none. Voices that fail to load are logged
+    /// and skipped.
+    #[arg(long, default_value = ptts::voice_catalog::DEFAULT_VOICE_CATALOG)]
+    voice_catalog: String,
 
     #[arg(long, default_value_t = 0.3)]
     temperature: f32,
@@ -65,12 +70,12 @@ struct Args {
     lang: String,
 
     /// Which word rewrites run on the normalized text: `default` (numbers, currency,
-    /// dashed-digits, emails, urls), `all` (those and phones, times, dates), `none`, or a
-    /// comma-separated list of rule names. Has no effect with `--lang none`.
+    /// dashed-digits, emails, urls, abbreviations, elongations), `all` (those and phones, times,
+    /// dates), `none`, or a comma-separated list of rule names. Has no effect with `--lang none`.
     #[arg(long, default_value = "default")]
     rewrites: String,
 
-    /// Set one of the checkpoint's conditioners, e.g. `padding_bonus=0.5`; repeatable. Those
+    /// Set one of the checkpoint's conditioners, e.g. `duration_delta=0.5`; repeatable. Those
     /// not set take their defaults.
     #[arg(long = "condition", value_name = "NAME=VALUE")]
     conditions: Vec<String>,
@@ -87,7 +92,7 @@ fn parse_request_limit(value: &str) -> Result<std::num::NonZeroUsize, String> {
 fn init_tracing() {
     // `info` for everything but the Hub download stack: `hf_hub` transfers through the Xet
     // backend, which reports every retry policy and range probe at `info`. Keep in sync with
-    // `LOG_DIRECTIVES` in `ptts/examples/model_helpers.rs`.
+    // `LOG_DIRECTIVES` in `ptts/src/bin/ptts/model_helpers.rs`.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(
             "info,xet=warn,xet_client=warn,xet_data=warn,xet_runtime=warn,xet_core_structures=warn",
@@ -104,9 +109,8 @@ async fn main() -> Result<()> {
     init_tracing();
     let args = Args::parse();
 
-    // The checkpoint is downloaded with hf-hub's async client on this runtime.
-    // The weight loading that follows is CPU-bound and blocks the runtime
-    // thread, which is fine here: nothing is served until it is done.
+    // The weight loading after the download is CPU-bound and blocks the runtime thread, which is
+    // fine here: nothing is served until it is done.
     let app_state = build_app_state(&args).await?;
 
     let app = Router::new()
@@ -141,9 +145,9 @@ async fn build_app_state(args: &Args) -> Result<model::AppState> {
         conditions.push((name.to_string(), value.to_string()));
     }
     model::load_ptts(
-        &args.config,
-        args.revision.as_deref(),
+        &args.model,
         args.voice_dir.as_ref(),
+        Some(args.voice_catalog.as_str()).filter(|c| !c.is_empty()),
         device,
         quant,
         args.temperature,
@@ -163,11 +167,11 @@ mod tests {
     #[test]
     fn request_limit_is_positive_and_defaults_to_one() {
         assert!(parse_request_limit(&usize::MAX.to_string()).is_err());
-        let args = Args::try_parse_from(["server", "--config", "model", "--lang", "none"]).unwrap();
+        let args = Args::try_parse_from(["server", "--model", "model", "--lang", "none"]).unwrap();
         assert_eq!(args.max_concurrent_requests.get(), 1);
         let args = Args::try_parse_from([
             "server",
-            "--config",
+            "--model",
             "model",
             "--lang",
             "none",
@@ -179,7 +183,7 @@ mod tests {
         assert!(
             Args::try_parse_from([
                 "server",
-                "--config",
+                "--model",
                 "model",
                 "--lang",
                 "none",

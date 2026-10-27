@@ -2,6 +2,7 @@
 name = "ptts-pyo3"
 version.workspace = true
 edition = "2024"
+publish = false
 description.workspace = true
 repository.workspace = true
 keywords.workspace = true
@@ -16,15 +17,13 @@ crate-type = ["cdylib"]
 
 [dependencies]
 xn = { workspace = true }
-ptts = { workspace = true, features = ["hf"] }
-hf-hub = { workspace = true }
+ptts = { workspace = true, features = ["hf", "hub"] }
 numpy = "0.28"
 # `abi3-py39`: one wheel per platform for every CPython from 3.9 on, rather than one
 # per interpreter. This crate takes minutes to compile, so the alternative is a release
 # matrix of platforms times interpreters -- and a new CPython release needing a rebuild
 # before anyone on it can install at all.
 pyo3 = { version = "0.28", features = ["extension-module", "abi3-py39"] }
-serde_json = { workspace = true }
 
 [features]
 default = []

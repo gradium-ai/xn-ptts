@@ -13,38 +13,53 @@ import numpy as np
 from numpy.typing import NDArray
 
 __version__: str
+DEFAULT_MODEL: str
+"""The model `TTS` loads when none is given, as `hf://owner/name@revision`."""
+DEFAULT_VOICE_CATALOG: str
+"""The voice catalog `TTS` and `catalog_voices` use when none is given, as
+`hf://owner/name@revision`."""
 
 __all__ = [
+    "DEFAULT_MODEL",
+    "DEFAULT_VOICE_CATALOG",
     "TTS",
     "AudioStream",
     "__version__",
     "available_devices",
     "available_quants",
     "build_info",
+    "catalog_voices",
     "get_num_threads",
+    "normalize",
     "set_num_threads",
 ]
 
 class TTS:
     """A loaded Phonon model.
 
-    `config` must name a local directory/config.json or a Hugging Face repo ID.
-    There is no default model. Local paths never download anything; Hub files are
-    downloaded on first use and cached. `revision` selects a branch, tag, or commit
-    for every Hub file and is only accepted with a Hub source.
+    `model` must name a local directory or config.json, or a Hugging Face repo as
+    `"hf://owner/name"` or `"hf://owner/name@revision"`. Left out, it is `DEFAULT_MODEL`. Local
+    paths never download anything; Hub files are downloaded on first use and cached. The revision, a
+    branch, tag, or commit, applies to every Hub file. `config` and `revision` are the
+    deprecated older spelling, where a bare `"owner/name"` named a repo.
 
     `lang` is required and keyword-only: text is normalized before it is tokenized, and the
     spoken forms of `@`, `+` and `=` differ per language, so there is nothing safe to default
     to. One of `"en"`, `"fr"`, `"de"`, `"es"`, `"pt"`, or `"none"`/`None` to skip normalizing.
 
     `rewrites` picks which word rewrites run on the normalized text: `"default"` (what `None`
-    means: numbers, currency, dashed-digits, emails, urls), `"all"` (those and phones, times,
-    dates), `"none"`, or a comma-separated list of rule names.
+    means: numbers, currency, dashed-digits, emails, urls, abbreviations, elongations), `"all"`
+    (those and phones, times, dates), `"none"`, or a comma-separated list of rule names.
+
+    `voice_catalog` is where a voice the checkpoint does not have is looked up: a Hugging Face
+    repo as `"hf://owner/name[@revision]"`, or a local `voices.jsonl` or folder holding one.
+    Left out, it is `DEFAULT_VOICE_CATALOG`. A voice is matched by name, in any case and with or
+    without accents, or by its catalog `voice_id`, and only the voices used are downloaded.
     """
 
     def __init__(
         self,
-        config: str | None = None,
+        model: str | None = None,
         device: str | None = None,
         quant: str | None = None,
         voice: str | None = None,
@@ -56,6 +71,8 @@ class TTS:
         lang: str | None,
         rewrites: str | None = None,
         conditions: dict[str, str | float] | None = None,
+        voice_catalog: str | PathLike[str] | None = None,
+        config: str | None = None,
         revision: str | None = None,
     ) -> None: ...
     @property
@@ -64,7 +81,11 @@ class TTS:
 
     @property
     def voices(self) -> list[str]:
-        """Names of the registered voices, sorted."""
+        """Names of the registered voices, sorted. Catalog voices join them once used."""
+
+    @property
+    def languages(self) -> list[str]:
+        """The languages the model was trained for, as listed in its config."""
 
     @property
     def device(self) -> str:
@@ -125,6 +146,10 @@ class TTS:
 
     def add_voice(self, name: str, path: str | PathLike[str]) -> None:
         """Register a voice from a precomputed embedding file."""
+
+    def add_voice_catalog(self, path: str | PathLike[str]) -> None:
+        """Register every voice of a JSONL catalog, one `{"name", "filename"}` object per line
+        with `filename` relative to the catalog."""
 
     def set_conditions(self, conditions: dict[str, str | float]) -> None:
         """Replace the conditions, without reloading the model.
@@ -197,3 +222,18 @@ def available_quants() -> list[str]:
 
 def build_info() -> dict[str, Any]:
     """The runtime's build configuration, for bug reports."""
+
+def catalog_voices(catalog: str | PathLike[str] | None = None) -> list[dict[str, str | None]]:
+    """The voices of a catalog, as dicts of `name`, `voice_id`, `language` and `description`.
+
+    `catalog` is as for `TTS`'s `voice_catalog`, `DEFAULT_VOICE_CATALOG` when left out. Only the catalog is downloaded, no voice and
+    no model.
+    """
+
+def normalize(text: str, *, lang: str | None, rewrites: str | None = None) -> str:
+    """`text` normalized as `TTS` with the same `lang` and `rewrites` normalizes it before
+    tokenizing, without loading a model.
+
+    Accented letters a checkpoint's tokenizer lacks are folded afterwards, by `TTS`, and are kept
+    here.
+    """

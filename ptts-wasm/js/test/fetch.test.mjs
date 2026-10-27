@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { fetchBytes } = await import('../fetch.js');
+const { fetchBytes, storeBytes } = await import('../fetch.js');
 
 function fakeNetwork(body) {
   const store = new Map();
@@ -38,6 +38,41 @@ test('fetchBytes downloads once, then serves from the cache', async () => {
 
   await fetchBytes('https://x/model', { cache: false });
   assert.equal(net.fetches(), 2, 'cache: false always downloads');
+});
+
+test('write: false reads the cache but leaves a download out of it, for storeBytes to keep', async () => {
+  const body = new Uint8Array([1, 2, 3]);
+  const net = fakeNetwork(body);
+  assert.deepEqual(await fetchBytes('https://x/w', { write: false }), body);
+  await fetchBytes('https://x/w', { write: false });
+  assert.equal(net.fetches(), 2, 'nothing was cached');
+
+  assert.equal(await storeBytes('https://x/w', body.slice().buffer), true);
+  const progress = [];
+  assert.deepEqual(await fetchBytes('https://x/w', { write: false, onProgress: (p) => progress.push(p) }), body);
+  assert.equal(net.fetches(), 2, 'served from what storeBytes kept');
+  assert.equal(progress.at(-1).cached, true);
+});
+
+test('storeBytes reports a failed write rather than throwing', async () => {
+  globalThis.caches = {
+    async open() {
+      return {
+        put: async () => {
+          throw new Error('QuotaExceededError');
+        },
+      };
+    },
+  };
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    assert.equal(await storeBytes('https://x/w', new Uint8Array([1])), false);
+  } finally {
+    console.warn = warn;
+  }
+  delete globalThis.caches;
+  assert.equal(await storeBytes('https://x/w', new Uint8Array([1])), false, 'no Cache API');
 });
 
 test('fetchBytes still works where the Cache API is missing', async () => {

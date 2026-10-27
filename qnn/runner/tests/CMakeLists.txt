@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.16)
+project(phonon_bundle_tests CXX)
+
+include(../cmake/Json.cmake)
+enable_testing()
+add_executable(qnn_bundle_test bundle.cpp)
+target_compile_features(qnn_bundle_test PRIVATE cxx_std_17)
+target_include_directories(qnn_bundle_test PRIVATE ..)
+target_link_libraries(qnn_bundle_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME qnn_bundle COMMAND qnn_bundle_test)

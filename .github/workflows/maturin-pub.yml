@@ -16,8 +16,11 @@
 #   - every job deletes `.cargo/config.toml` first, and sets `RUSTFLAGS` itself. That file
 #     pins `target-cpu=native`, which in a published wheel means "whatever CPU the runner
 #     happened to have" -- a wheel that faults with SIGILL on someone's older machine.
-#   - macOS builds with `--features accelerate`: the platform most likely to be someone's
-#     first impression was otherwise getting the slowest build we ship.
+#   - macOS builds with its fast paths on: `accelerate` everywhere, and `kai` and `metal` on
+#     Apple silicon (Arm's KleidiAI kernels for q8, a no-op on chips without SME2; Metal for
+#     f32 weights, which `device=None` then picks). The platform most likely to be someone's
+#     first impression was otherwise getting the slowest build we ship. A check fails the job
+#     if the KleidiAI kernels quietly did not compile.
 #   - the `test-wheel` step, which installs the wheel the job just built and runs pytest.
 #
 # `xn` picks its quantized SIMD kernels with `cfg!(target_feature = "avx")`, at compile time,
@@ -33,7 +36,14 @@ on:
       - main
     tags:
       - 'v*'
+    # Docs alone change no wheel. Tag pushes ignore path filters, so a release always builds.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
   workflow_dispatch:
 
 permissions:
@@ -160,10 +170,10 @@ jobs:
       fail-fast: false
       matrix:
         platform:
-          - { runner: macos-14, target: aarch64, rustflags: -C target-cpu=apple-m1 }
+          - { runner: macos-14, target: aarch64, rustflags: -C target-cpu=apple-m1, features: 'accelerate,kai,metal' }
           # `-avx,-avx2` is what `.cargo/config.toml` sets for this target; see the note in
           # CLAUDE.md about benchmarking macOS x86_64.
-          - { runner: macos-15-intel, target: x86_64, rustflags: -C target-feature=-avx,-avx2 }
+          - { runner: macos-15-intel, target: x86_64, rustflags: -C target-feature=-avx,-avx2, features: 'accelerate' }
     steps:
       - uses: actions/checkout@v7
       - name: Remove the local cargo config
@@ -175,10 +185,23 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --strip --out dist --manifest-path ptts-pyo3/Cargo.toml --features accelerate
+          args: --release --strip --out dist --manifest-path ptts-pyo3/Cargo.toml --features ${{ matrix.platform.features }}
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
         env:
           RUSTFLAGS: ${{ matrix.platform.rustflags }}
+      # xn's build script prints `cargo:rustc-cfg=xn_kai` only when the KleidiAI kernels compiled.
+      # A toolchain too old for them turns the feature off with a warning, which cargo hides for a
+      # crates.io dependency, so check the recorded output of the build that ships instead.
+      - name: Check that the KleidiAI kernels are in the build
+        if: contains(matrix.platform.features, 'kai')
+        shell: bash
+        run: |
+          set -euo pipefail
+          outputs=$(find target -path '*/release/build/xn-*/output')
+          if [ -z "$outputs" ] || ! grep -qs "cargo:rustc-cfg=xn_kai" $outputs; then
+            echo "::error::the KleidiAI kernels did not build with this toolchain"
+            exit 1
+          fi
       - uses: ./.github/actions/test-wheel
       - uses: actions/upload-artifact@v7
         with:
@@ -263,6 +286,23 @@ jobs:
       # Used to generate artifact attestation
       attestations: write
     steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Check the tag matches the workspace version
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PYTHON'
+          import os, pathlib, tomllib
+          version = tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"]
+          if os.environ["TAG"] != f"v{version}":
+              raise SystemExit(f"Tag {os.environ['TAG']} does not match workspace version {version}")
+          PYTHON
       - uses: actions/download-artifact@v8
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v4

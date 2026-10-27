@@ -39,6 +39,23 @@ pub struct MimiConfig {
     pub transformer_dim_feedforward: usize,
     #[serde(default)]
     pub downsample_channel_wise: bool,
+    /// Width of the SEANet decoder and of the decoder transformer's output, when it differs from
+    /// `dimension` (small decoders distilled from a larger codec). Unset: `dimension`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoder_dimension: Option<usize>,
+    /// Width of the encoder's latents, which its downsample projects to; `dimension` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inner_dim: Option<usize>,
+    /// FFN activation of the encoder and decoder transformers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gelu: Option<crate::transformer::Gelu>,
+}
+
+impl MimiConfig {
+    /// Width of the latents [`MimiEncoder::encode_to_latent`] returns.
+    pub fn encoder_latent_dim(&self) -> usize {
+        self.inner_dim.unwrap_or(self.dimension)
+    }
 }
 
 pub struct MimiEncoder<Q: BackendQ> {
@@ -84,7 +101,7 @@ impl<Q: BackendQ> MimiEncoder<Q> {
         )?;
 
         let output_dimensions = vec![cfg.dimension];
-        let encoder_transformer = ProjectedTransformer::load(
+        let mut encoder_transformer = ProjectedTransformer::load(
             &vb.pp("encoder_transformer"),
             cfg.dimension,
             &output_dimensions,
@@ -96,6 +113,7 @@ impl<Q: BackendQ> MimiEncoder<Q> {
             cfg.transformer_max_period,
             cfg.transformer_dim_feedforward,
         )?;
+        encoder_transformer.transformer.set_gelu(cfg.gelu.unwrap_or_default());
 
         let hop_length: usize = cfg.ratios.iter().product();
         let encoder_frame_rate = cfg.sample_rate as f64 / hop_length as f64;
@@ -106,6 +124,7 @@ impl<Q: BackendQ> MimiEncoder<Q> {
                 &vb.pp("downsample"),
                 downsample_stride,
                 cfg.dimension,
+                cfg.encoder_latent_dim(),
                 cfg.downsample_channel_wise,
             )?;
             Some(ds)
@@ -135,11 +154,12 @@ impl<Q: BackendQ> MimiEncoder<Q> {
 impl<Q: BackendQ> MimiDecoder<Q> {
     pub fn load(vb: &Path<Q::B>, cfg: &MimiConfig) -> Result<Self> {
         let pad_mode = crate::conv::PadMode::Constant;
+        let decoder_dimension = cfg.decoder_dimension.unwrap_or(cfg.dimension);
 
         let decoder = SEANetDecoder::load(
             &vb.pp("decoder"),
             cfg.channels,
-            cfg.dimension,
+            decoder_dimension,
             cfg.n_filters,
             cfg.n_residual_layers,
             &cfg.ratios,
@@ -156,8 +176,8 @@ impl<Q: BackendQ> MimiDecoder<Q> {
             cfg.quantizer_dimension,
             cfg.quantizer_output_dimension,
         )?;
-        let output_dimensions = vec![cfg.dimension];
-        let decoder_transformer = ProjectedTransformer::load(
+        let output_dimensions = vec![decoder_dimension];
+        let mut decoder_transformer = ProjectedTransformer::load(
             &vb.pp("decoder_transformer"),
             cfg.dimension,
             &output_dimensions,
@@ -169,6 +189,7 @@ impl<Q: BackendQ> MimiDecoder<Q> {
             cfg.transformer_max_period,
             cfg.transformer_dim_feedforward,
         )?;
+        decoder_transformer.transformer.set_gelu(cfg.gelu.unwrap_or_default());
         let hop_length: usize = cfg.ratios.iter().product();
         let encoder_frame_rate = cfg.sample_rate as f64 / hop_length as f64;
 

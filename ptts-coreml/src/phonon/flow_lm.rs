@@ -14,7 +14,7 @@
 //! It is fp16 throughout, which the ANE requires. rope cos/sin and the attention mask arrive
 //! ready-made from the host.
 
-use crate::mil::{Builder, DType, Var};
+use crate::mil::{Builder, DType, Gelu, Var};
 use crate::proto::core_ml::specification::Model;
 use crate::weights::Weights;
 
@@ -23,17 +23,36 @@ use crate::weights::Weights;
 pub struct Dims {
     pub d: usize,
     pub heads: usize,
+    /// Width of the attention's queries and output (`attn_dim`, else `d`).
+    pub attn: usize,
+    /// Key/value heads, each shared by `heads / kv_heads` query heads (`num_kv_heads`, else
+    /// `heads`). The graph repeats them, so the cache holds `heads` of them.
+    pub kv_heads: usize,
     pub layers: usize,
     pub ff: usize,
     pub ldim: usize,
+    /// Width the EOS head and the flow net read, through a `z_proj` from `d` (`z_dim`).
+    pub z: Option<usize>,
     pub flow_d: usize,
     pub flow_blocks: usize,
 }
 
 impl Dims {
     pub fn hd(&self) -> usize {
-        self.d / self.heads
+        self.attn / self.heads
     }
+}
+
+/// How the flow net turns noise into a latent (`ptts::flow_lm::FlowType`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FlowType {
+    /// One step from noise to the latent, conditioned on the times 0 and 1.
+    #[default]
+    Lsd,
+    /// One evaluation without time conditions, whose output is the latent.
+    Drifting,
+    /// One evaluation without time conditions, whose output is added to the noise.
+    Pointwise,
 }
 
 const FP: DType = DType::Fp16;
@@ -96,8 +115,8 @@ fn permute_rope_rows(dm: &Dims, w: &[f32], cols: usize) -> Vec<f32> {
     let half = dm.hd() / 2;
     let mut out = w.to_vec();
     for part in 0..2 {
-        // q occupies rows [0, D), k occupies [D, 2D); v stays as it is.
-        let base = part * dm.d;
+        // q occupies rows [0, A), k occupies [A, 2A); v stays as it is.
+        let base = part * dm.attn;
         for h in 0..dm.heads {
             for i in 0..half {
                 let src_lo = (base + h * dm.hd() + 2 * i) * cols;
@@ -107,6 +126,22 @@ fn permute_rope_rows(dm: &Dims, w: &[f32], cols: usize) -> Vec<f32> {
                 out[dst_lo..dst_lo + cols].copy_from_slice(&w[src_lo..src_lo + cols]);
                 out[dst_hi..dst_hi + cols].copy_from_slice(&w[src_hi..src_hi + cols]);
             }
+        }
+    }
+    out
+}
+
+/// Repeat the k and v rows of a fused `in_proj` once for each query head sharing them, in
+/// `repeat_interleave` order, so the graph and the cache see one k/v head per query head, as
+/// ptts caches them. With as many k/v heads as query heads, the rows are unchanged.
+fn repeat_kv_rows(dm: &Dims, w: &[f32], cols: usize) -> Vec<f32> {
+    let (hd, group) = (dm.hd(), dm.heads / dm.kv_heads);
+    let mut out = w[..dm.attn * cols].to_vec();
+    for part in 0..2 {
+        let base = dm.attn + part * dm.kv_heads * hd;
+        for h in 0..dm.heads {
+            let src = (base + h / group * hd) * cols;
+            out.extend_from_slice(&w[src..src + hd * cols]);
         }
     }
     out
@@ -126,6 +161,7 @@ fn layer(
     rows: &mut Vec<Var>,
     ctx: usize,
     t: usize,
+    gelu: Gelu,
 ) -> Result<Var, String> {
     let p = format!("flow_lm.transformer.layers.{i}");
     let (hi_, di) = (dm.heads as i32, dm.hd() as i32);
@@ -135,9 +171,10 @@ fn layer(
     let h = b.layer_norm(x, &n1w, &n1b, 1e-5);
     let inw = {
         let (shape, data) = wt.get(&format!("{p}.self_attn.in_proj.weight"))?;
-        b.weight(&permute_rope_rows(dm, data, shape[1]), shape)
+        let rows = repeat_kv_rows(dm, data, shape[1]);
+        b.weight(&permute_rope_rows(dm, &rows, shape[1]), &[3 * dm.attn, shape[1]])
     };
-    let qkv = b.linear(&h, &inw, None, &[1, t, 3 * dm.d]);
+    let qkv = b.linear(&h, &inw, None, &[1, t, 3 * dm.attn]);
     let qkv = b.reshape(&qkv, &[1, t, 3, dm.heads, dm.hd()]);
     let qkv = b.transpose(&qkv, &[2, 0, 3, 1, 4], &[3, 1, dm.heads, t, dm.hd()]);
     let part = |b: &mut Builder, k: i32| {
@@ -186,7 +223,7 @@ fn layer(
     let att = b.softmax(&att, -1);
     let o = b.matmul(&att, &vatt, false, &[1, dm.heads, t, dm.hd()]);
     let o = b.transpose(&o, &[0, 2, 1, 3], &[1, t, dm.heads, dm.hd()]);
-    let o = b.reshape(&o, &[1, t, dm.d]);
+    let o = b.reshape(&o, &[1, t, dm.attn]);
     let ow = w(b, wt, &format!("{p}.self_attn.out_proj.weight"))?;
     let o = b.linear(&o, &ow, None, &[1, t, dm.d]);
     let x = b.add(x, &o, &[1, t, dm.d]);
@@ -197,20 +234,29 @@ fn layer(
     let l1 = w(b, wt, &format!("{p}.linear1.weight"))?;
     let l2 = w(b, wt, &format!("{p}.linear2.weight"))?;
     let h = b.linear(&h, &l1, None, &[1, t, dm.ff]);
-    let h = b.gelu_exact(&h);
+    let h = b.gelu(&h, gelu);
     let h = b.linear(&h, &l2, None, &[1, t, dm.d]);
     Ok(b.add(&x, &h, &[1, t, dm.d]))
 }
 
+/// The norm closing each time embedder, as the checkpoint was trained with
+/// (`ptts::flow_lm::TimeRmsNorm`, `flow_lm.time_rms_norm` in its config).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TimeNorm {
+    /// `h * a / sqrt(mean(h^2) + eps)`, uncentred, as audiocraft computes it.
+    Rms,
+    /// `h * a / sqrt(var(h) + eps)`, the variance centred and unbiased, as pocket-tts computes
+    /// it. The mean is still not subtracted from `h`.
+    #[default]
+    RmsVar,
+}
+
 /// `TimestepEmbedder` at a fixed time, in f32 on the host: the step always goes from s = 0 to
 /// t = 1, so the embedding is a constant of the checkpoint and the graph only needs its value.
-///
-/// It ends in the checkpoint's "RMS" norm, which is not an RMS norm: it divides by the variance
-/// about the mean, but does not subtract the mean. Computing `mean(h^2)` instead, as this graph
-/// once did, only agrees when the mean is near zero -- true enough for one checkpoint to look
-/// exact and wrong for another. This follows `xn`'s `layer_norm` with `remove_mean(false)` and
-/// `unbiased(true)`, which is what ptts runs.
-fn time_embed(wt: &Weights, idx: usize, t: f32) -> Result<Vec<f32>, String> {
+/// It ends in `norm`, which has to be the one the checkpoint was trained with: the two only
+/// agree when the mean is near zero, true enough for one checkpoint to look exact and wrong for
+/// another.
+fn time_embed(wt: &Weights, idx: usize, t: f32, norm: TimeNorm) -> Result<Vec<f32>, String> {
     let p = format!("flow_lm.flow_net.time_embed.{idx}");
     let freqs = wt.data(&format!("{p}.freqs"))?;
     let mut x: Vec<f32> = freqs.iter().map(|f| (t * f).cos()).collect();
@@ -228,11 +274,16 @@ fn time_embed(wt: &Weights, idx: usize, t: f32) -> Result<Vec<f32>, String> {
     let h: Vec<f32> = linear(&x, "mlp.0")?.iter().map(|v| v / (1.0 + (-v).exp())).collect();
     let h = linear(&h, "mlp.2")?;
     let n = h.len() as f32;
-    let mean = h.iter().sum::<f32>() / n;
-    let var = h.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n;
-    let (inv, unbias) = (1.0 / (var + 1e-5).sqrt(), ((n - 1.0) / n).sqrt());
+    let ms = match norm {
+        TimeNorm::Rms => h.iter().map(|v| v * v).sum::<f32>() / n,
+        TimeNorm::RmsVar => {
+            let mean = h.iter().sum::<f32>() / n;
+            h.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / (n - 1.0)
+        }
+    };
+    let inv = 1.0 / (ms + 1e-5).sqrt();
     let alpha = wt.data(&format!("{p}.mlp.3.alpha"))?;
-    Ok(h.iter().zip(alpha).map(|(v, a)| v * inv * a * unbias).collect())
+    Ok(h.iter().zip(alpha).map(|(v, a)| v * inv * a).collect())
 }
 
 fn modulate(b: &mut Builder, x: &Var, shift: &Var, scale: &Var, n: usize) -> Var {
@@ -248,19 +299,30 @@ fn flow_net(
     wt: &Weights,
     cond: &Var,
     noise: &Var,
+    time_norm: TimeNorm,
+    flow: FlowType,
 ) -> Result<Var, String> {
     let p = "flow_lm.flow_net";
     let iw = w(b, wt, &format!("{p}.input_proj.weight"))?;
     let ib = w(b, wt, &format!("{p}.input_proj.bias"))?;
     let mut x = b.linear(noise, &iw, Some(&ib), &[1, dm.flow_d]);
-    // The two time conditions averaged, as `SimpleMLPAdaLN::forward` does.
-    let (t0, t1) = (time_embed(wt, 0, 0.0)?, time_embed(wt, 1, 1.0)?);
-    let ts: Vec<f32> = t0.iter().zip(&t1).map(|(a, b)| (a + b) * 0.5).collect();
-    let ts = b.const_f32(&ts, &[1, dm.flow_d]);
+    // The two time conditions averaged, as `SimpleMLPAdaLN::forward` does. The one-evaluation
+    // heads have none.
+    let ts = match flow {
+        FlowType::Lsd => {
+            let (t0, t1) = (time_embed(wt, 0, 0.0, time_norm)?, time_embed(wt, 1, 1.0, time_norm)?);
+            let ts: Vec<f32> = t0.iter().zip(&t1).map(|(a, b)| (a + b) * 0.5).collect();
+            Some(b.const_f32(&ts, &[1, dm.flow_d]))
+        }
+        FlowType::Drifting | FlowType::Pointwise => None,
+    };
     let cw = w(b, wt, &format!("{p}.cond_embed.weight"))?;
     let cb = w(b, wt, &format!("{p}.cond_embed.bias"))?;
     let c = b.linear(cond, &cw, Some(&cb), &[1, dm.flow_d]);
-    let y = b.add(&ts, &c, &[1, dm.flow_d]);
+    let y = match ts {
+        Some(ts) => b.add(&ts, &c, &[1, dm.flow_d]),
+        None => c,
+    };
     let fd = dm.flow_d as i32;
 
     for i in 0..dm.flow_blocks {
@@ -309,7 +371,17 @@ fn flow_net(
 /// same graph serves prefill and decode), `cos`/`sin [1, 1, t, HD/2]`, `mask [1, 1, t, ctx + t]`,
 /// `noise [1, LDIM]`, and the ring `k_all_in`/`v_all_in [L, H, ctx, HD]`. Outputs: `next_latent`
 /// and `eos` for the last position, and `k_new`/`v_new [L, H, t, HD]` for the host to store.
-pub fn build(wt: &Weights, dm: &Dims, ctx: usize, t: usize) -> Result<Built, String> {
+/// `time_norm` is the checkpoint's time-embedding norm, baked into the graph as a constant,
+/// `gelu` its FFN activation and `flow` its flow head.
+pub fn build(
+    wt: &Weights,
+    dm: &Dims,
+    ctx: usize,
+    t: usize,
+    time_norm: TimeNorm,
+    gelu: Gelu,
+    flow: FlowType,
+) -> Result<Built, String> {
     let mut b = Builder::new().with_float(FP);
     let emb = b.input("emb", FP, &[1, t, dm.d]);
     let cos = b.input("cos", FP, &[1, 1, t, dm.hd() / 2]);
@@ -322,7 +394,8 @@ pub fn build(wt: &Weights, dm: &Dims, ctx: usize, t: usize) -> Result<Built, Str
     let mut x = emb;
     let mut rows: Vec<Var> = Vec::new();
     for i in 0..dm.layers {
-        x = layer(dm, &mut b, wt, i, &x, (&cos, &sin, &mask), (&k_all, &v_all), &mut rows, ctx, t)?;
+        let (rope, kv) = ((&cos, &sin, &mask), (&k_all, &v_all));
+        x = layer(dm, &mut b, wt, i, &x, rope, kv, &mut rows, ctx, t, gelu)?;
     }
     let onw = w(&mut b, wt, "flow_lm.out_norm.weight")?;
     let onb = w(&mut b, wt, "flow_lm.out_norm.bias")?;
@@ -330,12 +403,23 @@ pub fn build(wt: &Weights, dm: &Dims, ctx: usize, t: usize) -> Result<Built, Str
     // Only the final position feeds the heads.
     let last = b.slice_tail(&h, 1, 1, &[1, 1, dm.d]);
     let t_out = b.reshape(&last, &[1, dm.d]);
+    let t_out = match dm.z {
+        Some(z) => {
+            let zw = w(&mut b, wt, "flow_lm.z_proj.weight")?;
+            b.linear(&t_out, &zw, None, &[1, z])
+        }
+        None => t_out,
+    };
 
     let ew = w(&mut b, wt, "flow_lm.out_eos.weight")?;
     let eb = w(&mut b, wt, "flow_lm.out_eos.bias")?;
     let eos = b.linear(&t_out, &ew, Some(&eb), &[1, 1]);
-    let dir = flow_net(dm, &mut b, wt, &t_out, &noise)?;
-    let next = b.add(&noise, &dir, &[1, dm.ldim]);
+    let dir = flow_net(dm, &mut b, wt, &t_out, &noise, time_norm, flow)?;
+    // A drifting head's output is the latent; the others' is added to the noise.
+    let next = match flow {
+        FlowType::Drifting => dir,
+        FlowType::Lsd | FlowType::Pointwise => b.add(&noise, &dir, &[1, dm.ldim]),
+    };
     let next = b.alias(&next, "next_latent");
     let eos = b.alias(&eos, "eos");
     // Only this call's rows, for every layer: [L, H, t, HD], 18 KB at t = 1.
@@ -346,4 +430,68 @@ pub fn build(wt: &Weights, dm: &Dims, ctx: usize, t: usize) -> Result<Built, Str
     let k_new = b.alias(&k, "k_new");
     let v_new = b.alias(&v, "v_new");
     Ok(b.finish_with_weights(&[&next, &eos, &k_new, &v_new]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kv_rows_repeat_for_the_query_heads_sharing_them() {
+        // Four query heads of two channels, two k/v heads, one column: each row holds its index.
+        let dm = Dims {
+            d: 8,
+            heads: 4,
+            attn: 8,
+            kv_heads: 2,
+            layers: 1,
+            ff: 8,
+            ldim: 2,
+            z: None,
+            flow_d: 4,
+            flow_blocks: 1,
+        };
+        let rows: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let q: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        // k is rows 8..12 and v rows 12..16; heads 0 and 1 share the first k/v head.
+        let k = [8., 9., 8., 9., 10., 11., 10., 11.];
+        let v = [12., 13., 12., 13., 14., 15., 14., 15.];
+        assert_eq!(repeat_kv_rows(&dm, &rows, 1), [q, k.to_vec(), v.to_vec()].concat());
+
+        let full = Dims { kv_heads: 4, ..dm };
+        let rows: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        assert_eq!(repeat_kv_rows(&full, &rows, 1), rows);
+    }
+
+    #[test]
+    fn both_time_norms_follow_their_formulas() {
+        // Zero weights leave `mlp.2`'s bias as the row reaching the norm: one with a clear mean,
+        // where centring matters, and alpha = 2.
+        let xs = [1.0f32, 2.0, 3.0, 6.0];
+        let p = "flow_lm.flow_net.time_embed.0";
+        let t = |name: &str, shape: &[usize], data: Vec<f32>| {
+            (format!("{p}.{name}"), (shape.to_vec(), data))
+        };
+        let wt = Weights::from_tensors(
+            [
+                t("freqs", &[1], vec![0.0]),
+                t("mlp.0.weight", &[4, 2], vec![0.0; 8]),
+                t("mlp.0.bias", &[4], vec![0.0; 4]),
+                t("mlp.2.weight", &[4, 4], vec![0.0; 16]),
+                t("mlp.2.bias", &[4], xs.to_vec()),
+                t("mlp.3.alpha", &[4], vec![2.0; 4]),
+            ]
+            .into(),
+        );
+        let (n, eps) = (4.0f32, 1e-5f32);
+        let mean = xs.iter().sum::<f32>() / n;
+        let var = xs.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / (n - 1.0);
+        let ms = xs.iter().map(|v| v * v).sum::<f32>() / n;
+        for (norm, den) in [(TimeNorm::Rms, ms), (TimeNorm::RmsVar, var)] {
+            let got = time_embed(&wt, 0, 1.0, norm).unwrap();
+            for (g, v) in got.iter().zip(xs) {
+                assert!((g - 2.0 * v / (den + eps).sqrt()).abs() < 1e-5, "{norm:?}: {got:?}");
+            }
+        }
+    }
 }

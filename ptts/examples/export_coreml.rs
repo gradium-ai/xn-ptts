@@ -5,21 +5,21 @@
 //! the voices, and a `bundle.json` describing it all with every file's size and SHA-256.
 //!
 //! ```bash
-//! cargo run --release -p ptts --example export_coreml -- out/phonon-coreml
-//! cargo run --release -p ptts --example export_coreml -- --dir path/to/checkpoint out/models
+//! cargo run --release -p ptts --example export_coreml --features hub -- out/models
+//! cargo run --release -p ptts --example export_coreml -- --model path/to/checkpoint out/models
 //! ```
 //!
 //! The graphs are built for the Neural Engine: fp16, fully static shapes, and a KV cache the
 //! host keeps. `--max-tokens` is the longest sentence the prefill graph takes; longer text is
 //! split into sentences at run time. Mimi stays f32 and runs on the CPU.
 
-#[path = "model_helpers.rs"]
+#[path = "../src/bin/ptts/model_helpers.rs"]
 mod model_helpers;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use model_helpers::Source;
 use ptts_coreml::Weights;
+use ptts_coreml::mil::Gelu;
 use ptts_coreml::package::write_mlpackage_with_weights;
 use ptts_coreml::phonon::{flow_lm as fl, mimi};
 use safetensors::tensor::{Dtype, TensorView};
@@ -31,16 +31,8 @@ use std::path::{Path, PathBuf};
 struct Args {
     /// Output directory.
     out: PathBuf,
-    /// Hugging Face repo to download the checkpoint from.
-    #[arg(long, required_unless_present = "dir", conflicts_with = "dir")]
-    repo: Option<String>,
-
-    /// Hugging Face branch, tag, or commit. Use a commit to reproduce a release.
-    #[arg(long, conflicts_with = "dir")]
-    revision: Option<String>,
-    /// A local checkpoint directory instead of the Hub.
-    #[arg(long)]
-    dir: Option<PathBuf>,
+    #[arg(long, default_value = model_helpers::DEFAULT_MODEL, help = model_helpers::MODEL_HELP)]
+    model: String,
     /// Weights file inside the repo or directory, when it has several.
     #[arg(long)]
     weights: Option<String>,
@@ -50,7 +42,7 @@ struct Args {
     /// A directory of voice `.safetensors` files, instead of the checkpoint's own.
     #[arg(long)]
     voices: Option<PathBuf>,
-    /// Set a conditioner, e.g. padding_bonus=0.5; repeatable. Fixed in the bundle: the app
+    /// Set a conditioner, e.g. duration_delta=0.5; repeatable. Fixed in the bundle: the app
     /// cannot change it.
     #[arg(long = "condition", value_name = "NAME=VALUE")]
     conditions: Vec<String>,
@@ -75,36 +67,76 @@ fn write(out: &Path, name: &str, built: fl::Built) -> Result<()> {
 fn main() -> Result<()> {
     let args = Args::parse();
     tracing_subscriber::fmt().with_env_filter(model_helpers::LOG_DIRECTIVES).init();
-    let source = match args.dir.as_deref() {
-        Some(dir) => Source::Dir(dir),
-        None => Source::Hub {
-            repo: args.repo.as_deref().context("--repo or --dir is required")?,
-            revision: args.revision.as_deref(),
-        },
+    let options = model_helpers::ResolveOptions {
+        quant: args.quant.parse()?,
+        weights: args.weights.as_deref(),
     };
-    let ck = model_helpers::locate(source, args.weights.as_deref(), args.quant.parse()?)?;
+    let ck = model_helpers::Checkpoint::locate(&args.model, options)?;
     let cfg = &ck.config;
     let f = &cfg.flow_lm;
     let dims = fl::Dims {
         d: f.d_model,
         heads: f.num_heads,
+        attn: f.attn_dim.unwrap_or(f.d_model),
+        kv_heads: f.num_kv_heads.unwrap_or(f.num_heads),
         layers: f.num_layers,
         ff: f.dim_feedforward,
         ldim: f.ldim,
+        z: f.z_dim,
         flow_d: f.flow_dim,
         flow_blocks: f.flow_depth,
     };
     anyhow::ensure!(
-        cfg.lsd_decode_steps == 1,
+        dims.heads > 0
+            && dims.attn.is_multiple_of(dims.heads)
+            && dims.kv_heads > 0
+            && dims.heads.is_multiple_of(dims.kv_heads),
+        "the config's attention heads do not divide its width or its key/value heads"
+    );
+    let flow = match f.flow_type {
+        ptts::flow_lm::FlowType::Lsd => fl::FlowType::Lsd,
+        ptts::flow_lm::FlowType::Drifting => fl::FlowType::Drifting,
+        ptts::flow_lm::FlowType::Pointwise => fl::FlowType::Pointwise,
+    };
+    anyhow::ensure!(
+        flow != fl::FlowType::Lsd || cfg.lsd_decode_steps == 1,
         "the Core ML graph takes one flow step; this checkpoint wants {}",
         cfg.lsd_decode_steps
     );
+    let time_norm = match f.time_rms_norm {
+        ptts::flow_lm::TimeRmsNorm::Rms => fl::TimeNorm::Rms,
+        ptts::flow_lm::TimeRmsNorm::RmsVar => fl::TimeNorm::RmsVar,
+    };
+    // The FFN activation each transformer was trained with, as ptts picks it.
+    let gelu = |g: Option<ptts::transformer::Gelu>| match g.unwrap_or_else(|| cfg.default_gelu()) {
+        ptts::transformer::Gelu::Erf => Gelu::Erf,
+        ptts::transformer::Gelu::Tanh => Gelu::Tanh,
+    };
     let m = &cfg.mimi;
+    let hop: usize = m.ratios.iter().product();
+    let mimi_dims = mimi::Dims {
+        ldim: m.quantizer_dimension,
+        dim: m.dimension,
+        d_model: m.transformer_d_model,
+        heads: m.transformer_num_heads,
+        layers: m.transformer_num_layers,
+        ff: m.transformer_dim_feedforward,
+        out_dim: m.decoder_dimension.unwrap_or(m.dimension),
+        n_filters: m.n_filters,
+        ratios: m.ratios.clone(),
+        kernel_size: m.kernel_size,
+        residual_kernel_size: m.residual_kernel_size,
+        last_kernel_size: m.last_kernel_size,
+        compress: m.compress,
+        steps: (m.sample_rate as f64 / hop as f64 / m.frame_rate).round() as usize,
+    };
     anyhow::ensure!(
-        (m.transformer_d_model, m.transformer_num_heads) == (mimi::DIM, mimi::HEADS),
-        "the Core ML Mimi graph is built for a {}-wide, {}-head decoder transformer",
-        mimi::DIM,
-        mimi::HEADS
+        m.channels == 1
+            && m.n_residual_layers == 1
+            && mimi_dims.steps > 1
+            && (m.quantizer_dimension, m.quantizer_output_dimension) == (f.ldim, m.dimension),
+        "the Core ML Mimi graph takes a mono decoder with one residual block per stage that \
+         upsamples the flow LM's latents"
     );
     let window = m.transformer_context;
 
@@ -126,7 +158,7 @@ fn main() -> Result<()> {
     // Voices may hold speaker-Mimi latents rather than ready-to-use embeddings, projected with
     // the same checkpoint weight the Rust runtime uses when adding a voice.
     let speaker_proj = ptts::loader::load_speaker_proj(&vb, cfg)?;
-    let model_ext = cfg.model_ext();
+    let embeddings_ext = cfg.embeddings_ext.as_deref();
 
     // What the flow LM adds to every frame's input, `D` wide: the checkpoint's conditioners
     // summed, at the values given and their defaults for the rest. Zeros without any.
@@ -153,7 +185,7 @@ fn main() -> Result<()> {
         for (name, path) in files {
             let emb = ptts::loader::load_voice_emb(
                 &path,
-                model_ext.as_deref(),
+                embeddings_ext,
                 speaker_proj.as_ref(),
                 &xn::CpuDevice,
             )
@@ -203,13 +235,18 @@ fn main() -> Result<()> {
     let ctx = vlen + args.max_tokens + max_frames + 16;
     tracing::info!(?dims, vlen, max_frames, ctx, "building graphs");
     let bad = |e: String| anyhow::anyhow!(e);
-    write(&args.out, &fl::package_name(ctx, 1), fl::build(&wt, &dims, ctx, 1).map_err(bad)?)?;
-    let prefill = fl::build(&wt, &dims, ctx, args.max_tokens).map_err(bad)?;
+    write(
+        &args.out,
+        &fl::package_name(ctx, 1),
+        fl::build(&wt, &dims, ctx, 1, time_norm, gelu(f.gelu), flow).map_err(bad)?,
+    )?;
+    let prefill =
+        fl::build(&wt, &dims, ctx, args.max_tokens, time_norm, gelu(f.gelu), flow).map_err(bad)?;
     write(&args.out, &fl::package_name(ctx, args.max_tokens), prefill)?;
     write(
         &args.out,
-        &mimi::package_name(window),
-        mimi::build(&wt, mimi::cache_len(window)).map_err(bad)?,
+        &mimi_dims.package_name(window),
+        mimi::build(&wt, &mimi_dims, mimi_dims.cache_len(window), gelu(m.gelu)).map_err(bad)?,
     )?;
 
     // The host-side tensors, f32, and the conditioning a voice without its own is spoken with.
@@ -220,8 +257,28 @@ fn main() -> Result<()> {
         defaults.entry(name.clone()).or_insert_with(|| value.clone());
     }
     let mut host: Vec<(&str, Vec<usize>, Vec<u8>)> = Vec::new();
-    for n in ["flow_lm.conditioner.embed.weight", "flow_lm.input_linear.weight", "flow_lm.bos_emb"]
-    {
+    // The text table at the model's width: a low-rank one through its `output_proj`, as ptts
+    // projects it at load.
+    let (shape, table) = get("flow_lm.conditioner.embed.weight")?;
+    let (shape, table) = match wt.get("flow_lm.conditioner.output_proj.weight") {
+        Ok((proj_shape, proj)) => {
+            let (rows, rank, d) = (shape[0], shape[1], proj_shape[0]);
+            let mut out = vec![0f32; rows * d];
+            for (row, o) in table.chunks(rank).zip(out.chunks_mut(d)) {
+                for (v, p) in o.iter_mut().zip(proj.chunks(rank)) {
+                    *v = row.iter().zip(p).map(|(a, b)| a * b).sum();
+                }
+            }
+            (vec![rows, d], out)
+        }
+        Err(_) => (shape.to_vec(), table.to_vec()),
+    };
+    host.push((
+        "flow_lm.conditioner.embed.weight",
+        shape,
+        table.iter().flat_map(|v| v.to_le_bytes()).collect(),
+    ));
+    for n in ["flow_lm.input_linear.weight", "flow_lm.bos_emb"] {
         let (shape, data) = get(n)?;
         host.push((n, shape.to_vec(), data.iter().flat_map(|v| v.to_le_bytes()).collect()));
     }
@@ -259,14 +316,17 @@ fn main() -> Result<()> {
         "ctx": ctx,
         "prefill_len": args.max_tokens,
         "max_frames": max_frames,
+        "mimi": mimi_dims.to_json(),
         "mimi_window": window,
         "eos_threshold": cfg.eos_threshold,
         "temperature": args.temperature,
         "dims": {
-            "d": dims.d, "heads": dims.heads, "layers": dims.layers, "ff": dims.ff,
-            "ldim": dims.ldim, "flow_d": dims.flow_d, "flow_blocks": dims.flow_blocks,
+            "d": dims.d, "heads": dims.heads, "attn": dims.attn, "kv_heads": dims.kv_heads,
+            "layers": dims.layers, "ff": dims.ff, "ldim": dims.ldim, "z": dims.z,
+            "flow_d": dims.flow_d, "flow_blocks": dims.flow_blocks,
         },
         "voices": voices.iter().map(|(n, _, _)| n).collect::<Vec<_>>(),
+        "languages": cfg.languages,
         "conditions": given,
         "files": files,
     });

@@ -9,6 +9,7 @@
 import { fetchBytes } from './fetch.js';
 import { chooseDevice, isGguf } from './device.js';
 import { chooseThreads } from './threads.js';
+import { hasRelaxedSimd } from './simd.js';
 
 let model = null;
 /** Samples per frame: a generation step returns a whole number of them. */
@@ -33,6 +34,18 @@ const yieldToEventLoop = () =>
   });
 
 /**
+ * Each build comes as two modules with the same JS: one using WebAssembly Relaxed SIMD and
+ * one without, for browsers that lack it. This picks the one the browser can compile, and
+ * hands the JS its URL. The `new URL` calls name their file literally, so a bundler emits
+ * the module beside the JS as it does the default one.
+ */
+const RELAXED_SIMD = hasRelaxedSimd();
+function moduleFor(relaxedUrl, simdUrl, simdDefault) {
+  if (RELAXED_SIMD) return relaxedUrl ? { module_or_path: relaxedUrl } : undefined;
+  return { module_or_path: simdUrl ?? simdDefault };
+}
+
+/**
  * Load the wasm build to run on the CPU, and start its threads.
  *
  * There are two builds. `wasm-threads/` runs generation on several threads, but its memory
@@ -54,7 +67,13 @@ async function loadWasm(options) {
   if (choice.threads > 1) {
     try {
       const wasm = await import('./wasm-threads/phonon_tts.js');
-      await wasm.default(options.threadsWasmUrl ? { module_or_path: options.threadsWasmUrl } : undefined);
+      await wasm.default(
+        moduleFor(
+          options.threadsWasmUrl,
+          options.threadsSimdWasmUrl,
+          new URL('./wasm-threads/phonon_tts_simd_bg.wasm', import.meta.url),
+        ),
+      );
       const workers = choice.threads - 1;
       // rayon's Web Workers first, then xn's CPU pool on them; both before any model loads.
       await wasm.initThreadPool(workers);
@@ -75,11 +94,13 @@ async function loadWasm(options) {
 async function loadSingleThreaded(options) {
   const wasm = await import('./wasm/phonon_tts.js');
   try {
-    await wasm.default(options.wasmUrl ? { module_or_path: options.wasmUrl } : undefined);
+    await wasm.default(
+      moduleFor(options.wasmUrl, options.simdWasmUrl, new URL('./wasm/phonon_tts_simd_bg.wasm', import.meta.url)),
+    );
   } catch (e) {
     if (e instanceof WebAssembly.CompileError) {
       throw new Error(
-        `this browser cannot run phonon-tts: it needs WebAssembly SIMD and Relaxed SIMD (${e.message})`,
+        `this browser cannot run phonon-tts: it needs WebAssembly SIMD (${e.message})`,
       );
     }
     throw e;
@@ -116,11 +137,12 @@ async function handleInit(id, options) {
   if (!weightsUrl) throw new Error(`this model has no '${quant}' weights`);
   const progress = (file) => (p) => post({ type: 'progress', id, file, ...p });
 
-  const [weights, tokenizer, config] = await Promise.all([
-    fetchBytes(weightsUrl, { cache, onProgress: progress('weights') }),
-    fetchBytes(spec.tokenizer, { cache, onProgress: progress('tokenizer') }),
-    fetchBytes(spec.config, { cache, onProgress: progress('config') }),
+  const files = await Promise.all([
+    download(weightsUrl, progress('weights')),
+    download(spec.tokenizer, progress('tokenizer')),
+    download(spec.config, progress('config')),
   ]);
+  const [weights, tokenizer, config] = files.map((f) => f.bytes);
   const load = (device) =>
     wasm.Model.load(
       weights,
@@ -149,16 +171,44 @@ async function handleInit(id, options) {
   }
   model ??= await load('cpu');
   frameSize = model.frame_size();
+  // The model holds its own copy now: the page can have these to cache.
+  for (const file of files) file.keep();
 
   for (const name of options.preload) await voiceIndex(name, progress(`voice:${name}`));
   return {
     sampleRate: model.sample_rate(),
     features: wasm.cpu_features(),
     device: model.device(),
+    languages: model.languages(),
     deviceReason,
     threads,
     threadsReason,
   };
+}
+
+/**
+ * Downloads `url`, or reads it from the cache, without writing the cache: `keep()` then hands a
+ * download to the page, which caches it (see `storeBytes` in fetch.js for why the worker does
+ * not). Call it only once the bytes are no longer needed here: they are transferred, not
+ * copied, so they are gone from this side afterwards. wasm copies what it is given, so that is
+ * as soon as the model or the voice has been loaded from them.
+ */
+async function download(url, onProgress) {
+  let cached = false;
+  const bytes = await fetchBytes(url, {
+    cache: settings.cache,
+    write: false,
+    onProgress: (p) => {
+      cached = p.cached;
+      onProgress?.(p);
+    },
+  });
+  const keep = () => {
+    if (!settings.cache || cached) return;
+    const buffer = bytes.byteLength === bytes.buffer.byteLength ? bytes.buffer : bytes.slice().buffer;
+    post({ type: 'store', url, bytes: buffer }, [buffer]);
+  };
+  return { bytes, keep };
 }
 
 /** The index of voice `name`, fetching and registering it on first use. */
@@ -170,8 +220,12 @@ function voiceIndex(name, onProgress) {
       const known = [...new Set([...Object.keys(settings.model.voices), ...voices.keys()])];
       return Promise.reject(new Error(`unknown voice '${name}'; known: ${known.join(', ')}`));
     }
-    entry = fetchBytes(url, { cache: settings.cache, onProgress })
-      .then((bytes) => model.add_voice(bytes))
+    entry = download(url, onProgress)
+      .then(async ({ bytes, keep }) => {
+        const index = await registerVoice(bytes);
+        keep();
+        return index;
+      })
       .catch((e) => {
         voices.delete(name); // let a later call retry
         throw e;
@@ -182,8 +236,28 @@ function voiceIndex(name, onProgress) {
 }
 
 async function handleAddVoice(name, source) {
-  const bytes = typeof source === 'string' ? await fetchBytes(source, { cache: settings.cache }) : new Uint8Array(source);
-  voices.set(name, model.add_voice(bytes));
+  const { bytes, keep } =
+    typeof source === 'string' ? await download(source) : { bytes: new Uint8Array(source), keep() {} };
+  const index = registerVoice(bytes);
+  voices.set(name, index);
+  try {
+    await index;
+    keep();
+  } catch (e) {
+    voices.delete(name); // let a later call retry
+    throw e;
+  }
+}
+
+/**
+ * Registers a voice and waits until the device has run its prompt. On WebGPU that is only
+ * recorded otherwise, and runs inside the next generation: after preloading several voices,
+ * the first one spoken would pay for all of them.
+ */
+async function registerVoice(bytes) {
+  const index = model.add_voice(bytes);
+  await model.flush();
+  return index;
 }
 
 async function handleGenerate(id, { text, voice, temperature, seed }) {

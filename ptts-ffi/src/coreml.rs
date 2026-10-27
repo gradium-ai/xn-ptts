@@ -17,6 +17,7 @@ pub struct Engine {
     normalize: Normalize,
     dir: PathBuf,
     voices: Vec<String>,
+    languages: Vec<String>,
 }
 
 fn voice_names(dir: &Path) -> Vec<String> {
@@ -55,14 +56,19 @@ impl Engine {
             dims: ptts_coreml::phonon::flow_lm::Dims {
                 d: dim("d")?,
                 heads: dim("heads")?,
+                // Bundles written before these were exported with their defaults.
+                attn: dim("attn").or_else(|_| dim("d"))?,
+                kv_heads: dim("kv_heads").or_else(|_| dim("heads"))?,
                 layers: dim("layers")?,
                 ff: dim("ff")?,
                 ldim: dim("ldim")?,
+                z: dim("z").ok(),
                 flow_d: dim("flow_d")?,
                 flow_blocks: dim("flow_blocks")?,
             },
             ctx: int("ctx")?,
             prefill_len: int("prefill_len")?,
+            mimi: ptts_coreml::phonon::mimi::Dims::from_json(&meta["mimi"])?,
             mimi_window: int("mimi_window")?,
             max_frames: int("max_frames")?,
             eos_threshold: get(&meta, "eos_threshold")? as f32,
@@ -71,6 +77,10 @@ impl Engine {
             flow_unit,
         };
         let voices = voice_names(dir);
+        let languages = meta["languages"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|l| l.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
         let voice = load_voice(dir, voices.first().ok_or("no voices in the bundle")?)?;
         let tokenizer =
             ptts::tok::Tok::open(&dir.join("tokenizer.json")).map_err(|e| e.to_string())?;
@@ -81,6 +91,7 @@ impl Engine {
             normalize,
             dir: dir.to_path_buf(),
             voices,
+            languages,
         })
     }
 
@@ -88,9 +99,19 @@ impl Engine {
         &self.voices
     }
 
+    pub fn languages(&self) -> &[String] {
+        &self.languages
+    }
+
     /// Switch to one of [`Self::voices`].
     pub fn set_voice(&mut self, name: &str) -> Result<(), String> {
         self.phonon.set_voice(load_voice(&self.dir, name)?)
+    }
+
+    /// Normalize text as `lang` from the next utterance on.
+    pub fn set_language(&mut self, lang: &str) -> Result<(), String> {
+        self.normalize = lang.parse::<Normalize>().map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     /// Split `text` into chunks the prefill graph takes.
@@ -104,14 +125,16 @@ impl Engine {
         // longer than the model says in one go.
         let fit_max = max.min(ptts::plan::MAX_FIT_TOKENS);
         let planned = ptts::plan::chunks(&self.tokenizer, text, self.normalize, max, FRAME_RATE)
-            .and_then(|chunks| ptts::plan::fit(chunks, fit_max, &self.tokenizer, FRAME_RATE))
+            .and_then(|chunks| {
+                ptts::plan::fit_with_word_limit(chunks, fit_max, max, &self.tokenizer, FRAME_RATE)
+            })
             .map_err(|e| e.to_string())?;
         let mut chunks = Vec::new();
         for chunk in planned.into_iter().filter(|c| !c.tokens.is_empty()) {
-            // Only a single word that is too long is left uncut.
+            // Only a single character that is too long is left uncut.
             if chunk.tokens.len() > max {
                 return Err(format!(
-                    "one word is {} tokens, over the {max} the model takes",
+                    "one character is {} tokens, over the {max} the model takes",
                     chunk.tokens.len()
                 ));
             }

@@ -1,4 +1,4 @@
-//! Email addresses: "laurent.mazare@gmail.com" becomes "laurent dot mazare at gmail dot com".
+//! Email addresses: "jane.smith@gmail.com" becomes "jane dot smith at gmail dot com".
 
 use super::{spell_short, suffix};
 use crate::preprocess::Lang;
@@ -73,13 +73,9 @@ mod tests {
         let cases = [
             (Lang::En, "foo@bar.com", "foo at bar dot com"),
             (Lang::En, "foo@bar.baz.com?", "foo at bar dot baz dot com?"),
-            (Lang::En, "laurent.mazare@gmail.com", "laurent dot mazare at gmail dot com"),
-            (
-                Lang::En,
-                "laurent.mazare@gra-dium.fr?",
-                "laurent dot mazare at gra dash dium dot F-R?",
-            ),
-            (Lang::En, "laurent+tag@gmail.com", "laurent plus tag at gmail dot com"),
+            (Lang::En, "jane.smith@gmail.com", "jane dot smith at gmail dot com"),
+            (Lang::En, "jane.smith@gra-dium.fr?", "jane dot smith at gra dash dium dot F-R?"),
+            (Lang::En, "jane+tag@gmail.com", "jane plus tag at gmail dot com"),
             (Lang::En, "first_last@x.co.uk.", "first underscore last at x dot co dot U-K."),
             (Lang::En, "a..b@x.io", "a dot dot b at x dot I-O"),
             (Lang::Fr, "alex@gmail.com", "alex arobaze gmail point com"),

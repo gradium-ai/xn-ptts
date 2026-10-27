@@ -1,12 +1,20 @@
 # Phonon on Android
 
+For supported Snapdragon NPUs, the [QNN AAR](../qnn/android/README.md) provides a
+Kotlin API and compiled model support on Android 12+ ARM64. Build it from this repository;
+the Maven package is not published yet. This guide covers the CPU library.
+
 Phonon runs on Android on the CPU as a C library: `libptts_ffi.so` and its header,
 [`ptts.h`](../ptts-ffi/include/ptts.h). Anything that can call C can use it: Kotlin and Java, C++
 through the NDK, Flutter, Unity, .NET and others. The iOS package exports the same calls, so one
-binding can serve both platforms.
+binding can serve both platforms. The [C guide](../ptts-ffi/README.md) describes the interface;
+this guide covers what is particular to Android.
 
 For native Android apps there is a ready-made Kotlin wrapper, [`PhononTTS.kt`](PhononTTS.kt).
 There is no Gradle package: you build the library and copy what you need into your app.
+
+To use Phonon as the phone's system voice, for TalkBack and any app that speaks through Android's
+`TextToSpeech`, build the engine app in [`tts-engine/`](tts-engine/README.md) instead.
 
 ## 1. Build the library
 
@@ -21,7 +29,9 @@ export ANDROID_NDK_HOME=/path/to/ndk
 This writes `android/jniLibs/arm64-v8a/libptts_ffi.so` for phones and
 `android/jniLibs/x86_64/libptts_ffi.so` for the emulator on an x86 machine. Copy the `jniLibs`
 folder to your app's `src/main/`. Only these two ABIs are built: there is no 32-bit
-(`armeabi-v7a`) library.
+(`armeabi-v7a`) library. JNA ships more ABIs, so limit your app to these two with
+`ndk { abiFilters += listOf("arm64-v8a", "x86_64") }` in `defaultConfig`; otherwise the app also
+installs on 32-bit phones, where Phonon fails to load.
 
 The arm64 build requires the dotprod and fp16 instructions (ARMv8.2), which nearly every phone
 since 2019 has. The kernels are chosen at compile time, so the library crashes on a phone without
@@ -30,45 +40,21 @@ everywhere but is slower.
 
 ## 2. Get a model
 
-The library loads a checkpoint folder:
-
-| File | What it is |
-|---|---|
-| `tokenizer.json` | The checkpoint's tokenizer. |
-| `model.q8.gguf` or `model.safetensors` | The weights: q8_0 GGUF, or f32 safetensors. GGUF is used when both are there. |
-| `config.json` | Optional. Without it, the default config is used. |
-| `voices/<name>.safetensors` or `embeddings/<name>.safetensors` | The voices, each named after its file. |
-| `default-voice.safetensors` | Optional. Listed as the voice `default`, and spoken when no voice is set. |
+The Phonon models are on Hugging Face, [listed in the README](../README.md#model-setup). The
+library loads a checkpoint folder: the [C guide](../ptts-ffi/README.md#2-get-a-model) lists its
+files and how to download them.
 
 Download the folder into the app's files directory on first run, rather than shipping it in the
-APK.
+APK. A gated model needs a Hugging Face token to download, so host its files yourself, under the
+model's license.
 
 ## 3. The interface
 
-[`ptts.h`](../ptts-ffi/include/ptts.h) has six calls:
-
-| Call | What it does |
-|---|---|
-| `ptts_new(dir, PTTS_UNIT_CPU, lang)` | Load the model folder. This is the slow call. |
-| `ptts_voices(h)` | The voice names, as one block of NUL-separated strings. |
-| `ptts_set_voice(h, name)` | Speak in one of them from now on. |
-| `ptts_speak(h, text, callback, user, &result)` | Speak `text`, passing the audio to `callback` as it is made. |
-| `ptts_last_error(h)` | Why the last call failed. Pass `NULL` after a failed `ptts_new`. |
-| `ptts_free(h)` | Free the model. Nothing else does. |
-
-Every binding follows the same rules:
-
-- **Load once.** Keep one handle for the life of the app rather than one per sentence.
-- **Calls block.** Make them off the main thread, and from one thread at a time.
-- **The audio is 24 kHz mono `float` in [-1, 1].** The callback runs on the thread that called
-  `ptts_speak`, with one or more frames at a time. Return `false` from it to stop early. It must not
-  call back into the same handle. Generation runs on its own threads, so a callback that waits for
-  playback does not slow it down.
-- **`lang` is required.** `en`, `fr`, `de`, `es` and `pt` normalize numbers and symbols for that
-  language, and `none` reads the text as written.
-- **Set the thread count** with the `RAYON_NUM_THREADS` environment variable before the first
-  `ptts_new`. The default is one thread per core, which is too many on phones that mix fast and
-  slow cores. Measure on your target phones.
+[`ptts.h`](../ptts-ffi/include/ptts.h) has eight calls. The
+[C guide](../ptts-ffi/README.md#3-the-interface) lists them, with the rules every binding follows.
+On Android, also set the thread count with the `RAYON_NUM_THREADS` environment variable before the
+first `ptts_new`. The default is one thread per core, which is too many on phones that mix fast
+and slow cores. Measure on your target phones.
 
 ## 4. Call it
 
@@ -128,41 +114,15 @@ keep its `PhononTTS` open.
 ### C or C++ with the NDK
 
 Include `ptts.h` and link `libptts_ffi.so`, for example as an imported library in your
-`CMakeLists.txt`:
-
-```c
-#include "ptts.h"
-
-static bool on_audio(const float *pcm, size_t n, void *user) {
-    // Queue `n` samples for playback, e.g. to an AAudio or Oboe stream.
-    return true; // false stops early
-}
-
-setenv("RAYON_NUM_THREADS", "2", 1);
-PttsHandle *h = ptts_new(model_dir, PTTS_UNIT_CPU, "en");
-if (!h) {
-    // ptts_last_error(NULL) says why.
-}
-PttsResult result;
-if (!ptts_speak(h, "Hello from Phonon.", on_audio, NULL, &result)) {
-    // ptts_last_error(h) says why.
-}
-ptts_free(h);
-```
-
-`ptts_speak` and `ptts_set_voice` return `false` on failure. Strings from `ptts_voices` and
-`ptts_last_error` belong to the library: copy them if you keep them.
+`CMakeLists.txt`. The [C guide](../ptts-ffi/README.md#4-call-it) shows the calls. Queue the audio
+the callback receives to an AAudio or Oboe stream, and call `setenv("RAYON_NUM_THREADS", "2", 1)`
+before `ptts_new`.
 
 ### Flutter, Unity, .NET and other frameworks
 
-Load `libptts_ffi.so` with the framework's usual way of calling C, and declare the six calls from
-`ptts.h`. In Flutter that is `dart:ffi`; in C#, `[DllImport("ptts_ffi")]`; in Unity, a native
-plugin under `Plugins/Android/arm64-v8a`. Three details matter in any language:
-
-- `ptts_speak`, `ptts_set_voice` and the callback use a C `bool`, which is one byte.
-- `size_t` is 64 bits on both ABIs the library is built for.
-- The callback runs on the thread that called `ptts_speak`, so call it from a thread your runtime
-  can run callbacks on.
+Load `libptts_ffi.so` with the framework's usual way of calling C, and declare the calls from
+`ptts.h`. The [C guide](../ptts-ffi/README.md#other-languages) has the details that matter in any
+language. In Unity, the library goes in a native plugin under `Plugins/Android/arm64-v8a`.
 
 These routes have not been tested here yet; the Kotlin wrapper and the C interface have.
 

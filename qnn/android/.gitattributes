@@ -1,0 +1,3 @@
+*.bat text eol=crlf
+gradlew.bat linguist-generated=true
+gradlew linguist-generated=true

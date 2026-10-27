@@ -1,0 +1,28 @@
+# PTTS_LANG=en docker compose -f ptts-openai-server/compose.hub.yaml up
+# Serves the default model; set PTTS_MODEL=hf://owner/name[@revision] for another one.
+# A gated model, such as hf://gradium/phonon-40m-fr, also needs HF_TOKEN set on the host.
+services:
+  ptts-openai-server:
+    image: "${PTTS_IMAGE:-ghcr.io/gradium-ai/ptts-openai-server:latest}"
+    ports:
+      - "8880:8880"
+      # For Home Assistant, with PTTS_WYOMING_ADDR below.
+      # - "10200:10200"
+    environment:
+      PTTS_MODEL: "${PTTS_MODEL:-}"
+      PTTS_LANG: "${PTTS_LANG:?Set PTTS_LANG to a supported normalization language}"
+      PTTS_QUANT: q8
+      # Serve the Wyoming protocol, which Home Assistant uses, as well as the OpenAI API.
+      # PTTS_WYOMING_ADDR: 0.0.0.0:10200
+      # For clients that only offer OpenAI's voice names or always send a speed.
+      # PTTS_OPENAI_VOICES: default
+      # PTTS_IGNORE_SPEED: "true"
+      # Pass through HF_TOKEN when it is set on the host. Gated and private models need it.
+      HF_TOKEN:
+      HF_HOME: /home/phonon/.cache/huggingface
+    volumes:
+      - model-cache:/home/phonon/.cache/huggingface
+    restart: unless-stopped
+
+volumes:
+  model-cache:

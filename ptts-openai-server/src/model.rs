@@ -3,15 +3,14 @@
 //! Everything about *how* speech is generated lives in `ptts::synth`. What is
 //! left here is deciding which files to load, which voices to register, and
 //! holding the result for the request handlers.
-//!
-//! Local artifact resolution is shared in `ptts::checkpoint`.
 
+use crate::compat::{Aliases, Compat};
 use anyhow::{Context as _, Result};
-use ptts::checkpoint::{
-    Checkpoint, ResolveOptions, is_local_source, read_config, weight_candidates,
-};
+use ptts::checkpoint::{Checkpoint, ResolveOptions};
+use ptts::hub::HubSource;
 use ptts::preprocess::Normalize;
 use ptts::synth::{DeviceKind, Quant, Synth};
+use ptts::voice_catalog::{DEFAULT_VOICE_CATALOG, VoiceCatalog};
 use std::sync::Arc;
 
 /// The loaded model and the request defaults, shared by every request.
@@ -23,7 +22,15 @@ pub struct Inner {
     pub requests: Arc<tokio::sync::Semaphore>,
     /// The checkpoint that loaded: its repo id, or for a local config the name of its folder.
     pub model_name: String,
+    /// Where the checkpoint is from: its Hub page, or this repository for a local folder.
+    pub model_url: String,
+    /// How text is normalized. Wyoming lists the voices in its language.
+    pub normalize: Normalize,
     pub voices: Vec<String>,
+    /// Other names requests may give for those voices.
+    pub aliases: Aliases,
+    /// Accept a `speed` other than 1 and speak at the normal rate.
+    pub ignore_speed: bool,
     pub seed_base: u64,
     pub sample_rate: u32,
     pub frame_size: u32,
@@ -37,57 +44,60 @@ impl std::ops::Deref for AppState {
     }
 }
 
-/// Existing async Hub transport. Local candidates use the shared checkpoint resolver.
-async fn load_from_hf(repo_id: &str, revision: Option<&str>, quant: Quant) -> Result<Checkpoint> {
-    tracing::info!(repo_id, revision = revision.unwrap_or("main"), "downloading model artifacts");
-    let repo = crate::utils::HfRepo::model(repo_id, revision)?;
-    let config = read_config(repo.get("config.json").await?)?;
-    let mut weights = None;
-    let mut first_error = None;
-    for name in weight_candidates(quant) {
-        match repo.get(name).await {
-            Ok(path) => {
-                weights = Some(path);
-                break;
-            }
-            Err(e) => {
-                first_error.get_or_insert(e);
-            }
-        }
+/// Resolve `model`, `hf://owner/name[@revision]` or a local checkpoint folder or `config.json`
+/// in one, with the name it is reported by and where it is from.
+async fn locate(model: &str, quant: Quant) -> Result<(Checkpoint, String, String)> {
+    let hub = HubSource::parse(model)?;
+    let source = model.to_string();
+    // The blocking Hub client runs its own runtime, which cannot be started inside this one.
+    let checkpoint = tokio::task::spawn_blocking(move || {
+        Checkpoint::locate(&source, ResolveOptions { quant, weights: None })
+    })
+    .await??;
+    if let Some(hub) = hub {
+        return Ok((checkpoint, hub.repo.clone(), hub.url()));
     }
-    let weights = weights
-        .ok_or_else(|| first_error.unwrap_or_else(|| anyhow::anyhow!("no weights in {repo_id}")))?;
-    let tokenizer = Some(repo.get("tokenizer.json").await?);
-    let mut voices = Vec::new();
-    let voice_files = repo.voice_files().await.unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "cannot list voice files; only the default voice file is tried");
-        Vec::new()
-    });
-    for (name, file) in voice_files {
-        match repo.get(&file).await {
-            Ok(path) => voices.push((name, path)),
-            Err(e) => {
-                tracing::warn!(voice = %name, error = %e, "failed to download voice embedding")
-            }
-        }
-    }
-    // A checkpoint with baked-in voices need not ship an external default.
-    if !voices.iter().any(|(name, _)| name == "default")
-        && let Ok(path) = repo.get(ptts::loader::DEFAULT_VOICE_FILE).await
-    {
-        voices.push(("default".to_string(), path));
-    }
-    voices.sort();
-    Ok(Checkpoint { config, weights, tokenizer, voices, quant })
+    let absolute = std::fs::canonicalize(model)?;
+    let dir = if absolute.is_dir() {
+        absolute.as_path()
+    } else {
+        absolute.parent().context("config has a parent directory")?
+    };
+    let name = dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    Ok((checkpoint, name, env!("CARGO_PKG_REPOSITORY").to_string()))
 }
 
-/// Load the model named by `config`: a local checkpoint folder or a `config.json` in one, a Hub
-/// repo ID. The source is required.
+/// The voices of the catalog `source` names, each downloaded on first use: those in `lang` and
+/// those with no language, or all of them when `lang` is `none`. A voice that cannot be fetched
+/// is logged and skipped.
+async fn catalog_voices(source: &str, lang: &str) -> Result<Vec<(String, std::path::PathBuf)>> {
+    let (source, lang) = (source.to_string(), lang.to_string());
+    // The blocking Hub client runs its own runtime, which cannot be started inside this one.
+    tokio::task::spawn_blocking(move || {
+        let catalog = VoiceCatalog::new(&source)?;
+        let mut voices = vec![];
+        for voice in catalog.voices()? {
+            if lang != "none" && voice.language.as_deref().is_some_and(|l| l != lang) {
+                continue;
+            }
+            match catalog.fetch(voice) {
+                Ok(path) => voices.push((voice.name.clone(), path)),
+                Err(e) => {
+                    tracing::warn!(voice = %voice.name, error = %e, "failed to fetch catalog voice")
+                }
+            }
+        }
+        Ok(voices)
+    })
+    .await?
+}
+
+/// Load the model named by `model`. The source is required.
 #[allow(clippy::too_many_arguments)]
 pub async fn load_ptts(
-    config: &std::path::Path,
-    revision: Option<&str>,
+    model: &str,
     voice_dir: Option<&std::path::PathBuf>,
+    voice_catalog: Option<&str>,
     device: DeviceKind,
     quant: Quant,
     temperature: f32,
@@ -95,6 +105,7 @@ pub async fn load_ptts(
     normalize: Normalize,
     conditions: &[(String, String)],
     max_concurrent_requests: std::num::NonZeroUsize,
+    compat: &Compat,
 ) -> Result<AppState> {
     anyhow::ensure!(
         max_concurrent_requests.get() <= tokio::sync::Semaphore::MAX_PERMITS,
@@ -102,25 +113,8 @@ pub async fn load_ptts(
         tokio::sync::Semaphore::MAX_PERMITS
     );
     quant.check_device(device)?;
-    let (m, model_name) = match config {
-        path if is_local_source(path) => {
-            anyhow::ensure!(revision.is_none(), "--revision requires a Hugging Face repo ID");
-            let checkpoint = Checkpoint::resolve(path, ResolveOptions { quant, weights: None })?;
-            let absolute = std::fs::canonicalize(path)?;
-            let dir = if absolute.is_dir() {
-                absolute.as_path()
-            } else {
-                absolute.parent().context("config has a parent directory")?
-            };
-            let name = dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
-            (checkpoint, name)
-        }
-        repo_id => {
-            let repo_id = repo_id.to_str().context("invalid repo ID path")?;
-            (load_from_hf(repo_id, revision, quant).await?, repo_id.to_string())
-        }
-    };
-    let extra_voices = if let Some(voice_dir) = voice_dir {
+    let (m, model_name, model_url) = locate(model, quant).await?;
+    let mut extra_voices = if let Some(voice_dir) = voice_dir {
         let found = ptts::loader::voices_in(voice_dir);
         if found.is_empty() {
             tracing::warn!(?voice_dir, "no voice files found in --voice-dir");
@@ -129,6 +123,16 @@ pub async fn load_ptts(
     } else {
         Vec::new()
     };
+    if let Some(catalog) = voice_catalog {
+        match catalog_voices(catalog, normalize.as_str()).await {
+            Ok(voices) => extra_voices.extend(voices),
+            // Offline, a server that needs no catalog voice still starts.
+            Err(e) if catalog == DEFAULT_VOICE_CATALOG => {
+                tracing::warn!(error = %e, "the default voice catalog could not be read")
+            }
+            Err(e) => return Err(e.context(format!("voice catalog {catalog}"))),
+        }
+    }
     let frame_rate = m.config.mimi.frame_rate;
     let mut builder = m.builder(normalize).device(device).quant(quant).temperature(temperature);
     for (name, value) in conditions {
@@ -145,6 +149,7 @@ pub async fn load_ptts(
 
     let voices = synth.voices();
     let default_voice = synth.default_voice().context("no voice embeddings found in model")?;
+    let aliases = Aliases::new(compat, &voices)?;
     let sample_rate = synth.sample_rate();
     let frame_size = (sample_rate as f64 / frame_rate).round() as u32;
     tracing::info!(
@@ -160,11 +165,46 @@ pub async fn load_ptts(
         synth,
         requests: Arc::new(tokio::sync::Semaphore::new(max_concurrent_requests.get())),
         model_name,
+        model_url,
+        normalize,
         voices,
+        aliases,
+        ignore_speed: compat.ignore_speed,
         seed_base,
         sample_rate,
         frame_size,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_catalog_voices_served_are_those_in_the_language() {
+        let dir = std::env::temp_dir().join(format!("ptts-server-catalog-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("voices.jsonl"),
+            r#"{"name": "Zoey", "filename": "voices/a.safetensors", "language": "en"}
+{"name": "Annika", "filename": "voices/b.safetensors", "language": "de"}
+{"name": "Mine", "filename": "voices/c.safetensors"}
+"#,
+        )
+        .unwrap();
+        let source = dir.to_str().unwrap();
+        let names = |voices: Vec<(String, std::path::PathBuf)>| -> Vec<String> {
+            voices.into_iter().map(|(name, _)| name).collect()
+        };
+        assert_eq!(names(catalog_voices(source, "en").await.unwrap()), ["Zoey", "Mine"]);
+        assert_eq!(
+            names(catalog_voices(source, "none").await.unwrap()),
+            ["Zoey", "Annika", "Mine"]
+        );
+        let (_, path) = catalog_voices(source, "de").await.unwrap().remove(0);
+        assert_eq!(path, dir.join("voices/b.safetensors"));
+        assert!(catalog_voices(dir.join("missing").to_str().unwrap(), "en").await.is_err());
+    }
 }
 
 #[cfg(test)]
@@ -188,9 +228,9 @@ mod checkpoint_tests {
         std::fs::write(extra_dir.join("invalid.safetensors"), b"unreadable optional voice")
             .unwrap();
         let loaded = load_ptts(
-            &path,
-            None,
+            path.to_str().unwrap(),
             Some(&extra_dir),
+            None,
             DeviceKind::Cpu,
             Quant::Q80,
             0.3,
@@ -198,6 +238,7 @@ mod checkpoint_tests {
             Normalize::OFF,
             &[],
             std::num::NonZeroUsize::new(1).unwrap(),
+            &Default::default(),
         )
         .await;
         std::fs::remove_dir_all(extra_dir).unwrap();

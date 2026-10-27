@@ -1,0 +1,8 @@
+# cargo-about's settings for THIRD_PARTY_LICENSES.md, the licence notices `make build` puts in
+# the npm package. A crate under a licence missing here fails the build, so adding one is a
+# deliberate choice. A crate offering a choice of licences is listed under the first one here
+# that it offers.
+accepted = ["Apache-2.0", "MIT", "Zlib", "Unicode-3.0"]
+targets = ["wasm32-unknown-unknown"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true

@@ -4,14 +4,20 @@
 // generating never blocks the page; this file only posts requests to it and turns its
 // replies into promises and async iterators.
 
+import { DEFAULT_MODEL, resolveHubModel } from './hub.js';
 import { concatPcm, encodeWav } from './wav.js';
+import { storeBytes } from './fetch.js';
 
 export { clearCache } from './fetch.js';
+export { DEFAULT_MODEL } from './hub.js';
 export { encodeWav, concatPcm } from './wav.js';
 
 const LANGS = ['en', 'fr', 'de', 'es', 'pt', 'none'];
 /** Rewrite rules the Rust side knows, beyond the whole-string values below. */
-const RULES = ['numbers', 'currency', 'dashed-digits', 'emails', 'urls', 'phones', 'times', 'dates'];
+const RULES = [
+  'numbers', 'currency', 'dashed-digits', 'emails', 'urls', 'abbreviations', 'elongations',
+  'phones', 'times', 'dates',
+];
 /** Values `Rules`'s `FromStr` accepts only as the entire string, never inside a list. */
 const WHOLE_RULES = ['default', 'all', 'none', 'off'];
 
@@ -43,6 +49,8 @@ export class PhononTTS {
   threads;
   /** Why `threads` is what it is, e.g. `'default'` or `'the page is not cross-origin isolated'`. */
   threadsReason;
+  /** The languages the model was trained for, as listed in its config. */
+  languages;
 
   /**
    * Download (or read from cache) a checkpoint and start it in a worker.
@@ -56,13 +64,15 @@ export class PhononTTS {
       rewrites,
       conditions,
       quant = 'q8',
-      model,
+      model = DEFAULT_MODEL,
       voices,
       cache = true,
       onProgress,
       workerUrl,
       wasmUrl,
       threadsWasmUrl,
+      simdWasmUrl,
+      threadsSimdWasmUrl,
       threads = 'auto',
       device,
     } = options ?? {};
@@ -82,26 +92,6 @@ export class PhononTTS {
     }
     if (threads !== 'auto' && !(Number.isInteger(threads) && threads >= 1)) {
       throw new TypeError(`threads must be 'auto' or a positive integer, got ${JSON.stringify(threads)}`);
-    }
-    // Required too. A default checkpoint would be one particular model's files, and loading
-    // a model other than the one the caller has in mind gives plausible speech with nothing
-    // to say it is the wrong model.
-    if (typeof model !== 'object' || model === null || Array.isArray(model)) {
-      throw new TypeError(
-        "model is required: where the checkpoint's files are, e.g. " +
-          "{ weights: { q8: '/model/model.q8.gguf' }, tokenizer: '/model/tokenizer.json', " +
-          "config: '/model/config.json', voices: { Freya: '/model/voices/Freya.safetensors' } }",
-      );
-    }
-    if (!isUrl(model.tokenizer)) {
-      throw new TypeError("model.tokenizer is required: the URL of the checkpoint's tokenizer.json");
-    }
-    if (!isUrl(model.config) || String(model.config).length === 0) {
-      throw new TypeError("model.config is required: the URL of the checkpoint's config.json");
-    }
-    // Checked before the worker starts, for the same reason as `rewrites` below.
-    if (!isUrl(model.weights?.[quant])) {
-      throw new TypeError(`model has no '${quant}' weights: set model.weights.${quant}, or pick another quant`);
     }
     // Checked here rather than left to Rust: `load` is async and the error would otherwise
     // arrive after the weights had been downloaded. This mirrors `Rules`'s `FromStr`, which trims
@@ -125,7 +115,7 @@ export class PhononTTS {
     // those; the shape is checked here, before the download.
     const isPlain = typeof conditions === 'object' && conditions !== null && !Array.isArray(conditions);
     if (conditions !== undefined && !isPlain) {
-      throw new TypeError('conditions must be an object of name to value, e.g. { padding_bonus: 0.5 }');
+      throw new TypeError('conditions must be an object of name to value, e.g. { duration_delta: 0.5 }');
     }
     const conditionList = Object.entries(conditions ?? {}).map(([name, value]) => {
       if (typeof value !== 'string' && !Number.isFinite(value)) {
@@ -133,7 +123,27 @@ export class PhononTTS {
       }
       return `${name}=${value}`;
     });
-    const defaultVoice = model.defaultVoice ?? Object.keys(model.voices ?? {})[0];
+    // Checked last, so a bad option fails before a Hub request.
+    const spec = typeof model === 'string' ? await resolveHubModel(model, { cache }) : model;
+    if (typeof spec !== 'object' || spec === null || Array.isArray(spec)) {
+      throw new TypeError(
+        "model must say where the checkpoint's files are, e.g. " +
+          "{ weights: { q8: '/model/model.q8.gguf' }, tokenizer: '/model/tokenizer.json', " +
+          "config: '/model/config.json', voices: { Freya: '/model/voices/Freya.safetensors' } }, " +
+          "or name a Hugging Face repo, 'hf://owner/name'. Leave it out for the default model.",
+      );
+    }
+    if (!isUrl(spec.tokenizer)) {
+      throw new TypeError("model.tokenizer is required: the URL of the checkpoint's tokenizer.json");
+    }
+    if (!isUrl(spec.config) || String(spec.config).length === 0) {
+      throw new TypeError("model.config is required: the URL of the checkpoint's config.json");
+    }
+    // Checked before the worker starts, for the same reason as `rewrites` above.
+    if (!isUrl(spec.weights?.[quant])) {
+      throw new TypeError(`model has no '${quant}' weights: set model.weights.${quant}, or pick another quant`);
+    }
+    const defaultVoice = spec.defaultVoice ?? Object.keys(spec.voices ?? {})[0];
     const preload = voices ?? (defaultVoice ? [defaultVoice] : []);
 
     // `new URL(..., import.meta.url)` inline, not through a variable: it is the pattern Vite,
@@ -141,7 +151,7 @@ export class PhononTTS {
     const worker = workerUrl
       ? new Worker(workerUrl, { type: 'module' })
       : new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
-    const tts = new PhononTTS(worker, model, defaultVoice);
+    const tts = new PhononTTS(worker, spec, defaultVoice);
     try {
       const reply = await tts.#request(
         {
@@ -151,11 +161,13 @@ export class PhononTTS {
             rewrites,
             conditions: conditionList,
             quant,
-            model: resolveModel(model),
+            model: resolveModel(spec),
             preload,
             cache,
             wasmUrl: wasmUrl ? resolveUrl(wasmUrl) : undefined,
             threadsWasmUrl: threadsWasmUrl ? resolveUrl(threadsWasmUrl) : undefined,
+            simdWasmUrl: simdWasmUrl ? resolveUrl(simdWasmUrl) : undefined,
+            threadsSimdWasmUrl: threadsSimdWasmUrl ? resolveUrl(threadsSimdWasmUrl) : undefined,
             threads,
             device,
           },
@@ -165,6 +177,12 @@ export class PhononTTS {
       tts.sampleRate = reply.sampleRate;
       tts.features = reply.features;
       tts.device = reply.device;
+      tts.languages = reply.languages;
+      if (lang !== 'none' && tts.languages.length && !tts.languages.includes(lang)) {
+        console.warn(
+          `[phonon-tts] text is normalized as ${lang}, but the model was trained for ${tts.languages.join(', ')}`,
+        );
+      }
       tts.deviceReason = reply.deviceReason;
       tts.threads = reply.threads;
       tts.threadsReason = reply.threadsReason;
@@ -180,7 +198,11 @@ export class PhononTTS {
     this.#worker = worker;
     this.#voices = new Set(Object.keys(model.voices ?? {}));
     this.#defaultVoice = defaultVoice;
-    worker.onmessage = ({ data }) => this.#pending.get(data.id)?.[data.type]?.(data);
+    worker.onmessage = ({ data }) => {
+      // A file the worker downloaded, for the page to cache: see `storeBytes` for why.
+      if (data.type === 'store') return void storeBytes(data.url, data.bytes);
+      this.#pending.get(data.id)?.[data.type]?.(data);
+    };
     worker.onerror = (e) => {
       e.preventDefault?.();
       // A dead worker never replies: fail what is pending and refuse what comes next, rather
@@ -246,6 +268,7 @@ export class PhononTTS {
     let finished = false;
     let failure = null;
     let started = false;
+    let cancelled = false;
 
     let resolveDone, rejectDone;
     const done = new Promise((res, rej) => ((resolveDone = res), (rejectDone = rej)));
@@ -266,7 +289,9 @@ export class PhononTTS {
       wake();
     };
     const cancel = () => {
-      if (finished) return;
+      buffered.length = 0;
+      if (finished || cancelled) return;
+      cancelled = true;
       if (started) this.#worker.postMessage({ type: 'cancel', id });
       else finish(null, { cancelled: true });
     };
@@ -275,6 +300,7 @@ export class PhononTTS {
 
     const handlers = {
       chunk: ({ pcm }) => {
+        if (cancelled) return;
         buffered.push(pcm);
         wake();
       },

@@ -68,6 +68,18 @@ def test_the_stubs_cover_everything_the_extension_exports():
     assert not missing, f"exported but not in the stubs: {sorted(missing)}"
 
 
+def test_the_stubs_all_matches_the_package_all():
+    # Type checkers read `__all__` from the stub, not from `__init__.py`.
+    tree = ast.parse((Path(ptts.__file__).parent / "__init__.pyi").read_text())
+    (stub_all,) = [
+        ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "__all__" for t in node.targets)
+    ]
+    assert sorted(stub_all) == sorted(ptts.__all__)
+
+
 def _stub_parameters(fn: ast.FunctionDef) -> list[tuple[str, str, object]]:
     args = fn.args
     positional = args.posonlyargs + args.args
@@ -171,11 +183,69 @@ def test_build_info_reports_what_a_bug_report_needs():
     assert info["version"] == ptts.__version__
 
 
+def test_normalize_reads_text_as_tts_does():
+    assert ptts.normalize("It costs $5.", lang="en") == "It costs 5 dollars."
+    assert ptts.normalize("Ça coûte 250 €.", lang="fr") == "Ça coûte 250 euros."
+    assert ptts.normalize("Call 3:45PM.", lang="en", rewrites="all") == "Call 3-45 PM."
+    assert ptts.normalize("It costs $5.", lang="en", rewrites="none") == "It costs $5."
+    assert ptts.normalize("It costs $5.", lang="none") == "It costs $5."
+    assert ptts.normalize("It costs $5.", lang=None) == "It costs $5."
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "needle"), [({"lang": "xx"}, "xx"), ({"lang": "en", "rewrites": "colours"}, "colours")]
+)
+def test_normalize_rejects_what_tts_rejects(kwargs, needle):
+    with pytest.raises(ValueError, match=needle):
+        ptts.normalize("hello", **kwargs)
+    with pytest.raises(TypeError):
+        ptts.normalize("hello")
+
+
 def test_thread_count_round_trips():
     before = ptts.get_num_threads()
     assert before >= 1
     ptts.set_num_threads(before)
     assert ptts.get_num_threads() == before
+
+
+# --- voice catalog ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def catalog(tmp_path: Path) -> Path:
+    (tmp_path / "voices.jsonl").write_text(
+        '{"filename": "voices/a1.safetensors", "name": "Kauã", "voice_id": "a1", "language": "pt"}\n'
+        '{"filename": "voices/b2.safetensors", "name": "Zoey", "locale": "en-us"}\n',
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def test_catalog_voices_lists_a_local_catalog(catalog):
+    for source in (catalog, catalog / "voices.jsonl", str(catalog)):
+        voices = ptts.catalog_voices(source)
+        assert [v["name"] for v in voices] == ["Kauã", "Zoey"]
+        assert voices[0] == {"name": "Kauã", "voice_id": "a1", "language": "pt", "description": None}
+
+
+def test_a_missing_catalog_is_a_lookup_error(tmp_path):
+    with pytest.raises(LookupError):
+        ptts.catalog_voices(tmp_path / "missing.jsonl")
+
+
+def test_list_voices_needs_no_lang_or_model(catalog, capsys):
+    from ptts.__main__ import main
+
+    assert main(["--list-voices", "--voice-catalog", str(catalog)]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines == ["Kauã\tpt\ta1\t-", "Zoey\t-\t-\t-"]
+
+
+def test_the_default_voice_catalog_is_pinned_to_a_commit():
+    repo, revision = ptts.DEFAULT_VOICE_CATALOG.removeprefix("hf://").split("@")
+    assert repo.count("/") == 1
+    assert len(revision) == 40 and all(c in "0123456789abcdef" for c in revision)
 
 
 # --- errors ----------------------------------------------------------------------------------
@@ -189,11 +259,15 @@ def test_thread_count_round_trips():
         # `src/lib.rs` is where that mapping lives, and this is what holds it to it.
         ({"quant": "q3k"}, ValueError, "q3k"),
         ({"device": "tpu"}, ValueError, "tpu"),
+        ({"model": "./missing", "revision": "test-commit"}, ValueError, "revision"),
         ({"config": "./missing", "revision": "test-commit"}, ValueError, "revision"),
-        ({"config": "/definitely/not/a/checkpoint/config.json"}, LookupError, "config.json"),
+        ({"model": "/definitely/not/a/checkpoint/config.json"}, LookupError, "config.json"),
+        ({"model": "owner/name"}, LookupError, "hf://owner/name"),
+        ({"model": "hf://owner"}, ValueError, "hf://owner"),
         ({"device": "cuda", "quant": "q8_0"}, NotImplementedError, "CPU-only"),
     ],
 )
+@pytest.mark.filterwarnings("ignore:config= and revision= are deprecated:DeprecationWarning")
 def test_a_bad_argument_raises_its_class_and_names_itself(kwargs, exc, needle):
     with pytest.raises(exc) as e:
         ptts.TTS(**kwargs, lang="en")
@@ -219,14 +293,13 @@ def test_nothing_is_downloaded_before_the_arguments_are_checked():
 
 @pytest.fixture(scope="module")
 def tts() -> ptts.TTS:
-    # Private rehearsals use the installed wheel and a local directory or Hub repo ID.
+    # Private rehearsals use the installed wheel and a local directory or hf:// repo.
     # Model tests require an explicit checkpoint; ordinary wheel checks need none.
     model = os.environ.get("PTTS_TEST_MODEL")
     if not model:
         pytest.skip("set PTTS_TEST_MODEL for checkpoint synthesis tests")
     return ptts.TTS(
-        config=model,
-        revision=os.environ.get("PTTS_TEST_REVISION"),
+        model,
         lang="en",
         device="cpu",
         quant="q8",
@@ -269,6 +342,27 @@ def test_an_unknown_voice_lists_the_ones_that_exist(tts):
     with pytest.raises(LookupError) as e:
         tts.synth("hi", voice="definitely-not-a-voice")
     assert tts.voices[0] in str(e.value)
+
+
+@pytest.mark.checkpoint
+def test_an_unknown_voice_with_an_unreadable_catalog_still_names_the_voices(tts, tmp_path):
+    model = os.environ["PTTS_TEST_MODEL"]
+    missing = tmp_path / "voices.jsonl"
+    other = ptts.TTS(model, lang="en", device="cpu", quant="q8", voice_catalog=missing)
+    with pytest.raises(LookupError) as e:
+        other.synth("hi", voice="definitely-not-a-voice")
+    message = str(e.value)
+    assert "definitely-not-a-voice" in message and other.voices[0] in message
+    assert str(missing) in message
+
+
+@pytest.mark.checkpoint
+def test_a_language_the_model_was_not_trained_for_is_warned_about(tts):
+    other = next((lang for lang in ("en", "fr", "de", "es", "pt") if lang not in tts.languages), None)
+    if not tts.languages or other is None:
+        pytest.skip("the checkpoint lists no languages, or all of them")
+    with pytest.warns(UserWarning, match=f"normalized as {other}"):
+        ptts.TTS(os.environ["PTTS_TEST_MODEL"], lang=other, device="cpu", quant="q8")
 
 
 @pytest.mark.checkpoint

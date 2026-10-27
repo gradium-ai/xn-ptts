@@ -2,16 +2,17 @@
 import PackageDescription
 
 let package = Package(
-    name: "PhononTTS",
+    name: "ptts",
     // iOS 18 / macOS 15: the models are Core ML 8 programs. Apple silicon only; the Neural
     // Engine is what makes this fast.
     platforms: [.iOS(.v18), .macOS(.v15)],
     products: [
-        .library(name: "PhononTTS", targets: ["PhononTTS"]),
+        .library(name: "ptts", targets: ["PhononTTS"]),
     ],
     targets: [
-        // The compiled Rust core, from `ios/build-xcframework.sh`. A client given a release
-        // zip instead would use `.binaryTarget(name:url:checksum:)` here.
+        // Source builds use the local compiled core. The release package and the root
+        // Package.swift replace this target with the release's download URL and the checksum of
+        // that exact archive (scripts/package-swift.py).
         .binaryTarget(name: "PhononCore", path: "PhononCore.xcframework"),
         .target(
             name: "PhononTTS",

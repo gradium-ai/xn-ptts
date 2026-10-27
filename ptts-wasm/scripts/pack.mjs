@@ -39,13 +39,23 @@ writeFileSync(join(out, 'package.json'), JSON.stringify({ name, version, ...rest
 // the copy list and the publish list cannot drift apart. A module added to one but not the
 // other would otherwise ship a package missing a file, and nothing here would say so.
 const fromJs = manifest.files.filter(
-  (f) => !f.startsWith('wasm/') && !f.startsWith('wasm-threads/') && !f.startsWith('LICENSE'),
+  (f) =>
+    !f.startsWith('wasm/') &&
+    !f.startsWith('wasm-threads/') &&
+    !f.startsWith('LICENSE') &&
+    f !== 'THIRD_PARTY_LICENSES.md',
 );
 for (const file of [...fromJs, 'README.md']) {
   copyFileSync(join(js, file), join(out, file));
 }
 for (const file of ['LICENSE-MIT', 'LICENSE-APACHE']) {
   copyFileSync(join(repoDir, file), join(out, file));
+}
+
+// `make build` writes the third-party notices with cargo-about. npm leaves out a `files` entry
+// that does not exist, so a package without them would publish without a word.
+if (!existsSync(join(out, 'THIRD_PARTY_LICENSES.md'))) {
+  console.warn(`no THIRD_PARTY_LICENSES.md in ${out}: this package must not be published`);
 }
 
 // wasm-pack drops a `*` .gitignore into its output. npm reads a .gitignore in a
@@ -76,6 +86,26 @@ if (existsSync(join(threads, 'phonon_tts_bg.wasm'))) {
     process.exit(1);
   }
   writeFileSync(helpers[0], after);
+}
+
+// The builds without Relaxed SIMD, for browsers that lack it, when they ran. Only their
+// module is kept, beside the Relaxed one: the worker loads it through the same JS, which
+// only works while wasm-bindgen generates the same JS for both. Checked here rather than
+// assumed. Comment lines are left out of the comparison: wasm-bindgen notes internal
+// indices in them that differ between builds.
+for (const [build, simd] of [['wasm', 'wasm-simd'], ['wasm-threads', 'wasm-threads-simd']]) {
+  const from = join(out, simd);
+  if (!existsSync(join(from, 'phonon_tts_bg.wasm'))) {
+    console.warn(`no ${simd} build: browsers without Relaxed SIMD cannot load ${build}/`);
+    continue;
+  }
+  const glue = (dir) => readFileSync(join(dir, 'phonon_tts.js'), 'utf8').replace(/^\s*\/\/.*$/gm, '');
+  if (glue(from) !== glue(join(out, build))) {
+    console.error(`${simd}/phonon_tts.js differs from ${build}/phonon_tts.js: the two modules need the same JS`);
+    process.exit(1);
+  }
+  copyFileSync(join(from, 'phonon_tts_bg.wasm'), join(out, build, 'phonon_tts_simd_bg.wasm'));
+  rmSync(from, { recursive: true, force: true });
 }
 
 console.log(`phonon-tts@${version} assembled in ${out}`);

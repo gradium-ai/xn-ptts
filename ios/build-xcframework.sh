@@ -1,14 +1,22 @@
 #!/bin/bash
-# Build PhononCore.xcframework, the compiled Rust core the PhononTTS Swift package wraps:
-# iPhone, the iOS simulator and Apple-silicon Macs, each a static library with the C header.
+# Build PhononCore.xcframework, the compiled Rust core the ptts Swift package wraps:
+# iPhone, the iOS simulator, Apple-silicon Macs and Mac Catalyst on Apple silicon, each a static
+# library with the C header.
 #
 # Output: ios/PhononTTS/PhononCore.xcframework
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-TARGETS=(aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin)
+TARGETS=(aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin aarch64-apple-ios-macabi)
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 PROFILE=release
+
+# Each target's default CPU, as in CI. .cargo/config.toml asks for target-cpu=native, the build
+# machine's CPU, and xn picks its kernels at compile time, so a framework built on a recent Mac
+# could use instructions older iPhones lack. An empty RUSTFLAGS takes precedence over that file
+# (an empty CARGO_TARGET_<triple>_RUSTFLAGS does not); CARGO_ENCODED_RUSTFLAGS would win over both.
+export RUSTFLAGS=""
+unset CARGO_ENCODED_RUSTFLAGS
 
 rustup target add "${TARGETS[@]}" >/dev/null
 for t in "${TARGETS[@]}"; do

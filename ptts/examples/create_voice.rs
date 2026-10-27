@@ -1,7 +1,16 @@
-#[path = "model_helpers.rs"]
+//! Write a voice embedding for a checkpoint, from audio or stored latents.
+//!
+//! ```text
+//! cargo run --release -p ptts --example create_voice --features audio -- \
+//!     --model /path/to/model --input voice.wav --output voice.safetensors
+//! ```
+//!
+//! The default model, or any `hf://owner/name` one, also needs `--features audio,hub`.
+
+#[path = "../src/bin/ptts/model_helpers.rs"]
 mod model_helpers;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use ptts::tts_model::MimiEnc;
 use xn::Tensor;
@@ -10,13 +19,11 @@ use xn::Tensor;
 #[command(name = "create-voice")]
 #[command(about = "Generate some embedding files for Phonon")]
 struct Args {
-    #[arg(long)]
-    config: String,
+    #[arg(long, default_value = model_helpers::DEFAULT_MODEL, help = model_helpers::MODEL_HELP)]
+    model: String,
 
-    /// Hugging Face branch, tag, or commit, for a Hub model.
-    #[arg(long)]
-    revision: Option<String>,
-
+    /// Weights file inside the model, when it has several. Defaults to the f32 weights, which
+    /// audio input needs: they carry the speaker encoder.
     #[arg(long)]
     weights: Option<String>,
 
@@ -41,31 +48,12 @@ fn main() -> Result<()> {
 }
 
 fn run(args: Args) -> Result<()> {
-    use std::str::FromStr;
-
     let dev = xn::CpuDevice;
-    tracing::info!("loading config from {}", args.config);
-    let (cfg, model_path) = if args.config.ends_with("json") {
-        anyhow::ensure!(args.revision.is_none(), "--revision requires a Hugging Face repo ID");
-        let cfg: ptts::tts_model::TTSConfig =
-            serde_json::from_str(&std::fs::read_to_string(&args.config)?)?;
-        let config = std::fs::canonicalize(args.config)?;
-        let parent = config.parent().context("config path has no parent")?;
-        let model_path = match args.weights.as_ref() {
-            None => parent.join("model.safetensors"),
-            Some(p) => std::path::PathBuf::from_str(p)?,
-        };
-        (cfg, model_path)
-    } else {
-        let repo = model_helpers::HubRepo::open(&args.config, args.revision.as_deref())?;
-        let cfg = repo.get("config.json")?;
-        let cfg: ptts::tts_model::TTSConfig = serde_json::from_str(&std::fs::read_to_string(cfg)?)?;
-        let model_path = match args.weights.as_ref() {
-            None => repo.get("model.safetensors")?,
-            Some(p) => std::path::PathBuf::from_str(p)?,
-        };
-        (cfg, model_path)
-    };
+    tracing::info!("loading {}", args.model);
+    let options =
+        model_helpers::ResolveOptions { weights: args.weights.as_deref(), ..Default::default() };
+    let checkpoint = model_helpers::Checkpoint::locate(&args.model, options)?;
+    let (cfg, model_path) = (checkpoint.config, checkpoint.weights);
     let model_ext = cfg.model_ext();
     tracing::info!(?model_ext, "model extension");
 

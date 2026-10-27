@@ -1,14 +1,13 @@
-#![allow(unused)]
 use anyhow::Result;
 
-#[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcmFormat {
     Raw,
     Alaw,
     Ulaw,
 }
 
-#[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Pcm { sample_rate: Option<usize>, format: PcmFormat },
     Wav,
@@ -51,14 +50,6 @@ impl Format {
 
     pub fn alaw(sample_rate: usize) -> Self {
         Self::Pcm { sample_rate: Some(sample_rate), format: PcmFormat::Alaw }
-    }
-
-    pub fn sample_rate(&self) -> Option<usize> {
-        match self {
-            Self::Pcm { sample_rate, .. } => *sample_rate,
-            Self::Wav => None,
-            Self::OggOpus => None,
-        }
     }
 }
 

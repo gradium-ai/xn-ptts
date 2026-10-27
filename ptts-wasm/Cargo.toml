@@ -2,6 +2,7 @@
 name = "ptts-wasm"
 version.workspace = true
 edition = "2024"
+publish = false
 description.workspace = true
 repository.workspace = true
 keywords.workspace = true
@@ -18,6 +19,8 @@ wasm-bindgen = { workspace = true }
 js-sys = { workspace = true }
 # `Model::generation_step` returns a promise: on WebGPU it awaits the GPU's readback.
 wasm-bindgen-futures = { workspace = true }
+# Records the next frames while the previous ones are read back.
+futures-util = { workspace = true }
 serde_json = { workspace = true }
 # Not `rand` / `rand_distr`: the noise source is `ptts::flow_lm::NormalRng` now. `getrandom`
 # stays, because selecting its `wasm_js` backend is this crate's business, not the library's.
@@ -33,5 +36,5 @@ wasm-opt = false
 default = []
 webgpu = ["xn/webgpu"]
 # Generation on several CPU threads. Needs a nightly toolchain with std rebuilt for atomics,
-# and a page that is cross-origin isolated: see the `build-threads` target in the Makefile.
+# and a page that is cross-origin isolated: see the `threads-toolchain` target in the Makefile.
 threads = ["dep:rayon", "dep:wasm-bindgen-rayon"]

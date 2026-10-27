@@ -3,7 +3,7 @@
 //! ```python
 //! import ptts
 //!
-//! tts = ptts.TTS(config="/path/to/model", lang="en")
+//! tts = ptts.TTS("/path/to/model", lang="en")
 //! tts.save("out.wav", "Hello world")
 //! ```
 //!
@@ -16,12 +16,10 @@
 //! other Python thread wanting the same lock, and Ctrl-C reaches neither.
 
 use numpy::{PyArray1, PyReadonlyArrayDyn, PyUntypedArrayMethods};
-use ptts::checkpoint::{
-    Checkpoint, ResolveOptions, is_local_source, read_config, weight_candidates,
-};
-use ptts::loader::DEFAULT_VOICE_FILE;
+use ptts::checkpoint::{Checkpoint, ResolveOptions};
 use ptts::preprocess::{Normalize, Rules};
 use ptts::synth::{DeviceKind, Quant, SpeechOptions, SpeechStream, Synth};
+use ptts::voice_catalog::VoiceCatalog;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::collections::HashMap;
@@ -62,157 +60,6 @@ impl<R, E: Into<ptts::Error>> IntoPy<R> for Result<R, E> {
     }
 }
 
-/// Resolve an explicitly supplied local directory/config or Hub repo ID.
-fn resolve(config: Option<&str>, revision: Option<&str>, quant: Quant) -> ptts::Result<Checkpoint> {
-    match config {
-        Some(path) if is_local_source(std::path::Path::new(path)) => {
-            if revision.is_some() {
-                return Err(ptts::Error::InvalidArgument(
-                    "revision requires a Hugging Face repo ID".into(),
-                ));
-            }
-            Checkpoint::resolve(path, ResolveOptions { quant, weights: None })
-        }
-        Some(repo_id) => resolve_hub(&hub(repo_id)?, repo_id, revision, quant),
-        None => Err(ptts::Error::InvalidArgument(
-            "config is required: supply a local model directory or Hugging Face repo ID".into(),
-        )),
-    }
-}
-
-/// A Hub repo: its own `config.json`, weights, a
-/// tokenizer, and voices under `voices/` or `embeddings/` plus an optional
-/// `default-voice.safetensors`. Only the files that are used get downloaded.
-fn resolve_hub(
-    repo: &HubRepo,
-    repo_id: &str,
-    revision: Option<&str>,
-    quant: Quant,
-) -> ptts::Result<Checkpoint> {
-    let cfg = read_config(hub_get(repo, "config.json", revision)?)?;
-    // One listing rather than a request per guessed name, and the only way to learn a repo's
-    // voices. If listing is unavailable, only standard weight and default-voice paths are tried.
-    let listing: Option<Vec<String>> = repo
-        .list_tree()
-        .maybe_revision(revision.map(str::to_owned))
-        .recursive(true)
-        .send()
-        .ok()
-        .map(|entries| {
-            entries
-                .into_iter()
-                .filter_map(|entry| match entry {
-                    hf_hub::repository::files::RepoTreeEntry::File { path, .. } => Some(path),
-                    _ => None,
-                })
-                .collect()
-        });
-    // Without a listing every name is a guess, and one that was never cached fails offline with
-    // a network error rather than a not-found. So it counts as absent, letting a later name the
-    // cache does hold be found, and the first such error is reported only if no weights resolve.
-    let first_err = std::cell::RefCell::new(None);
-    let get_optional = |name: &str| -> ptts::Result<Option<std::path::PathBuf>> {
-        if listing.as_ref().is_some_and(|files| !files.iter().any(|f| f == name)) {
-            return Ok(None);
-        }
-        match hub_get(repo, name, revision) {
-            Ok(path) => Ok(Some(path)),
-            Err(ptts::Error::NotFound(_)) => Ok(None),
-            Err(e) if listing.is_none() => {
-                first_err.borrow_mut().get_or_insert(e);
-                Ok(None)
-            }
-            Err(e) => Err(e),
-        }
-    };
-
-    let candidates = weight_candidates(quant);
-    let mut model_path = None;
-    for name in candidates {
-        if let Some(path) = get_optional(name)? {
-            model_path = Some(path);
-            break;
-        }
-    }
-    let Some(model_path) = model_path else {
-        return Err(first_err.borrow_mut().take().unwrap_or_else(|| {
-            ptts::Error::NotFound(format!(
-                "no weights in `{repo_id}`; expected one of {}",
-                candidates.join(", ")
-            ))
-        }));
-    };
-    let tokenizer_path = hub_get(repo, "tokenizer.json", revision)?;
-
-    let voice_files = ptts::loader::voice_paths(listing.clone().unwrap_or_default());
-    let mut voices = vec![];
-    for (name, file) in
-        voice_files.into_iter().chain([("default".to_string(), DEFAULT_VOICE_FILE.to_string())])
-    {
-        // A voice that will not download is skipped, as one that will not load is: `TTS.voices`
-        // shows which ones made it.
-        if let Ok(Some(path)) = get_optional(&file) {
-            push_voice(&mut voices, name, path);
-        }
-    }
-    Ok(Checkpoint {
-        config: cfg,
-        weights: model_path,
-        tokenizer: Some(tokenizer_path),
-        voices,
-        quant,
-    })
-}
-
-/// Add a voice unless one of that name is already there: the first found wins, so `voices/`
-/// beats `embeddings/`, and both beat `default-voice.safetensors`. `Synth` would otherwise keep
-/// whichever it registered last.
-fn push_voice(
-    voices: &mut Vec<(String, std::path::PathBuf)>,
-    name: String,
-    path: std::path::PathBuf,
-) {
-    if !voices.iter().any(|(n, _)| *n == name) {
-        voices.push((name, path));
-    }
-}
-
-type HubRepo = hf_hub::HFRepositorySync<hf_hub::repository::RepoTypeModel>;
-
-fn hub(repo_id: &str) -> ptts::Result<HubRepo> {
-    // Not `NotFound`: a client that will not start is an environment failure, not a name that
-    // failed to resolve. `Io` reaches Python as `OSError`, which is what a caller retries on.
-    let client = hf_hub::HFClientSync::new().map_err(|e| {
-        ptts::Error::Io(std::io::Error::other(format!("cannot reach the Hugging Face Hub: {e}")))
-    })?;
-    let (owner, name) = hf_hub::split_id(repo_id);
-    Ok(client.model(owner, name))
-}
-
-/// Download `filename` from `repo`, or find it in the local cache.
-fn hub_get(
-    repo: &HubRepo,
-    filename: &str,
-    revision: Option<&str>,
-) -> ptts::Result<std::path::PathBuf> {
-    // Only a genuine not-found is a name that failed to resolve. Offline, a timeout, a 429 or a
-    // 5xx are environment failures: they reach Python as `OSError`, which is what a caller
-    // retries on, rather than as a `LookupError` that says the file does not exist.
-    repo.download_file()
-        .filename(filename)
-        .maybe_revision(revision.map(str::to_owned))
-        .send()
-        .map_err(|e| match e {
-            hf_hub::HFError::EntryNotFound { .. } | hf_hub::HFError::LocalEntryNotFound { .. } => {
-                ptts::Error::NotFound(format!("`{filename}` is not in the repo: {e}"))
-            }
-            hf_hub::HFError::Io(io) => ptts::Error::Io(io),
-            other => ptts::Error::Io(std::io::Error::other(format!(
-                "cannot fetch `{filename}`: {other}"
-            ))),
-        })
-}
-
 /// Flatten a conditioning embedding of shape `[T, dim]` or `[1, T, dim]`.
 fn embedding_dims(arr: &PyReadonlyArrayDyn<'_, f32>) -> PyResult<(Vec<f32>, usize, usize)> {
     let (frames, dim) = match arr.shape() {
@@ -234,11 +81,18 @@ struct Tts {
     /// Voice for calls that name none. `SynthBuilder` picks its own during
     /// `build()`, which is before the voices below are registered.
     default_voice: Option<String>,
+    /// Where a voice the checkpoint does not have is looked up, and downloaded on first use.
+    catalog: Option<Arc<VoiceCatalog>>,
 }
 
 #[pymethods]
 impl Tts {
-    /// `TTS(config=None, device=None, quant=None, voice=None, temperature=0.3, seed=..., cfg_coef=None, eos_threshold=None, *, lang, rewrites=None, conditions=None, revision=None)`
+    /// `TTS(model=None, device=None, quant=None, voice=None, temperature=0.3, seed=..., cfg_coef=None, eos_threshold=None, *, lang, rewrites=None, conditions=None, voice_catalog=None)`
+    ///
+    /// `model` is a local model directory or `config.json`, or a Hugging Face repo as
+    /// `"hf://owner/name"` or `"hf://owner/name@revision"`. Left out, it is `DEFAULT_MODEL`,
+    /// downloaded and cached on first use. `config=` and `revision=` are its deprecated older
+    /// spelling, where a bare `"owner/name"` named a repo.
     ///
     /// `lang` is required and keyword-only: the language text is normalized as
     /// before it is tokenized, one of `"en"`, `"fr"`, `"de"`, `"es"` or
@@ -249,11 +103,16 @@ impl Tts {
     ///
     /// `rewrites` picks which word rewrites run on the normalized text:
     /// `"default"` (what `None` means: numbers, currency, dashed-digits,
-    /// emails, urls), `"all"` (those and phones, times, dates), `"none"`, or a
-    /// comma-separated list of rule names.
+    /// emails, urls, abbreviations, elongations), `"all"` (those and phones,
+    /// times, dates), `"none"`, or a comma-separated list of rule names.
+    ///
+    /// `voice_catalog` is where a voice the checkpoint does not have is looked
+    /// up: a Hugging Face repo as `"hf://owner/name[@revision]"`, or a local
+    /// `voices.jsonl` or folder holding one. Left out, it is `DEFAULT_VOICE_CATALOG`. A voice is matched by name, in any case and with or without accents, or
+    /// by its catalog `voice_id`, and only the voices used are downloaded.
     #[new]
     #[pyo3(signature = (
-        config = None,
+        model = None,
         device = None,
         quant = None,
         voice = None,
@@ -265,12 +124,14 @@ impl Tts {
         lang,
         rewrites = None,
         conditions = None,
+        voice_catalog = None,
+        config = None,
         revision = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
-        config: Option<String>,
+        model: Option<String>,
         device: Option<&str>,
         quant: Option<&str>,
         voice: Option<String>,
@@ -281,6 +142,8 @@ impl Tts {
         lang: Option<&str>,
         rewrites: Option<&str>,
         conditions: Option<HashMap<String, Bound<'_, PyAny>>>,
+        voice_catalog: Option<std::path::PathBuf>,
+        config: Option<String>,
         revision: Option<String>,
     ) -> PyResult<Self> {
         let conditions = conditions
@@ -288,18 +151,7 @@ impl Tts {
             .into_iter()
             .map(|(name, value)| Ok((name, value.str()?.to_string())))
             .collect::<PyResult<Vec<_>>>()?;
-        // `None` opts out as well as `"none"`: `lang` has to be passed, but a
-        // caller forwarding a config value should not have to special-case the
-        // absent one.
-        let normalize = match lang {
-            None => Normalize::OFF,
-            Some(lang) => lang.parse::<Normalize>().py()?,
-        };
-        let rules = match rewrites {
-            None => Rules::DEFAULT,
-            Some(rewrites) => rewrites.parse::<Rules>().py()?,
-        };
-        let normalize = normalize.with_rules(rules);
+        let normalize = normalization(lang, rewrites)?;
         let device = match device {
             None => DeviceKind::Auto,
             Some(name) => name.parse::<DeviceKind>().py()?,
@@ -311,9 +163,30 @@ impl Tts {
         // Device and weight-format checks run before downloading; `SynthBuilder`
         // would catch them, but only once the checkpoint is on disk.
         quant.check_device(device).py()?;
+        let model = match (model, config) {
+            (Some(_), Some(_)) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "pass model, not both model and config",
+                ));
+            }
+            (Some(model), None) if revision.is_none() => model,
+            (None, None) if revision.is_none() => ptts::checkpoint::DEFAULT_MODEL.to_string(),
+            (_, None) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "revision goes in the model: hf://owner/name@revision",
+                ));
+            }
+            (None, Some(config)) => {
+                let warning = py.get_type::<pyo3::exceptions::PyDeprecationWarning>();
+                PyErr::warn(py, &warning, c"config= and revision= are deprecated: use model=", 1)?;
+                ptts::checkpoint::legacy_source(&config, revision.as_deref()).py()?
+            }
+        };
         // Loading reads hundreds of megabytes and runs no Python.
-        py.detach(move || {
-            let artifacts = resolve(config.as_deref(), revision.as_deref(), quant).py()?;
+        let tts = py.detach(move || -> PyResult<Self> {
+            let options = ResolveOptions { quant, weights: None };
+            let artifacts = Checkpoint::locate(&model, options).py()?;
+            let catalog = Some(Arc::new(VoiceCatalog::new(&catalog_source(voice_catalog)).py()?));
             let mut builder = artifacts
                 .builder(normalize)
                 .device(device)
@@ -331,16 +204,17 @@ impl Tts {
             }
             let mut synth = builder.build().py()?;
             artifacts.register_voices(&mut synth);
-            if let Some(name) = voice.as_deref()
-                && !synth.voices().iter().any(|v| v == name)
-            {
-                return Err(to_py_err(ptts::Error::UnknownVoice {
-                    name: name.to_string(),
-                    known: synth.voices(),
-                }));
-            }
-            Ok(Self { inner: Arc::new(Mutex::new(synth)), default_voice: voice })
-        })
+            let voice = match voice {
+                Some(name) => Some(known_voice(catalog.as_deref(), &mut synth, &name)?),
+                None => None,
+            };
+            Ok(Self { inner: Arc::new(Mutex::new(synth)), default_voice: voice, catalog })
+        })?;
+        if let Some(warning) = normalize.language_warning(tts.lock()?.languages()) {
+            let warning = std::ffi::CString::new(warning).expect("no NUL in a warning");
+            PyErr::warn(py, &py.get_type::<pyo3::exceptions::PyUserWarning>(), &warning, 1)?;
+        }
+        Ok(tts)
     }
 
     /// Sample rate of the audio this model produces, in Hz.
@@ -349,10 +223,16 @@ impl Tts {
         Ok(self.lock()?.sample_rate())
     }
 
-    /// Names of the registered voices, sorted.
+    /// Names of the registered voices, sorted. Catalog voices join them once used.
     #[getter]
     fn voices(&self) -> PyResult<Vec<String>> {
         Ok(self.lock()?.voices())
+    }
+
+    /// The languages the model was trained for, as listed in its config.
+    #[getter]
+    fn languages(&self) -> PyResult<Vec<String>> {
+        Ok(self.lock()?.languages().to_vec())
     }
 
     /// Device the model is running on, e.g. `"cpu"`.
@@ -445,6 +325,13 @@ impl Tts {
         py.detach(move || inner.lock().map_err(|_| poisoned())?.add_voice_file(name, &path).py())
     }
 
+    /// Register every voice of a JSONL catalog, one `{"name", "filename"}` object per line
+    /// with `filename` relative to the catalog.
+    fn add_voice_catalog(&self, py: Python<'_>, path: std::path::PathBuf) -> PyResult<()> {
+        let inner = Arc::clone(&self.inner);
+        py.detach(move || inner.lock().map_err(|_| poisoned())?.add_voice_catalog(&path).py())
+    }
+
     /// Replace the conditions, without reloading the model. Values go through `str()`,
     /// as `conditions=` does, and an invalid one leaves the previous conditions in place.
     fn set_conditions(
@@ -533,12 +420,64 @@ impl Tts {
     /// against any other Python thread calling in.
     fn start(&self, py: Python<'_>, text: &str, opts: &SpeechOptions) -> PyResult<SpeechStream> {
         let inner = Arc::clone(&self.inner);
-        let opts = opts.clone();
+        let catalog = self.catalog.clone();
+        let mut opts = opts.clone();
         py.detach(move || {
-            let synth = inner.lock().map_err(|_| poisoned())?;
+            let mut synth = inner.lock().map_err(|_| poisoned())?;
+            if let Some(name) = opts.voice.take() {
+                opts.voice = Some(known_voice(catalog.as_deref(), &mut synth, &name)?);
+            }
             synth.stream_with(text, &opts).py()
         })
     }
+}
+
+/// The registered name of the voice `name` asks for, fetching it from `catalog` if there is
+/// one and the checkpoint does not have it.
+fn known_voice(catalog: Option<&VoiceCatalog>, synth: &mut Synth, name: &str) -> PyResult<String> {
+    let name = match catalog {
+        Some(catalog) => catalog.register(synth, name).py()?,
+        None => name.to_string(),
+    };
+    if !synth.voices().contains(&name) {
+        return Err(to_py_err(ptts::Error::UnknownVoice { name, known: synth.voices() }));
+    }
+    Ok(name)
+}
+
+/// `catalog`, or the default catalog when it is `None`.
+fn catalog_source(catalog: Option<std::path::PathBuf>) -> String {
+    match catalog {
+        Some(path) => path.to_string_lossy().into_owned(),
+        None => ptts::voice_catalog::DEFAULT_VOICE_CATALOG.to_string(),
+    }
+}
+
+/// The voices of a catalog, as dicts of `name`, `voice_id`, `language` and `description`.
+/// `catalog` is as for `TTS`'s `voice_catalog`. Only the catalog is downloaded, no voice and
+/// no model.
+#[pyfunction]
+#[pyo3(signature = (catalog = None))]
+fn catalog_voices(
+    py: Python<'_>,
+    catalog: Option<std::path::PathBuf>,
+) -> PyResult<Vec<HashMap<&'static str, Option<String>>>> {
+    py.detach(move || {
+        let catalog = VoiceCatalog::new(&catalog_source(catalog)).py()?;
+        Ok(catalog
+            .voices()
+            .py()?
+            .iter()
+            .map(|v| {
+                HashMap::from([
+                    ("name", Some(v.name.clone())),
+                    ("voice_id", v.voice_id.clone()),
+                    ("language", v.language.clone()),
+                    ("description", v.description.clone()),
+                ])
+            })
+            .collect())
+    })
 }
 
 /// A panic inside a `&mut self` method would leave the model half-updated, so a
@@ -619,6 +558,32 @@ impl AudioStream {
     }
 }
 
+fn normalization(lang: Option<&str>, rewrites: Option<&str>) -> PyResult<Normalize> {
+    // `None` opts out as well as `"none"`: `lang` has to be passed, but a
+    // caller forwarding a config value should not have to special-case the
+    // absent one.
+    let normalize = match lang {
+        None => Normalize::OFF,
+        Some(lang) => lang.parse::<Normalize>().py()?,
+    };
+    let rules = match rewrites {
+        None => Rules::DEFAULT,
+        Some(rewrites) => rewrites.parse::<Rules>().py()?,
+    };
+    Ok(normalize.with_rules(rules))
+}
+
+/// `normalize(text, *, lang, rewrites=None)`
+///
+/// `text` normalized as `TTS` with the same `lang` and `rewrites` normalizes it
+/// before tokenizing, without loading a model. Accented letters a checkpoint's
+/// tokenizer lacks are folded afterwards, by `TTS`, and are kept here.
+#[pyfunction]
+#[pyo3(signature = (text, *, lang, rewrites = None))]
+fn normalize(text: &str, lang: Option<&str>, rewrites: Option<&str>) -> PyResult<String> {
+    Ok(normalization(lang, rewrites)?.apply(text).into_owned())
+}
+
 /// Number of CPU threads used for tensor ops.
 #[pyfunction]
 fn get_num_threads() -> usize {
@@ -672,6 +637,8 @@ fn build_info(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
 #[pymodule(name = "_ptts")]
 fn ptts_(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    m.add("DEFAULT_MODEL", ptts::checkpoint::DEFAULT_MODEL)?;
+    m.add("DEFAULT_VOICE_CATALOG", ptts::voice_catalog::DEFAULT_VOICE_CATALOG)?;
     m.add_class::<Tts>()?;
     m.add_class::<AudioStream>()?;
     m.add_function(wrap_pyfunction!(get_num_threads, m)?)?;
@@ -679,6 +646,8 @@ fn ptts_(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(available_devices, m)?)?;
     m.add_function(wrap_pyfunction!(available_quants, m)?)?;
     m.add_function(wrap_pyfunction!(build_info, m)?)?;
+    m.add_function(wrap_pyfunction!(catalog_voices, m)?)?;
+    m.add_function(wrap_pyfunction!(normalize, m)?)?;
     Ok(())
 }
 
@@ -708,18 +677,12 @@ mod tests {
     }
 
     #[test]
-    fn q8_weights_lead_only_for_q8() {
+    fn gguf_weights_lead_only_for_their_quant() {
+        use ptts::checkpoint::weight_candidates;
         assert_eq!(weight_candidates(Quant::Q80)[0], "model.q8.gguf");
-        for quant in [Quant::F32, Quant::Q4k, Quant::Q81] {
+        assert_eq!(weight_candidates(Quant::Q4k)[0], "model.q4k.gguf");
+        for quant in [Quant::F32, Quant::Q81] {
             assert_eq!(weight_candidates(quant)[0], "model.safetensors", "{quant:?}");
         }
-    }
-
-    #[test]
-    fn the_first_voice_of_a_name_wins() {
-        let mut voices = vec![];
-        push_voice(&mut voices, "a".into(), "voices/a.safetensors".into());
-        push_voice(&mut voices, "a".into(), "embeddings/a.safetensors".into());
-        assert_eq!(voices, [("a".to_string(), "voices/a.safetensors".into())]);
     }
 }

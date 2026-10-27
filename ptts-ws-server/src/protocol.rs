@@ -1,10 +1,3 @@
-#[allow(dead_code)]
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ErrorMsg {
-    Error { message: String },
-}
-
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TtsRequest {
@@ -30,12 +23,6 @@ pub enum TtsRequest {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TtsReply {
-    Text {
-        text: String,
-        start_s: f64,
-        stop_s: f64,
-        stream_id: u32,
-    },
     Ready {
         model_name: String,
         sample_rate: u32,
@@ -54,9 +41,6 @@ pub enum TtsReply {
         message: String,
         code: u32,
     },
-    Stats {
-        json_stats: String,
-    },
     EndOfStream,
     Flushed {
         flush_id: u64,
@@ -66,6 +50,7 @@ pub enum TtsReply {
 pub mod error_codes {
     pub const BAD_REQUEST: u32 = 400;
     pub const NOT_FOUND: u32 = 404;
+    pub const TIMEOUT: u32 = 408;
     pub const INTERNAL: u32 = 500;
     pub const NOT_IMPLEMENTED: u32 = 501;
 }

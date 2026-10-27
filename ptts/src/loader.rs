@@ -111,6 +111,45 @@ pub fn voices_in(dir: &std::path::Path) -> Vec<(String, std::path::PathBuf)> {
     voices
 }
 
+/// Whether `path` is a plain relative path with `/` separators that stays inside the folder it
+/// is joined to: no root, drive, `.` or `..` component, and no empty one.
+pub(crate) fn is_path_inside(path: &str) -> bool {
+    !(path.is_empty()
+        || path.contains(['\\', ':'])
+        || path.starts_with('/')
+        || path.split('/').any(|p| p.is_empty() || p == "." || p == ".."))
+}
+
+/// The voices of a JSONL catalog, one `{"name", "filename"}` object per line, as (name, path)
+/// with `filename` resolved against the catalog's directory, which it must stay inside.
+pub fn read_voice_catalog(path: &std::path::Path) -> Result<Vec<(String, std::path::PathBuf)>> {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        name: String,
+        filename: String,
+    }
+    let dir = path.parent().unwrap_or(std::path::Path::new(""));
+    let mut voices = vec![];
+    for (i, line) in std::fs::read_to_string(path)?.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entry: Entry = serde_json::from_str(line)
+            .map_err(|e| Error::invalid_data(format!("{}:{}: {e}", path.display(), i + 1)))?;
+        if !is_path_inside(&entry.filename) {
+            return Err(Error::invalid_data(format!(
+                "{}:{}: voice '{}' names the file '{}', which is not a path inside the catalog",
+                path.display(),
+                i + 1,
+                entry.name,
+                entry.filename
+            )));
+        }
+        voices.push((entry.name, dir.join(entry.filename)));
+    }
+    Ok(voices)
+}
+
 /// A checkpoint directory's voices: those in each of [`VOICE_DIRS`], then
 /// [`DEFAULT_VOICE_FILE`] as `default`. A name found twice keeps the first, so `voices/` wins
 /// over `embeddings/`.
@@ -138,8 +177,8 @@ pub const EMB_TENSOR: &str = "emb";
 pub const SPEAKER_WAVS_TENSOR: &str = "speaker_wavs";
 
 /// The checkpoint's speaker projection, when it has one: the linear map from speaker-Mimi
-/// latents (`speaker_mimi_cfg().dimension` wide) to the flow LM's `d_model`. It turns stored
-/// `speaker_wavs` latents into the voice embedding the flow LM is conditioned on, see
+/// latents (`speaker_mimi_cfg().encoder_latent_dim()` wide) to the flow LM's `d_model`. It turns
+/// stored `speaker_wavs` latents into the voice embedding the flow LM is conditioned on, see
 /// [`load_voice_emb`]. Kept in f32 like the embeddings it produces.
 pub fn load_speaker_proj<B: Backend>(
     vb: &Path<B>,
@@ -148,7 +187,7 @@ pub fn load_speaker_proj<B: Backend>(
     if !vb.contains(SPEAKER_PROJ_WEIGHT) {
         return Ok(None);
     }
-    let shape = (cfg.flow_lm.d_model, cfg.speaker_mimi_cfg().dimension);
+    let shape = (cfg.flow_lm.d_model, cfg.speaker_mimi_cfg().encoder_latent_dim());
     let weight = vb.tensor(SPEAKER_PROJ_WEIGHT, shape)?;
     Ok(Some(Linear::new(weight)))
 }
@@ -174,22 +213,22 @@ enum VoiceTensor {
 ///   projection -- unprojected latents make the model babble or stop at once, with no other
 ///   symptom -- so `None` is an error for this kind of file and is ignored for the other.
 ///
-/// When `model_ext` is given and the file records one of its own, the two must agree -- a voice
-/// conditioned on a different checkpoint produces confident nonsense rather than an error, so it
-/// is worth catching here. Pass `None` to skip the check.
+/// When `embeddings_ext` is given and the file records a `model_ext`, it must be one of them -- a
+/// voice conditioned on a different checkpoint produces confident nonsense rather than an error,
+/// so it is worth catching here. Pass `None` to skip the check.
 ///
 /// The result is f32 regardless of the backend's quantization; convert with `to::<Q::T>()`.
 pub fn load_voice_emb<B: Backend>(
     path: &std::path::Path,
-    model_ext: Option<&str>,
+    embeddings_ext: Option<&[String]>,
     speaker_proj: Option<&Linear<f32, B>>,
     dev: &B,
 ) -> Result<Tensor<f32, B>> {
     let vb = VB::load(&[path], dev.clone())?;
     let label = format!("voice file {}", path.display());
     let emb = voice_emb_from_vb(&vb, &label, speaker_proj)?;
-    if let Some(model_ext) = model_ext {
-        check_model_ext(&read_safetensors_header(path)?, &label, model_ext)?;
+    if let Some(embeddings_ext) = embeddings_ext {
+        check_model_ext(&read_safetensors_header(path)?, &label, embeddings_ext)?;
     }
     Ok(emb)
 }
@@ -198,7 +237,7 @@ pub fn load_voice_emb<B: Backend>(
 /// filesystem, fetches its voices.
 pub fn load_voice_emb_from_bytes<B: Backend>(
     bytes: &[u8],
-    model_ext: Option<&str>,
+    embeddings_ext: Option<&[String]>,
     speaker_proj: Option<&Linear<f32, B>>,
     dev: &B,
 ) -> Result<Tensor<f32, B>> {
@@ -206,8 +245,8 @@ pub fn load_voice_emb_from_bytes<B: Backend>(
     // The header first: in memory it costs nothing, a mismatch is refused before any tensor is
     // decoded, and a file that is not safetensors gets a clearer error than `VB` gives.
     let header = safetensors_header_from_bytes(bytes, label)?;
-    if let Some(model_ext) = model_ext {
-        check_model_ext(header, label, model_ext)?;
+    if let Some(embeddings_ext) = embeddings_ext {
+        check_model_ext(header, label, embeddings_ext)?;
     }
     let vb = VB::from_bytes(vec![bytes.to_vec()], dev.clone())?;
     voice_emb_from_vb(&vb, label, speaker_proj)
@@ -299,7 +338,7 @@ pub fn load_config_voices<B: Backend>(
     Ok(voices)
 }
 
-fn project_latents<B: Backend>(
+pub(crate) fn project_latents<B: Backend>(
     tensor: &Tensor<f32, B>,
     label: &str,
     speaker_proj: Option<&Linear<f32, B>>,
@@ -326,9 +365,9 @@ fn project_latents<B: Backend>(
     Ok(proj.forward(&latents)?)
 }
 
-/// Fails if the voice file's safetensors `header` records a `model_ext` other than
-/// `model_ext`. A file that records none is accepted: older voices predate the metadata.
-fn check_model_ext(header: &[u8], label: &str, model_ext: &str) -> Result<()> {
+/// Fails if the voice file's safetensors `header` records a `model_ext` that is not one of
+/// `embeddings_ext`. A file that records none is accepted: older voices predate the metadata.
+fn check_model_ext(header: &[u8], label: &str, embeddings_ext: &[String]) -> Result<()> {
     // Not `SafeTensors::read_metadata`: it validates that the buffer holds the
     // tensor data as well as the header, which is exactly what is not read here.
     let header: serde_json::Value = serde_json::from_slice(header).map_err(|e| {
@@ -338,10 +377,10 @@ fn check_model_ext(header: &[u8], label: &str, model_ext: &str) -> Result<()> {
         && let Some(voice_model_ext) = voice_model_ext.as_str()
     {
         tracing::info!(?voice_model_ext, "voice embedding model_ext from metadata");
-        if voice_model_ext != model_ext {
+        if !embeddings_ext.iter().any(|ext| ext == voice_model_ext) {
             return Err(Error::invalid_data(format!(
-                "voice embedding model_ext '{voice_model_ext}' does not match config model_ext \
-                 '{model_ext}'"
+                "voice embedding model_ext '{voice_model_ext}' is not one of config \
+                 embeddings_ext {embeddings_ext:?}"
             )));
         }
     }
@@ -389,6 +428,25 @@ fn read_safetensors_header(path: &std::path::Path) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_files_stay_inside_the_catalog() {
+        let dir = std::env::temp_dir().join(format!("ptts-catalog-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let catalog = dir.join("voices.jsonl");
+        std::fs::write(&catalog, r#"{"name": "a", "filename": "voices/a.safetensors"}"#).unwrap();
+        assert_eq!(
+            read_voice_catalog(&catalog).unwrap(),
+            [("a".into(), dir.join("voices/a.safetensors"))]
+        );
+        for file in ["../a.safetensors", "/etc/a.safetensors", "voices/../../a.safetensors", "C:a"]
+        {
+            let line = format!(r#"{{"name": "a", "filename": "{file}"}}"#);
+            std::fs::write(&catalog, line).unwrap();
+            assert!(read_voice_catalog(&catalog).is_err(), "{file} was accepted");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn checkpoint_voices_follow_the_layout() {
@@ -487,12 +545,14 @@ mod tests {
             &format!(r#"{{"__metadata__":{{"model_ext":"abc@1"}},{tensor}}}"#),
         );
         let header = read_safetensors_header(&matching).unwrap();
-        check_model_ext(&header, "voice", "abc@1").unwrap();
-        assert!(check_model_ext(&header, "voice", "def@2").is_err());
+        let ext = |s: &str| vec![s.to_string()];
+        check_model_ext(&header, "voice", &ext("abc@1")).unwrap();
+        check_model_ext(&header, "voice", &[ext("def@2"), ext("abc@1")].concat()).unwrap();
+        assert!(check_model_ext(&header, "voice", &ext("def@2")).is_err());
 
         // A voice from before the metadata existed is accepted as-is.
         let bare = write("ptts-loader-voice-bare.safetensors", &format!(r#"{{{tensor}}}"#));
-        check_model_ext(&read_safetensors_header(&bare).unwrap(), "voice", "abc@1").unwrap();
+        check_model_ext(&read_safetensors_header(&bare).unwrap(), "voice", &ext("abc@1")).unwrap();
     }
 
     #[test]
@@ -506,10 +566,11 @@ mod tests {
         let tensor = r#""emb":{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]}"#;
         let bytes = file(&format!(r#"{{"__metadata__":{{"model_ext":"abc@1"}},{tensor}}}"#));
 
-        let emb = load_voice_emb_from_bytes(&bytes, Some("abc@1"), None, &xn::CPU).unwrap();
+        let ext = |s: &str| vec![s.to_string()];
+        let emb = load_voice_emb_from_bytes(&bytes, Some(&ext("abc@1")), None, &xn::CPU).unwrap();
         assert_eq!(emb.dims(), [1, 2, 2]);
         assert_eq!(emb.to_vec().unwrap(), [0., 1., 2., 3.]);
-        assert!(load_voice_emb_from_bytes(&bytes, Some("def@2"), None, &xn::CPU).is_err());
+        assert!(load_voice_emb_from_bytes(&bytes, Some(&ext("def@2")), None, &xn::CPU).is_err());
 
         // Error messages name the file once.
         let empty = [&2u64.to_le_bytes()[..], b"{}"].concat();

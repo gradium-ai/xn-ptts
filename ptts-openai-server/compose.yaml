@@ -1,13 +1,20 @@
 # docker compose -f ptts-openai-server/compose.yaml up
 services:
   ptts-openai-server:
-    image: ghcr.io/gradium-ai/ptts-openai-server:latest
+    image: "${PTTS_IMAGE:-ghcr.io/gradium-ai/ptts-openai-server:latest}"
     ports:
       - "8880:8880"
+      # For Home Assistant, with PTTS_WYOMING_ADDR below.
+      # - "10200:10200"
     environment:
-      PTTS_CONFIG: /models
+      PTTS_MODEL: /models
       PTTS_LANG: en
       PTTS_QUANT: q8
+      # Serve the Wyoming protocol, which Home Assistant uses, as well as the OpenAI API.
+      # PTTS_WYOMING_ADDR: 0.0.0.0:10200
+      # For clients that only offer OpenAI's voice names or always send a speed.
+      # PTTS_OPENAI_VOICES: default
+      # PTTS_IGNORE_SPEED: "true"
       # Voices of your own, made with the `create_voice` example, from the folder mounted below.
       # PTTS_VOICE_DIR: /voices
     volumes:

@@ -16,7 +16,7 @@ impl<T: WithDTypeF, B: Backend> DummyQuantizer<T, B> {
         Ok(Self { output_proj_weight, output_proj_bias })
     }
 
-    /// Forward pass: Conv1d with kernel_size=1, no bias.
+    /// Forward pass: Conv1d with kernel_size=1, with the bias when the checkpoint has one.
     /// Input: [B, dimension, T] -> Output: [B, output_dimension, T]
     pub fn forward(&self, x: &Tensor<T, B>) -> Result<Tensor<T, B>> {
         x.conv1d(&self.output_proj_weight, self.output_proj_bias.as_ref(), 1, 0, 1, 1)

@@ -67,9 +67,10 @@ const CPU_FRAMES_PER_STEP: usize = 1;
 /// the browser's GPU process, answered only through the event loop. A frame's next input is
 /// its latent, which never leaves the GPU, so several frames are sampled with no readback,
 /// decoded as one batch (which also gives the vocoder's matmuls more than one row), and read
-/// back together. The cost is up to this many frames past end-of-speech, which are dropped.
+/// back together. The next frames are recorded while these are read back, so the cost is up
+/// to twice this many frames past end-of-speech, which are dropped.
 #[cfg(feature = "webgpu")]
-const GPU_FRAMES_PER_STEP: usize = 8;
+const GPU_FRAMES_PER_STEP: usize = 4;
 
 /// Spare KV slots for the warm-up's throwaway chunk.
 #[cfg(feature = "webgpu")]
@@ -83,10 +84,14 @@ const WARM_UP_TEXT: &str = "Hello.";
 /// The CPU already has it. WebGPU has to wait for the GPU, which a browser reports only
 /// through its event loop, so nothing on that path may block.
 trait Readback: Backend {
+    /// Whether to record the next frames while the previous ones are read back. It pays
+    /// where a readback waits on the device; on the CPU it would only hold up the audio.
+    const OVERLAP: bool;
     async fn read(&self, t: &Tensor<f32, Self>) -> Result<Vec<f32>>;
 }
 
 impl Readback for CpuDevice {
+    const OVERLAP: bool = false;
     async fn read(&self, t: &Tensor<f32, Self>) -> Result<Vec<f32>> {
         t.to_vec()
     }
@@ -94,6 +99,7 @@ impl Readback for CpuDevice {
 
 #[cfg(feature = "webgpu")]
 impl Readback for WebGpuDevice {
+    const OVERLAP: bool = true;
     async fn read(&self, t: &Tensor<f32, Self>) -> Result<Vec<f32>> {
         self.tensor_to_vec(t).await
     }
@@ -127,6 +133,8 @@ struct ChunkState<Q: BackendQ<T = f32>> {
     /// Set once `eos` has run out: the frame that did it has been returned, and the next
     /// call ends the chunk.
     done: bool,
+    /// Frames recorded during the previous step's readback, returned by the next step.
+    in_flight: Option<Pending<Q::B>>,
 }
 
 struct GenState<Q: BackendQ<T = f32>> {
@@ -165,6 +173,7 @@ fn record_frames<Q: BackendQ<T = f32>>(
             Some(t) => StepInput::Latent(t),
         };
         let (latent, eos_logit) = model.generate_step_parts(&mut chunk.tts_state, input, rng)?;
+        latent.device().synchronize()?;
         chunk.prev_latent = Some(latent.clone());
         latents.push(latent);
         eos_logits.push(eos_logit);
@@ -175,6 +184,7 @@ fn record_frames<Q: BackendQ<T = f32>>(
     let pcm_len = pcm.elem_count();
     let eos = Tensor::cat(&eos_logits.iter().collect::<Vec<_>>(), 0)?;
     let out = Tensor::cat(&[&pcm.reshape(pcm_len)?, &eos.reshape(frames)?], 0)?;
+    out.device().synchronize()?;
     chunk.step += frames;
     Ok(Pending { out, pcm_len, frames })
 }
@@ -228,10 +238,9 @@ where
     /// (`speaker_wavs`), the formats every other frontend reads. It is run through the flow
     /// LM once, here, so generation can start from the resulting state.
     fn voice_from_emb(&self, bytes: &[u8], cfg: &TTSConfig) -> Result<RawState<Q::B>> {
-        let model_ext = cfg.model_ext();
         let emb = load_voice_emb_from_bytes(
             bytes,
-            model_ext.as_deref(),
+            cfg.embeddings_ext.as_deref(),
             self.speaker_proj.as_ref(),
             &self.device,
         )?;
@@ -310,6 +319,7 @@ where
             eos: EosPolicy::new(chunk.frames_after_eos),
             step: 0,
             done: false,
+            in_flight: None,
         });
         Ok(Some(chunk.tokens.len()))
     }
@@ -317,30 +327,43 @@ where
     /// Up to `frames_per_step` frames of the current chunk as PCM, or `None` once the chunk
     /// is finished.
     async fn step(&mut self) -> Result<Option<Vec<f32>>> {
-        let pending = {
-            let Some(gen_state) = self.gen_state.as_mut() else { return Ok(None) };
-            let Some(chunk) = gen_state.current.as_mut() else { return Ok(None) };
-            if chunk.done || chunk.step >= chunk.frame_budget {
-                gen_state.current = None;
-                return Ok(None);
+        let Self { model, device, gen_state, frames_per_step, .. } = self;
+        let Some(GenState { current, rng, .. }) = gen_state.as_mut() else { return Ok(None) };
+        let Some(chunk) = current.as_mut() else { return Ok(None) };
+        let pending = match chunk.in_flight.take() {
+            Some(pending) => pending,
+            None => {
+                if chunk.done || chunk.step >= chunk.frame_budget {
+                    *current = None;
+                    return Ok(None);
+                }
+                let frames = (*frames_per_step).min(chunk.frame_budget - chunk.step);
+                record_frames(model, chunk, rng, frames)?
             }
-            let frames = self.frames_per_step.min(chunk.frame_budget - chunk.step);
-            record_frames(&self.model, chunk, &mut gen_state.rng, frames)?
         };
-        let mut pcm = self.device.read(&pending.out).await?;
+        let left = chunk.frame_budget - chunk.step;
+        let (mut pcm, next) = if Q::B::OVERLAP && left > 0 {
+            let frames = (*frames_per_step).min(left);
+            let (pcm, next) = futures_util::future::join(device.read(&pending.out), async {
+                record_frames(model, chunk, rng, frames)
+            })
+            .await;
+            (pcm?, Some(next?))
+        } else {
+            (device.read(&pending.out).await?, None)
+        };
+        chunk.in_flight = next;
         let eos = pcm.split_off(pending.pcm_len);
 
         // Keep frames up to the one where the end-of-speech rule runs out. `should_stop` is
         // asked after each frame, so that frame itself is part of the output, and the next
-        // call reports the end of the chunk.
-        let Some(chunk) = self.gen_state.as_mut().and_then(|g| g.current.as_mut()) else {
-            return Ok(None);
-        };
+        // call reports the end of the chunk. Frames recorded past it are dropped.
         let per_frame = pcm.len() / pending.frames;
         let mut keep = pending.frames;
         for (i, logit) in eos.iter().enumerate().take(pending.frames) {
-            if chunk.eos.should_stop(self.model.eos_from_logit(std::slice::from_ref(logit))) {
+            if chunk.eos.should_stop(model.eos_from_logit(std::slice::from_ref(logit))) {
                 chunk.done = true;
+                chunk.in_flight = None;
                 keep = i + 1;
                 break;
             }
@@ -368,6 +391,7 @@ where
             eos: EosPolicy::new(0),
             step: 0,
             done: false,
+            in_flight: None,
         };
         let mut rng = NormalRng::new(0.3, 0)?;
         let pending = record_frames(&self.model, &mut chunk, &mut rng, frames)?;
@@ -605,11 +629,11 @@ impl Model {
     ///
     /// `rewrites` is optional and picks which word rewrites run on the
     /// normalized text: `"default"` (numbers, currency, dashed-digits, emails,
-    /// urls), `"all"` (those and phones, times, dates), `"none"`, or a
-    /// comma-separated list of rule names.
+    /// urls, abbreviations, elongations), `"all"` (those and phones, times,
+    /// dates), `"none"`, or a comma-separated list of rule names.
     ///
     /// `conditions` is optional and sets the config's conditioners, each as `"NAME=VALUE"`,
-    /// e.g. `["padding_bonus=0.5"]`. Those left out take their defaults.
+    /// e.g. `["duration_delta=0.5"]`. Those left out take their defaults.
     ///
     /// `device` is `"cpu"` or `"webgpu"`. WebGPU needs `q8` weights in a GGUF file, and a
     /// build with the `webgpu` feature.
@@ -706,6 +730,29 @@ impl Model {
         })
     }
 
+    /// Waits for the work the device has queued. On WebGPU, `add_voice` only records a voice's
+    /// prompt, and the GPU runs it here rather than inside the first step that speaks. The CPU
+    /// has nothing queued. Resolves at once while a `generation_step` holds the model, which
+    /// waits for the GPU itself.
+    pub fn flush(&self) -> js_sys::Promise {
+        let cell = Rc::clone(&self.loaded);
+        wasm_bindgen_futures::future_to_promise(async move {
+            #[cfg(feature = "webgpu")]
+            {
+                let device = cell.borrow().as_ref().and_then(|l| match &l.engine {
+                    AnyEngine::WebGpuQ8(e) => Some(e.device.clone()),
+                    _ => None,
+                });
+                if let Some(device) = device {
+                    device.flush_async().await.map_err(js_err)?;
+                }
+            }
+            #[cfg(not(feature = "webgpu"))]
+            let _ = cell;
+            Ok(JsValue::UNDEFINED)
+        })
+    }
+
     /// Drops the generation in progress, if any. Called while a `generation_step` is pending,
     /// it takes effect when that step returns: the step still delivers its frames, and the
     /// next one reports the end.
@@ -728,6 +775,11 @@ impl Model {
             Ok((sample_rate as f64 / l.cfg.mimi.frame_rate).round() as usize)
         })
         .map_err(js_err)
+    }
+
+    /// The languages the model was trained for, as listed in its config.
+    pub fn languages(&self) -> std::result::Result<Vec<String>, JsError> {
+        self.with(|l| Ok(l.cfg.languages.clone())).map_err(js_err)
     }
 
     /// `"cpu"` or `"webgpu"`: where this model runs.

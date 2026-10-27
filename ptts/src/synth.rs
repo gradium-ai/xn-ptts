@@ -19,7 +19,7 @@
 //!     Lang::En,
 //! )
 //! .tokenizer_file("model/tokenizer.json")
-//!     .add_voice("alba", "model/voices/alba.safetensors")
+//!     .add_voice("default", "model/default-voice.safetensors")
 //!     .build()?;
 //! let pcm = tts.say("Hello world")?;
 //! ptts::wav::write_wav_file("out.wav", &pcm, tts.sample_rate())?;
@@ -73,8 +73,9 @@ use xn::{Backend, BackendQ, Tensor};
 /// Which device to run on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DeviceKind {
-    /// The most capable compiled-in backend: CUDA, then Vulkan, then Metal,
-    /// then the CPU.
+    /// The most capable compiled-in backend for the weight format: CUDA, then
+    /// Vulkan, then Metal, then the CPU for f32 weights, and the CPU for
+    /// quantized ones, which only it runs.
     #[default]
     Auto,
     Cpu,
@@ -98,6 +99,13 @@ impl DeviceKind {
         } else {
             Self::Cpu
         }
+    }
+
+    /// Resolve [`Self::Auto`] for weights in `quant`: quantized weights run on
+    /// the CPU whatever GPU backend is compiled in, so `auto` never picks a
+    /// device that would refuse them.
+    pub fn resolve_for(self, quant: Quant) -> Self {
+        if self == Self::Auto && quant != Quant::F32 { Self::Cpu } else { self.resolve() }
     }
 }
 
@@ -144,7 +152,7 @@ impl Quant {
     /// combination fails in milliseconds rather than after a few hundred
     /// megabytes.
     pub fn check_device(self, device: DeviceKind) -> Result<()> {
-        let device = device.resolve();
+        let device = device.resolve_for(self);
         if device != DeviceKind::Cpu && self != Self::F32 {
             return Err(Error::unsupported(format!(
                 "quantization ({}) is CPU-only, but the selected device is {device:?}",
@@ -330,6 +338,12 @@ struct SynthOf<Q: BackendQ> {
     primed: Mutex<HashMap<(String, bool), Primed<Q>>>,
     conditioners: Conditioners<Q::T, Q::B>,
     conditions: Option<Tensor<Q::T, Q::B>>,
+    /// Whether a session should decode each frame on the flow-LM's own thread rather than
+    /// handing it to a second thread. Devices with one shared command queue (CUDA, Metal) have
+    /// no second execution unit for a second thread to overlap onto, so the split only adds
+    /// cross-thread contention over that queue; the CPU's separate cores make it a real win
+    /// there. Set once per backend in [`SynthBuilder::build_cuda`] and friends.
+    inline_decode: bool,
 }
 
 /// How many primed prefixes to keep. A process that clones voices under fresh names -- which
@@ -361,6 +375,7 @@ impl<Q: BackendQ> SynthOf<Q> {
             seq_budget,
             normalize: self.normalize,
             post_process: settings.post_process.clone(),
+            inline_decode: self.inline_decode,
         })
     }
 
@@ -395,12 +410,12 @@ impl<Q: BackendQ> SynthOf<Q> {
         cfg_coef: Option<f32>,
     ) -> Result<(TTSState<Q>, Option<(f32, TTSState<Q>)>)> {
         let Some((name, voice)) = self.voice_for(voice)? else {
-            let mut state = self.model.init_flow_lm_state(1, seq_budget)?;
+            let mut state = self.unprompted_state(seq_budget)?;
             state.flow_lm_state.conditions = self.conditions.clone();
             let cfg_state = match cfg_coef {
                 None => None,
                 Some(coef) => {
-                    let mut null_state = self.model.init_flow_lm_state(1, seq_budget)?;
+                    let mut null_state = self.unprompted_state(seq_budget)?;
                     null_state.flow_lm_state.conditions = self.conditions.clone();
                     Some((coef, null_state))
                 }
@@ -408,7 +423,7 @@ impl<Q: BackendQ> SynthOf<Q> {
             return Ok((state, cfg_state));
         };
 
-        let frames = voice.emb.dim(1usize)?;
+        let frames = self.model.voice_prompt_len(voice.emb.dim(1usize)?);
         if frames >= seq_budget {
             // Its own variant rather than `SeqBudgetExceeded`: nothing about the text is
             // wrong here, so "split the text" would be useless advice, and the prompt
@@ -453,8 +468,6 @@ impl<Q: BackendQ> SynthOf<Q> {
         Ok((state, cfg_state))
     }
 
-    /// Run the voice prompt, and with guidance on the null branch, into states just large
-    /// enough to hold them.
     fn check_no_baked_voices(&self) -> Result<()> {
         if self.cfg.voices.is_empty() {
             Ok(())
@@ -465,6 +478,14 @@ impl<Q: BackendQ> SynthOf<Q> {
         }
     }
 
+    fn unprompted_state(&self, seq_budget: usize) -> Result<TTSState<Q>> {
+        let mut state = self.model.init_flow_lm_state(1, seq_budget)?;
+        self.model.prompt_no_voice(&mut state)?;
+        Ok(state)
+    }
+
+    /// Run the voice prompt, and with guidance on the null branch, into states just large
+    /// enough to hold them.
     fn prime(&self, voice: &Voice<Q>, cfg_on: bool, frames: usize) -> Result<Primed<Q>> {
         let conditions = voice.conditions.clone().or_else(|| self.conditions.clone());
         let mut state = self.model.init_flow_lm_state(1, frames)?;
@@ -477,12 +498,16 @@ impl<Q: BackendQ> SynthOf<Q> {
             // Sized to what the null branch will consume, so the `emb`/`null_emb` length
             // invariant stays local to registration rather than load-bearing here.
             let null_frames = match voice.null_emb.as_ref() {
-                Some(null_emb) if !self.cfg.cfg_null_audio_empty => null_emb.dim(1usize)?,
+                Some(null_emb) if !self.cfg.cfg_null_audio_empty => {
+                    self.model.voice_prompt_len(null_emb.dim(1usize)?)
+                }
                 _ => frames,
             };
             let mut null_state = self.model.init_flow_lm_state(1, null_frames)?;
             null_state.flow_lm_state.conditions = conditions;
-            if !self.cfg.cfg_null_audio_empty {
+            if self.cfg.cfg_null_audio_empty {
+                self.model.prompt_no_voice(&mut null_state)?;
+            } else {
                 match voice.null_emb.as_ref() {
                     Some(null_emb) => self.model.prompt_audio(&mut null_state, null_emb)?,
                     None if !self.cfg.voices.is_empty() => {
@@ -524,6 +549,10 @@ impl<Q: BackendQ> SynthApi for SynthOf<Q> {
         self.model.device().name()
     }
 
+    fn languages(&self) -> &[String] {
+        self.cfg.languages.as_slice()
+    }
+
     fn voices(&self) -> Vec<String> {
         self.voices.keys().cloned().collect()
     }
@@ -544,10 +573,9 @@ impl<Q: BackendQ> SynthApi for SynthOf<Q> {
     fn add_voice_file(&mut self, name: &str, path: &FsPath) -> Result<()> {
         self.check_no_baked_voices()?;
         let dev = self.model.device().clone();
-        let model_ext = self.cfg.model_ext();
-        let emb =
-            loader::load_voice_emb(path, model_ext.as_deref(), self.model.speaker_proj(), &dev)?
-                .to::<Q::T>()?;
+        let embeddings_ext = self.cfg.embeddings_ext.as_deref();
+        let emb = loader::load_voice_emb(path, embeddings_ext, self.model.speaker_proj(), &dev)?
+            .to::<Q::T>()?;
         self.forget_primed(name);
         self.voices.insert(name.to_string(), Voice { emb, null_emb: None, conditions: None });
         Ok(())
@@ -625,6 +653,30 @@ impl<Q: BackendQ> SynthApi for SynthOf<Q> {
         };
         self.forget_primed(name);
         self.voices.insert(name.to_string(), Voice { emb, null_emb, conditions: None });
+        Ok(())
+    }
+
+    fn add_voice_from_latents(
+        &mut self,
+        name: &str,
+        latents: &[f32],
+        channels: usize,
+        frames: usize,
+    ) -> Result<()> {
+        self.check_no_baked_voices()?;
+        if latents.len() != channels * frames {
+            return Err(Error::invalid_argument(format!(
+                "latents have {} values, expected {channels} x {frames}",
+                latents.len()
+            )));
+        }
+        let dev = self.model.device().clone();
+        let latents = Tensor::from_vec(latents.to_vec(), (1, channels, frames), &dev)?;
+        let emb =
+            loader::project_latents(&latents, "the voice latents", self.model.speaker_proj())?
+                .to::<Q::T>()?;
+        self.forget_primed(name);
+        self.voices.insert(name.to_string(), Voice { emb, null_emb: None, conditions: None });
         Ok(())
     }
 
@@ -782,6 +834,8 @@ struct SessionOf<Q: BackendQ> {
     post_process: Vec<ModuleConfig>,
     /// Set while a generation is running. See the note on this type.
     in_flight: Arc<std::sync::atomic::AtomicBool>,
+    /// See [`SynthOf::inline_decode`].
+    inline_decode: bool,
 }
 
 impl<Q: BackendQ> SessionOf<Q> {
@@ -856,108 +910,127 @@ impl<Q: BackendQ> SessionOf<Q> {
         let mut post = Chain::from_modules(self.sample_rate(), &self.post_process);
 
         let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<Result<Vec<f32>>>(PCM_QUEUE);
-        let (latent_tx, latent_rx) = std::sync::mpsc::sync_channel::<Frame<Q>>(LATENT_QUEUE);
-        // The decoder says when the first frame's audio is out, and the flow-LM waits for it
-        // before its second step. Run side by side, the two compete for the device and the
-        // first decode, which is all the time to first audio waits on, comes out slower; held
-        // back, the flow-LM loses one decode's time, far ahead of real time.
-        let (first_tx, first_rx) = std::sync::mpsc::channel::<()>();
 
-        // Decoder: latents in, PCM out. Reset between chunks so each chunk
-        // starts from a clean codec state, matching the pre-refactor behavior.
-        let decode_model = Arc::clone(&self.model);
-        let decode_tx = pcm_tx.clone();
-        let decode_handle = std::thread::spawn(move || {
-            let mut first_tx = Some(first_tx);
-            let mut state = mimi_init.clone();
-            // The post-processing chain delays its output: its first `skip` samples are the
-            // zeros it was primed with, dropped here, and the stream's last are flushed below.
-            let mut skip = post.latency();
-            while let Ok(frame) = latent_rx.recv() {
-                let first = match frame {
-                    Frame::ChunkEnd => {
-                        state = mimi_init.clone();
-                        continue;
-                    }
-                    Frame::Latent(latent) => latent,
-                };
-                // Decode every latent the flow-LM has already queued in one
-                // call: the decoder is exact for any number of frames, and one
-                // call over several is much cheaper than one call per frame.
-                // Only what is already waiting is taken, so no frame is ever
-                // held back for a batch to fill — the first one included.
-                let mut reset_after = false;
-                let mut batch = vec![first];
-                while batch.len() < DECODE_BATCH {
-                    let Ok(frame) = latent_rx.try_recv() else { break };
-                    match frame {
-                        // Past a chunk boundary the codec state resets, so the
-                        // batch has to stop here and resume on the next frame.
+        let workers = if self.inline_decode {
+            // One shared command queue (CUDA, Metal): a second thread has no second execution
+            // unit to overlap onto, and only adds cross-thread contention for that queue. Decode
+            // each frame inline, on the flow-LM's own thread, instead -- see `inline_decode`.
+            let model = Arc::clone(&self.model);
+            let handle = std::thread::spawn(move || {
+                let _in_flight = in_flight;
+                let result =
+                    run_inline(&model, chunks, base_state, cfg_base, rng, mimi_init, &pcm_tx, post);
+                if let Err(e) = result {
+                    let _ = pcm_tx.send(Err(e));
+                }
+            });
+            vec![handle]
+        } else {
+            let (latent_tx, latent_rx) = std::sync::mpsc::sync_channel::<Frame<Q>>(LATENT_QUEUE);
+            // The decoder says when the first frame's audio is out, and the flow-LM waits for it
+            // before its second step. Run side by side, the two compete for the device and the
+            // first decode, which is all the time to first audio waits on, comes out slower; held
+            // back, the flow-LM loses one decode's time, far ahead of real time.
+            let (first_tx, first_rx) = std::sync::mpsc::channel::<()>();
+
+            // Decoder: latents in, PCM out. Reset between chunks so each chunk
+            // starts from a clean codec state, matching the pre-refactor behavior.
+            let decode_model = Arc::clone(&self.model);
+            let decode_tx = pcm_tx.clone();
+            let decode_handle = std::thread::spawn(move || {
+                let mut first_tx = Some(first_tx);
+                let mut state = mimi_init.clone();
+                // The post-processing chain delays its output: its first `skip` samples are the
+                // zeros it was primed with, dropped here, and the stream's last are flushed below.
+                let mut skip = post.latency();
+                while let Ok(frame) = latent_rx.recv() {
+                    let first = match frame {
                         Frame::ChunkEnd => {
-                            reset_after = true;
-                            break;
+                            state = mimi_init.clone();
+                            continue;
                         }
-                        Frame::Latent(latent) => batch.push(latent),
+                        Frame::Latent(latent) => latent,
+                    };
+                    // Decode every latent the flow-LM has already queued in one
+                    // call: the decoder is exact for any number of frames, and one
+                    // call over several is much cheaper than one call per frame.
+                    // Only what is already waiting is taken, so no frame is ever
+                    // held back for a batch to fill — the first one included.
+                    let mut reset_after = false;
+                    let mut batch = vec![first];
+                    while batch.len() < DECODE_BATCH {
+                        let Ok(frame) = latent_rx.try_recv() else { break };
+                        match frame {
+                            // Past a chunk boundary the codec state resets, so the
+                            // batch has to stop here and resume on the next frame.
+                            Frame::ChunkEnd => {
+                                reset_after = true;
+                                break;
+                            }
+                            Frame::Latent(latent) => batch.push(latent),
+                        }
+                    }
+                    let latent = match batch.len() {
+                        1 => batch.pop().expect("just checked"),
+                        _ => match Tensor::cat(&batch.iter().collect::<Vec<_>>(), 1) {
+                            Ok(latent) => latent,
+                            Err(e) => {
+                                let _ = decode_tx.send(Err(e.into()));
+                                return;
+                            }
+                        },
+                    };
+                    let pcm = decode_model
+                        .decode_latent(&latent, &mut state)
+                        .and_then(|audio| audio.narrow(0, ..1)?.contiguous()?.to_vec())
+                        .map(|mut pcm| {
+                            post.process(&mut pcm);
+                            let n = skip.min(pcm.len());
+                            skip -= n;
+                            pcm.drain(..n);
+                            pcm
+                        })
+                        .map_err(Error::from);
+                    let failed = pcm.is_err();
+                    if decode_tx.send(pcm).is_err() || failed {
+                        return;
+                    }
+                    if let Some(first_tx) = first_tx.take() {
+                        let _ = first_tx.send(());
+                    }
+                    if reset_after {
+                        state = mimi_init.clone();
                     }
                 }
-                let latent = match batch.len() {
-                    1 => batch.pop().expect("just checked"),
-                    _ => match Tensor::cat(&batch.iter().collect::<Vec<_>>(), 1) {
-                        Ok(latent) => latent,
-                        Err(e) => {
-                            let _ = decode_tx.send(Err(e.into()));
-                            return;
-                        }
-                    },
-                };
-                let pcm = decode_model
-                    .decode_latent(&latent, &mut state)
-                    .and_then(|audio| audio.narrow(0, ..1)?.contiguous()?.to_vec())
-                    .map(|mut pcm| {
-                        post.process(&mut pcm);
-                        let n = skip.min(pcm.len());
-                        skip -= n;
-                        pcm.drain(..n);
-                        pcm
-                    })
-                    .map_err(Error::from);
-                let failed = pcm.is_err();
-                if decode_tx.send(pcm).is_err() || failed {
-                    return;
+                let latency = post.latency();
+                if latency > skip {
+                    let mut tail = vec![0.0; latency];
+                    post.process(&mut tail);
+                    tail.drain(..skip);
+                    let _ = decode_tx.send(Ok(tail));
                 }
-                if let Some(first_tx) = first_tx.take() {
-                    let _ = first_tx.send(());
-                }
-                if reset_after {
-                    state = mimi_init.clone();
-                }
-            }
-            let latency = post.latency();
-            if latency > skip {
-                let mut tail = vec![0.0; latency];
-                post.process(&mut tail);
-                tail.drain(..skip);
-                let _ = decode_tx.send(Ok(tail));
-            }
-        });
+            });
 
-        // Flow-LM: text in, latents out.
-        let model = Arc::clone(&self.model);
-        let backbone_handle = std::thread::spawn(move || {
-            // Dropped when this thread ends, which is after its last write.
-            let _in_flight = in_flight;
-            let result =
-                run_backbone(&model, chunks, base_state, cfg_base, rng, &latent_tx, first_rx);
-            if let Err(e) = result {
-                let _ = pcm_tx.send(Err(e));
-            }
-        });
+            // Flow-LM: text in, latents out.
+            let model = Arc::clone(&self.model);
+            let backbone_handle = std::thread::spawn(move || {
+                // Dropped when this thread ends, which is after its last write.
+                let _in_flight = in_flight;
+                let result =
+                    run_backbone(&model, chunks, base_state, cfg_base, rng, &latent_tx, first_rx);
+                if let Err(e) = result {
+                    let _ = pcm_tx.send(Err(e));
+                }
+            });
+
+            vec![backbone_handle, decode_handle]
+        };
 
         Ok(SpeechStream {
             rx: Some(pcm_rx),
             sample_rate: self.sample_rate(),
             failed: false,
-            workers: Some([backbone_handle, decode_handle]),
+            workers: Some(workers),
         })
     }
 }
@@ -1118,6 +1191,92 @@ fn run_backbone<Q: BackendQ>(
     Ok(())
 }
 
+/// Like [`run_backbone`], but decodes each frame immediately on the same thread instead of
+/// handing it to a second one over a channel -- see [`SynthOf::inline_decode`]. With nothing
+/// running concurrently there is no second thread to rendezvous with before the second step,
+/// unlike `run_backbone`.
+#[allow(clippy::too_many_arguments)]
+fn run_inline<Q: BackendQ>(
+    model: &TTSModel<Q>,
+    chunks: Vec<Chunk>,
+    base_state: TTSState<Q>,
+    cfg_base: Option<(f32, TTSState<Q>)>,
+    mut rng: Box<dyn crate::flow_lm::Rng + Send>,
+    mimi_init: crate::mimi::MimiDecoderState<f32, Q::B>,
+    pcm_tx: &std::sync::mpsc::SyncSender<Result<Vec<f32>>>,
+    mut post: Chain,
+) -> Result<()> {
+    let mut mimi_state = mimi_init.clone();
+    // The post-processing chain delays its output: its first `skip` samples are the zeros it
+    // was primed with, dropped here, and the stream's last are flushed below.
+    let mut skip = post.latency();
+    for chunk in chunks.iter() {
+        let mut state = base_state.clone();
+        let mut cfg_state = cfg_base.clone();
+        model.prompt_text(&mut state, &chunk.tokens)?;
+        if let Some((_, null_state)) = cfg_state.as_mut() {
+            model.prompt_text_null(null_state)?;
+        }
+
+        let mut prev: Option<Tensor<Q::T, Q::B>> = None;
+        let mut eos = EosPolicy::new(chunk.frames_after_eos);
+
+        for _ in 0..chunk.frame_budget {
+            let input = match &prev {
+                None => StepInput::Bos { batch: 1 },
+                Some(t) => StepInput::Latent(t),
+            };
+            // Without guidance the eos logit is read back with the frame's audio, so the frame
+            // waits on the device once instead of twice.
+            let (next, is_eos, eos_logit) = match cfg_state.as_mut() {
+                Some((coef, null_state)) => {
+                    let (next, is_eos) =
+                        model.generate_step_cfg(&mut state, null_state, *coef, input, &mut rng)?;
+                    (next, is_eos, None)
+                }
+                None => {
+                    let (next, logit) = model.generate_step_parts(&mut state, input, &mut rng)?;
+                    (next, false, Some(logit))
+                }
+            };
+            let pcm = model
+                .decode_latent(&next, &mut mimi_state)
+                .and_then(|audio| audio.narrow(0, ..1)?.contiguous()?.to_vec())
+                .map(|mut pcm| {
+                    post.process(&mut pcm);
+                    let n = skip.min(pcm.len());
+                    skip -= n;
+                    pcm.drain(..n);
+                    pcm
+                })
+                .map_err(Error::from);
+            let failed = pcm.is_err();
+            // A closed channel means the consumer went away; stop quietly and let the caller
+            // report any error of its own.
+            if pcm_tx.send(pcm).is_err() || failed {
+                return Ok(());
+            }
+            let is_eos = match eos_logit {
+                Some(logit) => model.eos_from_logit(&logit.to_vec()?),
+                None => is_eos,
+            };
+            if eos.should_stop(is_eos) {
+                break;
+            }
+            prev = Some(next);
+        }
+        mimi_state = mimi_init.clone();
+    }
+    let latency = post.latency();
+    if latency > skip {
+        let mut tail = vec![0.0; latency];
+        post.process(&mut tail);
+        tail.drain(..skip);
+        let _ = pcm_tx.send(Ok(tail));
+    }
+    Ok(())
+}
+
 /// PCM chunks from a running generation.
 ///
 /// Each item is mono `f32` samples at [`Self::sample_rate`] — one Mimi frame's
@@ -1136,9 +1295,11 @@ pub struct SpeechStream {
     rx: Option<std::sync::mpsc::Receiver<Result<Vec<f32>>>>,
     sample_rate: u32,
     failed: bool,
-    /// The flow-LM and decoder threads, joined once the channel closes so that
-    /// a panic in either surfaces as an error rather than as truncated audio.
-    workers: Option<[std::thread::JoinHandle<()>; 2]>,
+    /// The generation thread(s), joined once the channel closes so that a panic in any of them
+    /// surfaces as an error rather than as truncated audio. Two threads (flow LM and Mimi
+    /// decoder) on the CPU, one thread doing both inline on devices with a single shared
+    /// command queue; see [`SynthOf::inline_decode`].
+    workers: Option<Vec<std::thread::JoinHandle<()>>>,
 }
 
 impl SpeechStream {
@@ -1368,7 +1529,10 @@ impl SynthBuilder {
     /// Load the checkpoint, choosing the device and weight format from
     /// [`Self::device`] and [`Self::quant`].
     pub fn build(self) -> Result<Synth> {
-        let device = self.device.resolve();
+        if let Some(warning) = self.normalize.language_warning(&self.config.languages) {
+            tracing::warn!("{warning}");
+        }
+        let device = self.device.resolve_for(self.quant);
         self.quant.check_device(device)?;
         match device {
             DeviceKind::Cpu => self.build_cpu(),
@@ -1382,7 +1546,7 @@ impl SynthBuilder {
     fn build_cpu(self) -> Result<Synth> {
         macro_rules! cpu {
             ($q:ty) => {
-                Ok(Synth(Box::new(self.load::<$q>(xn::CPU)?)))
+                Ok(Synth(Box::new(self.load::<$q>(xn::CPU, false)?)))
             };
         }
         match self.quant {
@@ -1407,7 +1571,11 @@ impl SynthBuilder {
         let dev = xn::cuda_backend::Device::new(0)?;
         // Event tracking costs a few percent and this workload never queries events.
         unsafe { dev.disable_event_tracking() };
-        let synth = self.load::<xn::Unquantized<half::bf16, _>>(dev)?;
+        // The flow LM and the Mimi decoder share one CUDA stream and cuBLAS handle, so running
+        // them on separate threads does not overlap GPU work the way it does on the CPU's
+        // separate cores -- it only adds cross-thread contention for that shared stream. Decode
+        // inline on the flow LM's thread instead; see `inline_decode`.
+        let synth = self.load::<xn::Unquantized<half::bf16, _>>(dev, true)?;
         Ok(Synth(Box::new(synth)))
     }
 
@@ -1416,7 +1584,7 @@ impl SynthBuilder {
         // `quant()` reports `self.quant`, which `check_device` keeps at F32 here.
         debug_assert_eq!(self.quant, Quant::F32);
         let dev = xn::vulkan_backend::Device::new(0)?;
-        let synth = self.load::<xn::Unquantized<f32, _>>(dev)?;
+        let synth = self.load::<xn::Unquantized<f32, _>>(dev, false)?;
         Ok(Synth(Box::new(synth)))
     }
 
@@ -1425,7 +1593,8 @@ impl SynthBuilder {
         // `quant()` reports `self.quant`, which `check_device` keeps at F32 here.
         debug_assert_eq!(self.quant, Quant::F32);
         let dev = xn::metal_backend::Device::new(0)?;
-        let synth = self.load::<xn::Unquantized<half::bf16, _>>(dev)?;
+        // Same reasoning as CUDA above: one shared command queue, so decode inline.
+        let synth = self.load::<xn::Unquantized<half::bf16, _>>(dev, true)?;
         Ok(Synth(Box::new(synth)))
     }
 
@@ -1448,8 +1617,9 @@ impl SynthBuilder {
         Err(Error::unsupported("this build has no Metal support; rebuild with the `metal` feature"))
     }
 
-    /// Load the weights and register the voices.
-    fn load<Q: BackendQ>(mut self, device: Q::B) -> Result<SynthOf<Q>> {
+    /// Load the weights and register the voices. `inline_decode` is forwarded to
+    /// [`SynthOf`]; see its field doc.
+    fn load<Q: BackendQ>(mut self, device: Q::B, inline_decode: bool) -> Result<SynthOf<Q>> {
         if !self.weights.is_file() {
             return Err(Error::not_found(format!(
                 "weights file not found: {}",
@@ -1499,6 +1669,7 @@ impl SynthBuilder {
             normalize: self.normalize,
             conditioners,
             conditions: None,
+            inline_decode,
         };
 
         for (name, emb) in baked_voices {
@@ -1574,6 +1745,9 @@ pub trait SynthApi: sealed::Sealed + Send + Sync {
     /// Registered voice names, sorted.
     fn voices(&self) -> Vec<String>;
 
+    /// The languages the model was trained for.
+    fn languages(&self) -> &[String];
+
     /// The voice a request that names none speaks in: the builder's [`SynthBuilder::voice`],
     /// else `default` (a checkpoint's own `default-voice.safetensors`), else the first by name.
     /// Decided per request, so a voice registered after the build counts. `None` when there
@@ -1589,6 +1763,14 @@ pub trait SynthApi: sealed::Sealed + Send + Sync {
 
     /// Register a precomputed voice embedding, replacing any voice of the same name.
     fn add_voice_file(&mut self, name: &str, path: &FsPath) -> Result<()>;
+
+    /// Register every voice of a JSONL catalog, see [`loader::read_voice_catalog`].
+    fn add_voice_catalog(&mut self, path: &FsPath) -> Result<()> {
+        for (name, path) in loader::read_voice_catalog(path)? {
+            self.add_voice_file(&name, &path)?;
+        }
+        Ok(())
+    }
 
     /// Clone a voice from a mono audio prompt.
     ///
@@ -1614,6 +1796,22 @@ pub trait SynthApi: sealed::Sealed + Send + Sync {
         frames: usize,
         dim: usize,
         null_emb: Option<&[f32]>,
+    ) -> Result<()>;
+
+    /// Register a voice from the speaker encoder's latents already in memory,
+    /// laid out as `channels` rows of `frames`.
+    ///
+    /// This is the `speaker_wavs` tensor of a voice file, `[1, channels, frames]`
+    /// before the checkpoint's speaker projection: what
+    /// [`Self::add_voice_file`] reads from such a file, and the form in which
+    /// voices are stored and exchanged. The projection is applied here, so it
+    /// fails on a checkpoint that has none.
+    fn add_voice_from_latents(
+        &mut self,
+        name: &str,
+        latents: &[f32],
+        channels: usize,
+        frames: usize,
     ) -> Result<()>;
 
     fn set_conditions(&mut self, conditions: HashMap<String, String>) -> Result<()>;
@@ -1653,7 +1851,7 @@ pub trait SynthApi: sealed::Sealed + Send + Sync {
     /// ```no_run
     /// # fn main() -> ptts::Result<()> {
     /// # let tts: ptts::synth::Synth = todo!();
-    /// let session = tts.session(&ptts::synth::SpeechOptions::default().voice("alba"), 1024)?;
+    /// let session = tts.session(&ptts::synth::SpeechOptions::default().voice("default"), 1024)?;
     /// for line in ["First.", "Second.", "Third."] {
     ///     let pcm = session.say(line)?;
     /// }
@@ -1665,8 +1863,8 @@ pub trait SynthApi: sealed::Sealed + Send + Sync {
     /// session is dropped. At 12.5 Hz a full [`MAX_TOKENS_PER_CHUNK`]-token
     /// chunk needs 796, so 1024 covers the usual target. Further sentences use
     /// the same cache. A single sentence too long for the budget, or longer than
-    /// [`plan::MAX_FIT_TOKENS`], is cut with [`plan::fit`]; an indivisible chunk
-    /// that still exceeds either limit is rejected.
+    /// [`plan::MAX_FIT_TOKENS`], is cut with [`plan::fit`], down to single characters
+    /// if needed. A single character that still exceeds either limit is rejected.
     fn session(&self, opts: &SpeechOptions, max_seq_len: usize) -> Result<Session>;
 
     /// Start generating `text` with per-request overrides.
@@ -1839,6 +2037,15 @@ mod tests {
     use super::*;
     use crate::preprocess::Lang;
 
+    #[test]
+    fn auto_runs_quantized_weights_on_the_cpu() {
+        // In a GPU build too: a GPU backend refuses quantized weights, so `auto` must not pick one.
+        assert_eq!(DeviceKind::Auto.resolve_for(Quant::Q80), DeviceKind::Cpu);
+        assert!(Quant::Q80.check_device(DeviceKind::Auto).is_ok());
+        assert_eq!(DeviceKind::Auto.resolve_for(Quant::F32), DeviceKind::Auto.resolve());
+        assert_eq!(DeviceKind::Metal.resolve_for(Quant::Q80), DeviceKind::Metal);
+    }
+
     fn defaults() -> Defaults {
         Defaults {
             voice: Some("alba".into()),
@@ -1959,7 +2166,7 @@ mod tests {
             rx: Some(pcm_rx),
             sample_rate: 24000,
             failed: false,
-            workers: Some([backbone, decoder]),
+            workers: Some(vec![backbone, decoder]),
         };
         let (done_tx, done_rx) = mpsc::sync_channel(1);
         let dropper = std::thread::spawn(move || {
@@ -1986,7 +2193,7 @@ mod tests {
             rx: Some(rx),
             sample_rate: 24000,
             failed: false,
-            workers: Some([worker, other]),
+            workers: Some(vec![worker, other]),
         };
         assert!(stream.next().unwrap().is_err());
         assert!(stopped.load(Ordering::Acquire));

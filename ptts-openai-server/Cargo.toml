@@ -2,6 +2,7 @@
 name = "ptts-openai-server"
 version.workspace = true
 edition = "2024"
+publish = false
 description.workspace = true
 repository.workspace = true
 keywords.workspace = true
@@ -13,12 +14,11 @@ anyhow = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 futures-util = { workspace = true }
-hf-hub = { workspace = true }
 kaudio = { workspace = true }
-ptts = { workspace = true, features = ["hf"] }
+ptts = { workspace = true, features = ["hf", "hub"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net"] }
 tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

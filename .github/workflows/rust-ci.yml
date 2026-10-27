@@ -21,6 +21,9 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # What the speech jobs say, and what `speech-check` holds every recording to. No numbers:
+  # Whisper writes those the way it expects them, not the way they were said.
+  SPEECH_TEXT: The weather was cold this morning. We drank hot tea by the window and talked about the trip.
 
 # `--all-features` is never used anywhere here: it turns on `cuda`, whose `cudarc` build script
 # shells out to `nvcc` and fails on every runner. Feature sets are named explicitly.
@@ -55,7 +58,7 @@ jobs:
       - name: Workspace, default features
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: ptts, every optional feature on
-        run: cargo clippy -p ptts --features hf,audio --all-targets -- -D warnings
+        run: cargo clippy -p ptts --features cli --all-targets -- -D warnings
       # The C interface as android/build.sh builds it, so it keeps compiling for Android. No NDK
       # is needed: nothing links and no build script compiles C.
       - name: ptts-ffi for Android
@@ -72,12 +75,18 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         rust: [stable, nightly]
+        include:
+          # The October 9 nightly crashes while compiling numpy on Windows.
+          # Use the compiler that passed this job until the regression is fixed.
+          - os: windows-latest
+            rust: nightly
+            toolchain: nightly-2026-10-08
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ matrix.rust }}
-          cache-key: test-${{ matrix.rust }}
+          toolchain: ${{ matrix.toolchain || matrix.rust }}
+          cache-key: test-${{ matrix.toolchain || matrix.rust }}
       # Two runs because they cover different things: `--all-targets` builds the examples but
       # skips doctests, and a plain `cargo test` runs the doctests. The crate documentation is
       # full of runnable examples, so both matter.
@@ -85,7 +94,7 @@ jobs:
         run: cargo test --workspace --all-targets $WS_EXCLUDE
         shell: bash
       - name: ptts, every optional feature on
-        run: cargo test -p ptts --features hf,audio --all-targets
+        run: cargo test -p ptts --features cli --all-targets
         shell: bash
       # `-p ptts` rather than `--workspace`: it is the only crate with doctests, and selecting
       # the two `cdylib` crates only produces "doc tests are not supported for crate type(s)
@@ -93,6 +102,22 @@ jobs:
       - name: Doctests
         run: cargo test -p ptts --doc && cargo test -p ptts --features hf,audio --doc
         shell: bash
+      # The C interface as a C program sees it. `ptts.h` is written by hand, so the C guide's
+      # example is compiled against the built library: a call it makes that the library no
+      # longer exports fails to link. Argument types are not checked. With no model it can only
+      # fail to load one, which still runs `ptts_new` and `ptts_last_error` through the C ABI.
+      # Not on Windows, whose linker takes different flags.
+      - name: C example
+        if: runner.os != 'Windows' && matrix.rust == 'stable'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p ptts-ffi
+          cc -std=c11 -Wall -Wextra -Wpedantic -Werror ptts-ffi/examples/speak.c -I ptts-ffi/include \
+            -L target/debug -lptts_ffi -Wl,-rpath,"$PWD/target/debug" -o "$RUNNER_TEMP/speak"
+          status=0
+          "$RUNNER_TEMP/speak" no-such-model en "Hello." "$RUNNER_TEMP/speech.wav" || status=$?
+          test "$status" = 1
       # Features that only build on this platform's SDK, or need an arm64 runner like `kai`.
       - name: macOS and arm64 features compile
         if: runner.os == 'macOS'
@@ -121,7 +146,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for features in "" hf audio hf,audio; do
+          for features in "" hf audio hf,audio hub cli; do
             echo "::group::ptts --features ${features:-<none>}"
             cargo check -p ptts --no-default-features --features "$features" --all-targets
             echo "::endgroup::"
@@ -170,14 +195,14 @@ jobs:
         env:
           RUSTDOCFLAGS: --cfg docsrs -D warnings
         # `+nightly` explicitly: the stable toolchain installed above is the default by then.
-        run: cargo +nightly doc -p ptts --no-deps --features hf,audio
+        run: cargo +nightly doc -p ptts --no-deps --features hf,audio,hub
 
       # Stable has no `docsrs` cfg and so no `feature(doc_cfg)`; this is what a contributor
       # running `cargo doc` gets, and it has to stay clean too.
       - name: And as a contributor will
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo +stable doc -p ptts --no-deps --features hf,audio
+        run: cargo +stable doc -p ptts --no-deps --features hf,audio,hub
 
   wasm:
     name: Wasm
@@ -213,6 +238,12 @@ jobs:
         env:
           RUSTFLAGS: -C target-feature=+simd128,+relaxed-simd
         run: cargo check -p ptts-wasm --target wasm32-unknown-unknown --all-targets --features webgpu
+      # The same without Relaxed SIMD, which Safari lacks, and so every browser on iOS: the
+      # package ships these modules too, and xn's kernels must keep building without it.
+      - name: Check the browser build without Relaxed SIMD
+        env:
+          RUSTFLAGS: -C target-feature=+simd128
+        run: cargo check -p ptts-wasm --target wasm32-unknown-unknown --all-targets --features webgpu
       # The JS wrapper that `phonon-tts` ships around this build. Its tests need neither a
       # browser nor a model; building the package itself is `npm-publish.yml`'s job.
       #
@@ -231,7 +262,7 @@ jobs:
       # needs a newer one fails here rather than for whoever builds the package next.
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-pack
+          tool: wasm-pack,cargo-about@0.9
       - name: Install binaryen
         run: |
           curl -sSfL https://github.com/WebAssembly/binaryen/releases/download/version_124/binaryen-version_124-x86_64-linux.tar.gz \
@@ -246,6 +277,13 @@ jobs:
         env:
           RUSTFLAGS: -C target-feature=+simd128,+relaxed-simd
         run: make build
+      - name: Keep the package for the browser speech job
+        uses: actions/upload-artifact@v7
+        with:
+          name: phonon-tts
+          path: ptts-wasm/pkg/
+          if-no-files-found: error
+          retention-days: 3
 
   coreml:
     name: Core ML and the Swift package
@@ -256,7 +294,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           components: clippy
-          targets: aarch64-apple-ios aarch64-apple-ios-sim
+          targets: aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-ios-macabi
           cache-key: coreml
           audio-deps: "false"
       # The Core ML runtime and the C interface's Core ML engine only exist on Apple targets, so
@@ -265,29 +303,234 @@ jobs:
         run: cargo clippy -p ptts-coreml -p ptts-ffi --features ptts-coreml/gguf --all-targets -- -D warnings
       - name: Clippy, iOS
         run: cargo clippy -p ptts-ffi --target aarch64-apple-ios -- -D warnings
-      # What an app actually consumes: the framework for iPhone, simulator and Mac, and the
-      # Swift package compiled against it, in Swift 6 language mode.
+      # What an app actually consumes: the framework for iPhone, simulator, Mac and Mac Catalyst,
+      # and the Swift package compiled against it, in Swift 6 language mode.
       - name: Framework and Swift package
         run: |
           ./ios/build-xcframework.sh
           swift build --package-path ios/PhononTTS
+      # The root Package.swift, the package Swift Package Manager reads from a release tag, is
+      # generated from ios/PhononTTS/Package.swift and pins the last release's framework. Only
+      # its manifest is checked here: main's sources can need a newer framework than that.
+      - name: Root Swift manifest
+        run: |
+          python3 scripts/package-swift.py check
+          swift package dump-package > /dev/null
+
+  # Whether the speech jobs below need to run: only when something they build or use changed,
+  # so a docs-only change does not wait on their release builds. Not a workflow `paths` filter,
+  # which would skip every job. A manual run always runs them.
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      speech: ${{ steps.filter.outputs.speech }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - id: filter
+        shell: bash
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_EVENT_NAME" in
+            # A pull request checks out its merge commit, whose first parent is the base branch.
+            pull_request) base=HEAD^1 ;;
+            push) git fetch --quiet --depth=1 origin "$BEFORE" && base=$BEFORE ;;
+            *) echo "speech=true" >> "$GITHUB_OUTPUT" && exit 0 ;;
+          esac
+          pattern='^(ptts[^/]*/|Cargo\.(toml|lock)$|\.github/workflows/rust-ci\.yml$|\.github/actions/setup-rust/|scripts/check-speech\.py$)'
+          if matched=$(git diff --name-only "$base" HEAD | grep -E "$pattern"); then
+            printf 'The speech jobs run for:\n%s\n' "$matched"
+            echo "speech=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Nothing the speech jobs use changed."
+            echo "speech=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # The default model, from the Hugging Face Hub, speaking through every backend a hosted runner
+  # can run. Nothing else here loads real weights, so a broken kernel, weight format or
+  # tokenizer could ruin the audio with every other job green. Each leg writes WAV files and
+  # `speech-check` listens to them. The command is built with the flags its release is
+  # (`cli-release.yml`), since the CPU kernels are picked at compile time. CUDA and the Neural
+  # Engine need hardware no hosted runner has.
+  speech:
+    name: Speech ${{ matrix.name }}
+    needs: changes
+    if: needs.changes.outputs.speech == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+            rustflags: -C target-cpu=x86-64-v3
+            features: vulkan
+            gpu: vulkan
+          # No dotprod, like the aarch64 Linux release, so xn's kernels for older Arm cores run.
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            rustflags: -C target-cpu=generic
+          - name: macos
+            os: macos-latest
+            rustflags: -C target-cpu=apple-m1
+            features: accelerate,kai,metal
+            gpu: metal
+          - name: windows
+            os: windows-latest
+            rustflags: -C target-cpu=x86-64-v3
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: speech
+          audio-deps: "false"
+      # glslc to build the shaders, and Mesa's lavapipe, a Vulkan driver that runs on the CPU.
+      - name: Install glslc and a software Vulkan driver
+        if: matrix.gpu == 'vulkan'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends glslc mesa-vulkan-drivers
+      - name: Build the command
+        run: cargo build --release --locked -p ptts --features cli,${{ matrix.features }} --bin ptts
+      - name: Speak on the CPU and the GPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HF_HOME="$RUNNER_TEMP/hf"
+          echo "HF_HOME=$HF_HOME" >> "$GITHUB_ENV"
+          mkdir -p speech
+          say() {
+            local name=$1
+            shift
+            target/release/ptts --lang en "$@" -o "speech/${{ matrix.name }}-$name.wav" "$SPEECH_TEXT"
+          }
+          for quant in f32 q8 q4k; do
+            say "cpu-$quant" --device cpu --quant "$quant"
+          done
+          if [ -n "${{ matrix.gpu }}" ]; then
+            say "${{ matrix.gpu }}-f32" --device "${{ matrix.gpu }}" --quant f32
+          fi
+      # `speak.c` against the C interface: on macOS its Core ML engine, which needs the
+      # checkpoint exported first, and elsewhere its CPU one, which reads the checkpoint the
+      # command just downloaded. Not on Windows, whose linker takes different flags.
+      - name: Speak through the C interface
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          snapshots=("$HF_HOME"/hub/models--*/snapshots/*)
+          if [ "${#snapshots[@]}" -ne 1 ]; then
+            echo "::error::expected one downloaded checkpoint, found ${#snapshots[@]}: ${snapshots[*]:-}"
+            exit 1
+          fi
+          model=${snapshots[0]}
+          name=c-api
+          if [ "$RUNNER_OS" = macOS ]; then
+            cargo run --release --locked -p ptts --example export_coreml -- --model "$model" "$RUNNER_TEMP/bundle"
+            model=$RUNNER_TEMP/bundle
+            name=coreml
+          fi
+          cargo build --release --locked -p ptts-ffi
+          cc -std=c11 -O2 ptts-ffi/examples/speak.c -I ptts-ffi/include -L target/release -lptts_ffi \
+            -Wl,-rpath,"$PWD/target/release" -o "$RUNNER_TEMP/speak"
+          "$RUNNER_TEMP/speak" "$model" en "$SPEECH_TEXT" "speech/${{ matrix.name }}-$name.wav"
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: speech-${{ matrix.name }}
+          path: speech/
+          if-no-files-found: error
+          retention-days: 14
+
+  # The npm package `wasm` built, in headless Chrome: the threaded build on a cross-origin
+  # isolated page, the single-threaded one without isolation, and WebGPU on SwiftShader, the
+  # software adapter Chrome ships.
+  speech-browser:
+    name: Speech in the browser
+    needs: [changes, wasm]
+    if: needs.changes.outputs.speech == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: phonon-tts
+          path: ptts-wasm/pkg
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Speak
+        working-directory: ptts-wasm
+        run: |
+          mkdir -p ../speech
+          node scripts/speak-in-chrome.mjs --text "$SPEECH_TEXT" --out ../speech/browser-cpu.wav
+          node scripts/speak-in-chrome.mjs --text "$SPEECH_TEXT" --out ../speech/browser-cpu-one-thread.wav \
+            --no-isolation
+          node scripts/speak-in-chrome.mjs --text "$SPEECH_TEXT" --out ../speech/browser-webgpu.wav \
+            --device webgpu -- --enable-unsafe-webgpu --enable-features=Vulkan --use-webgpu-adapter=swiftshader
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: speech-browser
+          path: speech/
+          if-no-files-found: error
+          retention-days: 14
+
+  # Whisper transcribes every recording, which has to read back as `SPEECH_TEXT`. Listening is
+  # the point: a wrong tokenizer or broken weights still make fluent-sounding speech. Runs even
+  # when a speech job failed, to check what the others made.
+  speech-check:
+    name: Speech check
+    if: ${{ !cancelled() && needs.changes.outputs.speech == 'true' }}
+    needs: [changes, speech, speech-browser]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: speech-*
+          path: speech
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install faster-whisper==1.2.1
+      - run: python scripts/check-speech.py --text "$SPEECH_TEXT" speech
 
   # One job to require in branch protection, instead of every matrix leg by name.
   ci-ok:
     name: CI
     if: always()
-    needs: [fmt, clippy, test, features, docs, wasm, coreml]
+    needs: [fmt, clippy, test, features, docs, wasm, coreml, changes, speech, speech-browser, speech-check]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # A speech job may be skipped only when `changes` said nothing it uses changed.
       - name: Fail if anything upstream did
         shell: bash
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          SPEECH: ${{ needs.changes.outputs.speech }}
         run: |
-          results="${{ join(needs.*.result, ' ') }}"
-          echo "$results"
-          for result in $results; do
-            if [ "$result" != "success" ]; then
-              echo "::error::a required job reported '$result'"
-              exit 1
+          failed=0
+          while read -r job result; do
+            echo "$job: $result"
+            if [ "$result" = skipped ] && [ "$SPEECH" = false ] && [[ "$job" == speech* ]]; then
+              continue
             fi
-          done
+            if [ "$result" != "success" ]; then
+              echo "::error::$job reported '$result'"
+              failed=1
+            fi
+          done < <(jq -r 'to_entries[] | "\(.key) \(.value.result)"' <<<"$NEEDS")
+          exit "$failed"

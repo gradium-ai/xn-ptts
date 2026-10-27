@@ -50,7 +50,7 @@ private struct Pointer<P>: @unchecked Sendable {
 
 /// Text to speech with Phonon, on the Neural Engine.
 ///
-/// Load once and keep it: loading reads ~400 MB of models and, on the first launch after an
+/// Load once and keep it: loading reads the models and, on the first launch after an
 /// install or a model update, compiles them for this device (about 10 s on an iPhone 16 Pro).
 /// Speaking is then much faster than real time, and audio is delivered as it is generated.
 ///
@@ -63,19 +63,34 @@ public final class Phonon: @unchecked Sendable {
     /// The voices the models were exported with, sorted.
     public let voices: [String]
 
+    /// The languages the model was trained for, as its config lists them.
+    public let languages: [String]
+
     private let handle: OpaquePointer
     // Every call into the handle runs here: the Rust side is not reentrant.
     private let queue: DispatchQueue
     private let current: Mutex<String>
+    private let currentLanguage: Mutex<Language>
 
     /// The voice speaking, one of `voices`.
     public var voice: String { current.withLock { $0 } }
 
-    private init(handle: OpaquePointer, queue: DispatchQueue) {
+    /// How text is normalized, as given to `load` or `setLanguage(_:)`.
+    public var language: Language { currentLanguage.withLock { $0 } }
+
+    private init(handle: OpaquePointer, queue: DispatchQueue, language: Language) {
         self.handle = handle
         self.queue = queue
+        let names = Self.names(ptts_voices(handle))
+        voices = names
+        languages = Self.names(ptts_languages(handle))
+        current = Mutex(names.first ?? "")
+        currentLanguage = Mutex(language)
+    }
+
+    private static func names(_ block: UnsafePointer<CChar>?) -> [String] {
         var names: [String] = []
-        if var p = ptts_voices(handle) {
+        if var p = block {
             while true {
                 let s = String(cString: p)
                 if s.isEmpty { break }
@@ -83,8 +98,7 @@ public final class Phonon: @unchecked Sendable {
                 p = p.advanced(by: s.utf8.count + 1)
             }
         }
-        voices = names
-        current = Mutex(names.first ?? "")
+        return names
     }
 
     deinit {
@@ -131,7 +145,7 @@ public final class Phonon: @unchecked Sendable {
             }) else { throw lastError(nil) }
             return Pointer(p: h)
         }
-        return Phonon(handle: h.p, queue: queue)
+        return Phonon(handle: h.p, queue: queue, language: language)
     }
 
     /// Switch to another of `voices`. This conditions the model on it, up to about 0.6 s on
@@ -142,6 +156,18 @@ public final class Phonon: @unchecked Sendable {
             guard name.withCString({ ptts_set_voice(h.p, $0) }) else { throw Self.lastError(h.p) }
         }
         current.withLock { $0 = name }
+    }
+
+    /// Normalize text as `language` from the next utterance on. Nothing is reloaded, so this is
+    /// immediate. Pair it with a voice of that language: the voice carries the accent.
+    public func setLanguage(_ language: Language) async throws {
+        let h = Pointer(p: handle)
+        try await Self.run(on: queue) {
+            guard language.rawValue.withCString({ ptts_set_language(h.p, $0) }) else {
+                throw Self.lastError(h.p)
+            }
+        }
+        currentLanguage.withLock { $0 = language }
     }
 
     private final class Sink: @unchecked Sendable {
@@ -183,7 +209,8 @@ public final class Phonon: @unchecked Sendable {
         }
     }
 
-    /// Speak `text` as a stream of sample chunks. Ending the iteration early stops generation.
+    /// Speak `text` as a stream of sample chunks. Cancel the consuming task to stop generation.
+    /// Breaking out of the loop alone does not reliably terminate the stream's producer.
     public func stream(_ text: String) -> AsyncThrowingStream<[Float], Error> {
         AsyncThrowingStream { continuation in
             let task = Task {

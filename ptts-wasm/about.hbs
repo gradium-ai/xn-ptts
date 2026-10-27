@@ -1,0 +1,23 @@
+# Third-party licences
+
+The WebAssembly modules in `phonon-tts` are compiled from the Rust crates listed here and from
+the Rust standard library, which is available under the MIT or Apache-2.0 licence
+(https://github.com/rust-lang/rust). Each distinct licence text is given once, with the crates
+it covers.
+
+{{#each overview}}
+- {{{name}}} ({{count}})
+{{/each}}
+{{#each licenses}}
+
+## {{{name}}}
+
+Used by:
+{{#each used_by}}
+- [{{crate.name}} {{crate.version}}]({{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}})
+{{/each}}
+
+```text
+{{{text}}}
+```
+{{/each}}

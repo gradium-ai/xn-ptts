@@ -1,0 +1,12 @@
+# Build outputs, AI Hub artifacts, bundles, model files and audio stay out of git.
+runner/build*/
+text-ffi/target/
+text-ffi/dist/
+export/out/
+export/bundle/
+export/ref/
+export/logs/
+export/__pycache__/
+*.wav
+*.bin
+*.dlc

@@ -1,14 +1,136 @@
 //! Numbers read out with their scale words.
 
-use super::suffix;
+use super::{all_digits, split_suffix, suffix};
 use crate::preprocess::Lang;
 
 /// Large numbers with their scale words: "1,234.56" becomes "1 thousand 234 point 56", and in
 /// French "1234,56" becomes "mille 234 virgule 56". Values under a thousand and years stay as
 /// digits, and a leading zero marks a code, not a quantity.
 pub(super) fn numbers(word: &str, lang: Lang) -> Option<String> {
-    let (words, suffix) = number_words(word, lang)?;
-    Some(format!("{words}{suffix}"))
+    let (body, end) = split_suffix(word);
+    if body.len() >= 2 && body.starts_with('0') && all_digits(body) {
+        return Some(format!("{}{end}", spell(body, lang)));
+    }
+    if let Some(range) = range(body, lang) {
+        return Some(format!("{range}{end}"));
+    }
+    // The Spanish ordinals written "1.er" and "3.er", which the URL rule would otherwise read
+    // as a domain.
+    if lang == Lang::Es {
+        match body.strip_suffix("er").map(|n| n.strip_suffix('.').unwrap_or(n)) {
+            Some("1") => return Some(format!("primer{end}")),
+            Some("3") => return Some(format!("tercer{end}")),
+            _ => {}
+        }
+    }
+    if let Some((words, suffix)) = number_words(word, lang) {
+        return Some(format!("{words}{suffix}"));
+    }
+    let (head, tail) = word.split_at(word.find('-')?);
+    if !tail[1..].starts_with(|c: char| c.is_alphabetic()) {
+        return None;
+    }
+    match number_words(head, lang)? {
+        (words, "") => Some(format!("{words}{tail}")),
+        _ => None,
+    }
+}
+
+fn range(body: &str, lang: Lang) -> Option<String> {
+    let (from, to) = body.split_once('-')?;
+    // German ranges start from a single digit too: "8-10 Stunden", "0-2 Jahren".
+    let shortest = if lang == Lang::De { 1 } else { 2 };
+    let small = |s: &str| {
+        (shortest..=3).contains(&s.len()) && all_digits(s) && (s.len() == 1 || !s.starts_with('0'))
+    };
+    let year =
+        |s: &str| s.len() == 4 && all_digits(s) && (s.starts_with("1") || s.starts_with("20"));
+    let ok = match (from.len(), to.len()) {
+        _ if small(from) && small(to) => from.parse::<u32>().ok()? < to.parse::<u32>().ok()?,
+        (4, 4) => year(from) && year(to) && from < to,
+        (4, 2) => year(from) && all_digits(to) && &from[2..] < to,
+        _ => false,
+    };
+    if !ok {
+        return None;
+    }
+    let word = match lang {
+        Lang::En => "to",
+        Lang::Fr => "à",
+        Lang::De => "bis",
+        Lang::Es | Lang::Pt => "a",
+    };
+    Some(format!("{from} {word} {to}"))
+}
+
+fn spell(s: &str, lang: Lang) -> String {
+    let words: [&str; 10] = match lang {
+        Lang::En => {
+            ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]
+        }
+        Lang::Fr => {
+            ["zéro", "un", "deux", "trois", "quatre", "cinq", "six", "sept", "huit", "neuf"]
+        }
+        Lang::De => {
+            ["null", "eins", "zwei", "drei", "vier", "fünf", "sechs", "sieben", "acht", "neun"]
+        }
+        Lang::Es => {
+            ["cero", "uno", "dos", "tres", "cuatro", "cinco", "seis", "siete", "ocho", "nueve"]
+        }
+        Lang::Pt => {
+            ["zero", "um", "dois", "três", "quatro", "cinco", "seis", "sete", "oito", "nove"]
+        }
+    };
+    let spoken = s.chars().filter(|&c| c != '-').map(|c| match c.to_digit(10) {
+        Some(d) => words[d as usize].to_string(),
+        None => c.to_string(),
+    });
+    spoken.collect::<Vec<_>>().join(" ")
+}
+
+pub(super) fn digit_run(words: &[&str], lang: Lang) -> Option<(String, usize)> {
+    let group = |s: &str| {
+        (1..=8).contains(&s.len())
+            && s.bytes().all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
+            && s.bytes().any(|b| b.is_ascii_digit())
+    };
+    let plus = words.first()?.starts_with('+');
+    let mut bodies = vec![];
+    let mut end = "";
+    for word in words {
+        let (body, suffix) = split_suffix(word);
+        let body = if bodies.is_empty() && plus { &body[1..] } else { body };
+        if !group(body) {
+            break;
+        }
+        bodies.push(body);
+        if !suffix.is_empty() {
+            end = suffix;
+            break;
+        }
+    }
+    let years = bodies.iter().all(|b| b.len() == 4 && matches!(&b[..2], "19" | "20"));
+    let long = bodies.len() >= 3 && !years;
+    if !long && !(bodies.len() == 2 && (plus || bodies.iter().any(|b| b.starts_with('0')))) {
+        return None;
+    }
+    let spelled = bodies.iter().map(|b| spell(b, lang)).collect::<Vec<_>>().join(", ");
+    let spelled = if plus { format!("{} {spelled}", lang.special_chars().plus) } else { spelled };
+    Some((format!("{spelled}{end}"), bodies.len()))
+}
+
+pub(super) fn ending_in(prev: Option<&str>, words: &[&str], lang: Lang) -> Option<(String, usize)> {
+    let prev = prev?.to_lowercase();
+    if !matches!(prev.as_str(), "ending" | "ends" | "ended") || *words.first()? != "in" {
+        return None;
+    }
+    let (body, end) = split_suffix(words.get(1)?);
+    let code = body.strip_prefix('-')?;
+    let ok = |b: u8| b.is_ascii_digit() || b.is_ascii_uppercase() || b == b'-';
+    if !code.bytes().any(|b| b.is_ascii_digit()) || !code.bytes().all(ok) {
+        return None;
+    }
+    Some((format!("in {}{end}", spell(code, lang)), 2))
 }
 
 /// What [`numbers`] reads `word` as, and the trailing punctuation it carries through, kept apart
@@ -143,9 +265,19 @@ mod tests {
             ("-4500", Some("minus 4 thousand 500")),
             ("-12.", Some("minus 12.")),
             // Not quantities: a code, a time, a range, a unit, a value past a trillion.
-            ("007", None),
+            ("007", Some("zero zero seven")),
+            ("0600.", Some("zero six zero zero.")),
+            ("7,000-ton", Some("7 thousand-ton")),
+            ("20-year-old", Some("20-year-old")),
+            ("20-25", Some("20 to 25")),
+            ("10-5", None),
+            ("22-22", None),
+            ("3-5", None),
             ("12:30", None),
-            ("10-15", None),
+            ("10-15", Some("10 to 15")),
+            ("1445-1450", Some("1445 to 1450")),
+            ("2024-25", Some("2024 to 25")),
+            ("1999-1998", None),
             ("3.5%", None),
             ("1234567890123", None),
             ("hello", None),
@@ -197,6 +329,14 @@ mod tests {
             (Lang::Pt, "2000000", Some("2 milhões")),
             (Lang::Pt, "2001000", Some("2 milhões mil")),
             (Lang::Pt, "1000000000", Some("1 bilhão")),
+            (Lang::De, "8-10", Some("8 bis 10")),
+            (Lang::De, "0-2", Some("0 bis 2")),
+            (Lang::De, "3-1", None),
+            (Lang::De, "01-5", None),
+            (Lang::Fr, "3-5", None),
+            (Lang::Es, "3.er", Some("tercer")),
+            (Lang::Es, "1er,", Some("primer,")),
+            (Lang::Es, "2.er", None),
         ];
         for (lang, input, expected) in rest {
             assert_eq!(numbers(input, lang).as_deref(), expected, "{lang:?} {input:?}");

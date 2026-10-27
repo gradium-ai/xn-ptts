@@ -3,15 +3,19 @@
 
 use super::Lang;
 
+mod abbreviations;
 mod currency;
 mod dashed_digits;
 mod dates;
+mod elongations;
 mod emails;
 mod numbers;
 mod phones;
 mod times;
 mod tlds;
 mod urls;
+
+pub(super) use currency::is_symbol as is_currency_symbol;
 
 /// A rule: it rewrites a whole word in a language, or declines it.
 type Rewrite = fn(&str, Lang) -> Option<String>;
@@ -37,6 +41,8 @@ const RULES: &[Rule] = &[
     Rule { name: "dashed-digits", rewrite: dashed_digits::dashed_digits, default: true },
     Rule { name: "emails", rewrite: emails::emails, default: true },
     Rule { name: "urls", rewrite: urls::urls, default: true },
+    Rule { name: "abbreviations", rewrite: abbreviations::abbreviations, default: true },
+    Rule { name: "elongations", rewrite: elongations::elongations, default: true },
     Rule { name: "phones", rewrite: phones::phones, default: false },
     Rule { name: "times", rewrite: times::times, default: false },
     Rule { name: "dates", rewrite: dates::dates, default: false },
@@ -103,6 +109,50 @@ pub fn rewrite_word(word: &str, lang: Lang, rules: Rules) -> Option<String> {
         .find_map(|(_, rule)| (rule.rewrite)(word, lang))
 }
 
+impl Rules {
+    fn has(self, name: &str) -> bool {
+        RULES.iter().position(|rule| rule.name == name).is_some_and(|i| self.0 & (1 << i) != 0)
+    }
+}
+
+pub(super) fn rewrite_text(
+    text: &str,
+    lang: Lang,
+    rules: Rules,
+    unclaimed: impl Fn(&str) -> String,
+) -> String {
+    let words: Vec<&str> = text.split(' ').collect();
+    let mut out: Vec<String> = Vec::with_capacity(words.len());
+    let mut i = 0;
+    while i < words.len() {
+        let prev = out.last().map(String::as_str);
+        let span = None
+            .or_else(|| {
+                rules.has("currency").then(|| currency::scaled(&words[i..], lang)).flatten()
+            })
+            .or_else(|| {
+                rules.has("numbers").then(|| numbers::digit_run(&words[i..], lang)).flatten()
+            })
+            .or_else(|| {
+                rules.has("numbers").then(|| numbers::ending_in(prev, &words[i..], lang)).flatten()
+            })
+            .or_else(|| {
+                rules
+                    .has("abbreviations")
+                    .then(|| abbreviations::ranks(&words[i..], lang))
+                    .flatten()
+            });
+        if let Some((rewritten, used)) = span {
+            out.push(rewritten);
+            i += used;
+            continue;
+        }
+        out.push(rewrite_word(words[i], lang, rules).unwrap_or_else(|| unclaimed(words[i])));
+        i += 1;
+    }
+    out.join(" ")
+}
+
 /// The sentence punctuation a rule carries through at the end of a word.
 const PUNCTUATION: &str = "!?.:,;…";
 
@@ -150,7 +200,9 @@ mod tests {
     fn rules_pick_what_runs() {
         assert_eq!("all".parse::<Rules>().unwrap(), Rules::ALL);
         assert_eq!("default".parse::<Rules>().unwrap(), Rules::DEFAULT);
-        let default = "numbers,currency,dashed-digits,emails,urls".parse::<Rules>().unwrap();
+        let default = "numbers,currency,dashed-digits,emails,urls,abbreviations,elongations"
+            .parse::<Rules>()
+            .unwrap();
         assert_eq!(default, Rules::DEFAULT);
         let opt_in = "phones,times,dates".parse::<Rules>().unwrap();
         assert_eq!(Rules(default.0 | opt_in.0), Rules::ALL);

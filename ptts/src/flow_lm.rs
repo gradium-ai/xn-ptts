@@ -7,6 +7,7 @@
 // Re-exported because `FlowLM::conditioner` is public and frontends tokenize through it.
 pub use crate::conditioners::LUTConditioner;
 use crate::mlp::SimpleMLPAdaLN;
+pub use crate::mlp::TimeRmsNorm;
 use crate::transformer::{StreamingTransformer, StreamingTransformerState};
 use crate::tts_model::TTSConfig;
 use std::collections::HashMap;
@@ -117,6 +118,40 @@ pub struct FlowLMConfig {
     pub flow_dim: usize,
     pub flow_depth: usize,
     pub ldim: usize,
+    /// FFN activation; when absent, [`TTSConfig::default_gelu`] decides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gelu: Option<crate::transformer::Gelu>,
+    /// The flow net's time-embedding RMS norm, see [`TimeRmsNorm`]: `rms_var` (the default) for
+    /// pocket-tts checkpoints, `rms` for audiocraft (phonon) ones.
+    #[serde(default)]
+    pub time_rms_norm: TimeRmsNorm,
+    /// How the flow net turns noise into a latent, see [`FlowType`].
+    #[serde(default)]
+    pub flow_type: FlowType,
+    /// Width of the backbone output the flow net and the EOS head read: a bias-free `z_proj`
+    /// from `d_model` when set, the transformer output itself when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub z_dim: Option<usize>,
+    /// Width of the attention's queries and output, `d_model` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attn_dim: Option<usize>,
+    /// Key/value heads, each shared by `num_heads / num_kv_heads` query heads (grouped-query
+    /// attention), `num_heads` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_kv_heads: Option<usize>,
+}
+
+/// The flow net's sampler.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowType {
+    /// Lagrangian self-distillation: `lsd_decode_steps` steps, each conditioned on two times.
+    #[default]
+    Lsd,
+    /// One evaluation without time conditions, whose output is the latent.
+    Drifting,
+    /// One evaluation without time conditions, whose output is added to the noise.
+    Pointwise,
 }
 
 /// Transformer-based flow language model.
@@ -133,6 +168,9 @@ pub struct FlowLM<Q: BackendQ> {
     out_norm_weight: Tensor<Q::T, Q::B>,
     out_norm_bias: Tensor<Q::T, Q::B>,
     out_eos: Linear<Q::T, Q::B>,
+    z_proj: Option<Linear<Q::T, Q::B>>,
+    flow_type: FlowType,
+    /// Width of the backbone output the flow net and the EOS head read.
     pub dim: usize,
     pub ldim: usize,
 }
@@ -177,17 +215,25 @@ impl<Q: BackendQ> FlowLM<Q> {
             conditions,
         )?;
 
+        let dim = cfg.z_dim.unwrap_or(cfg.d_model);
+        let num_time_conds = match cfg.flow_type {
+            FlowType::Lsd => 2,
+            FlowType::Drifting | FlowType::Pointwise => 0,
+        };
         let flow_net = SimpleMLPAdaLN::load(
             &vb.pp("flow_net"),
             cfg.ldim,       // in_channels
             cfg.flow_dim,   // model_channels
             cfg.ldim,       // out_channels
-            cfg.d_model,    // cond_channels
+            dim,            // cond_channels
             cfg.flow_depth, // num_res_blocks
-            2,              // num_time_conds
+            num_time_conds,
+            cfg.time_rms_norm,
         )?;
+        let z_proj =
+            cfg.z_dim.map(|z| Linear::load(vb.pp("z_proj"), cfg.d_model, z)).transpose()?;
 
-        let transformer = StreamingTransformer::load(
+        let mut transformer = StreamingTransformer::load(
             &vb.pp("transformer"),
             cfg.d_model,
             cfg.num_heads,
@@ -196,8 +242,12 @@ impl<Q: BackendQ> FlowLM<Q> {
             cfg.dim_feedforward,
             None,
             cfg.max_period,
-            crate::transformer::Kind::FlowLm,
+            crate::transformer::Kind::FlowLm {
+                attn_dim: cfg.attn_dim.unwrap_or(cfg.d_model),
+                num_kv_heads: cfg.num_kv_heads.unwrap_or(cfg.num_heads),
+            },
         )?;
+        transformer.set_gelu(cfg.gelu.unwrap_or_else(|| config.default_gelu()));
 
         let emb_std = vb.tensor("emb_std", (cfg.ldim,))?;
         let emb_mean = vb.tensor("emb_mean", (cfg.ldim,))?;
@@ -205,7 +255,7 @@ impl<Q: BackendQ> FlowLM<Q> {
         let input_linear = Linear::load(vb.pp("input_linear"), cfg.ldim, cfg.d_model)?;
         let out_norm_weight = vb.pp("out_norm").tensor("weight", (cfg.d_model,))?;
         let out_norm_bias = vb.pp("out_norm").tensor("bias", (cfg.d_model,))?;
-        let out_eos = Linear::load_b(vb.pp("out_eos"), cfg.d_model, 1)?;
+        let out_eos = Linear::load_b(vb.pp("out_eos"), dim, 1)?;
 
         Ok(Self {
             conditioner,
@@ -219,7 +269,9 @@ impl<Q: BackendQ> FlowLM<Q> {
             out_norm_weight,
             out_norm_bias,
             out_eos,
-            dim: cfg.d_model,
+            z_proj,
+            flow_type: cfg.flow_type,
+            dim,
             ldim: cfg.ldim,
         })
     }
@@ -247,7 +299,11 @@ impl<Q: BackendQ> FlowLM<Q> {
         // Remove prefix, keep only last seq_len positions
         let total = out.dim(1usize)?;
         let start = total - seq_len;
-        out.narrow(1, start..total)?.contiguous()
+        let out = out.narrow(1, start..total)?.contiguous()?;
+        match &self.z_proj {
+            Some(z_proj) => z_proj.forward(&out),
+            None => Ok(out),
+        }
     }
 
     fn step_embedding(&self, input: StepInput<'_, Q>) -> Result<Tensor<Q::T, Q::B>> {
@@ -274,7 +330,11 @@ impl<Q: BackendQ> FlowLM<Q> {
         let noise_data: Vec<Q::T> =
             (0..b * self.ldim).map(|_| Q::T::from_f32(rng.sample())).collect();
         let noise = Tensor::from_vec(noise_data, (b, self.ldim), t_out.device())?;
-        let latent = lsd_decode(&self.flow_net, t_out, &noise, lsd_decode_steps)?;
+        let latent = match self.flow_type {
+            FlowType::Lsd => lsd_decode(&self.flow_net, t_out, &noise, lsd_decode_steps)?,
+            FlowType::Drifting => self.flow_net.forward(t_out, &[], &noise)?,
+            FlowType::Pointwise => noise.add(&self.flow_net.forward(t_out, &[], &noise)?)?,
+        };
         Ok((latent.reshape((b, 1, self.ldim))?, eos_logit))
     }
 

@@ -16,6 +16,8 @@
     "./worker.js": "./worker.js",
     "./wasm/phonon_tts_bg.wasm": "./wasm/phonon_tts_bg.wasm",
     "./wasm-threads/phonon_tts_bg.wasm": "./wasm-threads/phonon_tts_bg.wasm",
+    "./wasm/phonon_tts_simd_bg.wasm": "./wasm/phonon_tts_simd_bg.wasm",
+    "./wasm-threads/phonon_tts_simd_bg.wasm": "./wasm-threads/phonon_tts_simd_bg.wasm",
     "./package.json": "./package.json"
   },
   "files": [
@@ -23,16 +25,20 @@
     "index.d.ts",
     "worker.js",
     "fetch.js",
+    "hub.js",
     "wav.js",
     "threads.js",
     "device.js",
+    "simd.js",
     "wasm/phonon_tts.js",
     "wasm/phonon_tts.d.ts",
     "wasm/phonon_tts_bg.wasm",
     "wasm/phonon_tts_bg.wasm.d.ts",
+    "wasm/phonon_tts_simd_bg.wasm",
     "wasm-threads/",
     "LICENSE-MIT",
-    "LICENSE-APACHE"
+    "LICENSE-APACHE",
+    "THIRD_PARTY_LICENSES.md"
   ],
   "sideEffects": [
     "./worker.js"
@@ -47,7 +53,7 @@
     "webassembly",
     "on-device",
     "offline",
-    "pocket-tts"
+    "phonon"
   ],
   "license": "MIT OR Apache-2.0",
   "author": "Gradium",

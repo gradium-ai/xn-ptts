@@ -33,6 +33,8 @@ pub struct PttsHandle {
     engine: Engine,
     /// The voice names as NUL-separated bytes, so `ptts_voices` can hand out a borrowed pointer.
     voice_blob: Vec<u8>,
+    /// The same for `ptts_languages`.
+    language_blob: Vec<u8>,
     last_error: Option<CString>,
 }
 
@@ -76,15 +78,21 @@ fn guarded<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     })
 }
 
+fn nul_separated(names: &[String]) -> Vec<u8> {
+    let mut blob = Vec::new();
+    for n in names {
+        blob.extend_from_slice(n.as_bytes());
+        blob.push(0);
+    }
+    blob.push(0);
+    blob
+}
+
 fn open(dir: &Path, unit: u32, lang: &str) -> Result<PttsHandle, String> {
     let engine = Engine::open(dir, unit, lang)?;
-    let mut voice_blob = Vec::new();
-    for v in engine.voices() {
-        voice_blob.extend_from_slice(v.as_bytes());
-        voice_blob.push(0);
-    }
-    voice_blob.push(0);
-    Ok(PttsHandle { engine, voice_blob, last_error: None })
+    let voice_blob = nul_separated(engine.voices());
+    let language_blob = nul_separated(engine.languages());
+    Ok(PttsHandle { engine, voice_blob, language_blob, last_error: None })
 }
 
 /// Load the model in `dir` for `unit` (`PTTS_UNIT_ANE` or `PTTS_UNIT_CPU`), normalizing text as
@@ -151,6 +159,16 @@ pub unsafe extern "C" fn ptts_voices(h: *const PttsHandle) -> *const c_char {
     unsafe { (*h).voice_blob.as_ptr() as *const c_char }
 }
 
+/// The languages the model was trained for, as its config lists them, in the same block format
+/// as `ptts_voices`. Borrowed.
+///
+/// # Safety
+/// `h` must come from `ptts_new`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ptts_languages(h: *const PttsHandle) -> *const c_char {
+    unsafe { (*h).language_blob.as_ptr() as *const c_char }
+}
+
 /// Switch to one of `ptts_voices`. Returns false on failure; see `ptts_last_error`.
 ///
 /// # Safety
@@ -166,6 +184,25 @@ pub unsafe extern "C" fn ptts_set_voice(h: *mut PttsHandle, name: *const c_char)
         h.engine.set_voice(&name)
     });
     match r {
+        Ok(()) => true,
+        Err(e) => {
+            h.last_error = Some(c_string(&e));
+            false
+        }
+    }
+}
+
+/// Normalize text as `lang` (`en`, `fr`, `de`, `es`, `pt`, or `none`) from the next `ptts_speak`
+/// on, as `ptts_new` does: switching languages needs no reload. Returns false on failure; see
+/// `ptts_last_error`.
+///
+/// # Safety
+/// `h` must come from `ptts_new`; `lang` must be NUL-terminated UTF-8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ptts_set_language(h: *mut PttsHandle, lang: *const c_char) -> bool {
+    let h = unsafe { &mut *h };
+    let lang = unsafe { CStr::from_ptr(lang) }.to_string_lossy().to_string();
+    match guarded(|| h.engine.set_language(&lang)) {
         Ok(()) => true,
         Err(e) => {
             h.last_error = Some(c_string(&e));

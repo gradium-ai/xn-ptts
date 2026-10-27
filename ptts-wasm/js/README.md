@@ -1,6 +1,6 @@
 # phonon-tts
 
-Text-to-speech that runs in the browser, on the user's device. No server, no API key. It streams speech from an explicitly supplied Phonon checkpoint, compiled to WebAssembly from the [Rust runtime](https://github.com/gradium-ai/xn-ptts).
+Text-to-speech that runs in the browser, on the user's device. No server, no API key. It streams speech from a Phonon checkpoint, compiled to WebAssembly from the [Rust runtime](https://github.com/gradium-ai/xn-ptts).
 
 ```bash
 npm install phonon-tts
@@ -9,20 +9,12 @@ npm install phonon-tts
 ```js
 import { PhononTTS } from 'phonon-tts';
 
-const tts = await PhononTTS.load({
-  lang: 'en',
-  model: {
-    weights: { q8: '/model/model.q8.gguf' },
-    tokenizer: '/model/tokenizer.json',
-    config: '/model/config.json',
-    voices: { Freya: '/model/voices/Freya.safetensors' },
-  },
-});
+const tts = await PhononTTS.load({ lang: 'en' });
 const wav = await tts.synthWav('Hello from your own browser.');
 new Audio(URL.createObjectURL(wav)).play();
 ```
 
-`model` is required: it says where the checkpoint's files are, here a model folder served under `/model/`. See [The model](#the-model) below.
+Without `model`, `load` uses the default model, `DEFAULT_MODEL`, from the Hugging Face Hub: Phonon 31m, which speaks English. See [The model](#the-model) below for another one.
 
 The first `load` downloads the files, whose size depends on the checkpoint. They are kept in the browser's Cache API, so later page loads start from disk.
 
@@ -46,7 +38,7 @@ for await (const pcm of tts.stream('A longer piece of text. It is split at sente
 }
 ```
 
-Long text is grouped into sentence-aligned chunks and spoken one after another. The usual target is 50 text tokens per chunk; a longer single sentence is split at up to 200 tokens. An indivisible piece over 200 tokens returns an input error before generation.
+Long text is grouped into sentence-aligned chunks and spoken one after another. The usual target is 50 text tokens per chunk; a longer single sentence is split at up to 200 tokens, cutting even a single word over the limit between its characters.
 
 To stop, break out of the loop, call `stream.cancel()`, or pass an `AbortSignal`:
 
@@ -56,7 +48,11 @@ const speech = tts.stream(text, { signal: controller.signal });
 stopButton.onclick = () => controller.abort();
 ```
 
-`speech.done` resolves with timing stats (frames, time to first audio, per-frame time) once generation ends.
+Cancellation discards unread stream chunks. Stop any audio already scheduled in your player separately, for example by closing its `AudioContext`. Wait for `speech.done` to finish cancellation before reusing playback resources; the next request on the same model is queued automatically.
+
+`speech.done` resolves with timing stats (frames, time to first audio, per-frame time) once generation ends. `stats.cancelled` reports whether the worker stopped before generation finished; it can be false if cancellation arrived after the worker finished.
+
+**Migration note:** `cancel()` now discards unread chunks even when generation has already finished. To keep all generated audio, drain the stream without cancelling it.
 
 ## API
 
@@ -64,17 +60,17 @@ stopButton.onclick = () => controller.abort();
 
 | Option | Default | |
 |---|---|---|
-| `model` | **required** | where the checkpoint's files are, see [The model](#the-model) |
+| `model` | `DEFAULT_MODEL` | where the checkpoint's files are, see [The model](#the-model) |
 | `lang` | **required** | `'en'`, `'fr'`, `'de'`, `'es'`, `'pt'`, or `'none'`. Numbers, dates and symbols are read out the way a speaker of that language would say them. The spoken forms differ per language, so there is no default. `'none'` passes text through as written. |
-| `rewrites` | `'default'` | which word rewrites run on the normalized text: `'default'` (numbers, currency, dashed-digits, emails, urls), `'all'` (those and phones, times, dates), `'none'`, or a comma-separated list of rule names. Inert when `lang` is `'none'`. |
-| `conditions` | | values for the conditioners the checkpoint's `config.json` lists, by name, e.g. `{ padding_bonus: 0.5 }`. Those left out take their defaults. |
+| `rewrites` | `'default'` | which word rewrites run on the normalized text: `'default'` (numbers, currency, dashed-digits, emails, urls, abbreviations, elongations), `'all'` (those and phones, times, dates), `'none'`, or a comma-separated list of rule names. Inert when `lang` is `'none'`. |
+| `conditions` | | values for the conditioners the checkpoint's `config.json` lists, by name, e.g. `{ duration_delta: 0.3 }`. Those left out take their defaults. |
 | `quant` | `'q8'` | `'q8'` (smaller, faster) or `'f32'` |
 | `voices` | the default voice | voices to fetch during `load`. Others are fetched the first time they are used. |
 | `cache` | `true` | keep downloads in the Cache API |
 | `onProgress` | | `({ file, loaded, total, cached }) => void`, for a progress bar |
 | `device` | `'cpu'` | `'cpu'`, `'webgpu'` or `'auto'`: where to generate, see [WebGPU](#webgpu) |
 | `threads` | `'auto'` | CPU threads to generate on, or `'auto'` for 3. Needs a cross-origin isolated page, see [Threads](#threads) |
-| `workerUrl`, `wasmUrl`, `threadsWasmUrl` | beside `index.js` | for setups that serve the package's files from elsewhere |
+| `workerUrl`, `wasmUrl`, `threadsWasmUrl`, `simdWasmUrl`, `threadsSimdWasmUrl` | beside `index.js` | for setups that serve the package's files from elsewhere |
 
 ### Instance
 
@@ -83,6 +79,7 @@ stopButton.onclick = () => controller.abort();
 - `tts.synthWav(text, options)` returns a WAV `Blob`.
 - `tts.voices`: the names you can pass as `voice`: the keys of `model.voices`, plus any added with `addVoice`.
 - `tts.addVoice(name, source)` registers a voice from a URL, `Blob` or bytes of a voice `.safetensors` file.
+- `tts.languages`: the languages the checkpoint's config says it was trained for.
 - `tts.sampleRate`: 24000.
 - `tts.device`: `'webgpu'` or `'cpu'`, where generation runs, and `tts.deviceReason` why.
 - `tts.threads`: the CPU threads generation runs on, and `tts.threadsReason` why that many.
@@ -100,7 +97,7 @@ Requests on one instance run one at a time, in the order they were made.
 
 ## The model
 
-`model` says where a checkpoint's files are. Relative URLs resolve against the page. There is no default: loading a checkpoint other than the one you meant still produces plausible speech, so the package never picks one for you.
+`model` says where a checkpoint's files are. Relative URLs resolve against the page. Left out, it is `DEFAULT_MODEL`, which the package exports: Phonon 31m (English), a public Hugging Face repo pinned to a commit.
 
 ```js
 await PhononTTS.load({
@@ -117,15 +114,23 @@ await PhononTTS.load({
 
 `defaultVoice` is the voice used when a request names none; it defaults to the first of `voices`. Only the weights for the `quant` you load have to be listed.
 
-Every model needs its own `config.json` and `tokenizer.json`. Supply their URLs in `ModelSpec`; the package has no model or config fallback. Pocket TTS checkpoints work through this same interface when they supply those files and compatible weights.
+A public Hugging Face repo can be named instead, as `hf://owner/name` or `hf://owner/name@revision` (a branch, tag or commit; `main` when left out):
+
+```js
+await PhononTTS.load({ lang: 'en', model: 'hf://gradium/phonon-31m-en@COMMIT_SHA' });
+```
+
+One request to the Hub finds the commit and the repo's files, and every file URL is pinned to that commit, so a cached file is never served after the repo changes. The files are picked as the native frontends pick them: `config.json`, `tokenizer.json`, `model.q8.gguf` or `model.safetensors`, and voices under `voices/` or `embeddings/` plus `default-voice.safetensors` as `default`. The Hub's answer is cached too, so a model loaded once also loads offline, or while the Hub fails; a branch then means the commit it pointed at when last looked up. Private and gated repos cannot be loaded this way: the browser has no token to send. That includes the Phonon 40m models. To use one, accept its terms on its Hugging Face page, download its files, and serve them with your app through a `ModelSpec` as above, under the model's license.
+
+Every model needs its own `config.json` and `tokenizer.json`. Supply their URLs in `ModelSpec`, or a repo that has them; the package has no model or config fallback. Pocket TTS checkpoints work through this same interface when they supply those files and compatible weights.
 
 ## How it runs
 
-The model runs in a dedicated Web Worker, on the GPU through WebGPU when the browser offers it and on the CPU otherwise. Generating never blocks the page, and the main thread only receives audio. The package is plain ES modules and needs no bundler. The worker is referenced with `new URL('./worker.js', import.meta.url)`, which Vite, webpack 5, Parcel and esbuild all recognise and bundle.
+The model runs in a dedicated Web Worker, on the CPU unless you ask for the GPU (see [WebGPU](#webgpu)). Generating never blocks the page, and the main thread only receives audio. The package is plain ES modules and needs no bundler. The worker is referenced with `new URL('./worker.js', import.meta.url)`, which Vite, webpack 5, Parcel and esbuild all recognise and bundle.
 
 Requirements:
 
-- A browser with WebAssembly SIMD and Relaxed SIMD, and module workers. Tested in Chrome and Firefox. A browser without Relaxed SIMD cannot load the module, and `load` rejects with an error saying so.
+- A browser with WebAssembly SIMD and module workers. Browsers with Relaxed SIMD get a faster build; others, such as Safari and every browser on iOS, load one without it. A browser without SIMD cannot load the module, and `load` rejects with an error saying so.
 - A secure context (`https://` or `localhost`) for caching. Elsewhere it still works, but downloads again on every load.
 
 How close to real time it gets depends on the device, on [WebGPU](#webgpu) and on [threads](#threads), and `q8` is noticeably faster than `f32`.
@@ -147,10 +152,10 @@ Cross-Origin-Embedder-Policy: require-corp
 
 With them, the page can only load cross-origin resources that opt in, through CORS or a `Cross-Origin-Resource-Policy` header. That includes the model files, if they are served from another origin.
 
-The package ships two wasm builds and picks one when it loads: the threaded build on an isolated page, the single-threaded one elsewhere, or if threads fail to start. Both produce the same audio. `tts.threads` says how many threads it got, and `tts.threadsReason` why. `'auto'` uses 3 threads, or fewer on a device with fewer cores: past a few threads, handing out the work costs more than it saves, and a thread that lands on an efficiency core slows the rest down. Pass `threads: 1` to stay on one thread, or a number of your own for devices you know better.
+The package ships two wasm builds, each with and without Relaxed SIMD, and picks one when it loads: the threaded build on an isolated page, the single-threaded one elsewhere, or if threads fail to start. Both produce the same audio. `tts.threads` says how many threads it got, and `tts.threadsReason` why. `'auto'` uses 3 threads, or fewer on a device with fewer cores: past a few threads, handing out the work costs more than it saves, and a thread that lands on an efficiency core slows the rest down. Pass `threads: 1` to stay on one thread, or a number of your own for devices you know better.
 
-This build speaks with ready-made voices only. Cloning a voice from an audio sample needs the Mimi encoder, which is not in the browser build. Create a voice file with the `create_voice` tool from the [repository](https://github.com/gradium-ai/xn-ptts), then load it with `addVoice`.
+This build speaks with ready-made voices only: cloning from an audio sample is not in the browser build. Voices from the catalog [`gradium/phonon-voices`](https://huggingface.co/gradium/phonon-voices) load with `addVoice` from the URL of their file, for example `await tts.addVoice('Zoey', 'https://huggingface.co/gradium/phonon-voices/resolve/main/voices/NbpkqMVS3CJeq2j8.safetensors')`. The catalog's `voices.jsonl` lists each voice's name, language and file. Voice files from the Gradium Studio scripts in the [repository](https://github.com/gradium-ai/xn-ptts#voices) load the same way.
 
 ## Licence
 
-The package is MIT OR Apache-2.0. Model weights are not part of it and come with their own license.
+The package is MIT OR Apache-2.0. The Rust crates compiled into its WebAssembly modules keep their own licences, and their notices are in `THIRD_PARTY_LICENSES.md`. Model weights are not part of it and come with their own licenses: Phonon 31m is under Apache 2.0, and Phonon 40m and Phonon 40m multilingual are under CC BY-NC 4.0. See each model's page on Hugging Face.

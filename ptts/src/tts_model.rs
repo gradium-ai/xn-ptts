@@ -59,6 +59,15 @@ pub struct TTSConfig {
     pub audio_prompt_max_duration: f32,
     #[serde(default)]
     pub cfg_null_audio_empty: bool,
+    /// If true, the CFG null branch gets no text at all. That is what a dropped transcript gives
+    /// in training with the fuser's packed prefix (`pad_prepend` false): its masked positions are
+    /// removed, so nothing of it reaches the model. If false, the null text is the text
+    /// conditioner's learnt padding row, which preserves the historical behavior.
+    #[serde(default)]
+    pub cfg_null_text_empty: bool,
+    /// Learnt tokens in front of the `speaker_wavs` and `transcript_in_segment` conditionings.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub prefix_sinks: std::collections::BTreeMap<String, PrefixSinkConfig>,
     #[serde(default)]
     pub speaker_mimi: Option<SpeakerMimiConfig>,
     #[serde(default)]
@@ -67,9 +76,24 @@ pub struct TTSConfig {
     pub fuser: Option<FuserConfig>,
     #[serde(default)]
     pub voices: Vec<VoiceConfig>,
+    #[serde(default)]
+    pub languages: Vec<String>,
+    #[serde(default)]
+    pub embeddings_ext: Option<Vec<String>>,
 }
 
 impl TTSConfig {
+    /// The FFN activation when the config names none: tanh for Pocket TTS checkpoints (no
+    /// `model_id`), erf otherwise.
+    pub fn default_gelu(&self) -> crate::transformer::Gelu {
+        use crate::transformer::Gelu;
+        if self.model_id.is_some() { Gelu::Erf } else { Gelu::Tanh }
+    }
+
+    fn mimi_with_gelu(&self, mimi: &MimiConfig) -> MimiConfig {
+        MimiConfig { gelu: Some(mimi.gelu.unwrap_or_else(|| self.default_gelu())), ..mimi.clone() }
+    }
+
     pub fn model_ext(&self) -> Option<String> {
         self.model_id.as_ref().map(|id| format!("{}@{}", id.sig, id.epoch))
     }
@@ -98,6 +122,39 @@ pub struct TTSModel<Q: BackendQ> {
     speaker_proj: Option<Linear<f32, Q::B>>,
     lsd_decode_steps: usize,
     eos_threshold: f32,
+    cfg_null_text_empty: bool,
+    speaker_sink: Option<PrefixSink<Q>>,
+    text_sink: Option<PrefixSink<Q>>,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct PrefixSinkConfig {
+    /// Whether a `sink_dropped` token replaces the sink when the conditioning is empty.
+    #[serde(default)]
+    pub dropped_token: bool,
+}
+
+struct PrefixSink<Q: BackendQ> {
+    sink: Tensor<Q::T, Q::B>,
+    dropped: Option<Tensor<Q::T, Q::B>>,
+}
+
+impl<Q: BackendQ> PrefixSink<Q> {
+    fn load(vb: &Path<Q::B>, prefix: &str, cfg: &PrefixSinkConfig, d_model: usize) -> Result<Self> {
+        let sink = vb.tensor(&format!("{prefix}.sink"), (1, 1, d_model))?;
+        let dropped = cfg
+            .dropped_token
+            .then(|| vb.tensor(&format!("{prefix}.sink_dropped"), (1, 1, d_model)))
+            .transpose()?;
+        Ok(Self { sink, dropped })
+    }
+
+    fn token(&self, present: bool) -> &Tensor<Q::T, Q::B> {
+        match (&self.dropped, present) {
+            (Some(dropped), false) => dropped,
+            _ => &self.sink,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -113,8 +170,22 @@ impl<Q: BackendQ> TTSModel<Q> {
         conditions: &HashMap<String, String>,
     ) -> Result<Self> {
         let flow_lm = FlowLM::load(&vb.pp("flow_lm"), tokenizer, cfg, conditions)?;
-        let mimi = MimiDecoder::load(&vb.pp("mimi"), &cfg.mimi)?;
+        let mimi = MimiDecoder::load(&vb.pp("mimi"), &cfg.mimi_with_gelu(&cfg.mimi))?;
         let speaker_proj = crate::loader::load_speaker_proj(vb, cfg)?;
+        let (mut speaker_sink, mut text_sink) = (None, None);
+        for (name, sink) in cfg.prefix_sinks.iter() {
+            let (prefix, slot) = match name.as_str() {
+                "speaker_wavs" => {
+                    ("flow_lm.condition_provider.conditioners.speaker_wavs", &mut speaker_sink)
+                }
+                "transcript_in_segment" => ("flow_lm.conditioner", &mut text_sink),
+                other => xn::bail!("unsupported prefix sink {other:?}"),
+            };
+            *slot = Some(PrefixSink::load(vb, prefix, sink, cfg.flow_lm.d_model)?);
+        }
+        if !cfg.prefix_sinks.is_empty() && !cfg.cfg_null_audio_empty {
+            xn::bail!("a checkpoint with prefix_sinks needs cfg_null_audio_empty: true")
+        }
 
         Ok(Self {
             flow_lm,
@@ -122,6 +193,9 @@ impl<Q: BackendQ> TTSModel<Q> {
             speaker_proj,
             lsd_decode_steps: cfg.lsd_decode_steps,
             eos_threshold: cfg.eos_threshold,
+            cfg_null_text_empty: cfg.cfg_null_text_empty,
+            speaker_sink,
+            text_sink,
         })
     }
 
@@ -152,13 +226,27 @@ impl<Q: BackendQ> TTSModel<Q> {
     /// Run flow LM step with text tokens. Increments state.
     pub fn prompt_text(&self, state: &mut TTSState<Q>, text_tokens: &[u32]) -> Result<()> {
         let text_embeddings = self.flow_lm.conditioner.embed_tokens(text_tokens)?;
+        let text_embeddings = match &self.text_sink {
+            Some(sink) => Tensor::cat(&[sink.token(!text_tokens.is_empty()), &text_embeddings], 1)?,
+            None => text_embeddings,
+        };
         let dev = text_embeddings.device();
         let empty_latents = Tensor::zeros((1, 0, self.flow_lm.ldim), dev)?;
         self.run_backbone_and_increment(state, &text_embeddings, &empty_latents)?;
         Ok(())
     }
 
+    /// The CFG null branch's text: nothing with `cfg_null_text_empty`, as training's packed
+    /// prefix gives for a dropped transcript, else the text conditioner's learnt padding row.
     pub fn prompt_text_null(&self, state: &mut TTSState<Q>) -> Result<()> {
+        if let Some(sink) = &self.text_sink {
+            let token = sink.token(false);
+            let empty_latents = Tensor::zeros((1, 0, self.flow_lm.ldim), token.device())?;
+            return self.run_backbone_and_increment(state, token, &empty_latents);
+        }
+        if self.cfg_null_text_empty {
+            return Ok(());
+        }
         let empty_text = match self.flow_lm.conditioner.learnt_padding() {
             None => xn::bail!("Model does not support null text prompt"),
             Some(p) => p,
@@ -169,6 +257,19 @@ impl<Q: BackendQ> TTSModel<Q> {
         Ok(())
     }
 
+    /// Positions [`Self::prompt_audio`] fills for a `frames`-long voice prompt.
+    pub fn voice_prompt_len(&self, frames: usize) -> usize {
+        frames + usize::from(self.speaker_sink.is_some())
+    }
+
+    /// Prompt with no voice, which only adds the voice sink's dropped token, if any.
+    pub fn prompt_no_voice(&self, state: &mut TTSState<Q>) -> Result<()> {
+        match self.speaker_sink {
+            Some(_) => self.prompt_audio(state, &self.empty_text()?),
+            None => Ok(()),
+        }
+    }
+
     /// Run flow LM step with audio conditioning. Increments state.
     pub fn prompt_audio(
         &self,
@@ -177,7 +278,13 @@ impl<Q: BackendQ> TTSModel<Q> {
     ) -> Result<()> {
         let dev = audio_conditioning.device();
         let empty_latents = Tensor::zeros((1, 0, self.flow_lm.ldim), dev)?;
-        let text_embeddings = Tensor::cat(&[&self.empty_text()?, audio_conditioning], 1)?;
+        let text_embeddings = match &self.speaker_sink {
+            Some(sink) => {
+                let present = audio_conditioning.dims3()?.1 > 0;
+                Tensor::cat(&[&self.empty_text()?, sink.token(present), audio_conditioning], 1)?
+            }
+            None => Tensor::cat(&[&self.empty_text()?, audio_conditioning], 1)?,
+        };
         self.run_backbone_and_increment(state, &text_embeddings, &empty_latents)?;
         Ok(())
     }
@@ -291,7 +398,7 @@ impl<Q: BackendQ> TTSModel<Q> {
 
     /// The empty text prefix a step with no new tokens is conditioned on.
     fn empty_text(&self) -> Result<Tensor<Q::T, Q::B>> {
-        Tensor::zeros((1, 0, self.flow_lm.conditioner.dim), self.device())
+        Tensor::zeros((1, 0, self.flow_lm.conditioner.output_dim), self.device())
     }
 }
 
@@ -306,8 +413,8 @@ impl<Q: BackendQ> MimiEnc<Q> {
     /// voice embedding on their own, and conditioning on them makes the model babble or stop
     /// at once with no other symptom, so a missing weight is better caught here.
     pub fn load(vb: &Path<Q::B>, cfg: &TTSConfig) -> Result<Self> {
-        let mimi_cfg = cfg.speaker_mimi_cfg();
-        let mimi = MimiEncoder::load(&vb.pp(cfg.speaker_mimi_prefix()), mimi_cfg)?;
+        let mimi_cfg = cfg.mimi_with_gelu(cfg.speaker_mimi_cfg());
+        let mimi = MimiEncoder::load(&vb.pp(cfg.speaker_mimi_prefix()), &mimi_cfg)?;
         if !vb.contains(crate::loader::SPEAKER_PROJ_WEIGHT) {
             xn::bail!(
                 "checkpoint has a speaker encoder under `{}` but no speaker projection \
@@ -320,7 +427,7 @@ impl<Q: BackendQ> MimiEnc<Q> {
         }
         let weights = vb.tensor(
             crate::loader::SPEAKER_PROJ_WEIGHT,
-            (cfg.flow_lm.d_model, mimi_cfg.dimension),
+            (cfg.flow_lm.d_model, mimi_cfg.encoder_latent_dim()),
         )?;
         Ok(Self { speaker_proj: Linear::new(weights), mimi })
     }
@@ -412,7 +519,8 @@ pub fn split_into_best_sentences(
     Ok(chunks)
 }
 
-/// Prepare text for generation: capitalize, add punctuation, pad short text.
+/// Prepare text for generation: collapse whitespace, capitalize and end with punctuation. Also
+/// returns how many frames to generate after end of speech, more for short text.
 pub fn prepare_text_prompt(text: &str) -> (String, usize) {
     let text = text.trim().to_string();
     if text.is_empty() {
@@ -467,6 +575,19 @@ mod tests {
     }
 
     #[test]
+    fn prefix_sinks_read_phonon_conditioner_names() {
+        let mut json = serde_json::to_value(crate::test_config()).unwrap();
+        assert!(json.get("prefix_sinks").is_none(), "no sinks, no key");
+        json["prefix_sinks"] = serde_json::json!({
+            "speaker_wavs": {"dropped_token": true},
+            "transcript_in_segment": {},
+        });
+        let cfg: TTSConfig = serde_json::from_value(json).unwrap();
+        assert!(cfg.prefix_sinks["speaker_wavs"].dropped_token);
+        assert!(!cfg.prefix_sinks["transcript_in_segment"].dropped_token);
+    }
+
+    #[test]
     fn config_round_trips_and_fills_defaults() {
         let cfg = crate::test_config();
         let json = serde_json::to_value(&cfg).unwrap();
@@ -480,6 +601,7 @@ mod tests {
             "audio_prompt_min_duration",
             "audio_prompt_max_duration",
             "cfg_null_audio_empty",
+            "cfg_null_text_empty",
             "speaker_mimi",
             "conditioners",
             "fuser",
@@ -490,8 +612,66 @@ mod tests {
         assert_eq!(old.audio_prompt_min_duration, default_audio_prompt_min_duration());
         assert_eq!(old.audio_prompt_max_duration, default_audio_prompt_max_duration());
         assert!(!old.cfg_null_audio_empty);
+        assert!(!old.cfg_null_text_empty);
         assert!(old.speaker_mimi.is_none());
         assert!(old.conditioners.is_empty() && old.fuser.is_none());
+    }
+
+    #[test]
+    fn gelu_defaults_to_erf_except_for_pocket_tts_checkpoints() {
+        use crate::transformer::Gelu;
+        // No `model_id`: a Pocket TTS checkpoint, trained with tanh.
+        let pocket = crate::test_config();
+        assert!(pocket.model_id.is_none() && pocket.flow_lm.gelu.is_none());
+        assert_eq!(pocket.default_gelu(), Gelu::Tanh);
+        assert_eq!(pocket.mimi_with_gelu(&pocket.mimi).gelu, Some(Gelu::Tanh));
+
+        // A phonon export without the key (written before it existed) was trained with erf.
+        let mut json = serde_json::to_value(crate::test_config()).unwrap();
+        let id = serde_json::json!({"sig": "78217628", "epoch": 200});
+        json.as_object_mut().unwrap().insert("model_id".into(), id);
+        let phonon: TTSConfig = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(phonon.default_gelu(), Gelu::Erf);
+        assert_eq!(phonon.mimi_with_gelu(&phonon.mimi).gelu, Some(Gelu::Erf));
+
+        // A key in the config wins either way, and round-trips.
+        json["flow_lm"]["gelu"] = serde_json::json!("tanh");
+        json["mimi"]["gelu"] = serde_json::json!("tanh");
+        let named: TTSConfig = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(named.flow_lm.gelu, Some(Gelu::Tanh));
+        assert_eq!(named.mimi_with_gelu(&named.mimi).gelu, Some(Gelu::Tanh));
+        assert_eq!(serde_json::to_value(&named).unwrap()["mimi"]["gelu"], "tanh");
+        assert_eq!(Gelu::default(), Gelu::Erf);
+    }
+
+    #[test]
+    fn architecture_keys_default_to_the_released_model() {
+        use crate::flow_lm::FlowType;
+        use serde_json::json;
+        let cfg = crate::test_config();
+        let f = &cfg.flow_lm;
+        assert_eq!(
+            (f.flow_type, f.z_dim, f.attn_dim, f.num_kv_heads),
+            (FlowType::Lsd, None, None, None)
+        );
+        assert_eq!(cfg.mimi.encoder_latent_dim(), cfg.mimi.dimension);
+
+        let mut json = serde_json::to_value(&cfg).unwrap();
+        json["flow_lm"]["flow_type"] = json!("pointwise");
+        json["flow_lm"]["z_dim"] = json!(64);
+        json["flow_lm"]["attn_dim"] = json!(192);
+        json["flow_lm"]["num_kv_heads"] = json!(1);
+        json["mimi"]["inner_dim"] = json!(32);
+        let small: TTSConfig = serde_json::from_value(json.clone()).unwrap();
+        let f = &small.flow_lm;
+        let keys = (f.flow_type, f.z_dim, f.attn_dim, f.num_kv_heads);
+        assert_eq!(keys, (FlowType::Pointwise, Some(64), Some(192), Some(1)));
+        assert_eq!(small.mimi.encoder_latent_dim(), 32);
+        assert_eq!(serde_json::to_value(&small).unwrap(), json);
+        assert_eq!(
+            serde_json::from_value::<FlowType>(json!("drifting")).unwrap(),
+            FlowType::Drifting
+        );
     }
 
     #[test]
