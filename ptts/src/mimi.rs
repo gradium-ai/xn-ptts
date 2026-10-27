@@ -43,9 +43,19 @@ pub struct MimiConfig {
     /// `dimension` (small decoders distilled from a larger codec). Unset: `dimension`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoder_dimension: Option<usize>,
+    /// Width of the encoder's latents, which its downsample projects to; `dimension` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inner_dim: Option<usize>,
     /// FFN activation of the encoder and decoder transformers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gelu: Option<crate::transformer::Gelu>,
+}
+
+impl MimiConfig {
+    /// Width of the latents [`MimiEncoder::encode_to_latent`] returns.
+    pub fn encoder_latent_dim(&self) -> usize {
+        self.inner_dim.unwrap_or(self.dimension)
+    }
 }
 
 pub struct MimiEncoder<Q: BackendQ> {
@@ -114,6 +124,7 @@ impl<Q: BackendQ> MimiEncoder<Q> {
                 &vb.pp("downsample"),
                 downsample_stride,
                 cfg.dimension,
+                cfg.encoder_latent_dim(),
                 cfg.downsample_channel_wise,
             )?;
             Some(ds)
