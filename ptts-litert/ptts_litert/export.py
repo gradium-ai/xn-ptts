@@ -31,8 +31,8 @@ def build(ck: Checkpoint, prefill_len: int, ctx: int) -> tuple[dict, dict]:
     fl, mc = cfg["flow_lm"], cfg["mimi"]
     heads = fl["num_heads"]
     head_dim = fl["d_model"] // heads
-    backbone = M.Transformer(W, "flow_lm.transformer", fl["num_layers"], heads)
-    mimi = M.Mimi(W, mc)
+    backbone = M.Transformer(W, "flow_lm.transformer", fl["num_layers"], heads, ck.gelu(fl))
+    mimi = M.Mimi(W, mc, ck.gelu(mc))
     prefill_tables = M.FlowTables(ctx, prefill_len, head_dim, fl["max_period"])
     step_tables = M.FlowTables(ctx, 1, head_dim, fl["max_period"])
     mimi_tables = M.MimiTables(mimi.window, mimi.steps, mimi.head_dim, mc["transformer_max_period"])

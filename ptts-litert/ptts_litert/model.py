@@ -91,7 +91,7 @@ class Scale(nn.Module):
 class Layer(nn.Module):
     """One `StreamingTransformerLayer` (`transformer.rs`), its cache passed in rather than held."""
 
-    def __init__(self, W, prefix: str, heads: int):
+    def __init__(self, W, prefix: str, heads: int, gelu: str):
         super().__init__()
         w = W[f"{prefix}.self_attn.in_proj.weight"]
         e = w.shape[1]
@@ -113,6 +113,7 @@ class Layer(nn.Module):
         else:
             self.ls1 = self.ls2 = nn.Identity()
         self.scale = self.d**-0.5
+        self.gelu = "tanh" if gelu == "tanh" else "none"
 
     def forward(self, x, k_cache, v_cache, cos, sin, mask):
         # x [1, S, E]; k_cache, v_cache [1, H, T, D]; cos, sin [S, D]; mask [1, S, T + S]
@@ -126,14 +127,14 @@ class Layer(nn.Module):
         att = torch.softmax(q @ keys.transpose(-1, -2) * self.scale + mask, -1)
         y = (att @ values).transpose(1, 2).reshape(1, s, e)
         x = x + self.ls1(self.out_proj(y))
-        y = self.linear2(F.gelu(self.linear1(self.norm2(x))))
+        y = self.linear2(F.gelu(self.linear1(self.norm2(x)), approximate=self.gelu))
         return x + self.ls2(y), k, v
 
 
 class Transformer(nn.Module):
-    def __init__(self, W, prefix: str, layers: int, heads: int):
+    def __init__(self, W, prefix: str, layers: int, heads: int, gelu: str):
         super().__init__()
-        self.layers = nn.ModuleList(Layer(W, f"{prefix}.layers.{i}", heads) for i in range(layers))
+        self.layers = nn.ModuleList(Layer(W, f"{prefix}.layers.{i}", heads, gelu) for i in range(layers))
 
     def forward(self, x, kv, cos, sin, mask):
         # kv [2L, H, T, D]: keys of layer l at 2l, values at 2l + 1.
@@ -147,20 +148,23 @@ class Transformer(nn.Module):
 # ---- flow net ----
 
 
-def rms_norm(x, alpha, eps=1e-5):
-    """`TimestepEmbedder`'s norm as `mlp.rs` computes it: x / sqrt(biased var + eps) * alpha * sqrt((n-1)/n)."""
-    n = x.shape[-1]
-    var = x.var(-1, unbiased=False, keepdim=True)
-    return x / torch.sqrt(var + eps) * alpha * math.sqrt((n - 1) / n)
+def rms_norm(x, alpha, kind: str, eps=1e-5):
+    """`TimestepEmbedder`'s norm (`mlp.rs`): over sqrt(mean(x^2) + eps) for `rms`, over
+    sqrt(unbiased var + eps) for `rms_var`."""
+    if kind == "rms":
+        return x / torch.sqrt((x * x).mean(-1, keepdim=True) + eps) * alpha
+    if kind == "rms_var":
+        return x / torch.sqrt(x.var(-1, unbiased=True, keepdim=True) + eps) * alpha
+    raise ValueError(f"unknown time_rms_norm {kind!r}: rms or rms_var")
 
 
-def timestep_embedding(W, prefix, t: float) -> torch.Tensor:
+def timestep_embedding(W, prefix, t: float, norm: str) -> torch.Tensor:
     freqs = W[f"{prefix}.freqs"]
     args = torch.tensor(t, dtype=torch.float32) * freqs
     emb = torch.cat([args.cos(), args.sin()])
     x = F.silu(emb @ W[f"{prefix}.mlp.0.weight"].T + W[f"{prefix}.mlp.0.bias"])
     x = x @ W[f"{prefix}.mlp.2.weight"].T + W[f"{prefix}.mlp.2.bias"]
-    return rms_norm(x, W[f"{prefix}.mlp.3.alpha"])
+    return rms_norm(x, W[f"{prefix}.mlp.3.alpha"], norm)
 
 
 class FlowNet(nn.Module):
@@ -170,15 +174,15 @@ class FlowNet(nn.Module):
     embedders at s = i / steps and t = (i + 1) / steps (`flow_lm::lsd_decode`).
     """
 
-    def __init__(self, W, prefix: str, depth: int, steps: int):
+    def __init__(self, W, prefix: str, depth: int, steps: int, time_norm: str):
         super().__init__()
         times = []
         for i in range(steps):
             s, t = i / steps, (i + 1) / steps
             times.append(
                 (
-                    timestep_embedding(W, f"{prefix}.time_embed.0", s)
-                    + timestep_embedding(W, f"{prefix}.time_embed.1", t)
+                    timestep_embedding(W, f"{prefix}.time_embed.0", s, time_norm)
+                    + timestep_embedding(W, f"{prefix}.time_embed.1", t, time_norm)
                 )
                 / 2
             )
@@ -283,7 +287,7 @@ class Mimi(nn.Module):
     [2L, H, W, D] holding the last W keys and values, right-aligned.
     """
 
-    def __init__(self, W, mc: dict):
+    def __init__(self, W, mc: dict, gelu: str):
         super().__init__()
         self.register_buffer("emb_std", W["flow_lm.emb_std"].clone())
         self.register_buffer("emb_mean", W["flow_lm.emb_mean"].clone())
@@ -296,7 +300,9 @@ class Mimi(nn.Module):
         self.samples_per_frame = self.steps * hop
         self.upsample = ConvTr(W, "mimi.upsample.convtr.convtr", self.steps, depthwise=True)
         heads = mc["transformer_num_heads"]
-        self.transformer = Transformer(W, "mimi.decoder_transformer.transformer", mc["transformer_num_layers"], heads)
+        self.transformer = Transformer(
+            W, "mimi.decoder_transformer.transformer", mc["transformer_num_layers"], heads, gelu
+        )
         self.window = mc["transformer_context"]
         assert mc["n_residual_layers"] == 1, "one residual block per decoder stage is supported"
         p = "mimi.decoder.model"
@@ -382,7 +388,9 @@ class FlowStep(nn.Module):
         self.backbone = backbone
         self.out_norm = layer_norm(W, "flow_lm.out_norm", 1e-5)
         self.out_eos = linear(W, "flow_lm.out_eos")
-        self.flow_net = FlowNet(W, "flow_lm.flow_net", fl["flow_depth"], config["lsd_decode_steps"])
+        self.flow_net = FlowNet(
+            W, "flow_lm.flow_net", fl["flow_depth"], config["lsd_decode_steps"], fl.get("time_rms_norm", "rms_var")
+        )
 
     def forward(self, emb, noise, kv, cos, sin, mask):
         x, kv_new = self.backbone(emb, kv, cos, sin, mask)
@@ -421,8 +429,8 @@ class FlowTables(nn.Module):
 class MimiTables(nn.Module):
     """RoPE tables and the mask for Mimi frame `frame`.
 
-    Query i sits at column W + i and sees columns i..W + i, so itself and the W keys before it
-    (`seq_idx - context <= key <= seq_idx`). The cache holds min(frame * steps, W) real
+    Query i sits at column W + i and sees columns i + 1..W + i, so itself and the W - 1 keys
+    before it (`seq_idx - context < key <= seq_idx`). The cache holds min(frame * steps, W) real
     entries, in its last slots.
     """
 
@@ -432,7 +440,7 @@ class MimiTables(nn.Module):
         self.register_buffer("offsets", torch.arange(steps, dtype=torch.int32))
         j = torch.arange(window + steps)[None, :]
         i = torch.arange(steps)[:, None]
-        self.register_buffer("band", (j >= i) & (j <= window + i))
+        self.register_buffer("band", (j > i) & (j <= window + i))
         self.register_buffer("cols", torch.arange(window + steps, dtype=torch.int32)[None, :])
         self.window, self.steps = window, steps
 
