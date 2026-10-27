@@ -1226,11 +1226,18 @@ fn run_inline<Q: BackendQ>(
                 None => StepInput::Bos { batch: 1 },
                 Some(t) => StepInput::Latent(t),
             };
-            let (next, is_eos) = match cfg_state.as_mut() {
+            // Without guidance the eos logit is read back with the frame's audio, so the frame
+            // waits on the device once instead of twice.
+            let (next, is_eos, eos_logit) = match cfg_state.as_mut() {
                 Some((coef, null_state)) => {
-                    model.generate_step_cfg(&mut state, null_state, *coef, input, &mut rng)?
+                    let (next, is_eos) =
+                        model.generate_step_cfg(&mut state, null_state, *coef, input, &mut rng)?;
+                    (next, is_eos, None)
                 }
-                None => model.generate_step(&mut state, input, &mut rng)?,
+                None => {
+                    let (next, logit) = model.generate_step_parts(&mut state, input, &mut rng)?;
+                    (next, false, Some(logit))
+                }
             };
             let pcm = model
                 .decode_latent(&next, &mut mimi_state)
@@ -1249,6 +1256,10 @@ fn run_inline<Q: BackendQ>(
             if pcm_tx.send(pcm).is_err() || failed {
                 return Ok(());
             }
+            let is_eos = match eos_logit {
+                Some(logit) => model.eos_from_logit(&logit.to_vec()?),
+                None => is_eos,
+            };
             if eos.should_stop(is_eos) {
                 break;
             }
