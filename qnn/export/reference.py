@@ -30,7 +30,7 @@ class TransformerRef:
     def __init__(self, W, prefix, layers, heads, max_period, layer_scale, context=None):
         self.W, self.p, self.n, self.h, self.mp = W, prefix, layers, heads, max_period
         self.ls, self.context = layer_scale, context
-        # Flow LM: (k [B, T, H, D], v) growing; Mimi: (k [B, H, T, D], v) trimmed to context.
+        # Flow LM: (k [B, T, H, D], v) growing; Mimi: (k [B, H, T, D], v) trimmed to context - 1.
         self.k = [None] * layers
         self.v = [None] * layers
         self.offset = 0  # FlowLm: current_end; Mimi: absolute_offset
@@ -47,7 +47,7 @@ class TransformerRef:
             if self.context is None:
                 ok = k_idx <= q_idx
             else:
-                ok = (k_idx >= (q_idx - self.context).clamp_min(0)) & (k_idx <= q_idx)
+                ok = (k_idx <= q_idx) & (q_idx < k_idx + self.context)
             mask = torch.where(ok, 0.0, float("-inf"))
         for i in range(self.n):
             p = f"{self.p}.layers.{i}"
@@ -68,7 +68,8 @@ class TransformerRef:
                 k, v = k.transpose(1, 2), v.transpose(1, 2)
                 K = k if self.k[i] is None else torch.cat([self.k[i], k], 2)
                 V = v if self.v[i] is None else torch.cat([self.v[i], v], 2)
-                self.k[i], self.v[i] = K[:, :, -self.context :], V[:, :, -self.context :]
+                start = max(K.shape[2] - (self.context - 1), 0)
+                self.k[i], self.v[i] = K[:, :, start:], V[:, :, start:]
             qq = q.transpose(1, 2)
             att = qq @ K.transpose(-1, -2) / math.sqrt(d)
             if mask is not None:
