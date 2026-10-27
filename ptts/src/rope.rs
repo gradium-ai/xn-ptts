@@ -2,6 +2,7 @@ use xn::{Backend, Result, Tensor, WithDTypeF};
 
 /// Rotary position embedding (RoPE).
 /// Precomputes cos/sin tables and wraps the tensor `rope_i` primitive.
+#[derive(Clone, Debug)]
 pub struct RotaryEmbedding<T: WithDTypeF, B: Backend> {
     cos: Tensor<T, B>,
     sin: Tensor<T, B>,
@@ -34,6 +35,14 @@ impl<T: WithDTypeF, B: Backend> RotaryEmbedding<T, B> {
 
         let cos = Tensor::from_vec(cos_data, (max_seq_len, half_dim), device)?;
         let sin = Tensor::from_vec(sin_data, (max_seq_len, half_dim), device)?;
+        Ok(Self { cos, sin })
+    }
+
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    /// The rows of the table at `positions`, a `[n]` index tensor on the device.
+    pub fn rows(&self, positions: &Tensor<i64, B>) -> Result<Self> {
+        let cos = self.cos.index_select(positions, 0)?;
+        let sin = self.sin.index_select(positions, 0)?;
         Ok(Self { cos, sin })
     }
 

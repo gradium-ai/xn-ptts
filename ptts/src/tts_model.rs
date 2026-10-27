@@ -199,6 +199,11 @@ impl<Q: BackendQ> TTSModel<Q> {
         })
     }
 
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn lsd_decode_steps(&self) -> usize {
+        self.lsd_decode_steps
+    }
+
     pub fn with_eos_threshold(mut self, eos_threshold: f32) -> Self {
         self.eos_threshold = eos_threshold;
         self
