@@ -114,6 +114,30 @@ fn voice_precedence_is_identical_for_all_callers() {
 }
 
 #[test]
+fn a_voice_catalog_adds_to_the_checkpoint_voices() {
+    let f = Fixture::new();
+    f.write("model.q8.gguf", b"q8");
+    f.write("voices/a.safetensors", b"a");
+    f.write("voices/b.safetensors", b"b");
+    f.write(
+        "catalog/voices.jsonl",
+        br#"{"name": "b", "filename": "other-b.safetensors"}
+{"name": "c", "filename": "c.safetensors"}
+"#,
+    );
+    let mut ck = f.q8(&f.0).unwrap();
+    ck.add_voice_catalog(f.0.join("catalog/voices.jsonl")).unwrap();
+    assert_eq!(
+        ck.voices,
+        vec![
+            ("a".into(), f.0.join("voices/a.safetensors")),
+            ("b".into(), f.0.join("catalog/other-b.safetensors")),
+            ("c".into(), f.0.join("catalog/c.safetensors"))
+        ]
+    );
+}
+
+#[test]
 fn only_tokenizer_json_is_selected() {
     let f = Fixture::new();
     f.write("model.q8.gguf", b"q8");

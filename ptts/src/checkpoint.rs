@@ -129,7 +129,7 @@ impl Checkpoint {
     /// Add the voices of a JSONL catalog, see [`crate::loader::read_voice_catalog`],
     /// replacing any of the same name.
     pub fn add_voice_catalog(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        let mut voices = std::collections::BTreeMap::new();
+        let mut voices: std::collections::BTreeMap<_, _> = self.voices.drain(..).collect();
         for (name, path) in crate::loader::read_voice_catalog(path.as_ref())? {
             voices.insert(name, path);
         }
@@ -188,11 +188,7 @@ pub fn read_config(path: impl AsRef<Path>) -> Result<TTSConfig> {
 }
 
 pub(crate) fn validate_relative_path(path: &str) -> Result<()> {
-    if path.is_empty()
-        || path.contains(['\\', ':'])
-        || path.starts_with('/')
-        || path.split('/').any(|p| p.is_empty() || p == "." || p == "..")
-    {
+    if !crate::loader::is_path_inside(path) {
         return Err(Error::InvalidData(format!(
             "weights path '{path}' must be relative to the checkpoint root"
         )));
