@@ -3,7 +3,7 @@
 Deliberately written the way the Rust is, not the way the graphs are: interleaved
 RoPE (`rope_i`), growing KV caches, -inf masks built like `transformer.rs`, Mimi's
 trimmed `KvCache`, convs that keep their state as the Rust does. It shares only
-the weights and the flow net's time conditioning with graphs.py.
+the weights, the flow net's time conditioning and the GELU choice with graphs.py.
 """
 
 import math
@@ -11,7 +11,7 @@ import math
 import torch
 from torch.nn import functional as F
 
-from graphs import lsd_times, summed_conditions
+from graphs import gelu_approximate, lsd_times, summed_conditions
 
 
 def rope_i(x, offset, max_period):
@@ -27,9 +27,9 @@ def rope_i(x, offset, max_period):
 
 
 class TransformerRef:
-    def __init__(self, W, prefix, layers, heads, max_period, layer_scale, context=None):
+    def __init__(self, W, prefix, layers, heads, max_period, layer_scale, context=None, gelu="none"):
         self.W, self.p, self.n, self.h, self.mp = W, prefix, layers, heads, max_period
-        self.ls, self.context = layer_scale, context
+        self.ls, self.context, self.gelu = layer_scale, context, gelu
         # Flow LM: (k [B, T, H, D], v) growing; Mimi: (k [B, H, T, D], v) trimmed to context - 1.
         self.k = [None] * layers
         self.v = [None] * layers
@@ -80,7 +80,7 @@ class TransformerRef:
                 y = y * W[f"{p}.layer_scale_1.scale"]
             x = x + y
             h = F.layer_norm(x, (e,), W[f"{p}.norm2.weight"], W[f"{p}.norm2.bias"], 1e-5)
-            y = F.gelu(h @ W[f"{p}.linear1.weight"].T) @ W[f"{p}.linear2.weight"].T
+            y = F.gelu(h @ W[f"{p}.linear1.weight"].T, approximate=self.gelu) @ W[f"{p}.linear2.weight"].T
             if self.ls:
                 y = y * W[f"{p}.layer_scale_2.scale"]
             x = x + y
@@ -115,13 +115,19 @@ class ConvTrRef:
 
 
 class MimiRef:
-    def __init__(self, W, mc):
+    def __init__(self, W, mc, gelu="none"):
         self.W = W
         hop = math.prod(mc["ratios"])
         self.steps = int(mc["sample_rate"] / hop / mc["frame_rate"])
         self.up = ConvTrRef(W, "mimi.upsample.convtr.convtr", self.steps, groups=mc["dimension"])
         self.tr = TransformerRef(W, "mimi.decoder_transformer.transformer", mc["transformer_num_layers"],
-                                 mc["transformer_num_heads"], mc["transformer_max_period"], True, mc["transformer_context"])
+                                 mc["transformer_num_heads"], mc["transformer_max_period"], True, mc["transformer_context"],
+                                 gelu)
+        # `ProjectedTransformer::load`: a projection only where the widths differ.
+        dim, width = mc["dimension"], mc["transformer_d_model"]
+        out = mc.get("decoder_dimension") or dim
+        self.input_proj = W["mimi.decoder_transformer.input_proj.weight"] if width != dim else None
+        self.output_proj = W["mimi.decoder_transformer.output_proj.0.weight"] if width != out else None
         p = "mimi.decoder.model"
         self.init = ConvRef(W, f"{p}.0.conv")
         self.stages = []
@@ -138,7 +144,13 @@ class MimiRef:
         x = latent * W["flow_lm.emb_std"] + W["flow_lm.emb_mean"]
         x = F.conv1d(x[:, :, None], W["mimi.quantizer.output_proj.weight"])
         x = self.up(x)
-        x = self.tr.forward(x.transpose(1, 2)).transpose(1, 2)
+        x = x.transpose(1, 2)
+        if self.input_proj is not None:
+            x = x @ self.input_proj.T
+        x = self.tr.forward(x)
+        if self.output_proj is not None:
+            x = x @ self.output_proj.T
+        x = x.transpose(1, 2)
         x = self.init(x)
         for ct, c1, c2 in self.stages:
             x = ct(F.elu(x))
@@ -199,7 +211,7 @@ class FlowLMRef:
 def generate(W, config, voice_emb, tokens, noises, max_frames, frames_after_eos=1, stop_at_eos=True):
     """`synth::run_backbone` + Mimi for one chunk. Returns the same dict as host.run."""
     lm = FlowLMRef(W, config)
-    mimi = MimiRef(W, config["mimi"])
+    mimi = MimiRef(W, config["mimi"], gelu_approximate(config, "mimi"))
     lm.prompt(voice_emb)
     lm.prompt(lm.text_embeddings(torch.as_tensor(tokens).reshape(-1).long()))
     latents, audio, eos_logits, inputs = [], [], [], []

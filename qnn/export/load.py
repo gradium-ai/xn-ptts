@@ -15,7 +15,7 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 
-from graphs import Backbone, MimiStep, Prefill, Step, Tables, VoicePrefill, summed_conditions
+from graphs import Backbone, MimiStep, Prefill, Step, Tables, VoicePrefill, gelu_approximate, summed_conditions
 from host import CACHE, PREFILL, Dims
 
 # The checkpoint directory (config.json, model.safetensors, tokenizer.json,
@@ -55,7 +55,8 @@ def load(checkpoint: Path = CHECKPOINT, io_half: bool = True, conditions: dict |
     fl, mc = config["flow_lm"], config["mimi"]
     assert fl["d_model"] % fl["num_heads"] == 0
 
-    mimi_step = MimiStep(W, mc, overlap_add=(not io_half) if overlap_add is None else overlap_add).eval()
+    mimi_step = MimiStep(W, mc, overlap_add=(not io_half) if overlap_add is None else overlap_add,
+                         gelu=gelu_approximate(config, "mimi")).eval()
     dims = Dims(
         layers=fl["num_layers"],
         heads=fl["num_heads"],
