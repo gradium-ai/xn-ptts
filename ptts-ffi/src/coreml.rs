@@ -64,6 +64,7 @@ impl Engine {
             },
             ctx: int("ctx")?,
             prefill_len: int("prefill_len")?,
+            mimi: ptts_coreml::phonon::mimi::Dims::from_json(&meta["mimi"])?,
             mimi_window: int("mimi_window")?,
             max_frames: int("max_frames")?,
             eos_threshold: get(&meta, "eos_threshold")? as f32,
