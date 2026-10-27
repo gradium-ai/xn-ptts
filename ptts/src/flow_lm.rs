@@ -87,19 +87,11 @@ fn lsd_decode<T: WithDTypeF, B: Backend>(
     num_steps: usize,
 ) -> Result<Tensor<T, B>> {
     let mut current = x_0.clone();
-    let dev = x_0.device();
 
     for i in 0..num_steps {
-        let s_val = i as f32 / num_steps as f32;
-        let t_val = (i + 1) as f32 / num_steps as f32;
-
-        // Create s and t tensors matching x_0 shape but with last dim = 1
-        let shape: Vec<usize> =
-            x_0.dims().iter().copied().take(x_0.rank() - 1).chain([1]).collect();
-        let s = Tensor::full(T::from_f32(s_val), shape.clone(), dev)?;
-        let t = Tensor::full(T::from_f32(t_val), shape, dev)?;
-
-        let flow_dir = flow_net.forward(transformer_out, &[&s, &t], &current)?;
+        let s = i as f32 / num_steps as f32;
+        let t = (i + 1) as f32 / num_steps as f32;
+        let flow_dir = flow_net.forward(transformer_out, &[s, t], &current)?;
         let step_scale = T::from_f32(1.0 / num_steps as f32);
         current = current.add(&flow_dir.scale(step_scale)?)?;
     }
