@@ -7,7 +7,7 @@
 //! CoreML states are fp16-only and Mimi has to run in f32. It is ~1.05MB each way, almost all
 //! of it the transformer KV cache.
 
-use crate::mil::{Builder, DType, Var};
+use crate::mil::{Builder, DType, Gelu, Var};
 use crate::weights::Weights;
 
 pub const DIM: usize = 512;
@@ -147,11 +147,12 @@ fn resblock(
     Ok((b.add(x, &h, &[1, cin, t]), tail))
 }
 
-/// The Mimi graph for one frame, with a `ctx`-slot transformer cache (`cache_len(window)`).
+/// The Mimi graph for one frame, with a `ctx`-slot transformer cache (`cache_len(window)`) and
+/// `gelu` as its transformer's FFN activation.
 ///
 /// f32 throughout, so it runs on the CPU: the vocoder is kept at its original precision, and
 /// the Neural Engine is fp16-only.
-pub fn build(wt: &Weights, ctx: usize) -> Result<super::flow_lm::Built, String> {
+pub fn build(wt: &Weights, ctx: usize, gelu: Gelu) -> Result<super::flow_lm::Built, String> {
     let fp = DType::Fp32;
     let mut b = Builder::new().with_float(fp);
     let latent = b.input("latent", fp, &[1, 1, LDIM]);
@@ -240,7 +241,7 @@ pub fn build(wt: &Weights, ctx: usize) -> Result<super::flow_lm::Built, String> 
         let l1 = w(&mut b, wt, &format!("{p}.linear1.weight"))?;
         let l2 = w(&mut b, wt, &format!("{p}.linear2.weight"))?;
         let f = b.linear(&n, &l1, None, &[1, STEPS, FF]);
-        let f = b.gelu_exact(&f);
+        let f = b.gelu(&f, gelu);
         let f = b.linear(&f, &l2, None, &[1, STEPS, DIM]);
         let ls2 = w(&mut b, wt, &format!("{p}.layer_scale_2.scale"))?;
         let f = b.mul(&f, &ls2, &[1, STEPS, DIM]);

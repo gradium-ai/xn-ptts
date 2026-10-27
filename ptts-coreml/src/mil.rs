@@ -45,6 +45,14 @@ impl DType {
     }
 }
 
+/// The GELU a checkpoint was trained with: the exact one, or its tanh approximation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Gelu {
+    Tanh,
+    #[default]
+    Erf,
+}
+
 fn tensor_type(dt: DType, shape: &[usize]) -> m::ValueType {
     m::ValueType {
         r#type: Some(m::value_type::Type::TensorType(m::TensorType {
@@ -388,8 +396,11 @@ impl Builder {
         )
     }
 
-    pub fn gelu_exact(&mut self, x: &Var) -> Var {
-        let mode = self.const_str("EXACT");
+    pub fn gelu(&mut self, x: &Var, kind: Gelu) -> Var {
+        let mode = self.const_str(match kind {
+            Gelu::Erf => "EXACT",
+            Gelu::Tanh => "TANH_APPROXIMATION",
+        });
         let dt = x.dtype;
         let sh = x.shape.clone();
         self.op("gelu", &[("x", x), ("mode", &mode)], dt, &sh)
