@@ -19,6 +19,7 @@ mod model_helpers;
 use anyhow::{Context, Result};
 use clap::Parser;
 use ptts_coreml::Weights;
+use ptts_coreml::mil::Gelu;
 use ptts_coreml::package::write_mlpackage_with_weights;
 use ptts_coreml::phonon::{flow_lm as fl, mimi};
 use safetensors::tensor::{Dtype, TensorView};
@@ -98,6 +99,11 @@ fn main() -> Result<()> {
     let time_norm = match f.time_rms_norm {
         ptts::flow_lm::TimeRmsNorm::Rms => fl::TimeNorm::Rms,
         ptts::flow_lm::TimeRmsNorm::RmsVar => fl::TimeNorm::RmsVar,
+    };
+    // The FFN activation each transformer was trained with, as ptts picks it.
+    let gelu = |g: Option<ptts::transformer::Gelu>| match g.unwrap_or_else(|| cfg.default_gelu()) {
+        ptts::transformer::Gelu::Erf => Gelu::Erf,
+        ptts::transformer::Gelu::Tanh => Gelu::Tanh,
     };
     let m = &cfg.mimi;
     anyhow::ensure!(
@@ -206,14 +212,15 @@ fn main() -> Result<()> {
     write(
         &args.out,
         &fl::package_name(ctx, 1),
-        fl::build(&wt, &dims, ctx, 1, time_norm).map_err(bad)?,
+        fl::build(&wt, &dims, ctx, 1, time_norm, gelu(f.gelu)).map_err(bad)?,
     )?;
-    let prefill = fl::build(&wt, &dims, ctx, args.max_tokens, time_norm).map_err(bad)?;
+    let prefill =
+        fl::build(&wt, &dims, ctx, args.max_tokens, time_norm, gelu(f.gelu)).map_err(bad)?;
     write(&args.out, &fl::package_name(ctx, args.max_tokens), prefill)?;
     write(
         &args.out,
         &mimi::package_name(window),
-        mimi::build(&wt, mimi::cache_len(window)).map_err(bad)?,
+        mimi::build(&wt, mimi::cache_len(window), gelu(m.gelu)).map_err(bad)?,
     )?;
 
     // The host-side tensors, f32, and the conditioning a voice without its own is spoken with.

@@ -14,7 +14,7 @@
 //! It is fp16 throughout, which the ANE requires. rope cos/sin and the attention mask arrive
 //! ready-made from the host.
 
-use crate::mil::{Builder, DType, Var};
+use crate::mil::{Builder, DType, Gelu, Var};
 use crate::proto::core_ml::specification::Model;
 use crate::weights::Weights;
 
@@ -126,6 +126,7 @@ fn layer(
     rows: &mut Vec<Var>,
     ctx: usize,
     t: usize,
+    gelu: Gelu,
 ) -> Result<Var, String> {
     let p = format!("flow_lm.transformer.layers.{i}");
     let (hi_, di) = (dm.heads as i32, dm.hd() as i32);
@@ -197,7 +198,7 @@ fn layer(
     let l1 = w(b, wt, &format!("{p}.linear1.weight"))?;
     let l2 = w(b, wt, &format!("{p}.linear2.weight"))?;
     let h = b.linear(&h, &l1, None, &[1, t, dm.ff]);
-    let h = b.gelu_exact(&h);
+    let h = b.gelu(&h, gelu);
     let h = b.linear(&h, &l2, None, &[1, t, dm.d]);
     Ok(b.add(&x, &h, &[1, t, dm.d]))
 }
@@ -324,13 +325,15 @@ fn flow_net(
 /// same graph serves prefill and decode), `cos`/`sin [1, 1, t, HD/2]`, `mask [1, 1, t, ctx + t]`,
 /// `noise [1, LDIM]`, and the ring `k_all_in`/`v_all_in [L, H, ctx, HD]`. Outputs: `next_latent`
 /// and `eos` for the last position, and `k_new`/`v_new [L, H, t, HD]` for the host to store.
-/// `time_norm` is the checkpoint's time-embedding norm, baked into the graph as a constant.
+/// `time_norm` is the checkpoint's time-embedding norm, baked into the graph as a constant, and
+/// `gelu` its FFN activation.
 pub fn build(
     wt: &Weights,
     dm: &Dims,
     ctx: usize,
     t: usize,
     time_norm: TimeNorm,
+    gelu: Gelu,
 ) -> Result<Built, String> {
     let mut b = Builder::new().with_float(FP);
     let emb = b.input("emb", FP, &[1, t, dm.d]);
@@ -344,7 +347,8 @@ pub fn build(
     let mut x = emb;
     let mut rows: Vec<Var> = Vec::new();
     for i in 0..dm.layers {
-        x = layer(dm, &mut b, wt, i, &x, (&cos, &sin, &mask), (&k_all, &v_all), &mut rows, ctx, t)?;
+        let (rope, kv) = ((&cos, &sin, &mask), (&k_all, &v_all));
+        x = layer(dm, &mut b, wt, i, &x, rope, kv, &mut rows, ctx, t, gelu)?;
     }
     let onw = w(&mut b, wt, "flow_lm.out_norm.weight")?;
     let onb = w(&mut b, wt, "flow_lm.out_norm.bias")?;
