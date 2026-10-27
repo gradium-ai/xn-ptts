@@ -58,6 +58,16 @@ class Checkpoint:
                     W[name] = f.get_tensor(k).float()
         return cls(dir, config, W)
 
+    def gelu(self, section: dict) -> str:
+        """A section's FFN activation, `erf` or `tanh`; when it names none, `TTSConfig::default_gelu`.
+
+        Pocket TTS checkpoints, which have no `model_id`, were trained with the tanh GELU.
+        """
+        gelu = section.get("gelu") or ("erf" if self.config.get("model_id") else "tanh")
+        if gelu not in ("erf", "tanh"):
+            raise SystemExit(f"unknown gelu {gelu!r}: erf or tanh")
+        return gelu
+
     def voices(self, voices_dir: Path | None = None) -> list[tuple[str, Path]]:
         """`loader::voices_in` for a given directory, else `loader::checkpoint_voices`."""
         if voices_dir is not None:
