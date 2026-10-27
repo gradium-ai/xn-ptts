@@ -77,24 +77,31 @@ fn main() -> Result<()> {
     let dims = fl::Dims {
         d: f.d_model,
         heads: f.num_heads,
+        attn: f.attn_dim.unwrap_or(f.d_model),
+        kv_heads: f.num_kv_heads.unwrap_or(f.num_heads),
         layers: f.num_layers,
         ff: f.dim_feedforward,
         ldim: f.ldim,
+        z: f.z_dim,
         flow_d: f.flow_dim,
         flow_blocks: f.flow_depth,
     };
     anyhow::ensure!(
-        cfg.lsd_decode_steps == 1,
+        dims.heads > 0
+            && dims.attn.is_multiple_of(dims.heads)
+            && dims.kv_heads > 0
+            && dims.heads.is_multiple_of(dims.kv_heads),
+        "the config's attention heads do not divide its width or its key/value heads"
+    );
+    let flow = match f.flow_type {
+        ptts::flow_lm::FlowType::Lsd => fl::FlowType::Lsd,
+        ptts::flow_lm::FlowType::Drifting => fl::FlowType::Drifting,
+        ptts::flow_lm::FlowType::Pointwise => fl::FlowType::Pointwise,
+    };
+    anyhow::ensure!(
+        flow != fl::FlowType::Lsd || cfg.lsd_decode_steps == 1,
         "the Core ML graph takes one flow step; this checkpoint wants {}",
         cfg.lsd_decode_steps
-    );
-    anyhow::ensure!(
-        f.flow_type == ptts::flow_lm::FlowType::Lsd
-            && f.z_dim.is_none()
-            && f.attn_dim.is_none_or(|a| a == f.d_model)
-            && f.num_kv_heads.is_none_or(|h| h == f.num_heads),
-        "the Core ML flow LM graph takes an LSD head and full multi-head attention, without \
-         z_dim, attn_dim or num_kv_heads"
     );
     let time_norm = match f.time_rms_norm {
         ptts::flow_lm::TimeRmsNorm::Rms => fl::TimeNorm::Rms,
@@ -231,10 +238,10 @@ fn main() -> Result<()> {
     write(
         &args.out,
         &fl::package_name(ctx, 1),
-        fl::build(&wt, &dims, ctx, 1, time_norm, gelu(f.gelu)).map_err(bad)?,
+        fl::build(&wt, &dims, ctx, 1, time_norm, gelu(f.gelu), flow).map_err(bad)?,
     )?;
     let prefill =
-        fl::build(&wt, &dims, ctx, args.max_tokens, time_norm, gelu(f.gelu)).map_err(bad)?;
+        fl::build(&wt, &dims, ctx, args.max_tokens, time_norm, gelu(f.gelu), flow).map_err(bad)?;
     write(&args.out, &fl::package_name(ctx, args.max_tokens), prefill)?;
     write(
         &args.out,
@@ -250,8 +257,28 @@ fn main() -> Result<()> {
         defaults.entry(name.clone()).or_insert_with(|| value.clone());
     }
     let mut host: Vec<(&str, Vec<usize>, Vec<u8>)> = Vec::new();
-    for n in ["flow_lm.conditioner.embed.weight", "flow_lm.input_linear.weight", "flow_lm.bos_emb"]
-    {
+    // The text table at the model's width: a low-rank one through its `output_proj`, as ptts
+    // projects it at load.
+    let (shape, table) = get("flow_lm.conditioner.embed.weight")?;
+    let (shape, table) = match wt.get("flow_lm.conditioner.output_proj.weight") {
+        Ok((proj_shape, proj)) => {
+            let (rows, rank, d) = (shape[0], shape[1], proj_shape[0]);
+            let mut out = vec![0f32; rows * d];
+            for (row, o) in table.chunks(rank).zip(out.chunks_mut(d)) {
+                for (v, p) in o.iter_mut().zip(proj.chunks(rank)) {
+                    *v = row.iter().zip(p).map(|(a, b)| a * b).sum();
+                }
+            }
+            (vec![rows, d], out)
+        }
+        Err(_) => (shape.to_vec(), table.to_vec()),
+    };
+    host.push((
+        "flow_lm.conditioner.embed.weight",
+        shape,
+        table.iter().flat_map(|v| v.to_le_bytes()).collect(),
+    ));
+    for n in ["flow_lm.input_linear.weight", "flow_lm.bos_emb"] {
         let (shape, data) = get(n)?;
         host.push((n, shape.to_vec(), data.iter().flat_map(|v| v.to_le_bytes()).collect()));
     }
@@ -294,8 +321,9 @@ fn main() -> Result<()> {
         "eos_threshold": cfg.eos_threshold,
         "temperature": args.temperature,
         "dims": {
-            "d": dims.d, "heads": dims.heads, "layers": dims.layers, "ff": dims.ff,
-            "ldim": dims.ldim, "flow_d": dims.flow_d, "flow_blocks": dims.flow_blocks,
+            "d": dims.d, "heads": dims.heads, "attn": dims.attn, "kv_heads": dims.kv_heads,
+            "layers": dims.layers, "ff": dims.ff, "ldim": dims.ldim, "z": dims.z,
+            "flow_d": dims.flow_d, "flow_blocks": dims.flow_blocks,
         },
         "voices": voices.iter().map(|(n, _, _)| n).collect::<Vec<_>>(),
         "languages": cfg.languages,
