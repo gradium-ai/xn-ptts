@@ -306,8 +306,8 @@ fn flow_net(
     let iw = w(b, wt, &format!("{p}.input_proj.weight"))?;
     let ib = w(b, wt, &format!("{p}.input_proj.bias"))?;
     let mut x = b.linear(noise, &iw, Some(&ib), &[1, dm.flow_d]);
-    // The two time conditions averaged, as `SimpleMLPAdaLN::forward` does. The one-evaluation
-    // heads have none.
+    // The two time conditions averaged, as `SimpleMLPAdaLN::time_embedding` does. The
+    // one-evaluation heads have none.
     let ts = match flow {
         FlowType::Lsd => {
             let (t0, t1) = (time_embed(wt, 0, 0.0, time_norm)?, time_embed(wt, 1, 1.0, time_norm)?);
