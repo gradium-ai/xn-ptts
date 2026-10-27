@@ -30,9 +30,10 @@ What differs from pocket-tts, all read off `xn-ptts/ptts/src`:
   so it is computed once at load (no sin/cos in the graph). `flow.w_s_t` is not
   used: `ptts` drops it on load (`loader::remap_key`), and its LSD decode feeds
   s and t straight to the two time embedders.
-- Mimi's attention window: query i sees the w cached slots from i on, plus the
-  new keys up to itself, so w + 1 keys (the Rust mask allows
-  `seq_idx - context <= key <= seq_idx`); the pocket-tts export masked slot i too.
+- Mimi's attention window: query i sees the cached slots after i, plus the new
+  keys up to itself, so w keys (the Rust mask allows
+  `key <= seq_idx < key + context`, pocket-tts's `delta < context`). The cache
+  keeps w slots, so its oldest slot is never read.
 - The EOS logit is compared against a positive threshold (4.0) on the host.
 """
 
@@ -468,8 +469,8 @@ class Tables(nn.Module):
         self.register_buffer("mimi_sin", sin)
         j = torch.arange(w + s)[None, :]
         i = torch.arange(s)[:, None]
-        # Query i sits at column w + i; it sees columns i..w + i (`seq_idx - context <= key <= seq_idx`).
-        self.register_buffer("mimi_band", (j >= i) & (j <= w + i))
+        # Query i sits at column w + i; it sees columns i + 1..w + i (`key <= seq_idx < key + context`).
+        self.register_buffer("mimi_band", (j > i) & (j <= w + i))
         self.register_buffer("mimi_j", torch.arange(w + s, dtype=torch.int32)[None, :])
         self.window, self.steps = w, s
         self.cache = cache
