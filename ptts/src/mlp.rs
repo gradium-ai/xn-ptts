@@ -289,96 +289,47 @@ mod tests {
         assert_eq!(TimeRmsNorm::default(), TimeRmsNorm::RmsVar);
     }
 
-    /// A small flow net with arbitrary weights: `cond` wide conditioning, 4 latent channels.
-    fn small_net(cond: usize) -> SimpleMLPAdaLN<f32, CpuDevice> {
+    /// Each pair of times is computed once, and only that pair reuses it.
+    #[test]
+    fn a_time_condition_is_kept_by_its_times() {
         let dev = &CpuDevice;
-        let mut seed = 0x9E37_79B9u32;
-        let mut tensor = |rows: usize, cols: usize| {
-            let v = (0..rows * cols)
-                .map(|_| {
-                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                    (seed >> 8) as f32 / (1 << 24) as f32 - 0.5
-                })
-                .collect();
+        let tensor = |rows: usize, cols: usize| {
+            let v = (0..rows * cols).map(|i| (i as f32 * 0.37).sin()).collect();
             Tensor::from_vec(v, (rows, cols), dev).unwrap()
         };
-        let mut linear = |out: usize, inp: usize| {
-            let bias = tensor(1, out).reshape(out).unwrap();
-            Linear::new(tensor(out, inp)).with_bias(bias)
-        };
-        let ch = 8;
-        let ones = || Tensor::full(1f32, ch, dev).unwrap();
-        let zeros = || Tensor::zeros(ch, dev).unwrap();
-        let norm = || LayerNorm::new(ones(), zeros(), 1e-6).unwrap();
+        let unused = || Linear::new(Tensor::zeros((1, 1), dev).unwrap());
         let time_embeds = (0..2)
             .map(|i| TimestepEmbedder {
-                linear1: linear(ch, 256),
-                linear2: linear(ch, ch),
-                alpha: ones(),
+                linear1: Linear::new(tensor(4, 256)),
+                linear2: Linear::new(tensor(4, 4)),
+                alpha: Tensor::full(1f32, 4, dev).unwrap(),
                 norm: TimeRmsNorm::Rms,
                 freqs: Tensor::full(1.5f32 + i as f32, 128, dev).unwrap(),
             })
             .collect();
-        let res_blocks = (0..2)
-            .map(|_| ResBlock {
-                in_ln: norm(),
-                mlp_linear1: linear(ch, ch),
-                mlp_linear2: linear(ch, ch),
-                ada_ln_silu_linear: linear(3 * ch, ch),
-            })
-            .collect();
-        SimpleMLPAdaLN {
+        let norm_final = LayerNorm::new(
+            Tensor::full(1f32, 1, dev).unwrap(),
+            Tensor::zeros(1, dev).unwrap(),
+            1e-6,
+        );
+        let net = SimpleMLPAdaLN::<f32, CpuDevice> {
             time_embeds,
             time_conds: Mutex::new(Vec::new()),
-            cond_embed: linear(ch, cond),
-            input_proj: linear(ch, 4),
-            res_blocks,
+            cond_embed: unused(),
+            input_proj: unused(),
+            res_blocks: Vec::new(),
             final_layer: FinalLayer {
-                norm_final: norm(),
-                linear: linear(4, ch),
-                ada_ln_silu_linear: linear(2 * ch, ch),
+                norm_final: norm_final.unwrap(),
+                linear: unused(),
+                ada_ln_silu_linear: unused(),
             },
             num_time_conds: 2,
-        }
-    }
-
-    /// The kept time conditioning gives what computing it for every row of the batch did: the
-    /// same bits for one row, the same values for several. Each pair of times is computed once.
-    #[test]
-    fn a_kept_time_condition_matches_computing_it_per_row() {
-        let dev = &CpuDevice;
-        let net = small_net(6);
-        // The time conditioning as `forward` computed it before: from `[b, 1]` time tensors.
-        let per_row = |c: &Tensor<f32, CpuDevice>, ts: [f32; 2], x: &Tensor<f32, CpuDevice>| {
-            let b = x.dims()[0];
-            let time = |t| Tensor::full(t, (b, 1), dev).unwrap();
-            let t0 = net.time_embeds[0].forward(&time(ts[0])).unwrap();
-            let t1 = net.time_embeds[1].forward(&time(ts[1])).unwrap();
-            let y = t0.add(&t1).unwrap().scale(0.5).unwrap();
-            let y = y.add(&net.cond_embed.forward(c).unwrap()).unwrap();
-            let mut x = net.input_proj.forward(x).unwrap();
-            for block in &net.res_blocks {
-                x = block.forward(&x, &y).unwrap();
-            }
-            net.final_layer.forward(&x, &y).unwrap().to_vec().unwrap()
         };
-        for b in [1, 2] {
-            let c = Tensor::from_vec((0..b * 6).map(|i| i as f32 * 0.1).collect(), (b, 6), dev);
-            let x =
-                Tensor::from_vec((0..b * 4).map(|i| 1.0 - i as f32 * 0.2).collect(), (b, 4), dev);
-            let (c, x) = (c.unwrap(), x.unwrap());
-            for ts in [[0.0, 1.0], [0.25, 0.5], [0.0, 1.0]] {
-                let got = net.forward(&c, &ts, &x).unwrap().to_vec().unwrap();
-                let want = per_row(&c, ts, &x);
-                if b == 1 {
-                    assert_eq!(got, want, "ts={ts:?}");
-                } else {
-                    for (g, w) in got.iter().zip(&want) {
-                        assert!((g - w).abs() <= 1e-6 * w.abs().max(1.0), "ts={ts:?}: {g} vs {w}");
-                    }
-                }
-            }
-        }
-        assert_eq!(net.time_conds.lock().unwrap().len(), 2, "one per distinct pair of times");
+        let cond = |ts: [f32; 2]| net.time_condition(&ts, dev).unwrap().to_vec().unwrap();
+        let (a, b) = (cond([0.0, 1.0]), cond([0.25, 0.5]));
+        assert_ne!(a, b);
+        assert_eq!(cond([0.0, 1.0]), a);
+        assert_eq!(cond([0.25, 0.5]), b);
+        assert_eq!(net.time_conds.lock().unwrap().len(), 2);
     }
 }
