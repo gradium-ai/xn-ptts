@@ -28,7 +28,7 @@ import torch
 from check import graph_call
 from compare_ref import REF, read
 from host import run, voice_cache
-from load import load, voice_embedding, voice_latents
+from load import load, voice_embedding
 
 OUT = Path(os.environ.get("PHONON_OUT", Path(__file__).parent / "out"))
 OUTPUT_NAMES = {
@@ -82,7 +82,7 @@ def main():
     tokens = torch.tensor([m["text"]["token_ids"]], dtype=torch.int32)
     n_tokens = tokens.shape[1]
     noise = read(case, "noise.bin", m)
-    emb = voice_embedding(ph.weights, voice_latents(m["voice"]["path"]))
+    emb = voice_embedding(ph.weights, m["voice"]["path"])
     kv, pos = voice_cache(ph, emb, torch.float16)
     ref_audio = read(case, "audio.bin", m).numpy()
 

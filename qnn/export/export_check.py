@@ -1,24 +1,28 @@
 """torch.export every graph, in both variants, and check the exported programs match eager.
 
-    python export_check.py
+    python export_check.py [--voice Freya]
 
 Inputs are real: recorded from a short generation (the last prefill and step
 calls, and a voice_prefill on a real voice). The NPU variant has fp16 I/O; the
 CPU variant fp32 I/O and transposed convs as overlap-add.
 """
 
+import argparse
+
 import torch
 
 from check import graph_call, tokenize
+from graphs import VoicePrefill
 from host import int32, noise_source, run, voice_cache, CACHE
-from load import load, voice_embedding, voice_latents
+from load import load, voice_embedding
 
 
 @torch.no_grad()
-def check(io_half: bool):
-    ph = load(io_half=io_half, voice_frames=125)
+def check(io_half: bool, voice: str):
+    ph = load(io_half=io_half)
     dtype = torch.float16 if io_half else torch.float32
-    emb = voice_embedding(ph.weights, voice_latents("Freya"))
+    emb = voice_embedding(ph.weights, voice)
+    ph.graphs["voice_prefill"] = VoicePrefill(ph.backbone, ph.tables, emb.shape[1], io_half).eval()
     tokens, _ = tokenize("Hello world.")
     kv, pos = voice_cache(ph, emb, dtype)
     nxt = noise_source(ph.dims.ldim)
@@ -43,5 +47,8 @@ def check(io_half: bool):
 
 
 if __name__ == "__main__":
-    check(True)
-    check(False)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--voice", default="Freya")
+    args = ap.parse_args()
+    check(True, args.voice)
+    check(False, args.voice)
