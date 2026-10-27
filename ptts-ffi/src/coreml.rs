@@ -56,9 +56,13 @@ impl Engine {
             dims: ptts_coreml::phonon::flow_lm::Dims {
                 d: dim("d")?,
                 heads: dim("heads")?,
+                // Bundles written before these were exported with their defaults.
+                attn: dim("attn").or_else(|_| dim("d"))?,
+                kv_heads: dim("kv_heads").or_else(|_| dim("heads"))?,
                 layers: dim("layers")?,
                 ff: dim("ff")?,
                 ldim: dim("ldim")?,
+                z: dim("z").ok(),
                 flow_d: dim("flow_d")?,
                 flow_blocks: dim("flow_blocks")?,
             },
