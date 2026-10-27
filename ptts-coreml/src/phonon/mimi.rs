@@ -21,12 +21,12 @@ pub const STEPS: usize = UP_STRIDE;
 pub const RATIOS: [usize; 3] = [6, 5, 4];
 pub const FRAME: usize = 1920;
 
-/// Slots of the transformer KV cache for an attention window of `window` past positions.
+/// Slots of the transformer KV cache for an attention window of `window` positions.
 ///
-/// The reference trims its cache to `window` positions after each call and appends the call's
-/// `STEPS` new rows before attending, so every query sees `window` past positions plus itself.
-/// A cache of only `window` slots, new rows included, drops up to `STEPS` of the oldest ones:
-/// exact for the first 15 frames, then 24-40 dB SNR against the reference for every frame after.
+/// The reference keeps `window - 1` positions between calls and appends the call's `STEPS` new
+/// rows before attending, so every query sees `window` positions, itself included. This cache
+/// keeps one more, which the mask never shows, so bundles exported with it still load. A cache
+/// of only `window` slots, new rows included, would drop up to `STEPS` of the oldest ones.
 pub fn cache_len(window: usize) -> usize {
     window + STEPS
 }
