@@ -106,11 +106,30 @@ fn main() -> Result<()> {
         ptts::transformer::Gelu::Tanh => Gelu::Tanh,
     };
     let m = &cfg.mimi;
+    let hop: usize = m.ratios.iter().product();
+    let mimi_dims = mimi::Dims {
+        ldim: m.quantizer_dimension,
+        dim: m.dimension,
+        d_model: m.transformer_d_model,
+        heads: m.transformer_num_heads,
+        layers: m.transformer_num_layers,
+        ff: m.transformer_dim_feedforward,
+        out_dim: m.decoder_dimension.unwrap_or(m.dimension),
+        n_filters: m.n_filters,
+        ratios: m.ratios.clone(),
+        kernel_size: m.kernel_size,
+        residual_kernel_size: m.residual_kernel_size,
+        last_kernel_size: m.last_kernel_size,
+        compress: m.compress,
+        steps: (m.sample_rate as f64 / hop as f64 / m.frame_rate).round() as usize,
+    };
     anyhow::ensure!(
-        (m.transformer_d_model, m.transformer_num_heads) == (mimi::DIM, mimi::HEADS),
-        "the Core ML Mimi graph is built for a {}-wide, {}-head decoder transformer",
-        mimi::DIM,
-        mimi::HEADS
+        m.channels == 1
+            && m.n_residual_layers == 1
+            && mimi_dims.steps > 1
+            && (m.quantizer_dimension, m.quantizer_output_dimension) == (f.ldim, m.dimension),
+        "the Core ML Mimi graph takes a mono decoder with one residual block per stage that \
+         upsamples the flow LM's latents"
     );
     let window = m.transformer_context;
 
@@ -219,8 +238,8 @@ fn main() -> Result<()> {
     write(&args.out, &fl::package_name(ctx, args.max_tokens), prefill)?;
     write(
         &args.out,
-        &mimi::package_name(window),
-        mimi::build(&wt, mimi::cache_len(window), gelu(m.gelu)).map_err(bad)?,
+        &mimi_dims.package_name(window),
+        mimi::build(&wt, &mimi_dims, mimi_dims.cache_len(window), gelu(m.gelu)).map_err(bad)?,
     )?;
 
     // The host-side tensors, f32, and the conditioning a voice without its own is spoken with.
@@ -270,6 +289,7 @@ fn main() -> Result<()> {
         "ctx": ctx,
         "prefill_len": args.max_tokens,
         "max_frames": max_frames,
+        "mimi": mimi_dims.to_json(),
         "mimi_window": window,
         "eos_threshold": cfg.eos_threshold,
         "temperature": args.temperature,
