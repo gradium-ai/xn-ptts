@@ -127,7 +127,8 @@ impl std::str::FromStr for DeviceKind {
     }
 }
 
-/// Weight format for the flow-LM transformer linears. Quantization is CPU-only.
+/// Weight format for the flow-LM transformer linears. Quantization runs on the CPU, and q8_0 on
+/// CUDA too.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Quant {
     #[default]
@@ -154,9 +155,11 @@ impl Quant {
     /// megabytes.
     pub fn check_device(self, device: DeviceKind) -> Result<()> {
         let device = device.resolve_for(self);
-        if device != DeviceKind::Cpu && self != Self::F32 {
+        let cuda_q8 = device == DeviceKind::Cuda && self == Self::Q80;
+        if device != DeviceKind::Cpu && self != Self::F32 && !cuda_q8 {
             return Err(Error::unsupported(format!(
-                "quantization ({}) is CPU-only, but the selected device is {device:?}",
+                "quantization ({}) runs on the CPU, and q8_0 on CUDA too, but the selected device \
+                 is {device:?}",
                 self.as_str()
             )));
         }
@@ -1748,16 +1751,26 @@ impl SynthBuilder {
     #[cfg(feature = "cuda")]
     fn build_cuda(self) -> Result<Synth> {
         use xn::cuda_backend::Device;
-        // `quant()` reports `self.quant`, which `check_device` keeps at F32 here.
-        debug_assert_eq!(self.quant, Quant::F32);
         // Mimi gets a device handle of its own, so a stream and a cuBLAS handle of its own, and
         // decodes on its own thread, overlapping the flow LM. Both handles share the context.
         let mimi_dev = Device::new(0)?;
         let dev = Device::new(0)?;
         // Event tracking costs a few percent and this workload never queries events.
         unsafe { dev.disable_event_tracking() };
-        let synth = self.load_on::<xn::Unquantized<half::bf16, _>>(dev, Some(mimi_dev), false)?;
-        Ok(Synth(Box::new(synth)))
+        // `check_device` lets only these two through to CUDA.
+        let synth: Box<dyn SynthApi> = match self.quant {
+            Quant::Q80 => Box::new(self.load_on::<xn::cuda_backend::q8::Q8<half::bf16>>(
+                dev,
+                Some(mimi_dev),
+                false,
+            )?),
+            _ => Box::new(self.load_on::<xn::Unquantized<half::bf16, _>>(
+                dev,
+                Some(mimi_dev),
+                false,
+            )?),
+        };
+        Ok(Synth(synth))
     }
 
     #[cfg(feature = "vulkan")]

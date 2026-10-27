@@ -218,7 +218,7 @@ def available_devices() -> list[str]:
     """The device names this build accepts, most capable first. `"auto"` picks the first."""
 
 def available_quants() -> list[str]:
-    """The weight formats `quant=` accepts. All are CPU-only."""
+    """The weight formats `quant=` accepts. They run on the CPU, and q8_0 on CUDA too."""
 
 def build_info() -> dict[str, Any]:
     """The runtime's build configuration, for bug reports."""

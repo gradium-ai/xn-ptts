@@ -264,7 +264,7 @@ def test_the_default_voice_catalog_is_pinned_to_a_commit():
         ({"model": "/definitely/not/a/checkpoint/config.json"}, LookupError, "config.json"),
         ({"model": "owner/name"}, LookupError, "hf://owner/name"),
         ({"model": "hf://owner"}, ValueError, "hf://owner"),
-        ({"device": "cuda", "quant": "q8_0"}, NotImplementedError, "CPU-only"),
+        ({"device": "cuda", "quant": "q4_0"}, NotImplementedError, "runs on the CPU"),
     ],
 )
 @pytest.mark.filterwarnings("ignore:config= and revision= are deprecated:DeprecationWarning")
@@ -282,7 +282,7 @@ def test_nothing_is_downloaded_before_the_arguments_are_checked():
     import time
 
     start = time.monotonic()
-    for kwargs in ({"quant": "q3k"}, {"device": "cuda", "quant": "q8_0"}):
+    for kwargs in ({"quant": "q3k"}, {"device": "cuda", "quant": "q4_0"}):
         with pytest.raises(Exception):
             ptts.TTS(**kwargs, lang="en")
     assert time.monotonic() - start < 30.0

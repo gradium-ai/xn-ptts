@@ -52,6 +52,11 @@ struct Args {
     #[arg(long, default_value_t = false)]
     cpu: bool,
 
+    /// Device to run on: auto, cpu, cuda, vulkan or metal. Without it, quantized weights run on
+    /// the CPU and others where `auto` puts them.
+    #[arg(long)]
+    device: Option<String>,
+
     /// Number of CPU threads for tensor ops.
     #[arg(long)]
     threads: Option<usize>,
@@ -424,9 +429,13 @@ fn bench_synth(args: &Args, normalize: Normalize, quant: Quant) -> Result<()> {
     let voice = if baked { args.voice.to_string_lossy().into_owned() } else { "bench".into() };
 
     let t_load = Instant::now();
-    // Quantized weights run only on the CPU, so a GPU build picks it for them, as `--breakdown`
-    // does, rather than failing to build.
-    let device = if args.cpu || quant != Quant::F32 { DeviceKind::Cpu } else { DeviceKind::Auto };
+    // `auto` takes quantized weights to the CPU, as `--breakdown` does, rather than to a GPU
+    // backend that may not run them.
+    let device = match &args.device {
+        Some(name) => name.parse()?,
+        None if args.cpu || quant != Quant::F32 => DeviceKind::Cpu,
+        None => DeviceKind::Auto,
+    };
     let mut builder = SynthBuilder::new(cfg, &args.model, normalize)
         .tokenizer_file(tokenizer_path)
         .device(device)
