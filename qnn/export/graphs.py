@@ -18,10 +18,10 @@ the attention scores unchanged; the cached keys are in that order.
 What differs from pocket-tts, all read off `xn-ptts/ptts/src`:
 
 - The weights are read straight from the checkpoint, no pocket-tts modules.
-- GELU is the exact (erf) one, in both transformers (F.gelu). QAIRT converts
-  it to QNN's Gelu op whatever `approximate` says (and rejects torch.erf); on
-  the S25 HTP that op is within 1.5e-4 of the exact GELU, fp16 level
-  (diag_gelu.py), so it needs no rewrite.
+- GELU is the exact (erf) one in the flow LM (F.gelu), and in Mimi the config's
+  (`gelu_approximate`). QAIRT converts F.gelu to QNN's Gelu op whatever
+  `approximate` says (and rejects torch.erf); on the S25 HTP that op is within
+  1.5e-4 of the exact GELU, fp16 level (diag_gelu.py), so it needs no rewrite.
 - The flow LM transformer has no layer scale; Mimi's has.
 - Every generated frame's input gets a constant bias: the summed conditioners
   (`num_speakers`, a lut, at its default "1"). Text and voice positions do not.
@@ -116,11 +116,20 @@ class Scale(nn.Module):
         return x * self.scale
 
 
+def gelu_approximate(config: dict, section: str) -> str:
+    """F.gelu's `approximate` for the transformer in `config[section]`: its `gelu`, or when that is
+    absent tanh for a checkpoint without a `model_id` and erf otherwise (`TTSConfig::default_gelu`)."""
+    gelu = config[section].get("gelu") or ("erf" if config.get("model_id") else "tanh")
+    assert gelu in ("erf", "tanh"), f"unknown gelu {gelu!r}"
+    return "none" if gelu == "erf" else "tanh"
+
+
 class Layer(nn.Module):
     """One StreamingTransformerLayer (`transformer.rs`) with the cache passed in rather than held."""
 
-    def __init__(self, W, prefix: str, heads: int, layer_scale: bool):
+    def __init__(self, W, prefix: str, heads: int, layer_scale: bool, gelu: str = "none"):
         super().__init__()
+        self.gelu = gelu
         w = W[f"{prefix}.self_attn.in_proj.weight"]
         e = w.shape[1]
         self.h, self.d = heads, e // heads
@@ -154,7 +163,7 @@ class Layer(nn.Module):
         att = torch.softmax(q @ keys.transpose(-1, -2) * self.scale + mask, -1)
         y = (att @ values).transpose(1, 2).reshape(1, s, self.h * self.d)
         x = x + self.ls1(self.out_proj(y))
-        y = self.linear2(F.gelu(self.linear1(self.norm2(x))))
+        y = self.linear2(F.gelu(self.linear1(self.norm2(x)), approximate=self.gelu))
         return x + self.ls2(y), k, v
 
 
@@ -379,12 +388,12 @@ class MimiStep(nn.Module):
     right-aligned (slot W - 1 is the newest).
     """
 
-    def __init__(self, W, mc: dict, overlap_add: bool = False):
+    def __init__(self, W, mc: dict, overlap_add: bool = False, gelu: str = "none"):
         super().__init__()
         self.overlap_add = overlap_add
         self.register_buffer("emb_std", W["flow_lm.emb_std"].clone())
         self.register_buffer("emb_mean", W["flow_lm.emb_mean"].clone())
-        ow = W["mimi.quantizer.output_proj.weight"][..., 0]  # [512, 32]
+        ow = W["mimi.quantizer.output_proj.weight"][..., 0]  # [dimension, ldim]
         self.output_proj = nn.Linear(ow.shape[1], ow.shape[0], bias=False)
         self.output_proj.weight.data = ow.clone()
         hop = math.prod(mc["ratios"])
@@ -393,8 +402,15 @@ class MimiStep(nn.Module):
         self.samples_per_frame = self.steps * hop
         assert abs(enc_rate - mc["frame_rate"]) > 0.01
         self.upsample = conv_tr1d(W, "mimi.upsample.convtr.convtr", self.steps, groups=mc["dimension"])
+        # `ProjectedTransformer`: from `dimension` to `transformer_d_model` and on to the
+        # decoder's `decoder_dimension`, each projection only where the widths differ.
+        dim, width = mc["dimension"], mc["transformer_d_model"]
+        p = "mimi.decoder_transformer"
+        self.transformer_in = linear(W, f"{p}.input_proj", bias=False) if width != dim else nn.Identity()
+        out = mc.get("decoder_dimension") or dim
+        self.transformer_out = linear(W, f"{p}.output_proj.0", bias=False) if width != out else nn.Identity()
         self.layers = nn.ModuleList(
-            Layer(W, f"mimi.decoder_transformer.transformer.layers.{i}", mc["transformer_num_heads"], True)
+            Layer(W, f"{p}.transformer.layers.{i}", mc["transformer_num_heads"], True, gelu)
             for i in range(mc["transformer_num_layers"])
         )
         self.window = mc["transformer_context"]
@@ -413,8 +429,10 @@ class MimiStep(nn.Module):
         self.final_conv = conv1d(W, f"{p}.{idx + 1}.conv")
         assert all(c.kernel_size[0] == 1 for c in self.res2)
 
-        dim = mc["dimension"]
-        self.shapes = [(1, dim, self.upsample.kernel_size[0] - self.steps), (1, dim, self.init_conv.kernel_size[0] - 1)]
+        self.shapes = [
+            (1, dim, self.upsample.kernel_size[0] - self.steps),
+            (1, self.init_conv.in_channels, self.init_conv.kernel_size[0] - 1),
+        ]
         for ct, r1 in zip(self.convtrs, self.res1):
             self.shapes.append((1, ct.out_channels, ct.kernel_size[0] - ct.stride[0]))
             self.shapes.append((1, r1.in_channels, r1.kernel_size[0] - 1))
@@ -428,17 +446,17 @@ class MimiStep(nn.Module):
     def forward(self, latent, cos, sin, mask, *states):
         states = list(states)
         kv = states.pop()
-        x = self.output_proj(latent * self.emb_std + self.emb_mean)[:, :, None]  # [1, 512, 1]
+        x = self.output_proj(latent * self.emb_std + self.emb_mean)[:, :, None]  # [1, dimension, 1]
         x, up = convtr_step(self.upsample, states[0], x, self.overlap_add)
         new_states = [up]
 
-        x = x.transpose(1, 2)  # [1, steps, E]
+        x = self.transformer_in(x.transpose(1, 2))  # [1, steps, E]
         new_kv = []
         for i, layer in enumerate(self.layers):
             k_cache, v_cache = kv[2 * i : 2 * i + 1], kv[2 * i + 1 : 2 * i + 2]
             x, k, v = layer(x, k_cache, v_cache, cos, sin, mask)
             new_kv += [torch.cat([k_cache, k], 2)[:, :, self.steps :], torch.cat([v_cache, v], 2)[:, :, self.steps :]]
-        x = x.transpose(1, 2)
+        x = self.transformer_out(x).transpose(1, 2)
 
         it = iter(states[1:])
         x, s = conv_step(self.init_conv, next(it), x)
