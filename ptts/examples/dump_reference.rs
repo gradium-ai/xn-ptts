@@ -203,7 +203,7 @@ fn main() -> Result<()> {
     // Conditioning, exactly as the library computes it.
     let voice_emb = ptts::loader::load_voice_emb(
         &voice_path,
-        cfg.model_ext().as_deref(),
+        cfg.embeddings_ext.as_deref(),
         model.speaker_proj(),
         &dev,
     )?;
