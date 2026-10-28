@@ -90,10 +90,15 @@ Phonon::Phonon(const Options& o) : rng_(o.seed) {
     // The standalone CLI can load the text frontend from its supplied bundle.
 #if defined(__ANDROID__)
     const char* platform = "android-arm64";
+    const char* fallback = "libptts_text.so";
+#elif defined(_WIN32)
+    const char* platform = "windows-arm64";
+    const char* fallback = "ptts_text.dll";
 #else
     const char* platform = "linux-arm64";
+    const char* fallback = "libptts_text.so";
 #endif
-    const auto& entry = text.contains("library") ? text.at("library") : nlohmann::json("libptts_text.so");
+    const auto& entry = text.contains("library") ? text.at("library") : nlohmann::json(fallback);
     std::string name = entry.is_object() ? std::string(entry.at(platform)) : std::string(entry);
     std::ifstream in_bundle(dir + name);
     library = in_bundle ? dir + name : lib(o, name);
