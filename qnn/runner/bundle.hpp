@@ -34,7 +34,8 @@ inline std::string select_context_binary(const nlohmann::json &binaries,
     throw std::runtime_error("no compiled QNN model for " + soc +
                              "; bundle needs soc_models metadata");
   const std::filesystem::path path(selected);
-  if (path.is_absolute())
+  // Not is_absolute(): on Windows "C:file" and "\file" are not absolute.
+  if (path.has_root_path())
     throw std::runtime_error("context binary must be relative to the bundle");
   for (const auto &part : path)
     if (part == "..")

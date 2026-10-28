@@ -1,6 +1,6 @@
 #include "qnn_model.hpp"
 
-#include <dlfcn.h>
+#include "platform_dl.hpp"
 
 #include <cstdarg>
 #include <cstdio>
