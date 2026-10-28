@@ -84,8 +84,12 @@ or callback failure. Concurrent generation and closing during generation are rej
 Each [GitHub Release](https://github.com/gradium-ai/xn-ptts/releases) has a QNN bundle for
 Phonon 31m, the default model, as `phonon-31m-en-qnn.zip`. It holds context binaries for the
 SM8650, SM8750, SM8850 and QCS8275, each checked on that SoC, and the English voices of the
-voice catalog. For another model, such as one of the gated Phonon 40m models, build a bundle
-with the export tools below. They compile on Qualcomm AI Hub, so they need an AI Hub account.
+voice catalog. From 0.5.0 it also holds one for the SC8380XP (Snapdragon X Elite), for
+`qnn/runner` embedded in a Windows app. The bundle has no Windows text library, so set
+`Options.text_library` to a `ptts_text.dll` built from `qnn/text-ffi`. The context binaries
+were built with QAIRT 2.50 and do not load on an older QNN runtime. For another model, such
+as one of the gated Phonon 40m models, build a bundle with the export tools below. They
+compile on Qualcomm AI Hub, so they need an AI Hub account.
 
 A bundle holds `metadata.json`, a tokenizer, BOS data, voices and compiled context binaries.
 These are exported model assets, not raw safetensors or GGUF checkpoints.
