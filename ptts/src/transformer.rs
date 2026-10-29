@@ -4,9 +4,10 @@
 //! belongs to, as the two lay out their attention differently.
 
 use crate::layer_scale::LayerScale;
+use crate::q8::Q8Linear;
 use crate::rope::RotaryEmbedding;
 use xn::nn::{LayerNorm, Linear, var_builder::Path};
-use xn::{Backend, BackendQ, Result, Tensor, TensorView, WithDTypeF};
+use xn::{Backend, BackendQ, Result, Tensor, TensorView, Unquantized, WithDTypeF};
 
 /// State for StreamingMultiheadAttention.
 #[derive(Debug, Clone)]
@@ -292,6 +293,8 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformerState<T, B> {
 pub struct MimiStreamingMultiheadAttention<T: WithDTypeF, B: Backend> {
     in_proj: Linear<T, B>,
     out_proj: Linear<T, B>,
+    /// q8_0 versions of `in_proj` and `out_proj`, used instead when set.
+    q8: Option<(Q8Linear, Q8Linear)>,
     embed_dim: usize,
     num_heads: usize,
     context: usize,
@@ -302,7 +305,7 @@ impl<T: WithDTypeF, B: Backend> MimiStreamingMultiheadAttention<T, B> {
         let out_dim = 3 * embed_dim;
         let in_proj = Linear::load(vb.pp("in_proj"), embed_dim, out_dim)?;
         let out_proj = Linear::load(vb.pp("out_proj"), embed_dim, embed_dim)?;
-        Ok(Self { in_proj, out_proj, embed_dim, num_heads, context })
+        Ok(Self { in_proj, out_proj, q8: None, embed_dim, num_heads, context })
     }
 
     pub fn init_state(&self) -> Result<KvCache<T, B>> {
@@ -319,7 +322,10 @@ impl<T: WithDTypeF, B: Backend> MimiStreamingMultiheadAttention<T, B> {
         let (b, t, _) = query.dims3()?;
         let d = self.embed_dim / self.num_heads;
 
-        let projected = self.in_proj.forward(query)?;
+        let projected = match &self.q8 {
+            Some((in_proj, _)) => in_proj.forward(query)?,
+            None => self.in_proj.forward(query)?,
+        };
         let packed = projected.reshape((b, t, 3, self.num_heads, d))?;
         let q = packed.narrow(2, 0..1)?.contiguous()?.reshape((b, t, self.num_heads, d))?;
         let k = packed.narrow(2, 1..2)?.contiguous()?.reshape((b, t, self.num_heads, d))?;
@@ -349,7 +355,10 @@ impl<T: WithDTypeF, B: Backend> MimiStreamingMultiheadAttention<T, B> {
         state.trim()?;
 
         let x = x.transpose(1, 2)?.reshape((b, t, self.embed_dim))?;
-        self.out_proj.forward(&x)
+        match &self.q8 {
+            Some((_, out_proj)) => out_proj.forward(&x.contiguous()?),
+            None => self.out_proj.forward(&x),
+        }
     }
 }
 
@@ -395,6 +404,8 @@ pub struct StreamingTransformerLayer<Q: BackendQ> {
     norm2: LayerNorm<Q::T, Q::B>,
     linear1: Q::LinearQ,
     linear2: Q::LinearQ,
+    /// q8_0 versions of `linear1` and `linear2`, used instead when set.
+    q8: Option<(Q8Linear, Q8Linear)>,
     layer_scale_1: Option<LayerScale<Q::T, Q::B>>,
     layer_scale_2: Option<LayerScale<Q::T, Q::B>>,
     pub gelu: Gelu,
@@ -450,6 +461,7 @@ impl<Q: BackendQ> StreamingTransformerLayer<Q> {
             norm2,
             linear1,
             linear2,
+            q8: None,
             layer_scale_1,
             layer_scale_2,
             gelu: Gelu::default(),
@@ -498,16 +510,55 @@ impl<Q: BackendQ> StreamingTransformerLayer<Q> {
 
         // FF block: x + layer_scale_2(ff(norm2(x)))
         let norm2 = self.norm2.forward(&x)?;
-        let mut ff_out = self.linear1.forward(&norm2)?;
-        ff_out = match self.gelu {
-            Gelu::Tanh => gelu_tanh(&ff_out)?,
-            Gelu::Erf => ff_out.gelu_erf()?,
+        let gelu = |x: Tensor<Q::T, Q::B>| match self.gelu {
+            Gelu::Tanh => gelu_tanh(&x),
+            Gelu::Erf => x.gelu_erf(),
         };
-        ff_out = self.linear2.forward(&ff_out)?;
+        let mut ff_out = match &self.q8 {
+            Some((linear1, linear2)) => linear2.forward(&gelu(linear1.forward(&norm2)?)?)?,
+            None => self.linear2.forward(&gelu(self.linear1.forward(&norm2)?)?)?,
+        };
         if let Some(ls) = &self.layer_scale_2 {
             ff_out = ls.forward(&ff_out)?;
         }
         x.add(&ff_out)
+    }
+}
+
+/// The q8_0 copies of one Mimi layer's matmuls: attention in and out, then feed-forward.
+pub(crate) struct LayerQ8 {
+    attn: (Q8Linear, Q8Linear),
+    ff: (Q8Linear, Q8Linear),
+}
+
+impl<B: Backend> StreamingTransformerLayer<Unquantized<f32, B>> {
+    fn prepare_q8(&self) -> Result<LayerQ8> {
+        let AttentionKind::Mimi(attn) = &self.self_attn else {
+            xn::bail!("only a Mimi transformer can be quantized this way")
+        };
+        Ok(LayerQ8 {
+            attn: (Q8Linear::from_linear(&attn.in_proj)?, Q8Linear::from_linear(&attn.out_proj)?),
+            ff: (Q8Linear::from_linear(&self.linear1)?, Q8Linear::from_linear(&self.linear2)?),
+        })
+    }
+
+    fn apply_q8(&mut self, q8: LayerQ8) {
+        if let AttentionKind::Mimi(attn) = &mut self.self_attn {
+            attn.q8 = Some(q8.attn);
+        }
+        self.q8 = Some(q8.ff);
+    }
+}
+
+impl<B: Backend> StreamingTransformer<Unquantized<f32, B>> {
+    /// The q8_0 copies of every layer's matmuls, for [`Self::apply_q8`]. Changes nothing, so a
+    /// failure leaves the transformer as it was. CPU only.
+    pub(crate) fn prepare_q8(&self) -> Result<Vec<LayerQ8>> {
+        self.layers.iter().map(|l| l.prepare_q8()).collect()
+    }
+
+    pub(crate) fn apply_q8(&mut self, q8: Vec<LayerQ8>) {
+        self.layers.iter_mut().zip(q8).for_each(|(l, q)| l.apply_q8(q));
     }
 }
 
@@ -914,5 +965,84 @@ mod bad_config_tests {
             let err = load(8, 4, kv_heads).err().unwrap_or_else(|| panic!("{kv_heads} kv heads"));
             assert!(err.to_string().contains("key/value heads"), "{err}");
         }
+    }
+}
+
+#[cfg(test)]
+mod q8_tests {
+    use super::*;
+    use xn::CpuDevice;
+    use xn::nn::VB;
+
+    type F32 = xn::Unquantized<f32, CpuDevice>;
+    const D: usize = 64;
+    const FF: usize = 128;
+
+    /// A one-layer transformer of `kind` with random weights.
+    fn transformer(kind: Kind) -> StreamingTransformer<F32> {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0);
+        let p = "layers.0";
+        let mut tensors: Vec<(String, Vec<usize>, f32)> = vec![
+            (format!("{p}.self_attn.in_proj.weight"), vec![3 * D, D], 0.2),
+            (format!("{p}.self_attn.out_proj.weight"), vec![D, D], 0.2),
+            (format!("{p}.linear1.weight"), vec![FF, D], 0.2),
+            (format!("{p}.linear2.weight"), vec![D, FF], 0.2),
+            (format!("{p}.norm1.weight"), vec![D], 1.0),
+            (format!("{p}.norm1.bias"), vec![D], 0.1),
+            (format!("{p}.norm2.weight"), vec![D], 1.0),
+            (format!("{p}.norm2.bias"), vec![D], 0.1),
+        ];
+        if kind == Kind::Mimi {
+            tensors.push((format!("{p}.layer_scale_1.scale"), vec![D], 1.0));
+            tensors.push((format!("{p}.layer_scale_2.scale"), vec![D], 1.0));
+        }
+        let (mut header, mut data) = (serde_json::Map::new(), Vec::new());
+        for (name, shape, scale) in tensors {
+            let start = data.len();
+            for _ in 0..shape.iter().product::<usize>() {
+                data.extend(rng.random_range(-scale..scale).to_le_bytes());
+            }
+            header.insert(
+                name,
+                serde_json::json!({"dtype": "F32", "shape": shape, "data_offsets": [start, data.len()]}),
+            );
+        }
+        let header = serde_json::to_vec(&header).unwrap();
+        let bytes = [(header.len() as u64).to_le_bytes().as_slice(), &header, &data].concat();
+        let vb = VB::from_bytes(vec![bytes], CpuDevice).unwrap().root();
+        let layer_scale = (kind == Kind::Mimi).then_some(0.01);
+        StreamingTransformer::load(&vb, D, 4, 1, layer_scale, FF, Some(250), 10_000., kind).unwrap()
+    }
+
+    fn run(t: &StreamingTransformer<F32>, x: &Tensor<f32, CpuDevice>) -> Vec<f32> {
+        let mut state = t.init_state(1, 0).unwrap();
+        t.forward(x, &mut state).unwrap().to_vec().unwrap()
+    }
+
+    #[test]
+    fn a_q8_mimi_transformer_matches_the_f32_one() {
+        let mut t = transformer(Kind::Mimi);
+        let x = Tensor::from_vec(
+            (0..16 * D).map(|i| (i as f32 * 0.37).sin()).collect(),
+            (1, 16, D),
+            &CpuDevice,
+        )
+        .unwrap();
+        let want = run(&t, &x);
+        let q8 = t.prepare_q8().unwrap();
+        t.apply_q8(q8);
+        let got = run(&t, &x);
+        let num: f32 = got.iter().zip(&want).map(|(a, b)| (a - b) * (a - b)).sum();
+        let den: f32 = want.iter().map(|b| b * b).sum();
+        let err = (num / den).sqrt();
+        assert!(err > 0.0 && err < 0.01, "{err}");
+    }
+
+    #[test]
+    fn a_flow_lm_transformer_is_not_quantized_this_way() {
+        let err =
+            transformer(Kind::FlowLm).prepare_q8().err().expect("a flow LM layer was quantized");
+        assert!(err.to_string().contains("Mimi"), "{err}");
     }
 }
