@@ -166,7 +166,7 @@ pub const SPECIAL_CHARS_IT: SpecialChars = SpecialChars {
     plus: "più",
     equals: "uguale",
     colon: "due punti",
-    slash: "slash",
+    slash: "barra",
     dash: "trattino",
     dot: "punto",
     underscore: "trattino basso",
@@ -177,10 +177,10 @@ pub const SPECIAL_CHARS_NL: SpecialChars = SpecialChars {
     plus: "plus",
     equals: "is gelijk aan",
     colon: "dubbele punt",
-    slash: "slash",
+    slash: "schuine streep",
     dash: "streepje",
     dot: "punt",
-    underscore: "laag streepje",
+    underscore: "liggend streepje",
 };
 
 pub const SPECIAL_CHARS_JA: SpecialChars = SpecialChars {
@@ -391,18 +391,6 @@ impl Lang {
         }
     }
 
-    fn pi(self) -> &'static str {
-        match self {
-            Lang::De => "Pi",
-            Lang::Ar => "باي",
-            Lang::Hi => "पाई",
-            Lang::Ko => "파이",
-            Lang::Ja => "パイ",
-            Lang::Zh => "派",
-            _ => "pi",
-        }
-    }
-
     fn love(self) -> &'static str {
         match self {
             Lang::En => "love",
@@ -583,7 +571,7 @@ impl Lang {
             (Lang::It, None) => format!("{n} stelle"),
             (Lang::Nl, Some(of)) => format!("{n} van de {of} sterren"),
             (Lang::Nl, None) => format!("{n} sterren"),
-            (Lang::Ja, Some(of)) => format!("{of}つ中星{n}つ"),
+            (Lang::Ja, Some(of)) => format!("{of}つ星のうち{n}つ"),
             (Lang::Ja, None) => format!("星{n}つ"),
             (Lang::Zh, Some(of)) => format!("{n}星，满分{of}星"),
             (Lang::Zh, None) => format!("{n}星"),
@@ -648,11 +636,6 @@ impl Lang {
     }
 
     fn greek(self, c: char) -> Option<String> {
-        const NAMES: [&str; 24] = [
-            "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa",
-            "lambda", "mu", "nu", "xi", "omicron", "pi", "rho", "sigma", "tau", "upsilon", "phi",
-            "chi", "psi", "omega",
-        ];
         let i = match c {
             'α'..='ρ' => c as usize - 'α' as usize,
             'ς' => 17,
@@ -661,7 +644,48 @@ impl Lang {
             'Σ'..='Ω' => c as usize - 'Α' as usize - 1,
             _ => return None,
         };
-        let name = NAMES[i];
+        let names = match self {
+            Lang::En | Lang::Fr | Lang::De | Lang::Es | Lang::Pt => {
+                "alpha|beta|gamma|delta|epsilon|zeta|eta|theta|iota|kappa|lambda|mu|nu|xi|omicron|pi|rho|sigma|tau|upsilon|phi|chi|psi|omega"
+            }
+            Lang::Ar => {
+                "ألفا|بيتا|غاما|دلتا|إبسيلون|زيتا|إيتا|ثيتا|يوتا|كابا|لامدا|مو|نو|كسي|أوميكرون|باي|رو|سيغما|تاو|أبسيلون|فاي|خي|بساي|أوميغا"
+            }
+            Lang::Hi => {
+                "अल्फा|बीटा|गामा|डेल्टा|एप्सिलॉन|जीटा|ईटा|थीटा|आयोटा|कप्पा|लैम्ब्डा|म्यू|न्यू|क्साई|ओमिक्रॉन|पाई|रो|सिग्मा|टाऊ|अप्सिलॉन|फाई|काई|साई|ओमेगा"
+            }
+            Lang::Ko => {
+                "알파|베타|감마|델타|엡실론|제타|에타|세타|요타|카파|람다|뮤|뉴|크시|오미크론|파이|로|시그마|타우|입실론|피|카이|프사이|오메가"
+            }
+            Lang::Pl => {
+                "alfa|beta|gamma|delta|epsilon|dzeta|eta|theta|jota|kappa|lambda|mi|ni|ksi|omikron|pi|ro|sigma|tau|ypsilon|fi|chi|psi|omega"
+            }
+            Lang::Sv => {
+                "alfa|beta|gamma|delta|epsilon|zeta|eta|theta|jota|kappa|lambda|my|ny|xi|omikron|pi|rho|sigma|tau|ypsilon|fi|chi|psi|omega"
+            }
+            Lang::Fi => {
+                "alfa|beeta|gamma|delta|epsilon|zeeta|eeta|theeta|ioota|kappa|lambda|myy|nyy|ksii|omikron|pii|rhoo|sigma|tau|ypsilon|fii|khii|psii|oomega"
+            }
+            Lang::No | Lang::Da => {
+                "alfa|beta|gamma|delta|epsilon|zeta|eta|theta|jota|kappa|lambda|my|ny|ksi|omikron|pi|rho|sigma|tau|ypsilon|fi|khi|psi|omega"
+            }
+            Lang::It => {
+                "alfa|beta|gamma|delta|epsilon|zeta|eta|theta|iota|kappa|lambda|mi|ni|xi|omicron|pi greco|rho|sigma|tau|ipsilon|fi|chi|psi|omega"
+            }
+            Lang::Nl => {
+                "alfa|bèta|gamma|delta|epsilon|zèta|èta|thèta|jota|kappa|lambda|mu|nu|xi|omikron|pi|rho|sigma|tau|upsilon|phi|chi|psi|omega"
+            }
+            Lang::Ja => {
+                "アルファ|ベータ|ガンマ|デルタ|イプシロン|ゼータ|イータ|シータ|イオタ|カッパ|ラムダ|ミュー|ニュー|クシー|オミクロン|パイ|ロー|シグマ|タウ|ウプシロン|ファイ|カイ|プサイ|オメガ"
+            }
+            Lang::Zh => {
+                "阿尔法|贝塔|伽马|德尔塔|艾普西隆|泽塔|伊塔|西塔|约塔|卡帕|拉姆达|缪|纽|克西|奥密克戎|派|柔|西格玛|陶|宇普西龙|斐|卡|普西|欧米伽"
+            }
+            Lang::Tr => {
+                "alfa|beta|gama|delta|epsilon|zeta|eta|teta|iota|kapa|lambda|mü|nü|ksi|omikron|pi|ro|sigma|tau|ipsilon|fi|ki|psi|omega"
+            }
+        };
+        let name = names.split('|').nth(i)?;
         Some(match self {
             Lang::De => name[..1].to_uppercase() + &name[1..],
             _ => name.to_string(),
@@ -1116,9 +1140,13 @@ pub fn normalize_text(input: &str, lang: Lang, rules: Rules) -> String {
                 }
             }
             c if lang.greek(c).is_some() => res.push_spoken(&lang.greek(c).unwrap_or_default()),
+            '‰' if lang == Lang::Zh && res.buffer.last().is_some_and(char::is_ascii_digit) => {
+                let from = res.buffer.iter().rposition(|c| !c.is_ascii_digit() && *c != '.');
+                let n: String = res.buffer.drain(from.map_or(0, |i| i + 1)..).collect();
+                res.push_spoken(&format!("千分之{n}"));
+            }
             c if lang.symbol(c).is_some() => res.push_spoken(lang.symbol(c).unwrap_or_default()),
             '±' => res.push_spoken(lang.plus_minus()),
-            'π' => res.push_spoken(lang.pi()),
             '❤' | '♥' => {
                 chars.next_if_eq(&'\u{FE0F}');
                 res.push_spoken(lang.love());
@@ -1163,6 +1191,13 @@ pub fn normalize_text(input: &str, lang: Lang, rules: Rules) -> String {
                 && chars.peek().is_some_and(char::is_ascii_digit)
                 && chars.clone().find(|c| !c.is_ascii_digit()) != Some('-') => {}
             '…' => res.push('.'),
+            '=' if lang == Lang::Ko => {
+                let particle =
+                    korean_topic_particle(res.buffer.iter().rev().find(|c| !c.is_whitespace()));
+                res.pop_whitespace();
+                res.push_str(particle);
+                res.push_whitespace();
+            }
             '=' => res.push_spoken(lang.special_chars().equals),
             ':' if !prev.is_none_or(char::is_whitespace)
                 && !chars.peek().is_none_or(|c| c.is_whitespace()) =>
@@ -1188,6 +1223,18 @@ pub fn normalize_text(input: &str, lang: Lang, rules: Rules) -> String {
     let text = rewrite::rewrite_text(&text, lang, rules, |w| spell_symbols(w, lang, rules));
     let text = strip_closing_quote(&text);
     if lang == Lang::Ja { space_chars(text) } else { text.to_string() }
+}
+
+/// The topic particle Korean reads `=` as, 은 after a syllable ending on a consonant and 는 after
+/// a vowel, as the digit or Latin letter before it is read ("1은 2", "a는 b").
+fn korean_topic_particle(before: Option<&char>) -> &'static str {
+    let consonant = match before {
+        Some(&c @ '가'..='힣') => !(c as u32 - '가' as u32).is_multiple_of(28),
+        Some(c) if c.is_ascii_digit() => "013678".contains(*c),
+        Some(c) if c.is_ascii_alphabetic() => "lmnrLMNR".contains(*c),
+        _ => false,
+    };
+    if consonant { "은" } else { "는" }
 }
 
 /// Japanese as the checkpoints were trained on it: one space between characters, with runs of
@@ -1368,9 +1415,30 @@ mod tests {
         assert_eq!(normalize_text("1+1=2", Lang::Pt, Rules::DEFAULT), "1 mais 1 igual 2");
         assert_eq!(normalize_text("a@b", Lang::It, Rules::DEFAULT), "a chiocciola b");
         assert_eq!(normalize_text("1+1=2", Lang::Tr, Rules::DEFAULT), "1 artı 1 eşittir 2");
+        assert_eq!(normalize_text("1+1=2", Lang::Ko, Rules::DEFAULT), "1 플러스 1은 2");
+        assert_eq!(normalize_text("2 + 2 = 4", Lang::Ko, Rules::DEFAULT), "2 플러스 2는 4");
+        assert_eq!(normalize_text("x=y, n=값", Lang::Ko, Rules::DEFAULT), "x는 y, n은 값");
+        assert_eq!(normalize_text("값=3, 나=4", Lang::Ko, Rules::DEFAULT), "값은 3, 나는 4");
+        assert_eq!(normalize_text("α, β, π", Lang::Zh, Rules::DEFAULT), "阿尔法, 贝塔, 派");
+        assert_eq!(
+            normalize_text("5‰, 2.5‰, ‰", Lang::Zh, Rules::DEFAULT),
+            "千分之5, 千分之2.5, 千分之"
+        );
+        assert_eq!(normalize_text("Δ, ρ, π", Lang::Fi, Rules::DEFAULT), "delta, rhoo, pii");
+        assert_eq!(normalize_text("π, Ω", Lang::It, Rules::DEFAULT), "pi greco, omega");
+        assert_eq!(normalize_text("π≈3", Lang::De, Rules::DEFAULT), "Pi ungefähr 3");
+        for lang in Lang::ALL {
+            for c in 'α'..='ω' {
+                assert!(lang.greek(c).is_some_and(|s| !s.is_empty()), "{lang:?} {c}");
+            }
+        }
         assert_eq!(
             normalize_text("1+1=2", Lang::Ja, Rules::DEFAULT),
             "1 プ ラ ス 1 イ コ ー ル 2 。"
+        );
+        assert_eq!(
+            normalize_text("★★★★☆ α", Lang::Ja, Rules::DEFAULT),
+            "5 つ 星 の う ち 4 つ ア ル フ ァ 。"
         );
         for lang in Lang::ALL {
             for c in "×÷≤≥≠≈√∞∑‰".chars() {
