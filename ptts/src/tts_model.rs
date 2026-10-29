@@ -536,7 +536,11 @@ pub const SENTENCE_ENDS: &[&str] = &[".", "!", "...", "?", "。", "！", "？", 
 fn full_stop(c: char) -> char {
     match c as u32 {
         0x0900..=0x097F => '।',
-        0x3040..=0x30FF | 0x3400..=0x9FFF => '。',
+        0x3040..=0x30FF
+        | 0x3400..=0x9FFF
+        | 0xF900..=0xFAFF
+        | 0xFF66..=0xFF9F
+        | 0x20000..=0x2FA1F => '。',
         _ => '.',
     }
 }
@@ -558,7 +562,12 @@ pub fn prepare_text_prompt(text: &str) -> (String, usize) {
         text = first.to_uppercase().to_string() + chars.as_str();
     }
     if let Some(last) = text.chars().last().filter(|c| c.is_alphanumeric()) {
-        text.push(full_stop(last));
+        let stop = full_stop(last);
+        // Text spaced one character at a time, as Japanese is, keeps its `。` spaced too.
+        if stop == '。' && text.chars().rev().nth(1) == Some(' ') {
+            text.push(' ');
+        }
+        text.push(stop);
     }
     (text, frames_after_eos)
 }
@@ -591,8 +600,10 @@ mod tests {
             ("one\r\ntwo   three\nfour five", "One two three four five.", 1),
             ("éclair au chocolat", "Éclair au chocolat.", 3),
             // The full stop of the script the text ends in.
-            ("で す", "で す。", 3),
+            ("で す", "で す 。", 3),
             ("你好", "你好。", 3),
+            ("ｶﾀｶﾅ", "ｶﾀｶﾅ。", 3),
+            ("𠀋", "𠀋。", 3),
             ("नमस्ते", "नमस्ते।", 3),
             ("안녕하세요", "안녕하세요.", 3),
             ("です。", "です。", 3),

@@ -279,7 +279,7 @@ pub fn max_tokens_for(room: usize, frame_rate: f64) -> usize {
 mod tests {
     use super::*;
 
-    /// One token per word and per `.`, `!`, `?` or `。`, so sentence ends get their own ids as
+    /// One token per word and per `.`, `!` or `?`, so sentence ends get their own ids as
     /// they do in the real tokenizer.
     #[derive(Default)]
     struct Words(std::cell::RefCell<Vec<String>>);
@@ -296,7 +296,7 @@ mod tests {
             };
             let mut ids = vec![];
             for word in text.split_whitespace() {
-                let stem = word.trim_end_matches(['.', '!', '?', '。']);
+                let stem = word.trim_end_matches(['.', '!', '?']);
                 if !stem.is_empty() {
                     ids.push(id(stem.to_string()));
                 }
@@ -310,7 +310,7 @@ mod tests {
             let mut text = String::new();
             for &t in tokens {
                 let piece = &vocab[t as usize];
-                if !text.is_empty() && !matches!(piece.as_str(), "." | "!" | "?" | "。") {
+                if !text.is_empty() && !matches!(piece.as_str(), "." | "!" | "?") {
                     text.push(' ');
                 }
                 text.push_str(piece);
@@ -359,15 +359,20 @@ mod tests {
         }
     }
 
+    /// Spaced as Japanese is, so `。` is a word, and a piece, of its own.
     #[test]
     fn chunks_end_sentences_at_the_other_scripts_marks() {
         let tok = Words::default();
-        let planned = chunks(&tok, "一 二。 三 四。", Normalize::OFF, 3, 12.5).unwrap();
-        assert_eq!(texts(&planned), ["一 二。", "三 四。"]);
-        let fitted =
-            fit(chunks(&tok, "一 二。 三 四 五", Normalize::OFF, 50, 12.5).unwrap(), 4, &tok, 12.5)
-                .unwrap();
-        assert_eq!(texts(&fitted), ["一 二。", "三 四 五。"]);
+        let planned = chunks(&tok, "一 二 。 三 四 。", Normalize::OFF, 3, 12.5).unwrap();
+        assert_eq!(texts(&planned), ["一 二 。", "三 四 。"]);
+        let fitted = fit(
+            chunks(&tok, "一 二 。 三 四 五", Normalize::OFF, 50, 12.5).unwrap(),
+            4,
+            &tok,
+            12.5,
+        )
+        .unwrap();
+        assert_eq!(texts(&fitted), ["一 二 。", "三 四 五 。"]);
     }
 
     #[test]
