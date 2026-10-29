@@ -42,7 +42,7 @@ def check(r: requests.Response, *args, **kwargs) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("audio", type=Path, help="a recording of the speaker (wav, mp3, flac, ...)")
-    p.add_argument("--lang", required=True, choices=["en", "fr", "de", "es", "pt"], help="the recording's language")
+    p.add_argument("--lang", required=True, choices=["en", "fr", "de", "es", "pt", "ar", "hi", "ko", "pl", "sv", "fi", "no", "it", "nl", "ja", "zh", "da", "tr"], help="the recording's language")
     p.add_argument("--name", help="the voice's name in your account (default: the audio file's name)")
     p.add_argument("--start", type=float, default=0.0, help="where the speech starts in the recording, in seconds")
     p.add_argument("-o", "--out", type=Path, help="output file (default: VOICE_ID.safetensors)")

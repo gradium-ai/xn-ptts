@@ -30,8 +30,8 @@ impl Currency {
     }
 
     /// The currency's name in `lang`, singular and plural.
-    fn name(self, lang: Lang) -> (&'static str, &'static str) {
-        match (self, lang) {
+    fn name(self, lang: Lang) -> Option<(&'static str, &'static str)> {
+        Some(match (self, lang) {
             (Self::Dollar, Lang::En | Lang::Fr) => ("dollar", "dollars"),
             (Self::Dollar, Lang::De) => ("Dollar", "Dollar"),
             (Self::Dollar, Lang::Es | Lang::Pt) => ("dólar", "dólares"),
@@ -50,7 +50,8 @@ impl Currency {
             (Self::Cent, Lang::De) => ("Cent", "Cent"),
             (Self::Cent, Lang::Es | Lang::Pt) => ("centavo", "centavos"),
             (Self::Real, _) => ("real", "reais"),
-        }
+            _ => return None,
+        })
     }
 }
 
@@ -90,7 +91,7 @@ pub(super) fn currency(word: &str, lang: Lang) -> Option<String> {
     // Always the plural, even for 1: "$1" reads "1 dollars". A quirk, kept so that the readings
     // stay identical to the ones the serving stack already speaks. The cent sign is newer than
     // that, so "1¢" reads "1 cent".
-    let (one, many) = currency.name(lang);
+    let (one, many) = currency.name(lang)?;
     let name = if currency == Currency::Cent && amount == "1" { one } else { many };
     Some(format!("{}{suffix}", with_name(&spoken, name, lang)))
 }
@@ -130,6 +131,7 @@ fn scale_word(word: &str, lang: Lang) -> bool {
         Lang::De => &["Tausend", "Million", "Millionen", "Milliarde", "Milliarden"],
         Lang::Es => &["mil", "millón", "millones"],
         Lang::Pt => &["mil", "milhão", "milhões", "bilhão", "bilhões"],
+        _ => &[],
     };
     words.contains(&word)
 }
@@ -139,7 +141,7 @@ fn with_scale(amount: &str, scale: &str, currency: Currency, lang: Lang) -> Opti
     if !rest.is_empty() {
         return None;
     }
-    let (_, name) = currency.name(lang);
+    let (_, name) = currency.name(lang)?;
     Some(with_name(&format!("{amount} {scale}"), name, lang))
 }
 
@@ -186,13 +188,13 @@ fn with_cents(amount: &str, currency: Currency, lang: Lang) -> Option<String> {
                 })
         })?,
         Lang::Fr => amount.rsplit_once(',').filter(|(whole, _)| all_digits(whole))?,
-        Lang::De | Lang::Es | Lang::Pt => return None,
+        _ => return None,
     };
     if cents.len() != 2 || !all_digits(cents) {
         return None;
     }
     let (whole, _) = number_words(whole, lang)?;
-    let (one, many) = currency.name(lang);
+    let (one, many) = currency.name(lang)?;
     let units = with_name(&whole, if whole == "1" { one } else { many }, lang);
     if cents == "00" {
         return Some(units);
@@ -220,7 +222,7 @@ fn with_name(amount: &str, name: &str, lang: Lang) -> String {
         Lang::Fr => &["million", "millions", "milliard", "milliards"],
         Lang::Es => &["millón", "millones"],
         Lang::Pt => &["milhão", "milhões", "bilhão", "bilhões"],
-        Lang::En | Lang::De => &[],
+        _ => &[],
     };
     if !nouns.iter().any(|noun| amount.ends_with(noun)) {
         format!("{amount} {name}")

@@ -1,5 +1,7 @@
 /** Text-normalization language. `'none'` hands text to the tokenizer as written. */
-export type Lang = 'en' | 'fr' | 'de' | 'es' | 'pt' | 'none';
+export type Lang =
+  | 'en' | 'fr' | 'de' | 'es' | 'pt' | 'ar' | 'hi' | 'ko' | 'pl' | 'sv' | 'fi' | 'no' | 'it' | 'nl'
+  | 'ja' | 'zh' | 'da' | 'tr' | 'none';
 
 /** Weight format. `q8` is smaller and faster on CPU. */
 export type Quant = 'f32' | 'q8';
@@ -44,7 +46,7 @@ export interface LoadOptions {
    * (or `'off'`), or a comma-separated list of rule names. Case and surrounding space do not
    * matter, and `'default'` / `'all'` / `'none'` / `'off'` count only on their own, not inside a
    * list. Ignored when `lang` is `'none'`, which does
-   * not normalize at all.
+   * not normalize at all, and the rules only read `'en'`, `'fr'`, `'de'`, `'es'` and `'pt'`.
    */
   rewrites?: string;
   /**

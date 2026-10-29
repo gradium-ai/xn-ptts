@@ -63,14 +63,21 @@ class PhononTTS internal constructor(private var handle: Long, private val nativ
     data class Result(val frames: Int, val samples: Long, val ttfaMs: Double, val totalMs: Double, val cancelled: Boolean)
 
     companion object {
+        /** The values [load] takes as its language. */
+        val LANGUAGES = setOf(
+            "en", "fr", "de", "es", "pt", "ar", "hi", "ko", "pl", "sv", "fi", "no", "it", "nl", "ja", "zh",
+            "da", "tr", "none",
+        )
+
         /**
          * Load an exported QNN bundle from [modelDir], using an explicit normalization [lang].
-         * Supports en, fr, de, es, pt and none. This engine uses QNN HTP and has no CPU fallback.
+         * Supports en, fr, de, es, pt, ar, hi, ko, pl, sv, fi, no, it, nl, ja, zh, da, tr and
+         * none. This engine uses QNN HTP and has no CPU fallback.
          * The bundle must declare this phone's Build.SOC_MODEL in its soc_models metadata.
          */
         @JvmStatic
         fun load(context: Context, modelDir: File, lang: String): PhononTTS {
-            require(lang in setOf("en", "fr", "de", "es", "pt", "none")) { "Unsupported language: $lang" }
+            require(lang in LANGUAGES) { "Unsupported language: $lang" }
             val libraries = File(context.applicationInfo.nativeLibraryDir)
             check(File(libraries, "libQnnHtp.so").isFile) {
                 "QNN needs extracted native libraries. Set android.packaging.jniLibs.useLegacyPackaging = true in the app."

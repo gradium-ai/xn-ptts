@@ -57,7 +57,7 @@ The first run downloads the default model, Phonon 31m, from Hugging Face and cac
 ptts --model /path/to/model --lang en --quant q8 "Hello world" -o out.wav
 ```
 
-The folder must contain `config.json`, `tokenizer.json`, weights, and any required voice assets. Use q8 for a q8 GGUF checkpoint, or omit `--quant` for f32 weights. `--lang` selects how the runtime reads numbers and symbols: `en`, `fr`, `de`, `es`, `pt`, or `none` to keep text unchanged. Choose it for the language of your input; the checkpoint determines which spoken languages it supports. The default model speaks English. For French, German, Spanish or Portuguese, use a Phonon 40m model, [listed in the README](https://github.com/gradium-ai/xn-ptts#model-setup).
+The folder must contain `config.json`, `tokenizer.json`, weights, and any required voice assets. Use q8 for a q8 GGUF checkpoint, or omit `--quant` for f32 weights. `--lang` selects how the runtime reads numbers and symbols: `en`, `fr`, `de`, `es`, `pt`, `ar`, `hi`, `ko`, `pl`, `sv`, `fi`, `no`, `it`, `nl`, `ja`, `zh`, `da`, `tr`, or `none` to keep text unchanged. Numbers, amounts and addresses are read out in the first five only. Choose it for the language of your input; the checkpoint determines which spoken languages it supports. The default model speaks English. For French, German, Spanish or Portuguese, use a Phonon 40m model, [listed in the README](https://github.com/gradium-ai/xn-ptts#model-setup).
 
 You can also use a Hugging Face repo, such as Phonon 40m in French:
 

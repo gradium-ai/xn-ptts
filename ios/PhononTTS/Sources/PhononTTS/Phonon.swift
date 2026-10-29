@@ -16,6 +16,10 @@ public enum ComputeUnit: Sendable {
 /// "at" where it should say "ät". `.none` hands the text to the model as written.
 public enum Language: String, Sendable {
     case english = "en", french = "fr", german = "de", spanish = "es", portuguese = "pt"
+    /// Symbols are spelled out in these, numbers and amounts are not.
+    case arabic = "ar", hindi = "hi", korean = "ko", polish = "pl", swedish = "sv", finnish = "fi"
+    case norwegian = "no", italian = "it", dutch = "nl", japanese = "ja", chinese = "zh"
+    case danish = "da", turkish = "tr"
     case none
 }
 

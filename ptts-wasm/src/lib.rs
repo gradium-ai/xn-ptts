@@ -623,14 +623,17 @@ impl Model {
     /// `quant` is `"f32"` or `"q8"`.
     ///
     /// `lang` is required: the language text is normalized as before it is
-    /// tokenized, one of `"en"`, `"fr"`, `"de"`, `"es"`, `"pt"`, or `"none"`
+    /// tokenized, one of `"en"`, `"fr"`, `"de"`, `"es"`, `"pt"`, `"ar"`, `"hi"`,
+    /// `"ko"`, `"pl"`, `"sv"`, `"fi"`, `"no"`, `"it"`, `"nl"`, `"ja"`, `"zh"`,
+    /// `"da"`, `"tr"`, or `"none"`
     /// to hand text to the tokenizer as written. The spoken forms of `@`, `+`
     /// and `=` differ per language, so there is nothing safe to default to.
     ///
     /// `rewrites` is optional and picks which word rewrites run on the
     /// normalized text: `"default"` (numbers, currency, dashed-digits, emails,
     /// urls, abbreviations, elongations), `"all"` (those and phones, times,
-    /// dates), `"none"`, or a comma-separated list of rule names.
+    /// dates), `"none"`, or a comma-separated list of rule names. The rules
+    /// only read `"en"`, `"fr"`, `"de"`, `"es"` and `"pt"`.
     ///
     /// `conditions` is optional and sets the config's conditioners, each as `"NAME=VALUE"`,
     /// e.g. `["duration_delta=0.5"]`. Those left out take their defaults.

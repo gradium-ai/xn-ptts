@@ -61,8 +61,8 @@ Cancellation discards unread stream chunks. Stop any audio already scheduled in 
 | Option | Default | |
 |---|---|---|
 | `model` | `DEFAULT_MODEL` | where the checkpoint's files are, see [The model](#the-model) |
-| `lang` | **required** | `'en'`, `'fr'`, `'de'`, `'es'`, `'pt'`, or `'none'`. Numbers, dates and symbols are read out the way a speaker of that language would say them. The spoken forms differ per language, so there is no default. `'none'` passes text through as written. |
-| `rewrites` | `'default'` | which word rewrites run on the normalized text: `'default'` (numbers, currency, dashed-digits, emails, urls, abbreviations, elongations), `'all'` (those and phones, times, dates), `'none'`, or a comma-separated list of rule names. Inert when `lang` is `'none'`. |
+| `lang` | **required** | `'en'`, `'fr'`, `'de'`, `'es'`, `'pt'`, `'ar'`, `'hi'`, `'ko'`, `'pl'`, `'sv'`, `'fi'`, `'no'`, `'it'`, `'nl'`, `'ja'`, `'zh'`, `'da'`, `'tr'`, or `'none'`. Numbers, dates and symbols are read out the way a speaker of that language would say them. The spoken forms differ per language, so there is no default. `'none'` passes text through as written. |
+| `rewrites` | `'default'` | which word rewrites run on the normalized text: `'default'` (numbers, currency, dashed-digits, emails, urls, abbreviations, elongations), `'all'` (those and phones, times, dates), `'none'`, or a comma-separated list of rule names. Inert when `lang` is `'none'`, and the rules only read `'en'`, `'fr'`, `'de'`, `'es'` and `'pt'`. |
 | `conditions` | | values for the conditioners the checkpoint's `config.json` lists, by name, e.g. `{ duration_delta: 0.3 }`. Those left out take their defaults. |
 | `quant` | `'q8'` | `'q8'` (smaller, faster) or `'f32'` |
 | `voices` | the default voice | voices to fetch during `load`. Others are fetched the first time they are used. |

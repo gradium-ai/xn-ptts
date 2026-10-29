@@ -59,6 +59,7 @@ fn range(body: &str, lang: Lang) -> Option<String> {
         Lang::Fr => "à",
         Lang::De => "bis",
         Lang::Es | Lang::Pt => "a",
+        _ => return None,
     };
     Some(format!("{from} {word} {to}"))
 }
@@ -80,6 +81,7 @@ fn spell(s: &str, lang: Lang) -> String {
         Lang::Pt => {
             ["zero", "um", "dois", "três", "quatro", "cinco", "seis", "sete", "oito", "nove"]
         }
+        _ => return s.to_string(),
     };
     let spoken = s.chars().filter(|&c| c != '-').map(|c| match c.to_digit(10) {
         Some(d) => words[d as usize].to_string(),
@@ -207,6 +209,7 @@ pub(super) fn number_words(word: &str, lang: Lang) -> Option<(String, &str)> {
                 (1_000_000, "milhão", "milhões"),
                 (1000, "mil", "mil"),
             ],
+            _ => return None,
         };
         let mut parts: Vec<String> = scales
             .iter()

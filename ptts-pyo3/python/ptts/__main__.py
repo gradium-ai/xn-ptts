@@ -33,7 +33,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument(
         "-l",
         "--lang",
-        help="required: normalize text as en, fr, de, es, pt, or none to skip",
+        help="required: normalize text as en, fr, de, es, pt, ar, hi, ko, pl, sv, fi, no, it, nl, ja, zh, da, tr, or none to skip",
     )
     p.add_argument(
         "-r",
@@ -97,7 +97,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.lang is None:
         # Text is normalized before it is tokenized, and the spoken forms of `@`, `+` and `=`
         # differ per language, so there is nothing safe to guess on the caller's behalf.
-        parser.error("--lang is required: one of en, fr, de, es, pt, or none to skip it")
+        parser.error("--lang is required: a language code such as en or fr, or none to skip it")
 
     if args.threads is not None:
         # After the arguments are checked, before the model loads: this sizes a global pool

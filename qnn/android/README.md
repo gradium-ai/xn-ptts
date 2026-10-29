@@ -75,7 +75,8 @@ val result = tts.speak("Hello from Phonon.") { pcm ->
 tts.close()
 ```
 
-Supported normalization choices are `en`, `fr`, `de`, `es`, `pt` and `none`. The language is
+Supported normalization choices are `en`, `fr`, `de`, `es`, `pt`, `ar`, `hi`, `ko`, `pl`, `sv`,
+`fi`, `no`, `it`, `nl`, `ja`, `zh`, `da`, `tr` and `none`. The language is
 required. Callback exceptions propagate, and the model remains reusable after cancellation
 or callback failure. Concurrent generation and closing during generation are rejected.
 

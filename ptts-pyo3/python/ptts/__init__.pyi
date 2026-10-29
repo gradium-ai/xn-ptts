@@ -45,11 +45,14 @@ class TTS:
 
     `lang` is required and keyword-only: text is normalized before it is tokenized, and the
     spoken forms of `@`, `+` and `=` differ per language, so there is nothing safe to default
-    to. One of `"en"`, `"fr"`, `"de"`, `"es"`, `"pt"`, or `"none"`/`None` to skip normalizing.
+    to. One of `"en"`, `"fr"`, `"de"`, `"es"`, `"pt"`, `"ar"`, `"hi"`, `"ko"`, `"pl"`, `"sv"`,
+    `"fi"`, `"no"`, `"it"`, `"nl"`, `"ja"`, `"zh"`, `"da"`, `"tr"`, or `"none"`/`None` to skip
+    normalizing.
 
     `rewrites` picks which word rewrites run on the normalized text: `"default"` (what `None`
     means: numbers, currency, dashed-digits, emails, urls, abbreviations, elongations), `"all"`
-    (those and phones, times, dates), `"none"`, or a comma-separated list of rule names.
+    (those and phones, times, dates), `"none"`, or a comma-separated list of rule names. The
+    rules only read `"en"`, `"fr"`, `"de"`, `"es"` and `"pt"`.
 
     `voice_catalog` is where a voice the checkpoint does not have is looked up: a Hugging Face
     repo as `"hf://owner/name[@revision]"`, or a local `voices.jsonl` or folder holding one.
