@@ -454,7 +454,10 @@ impl StringAppender {
     fn keeps(&self, last: char) -> bool {
         match last {
             '"' | '\'' | '@' | '+' | '%' | '#' | '&' => true,
-            '$' => self.buffer.len() >= 2 && self.buffer[self.buffer.len() - 2].is_ascii_digit(),
+            '$' => {
+                self.buffer.len() >= 2 && self.buffer[self.buffer.len() - 2].is_ascii_digit()
+                    || self.buffer.ends_with(&['U', 'S', '$'])
+            }
             _ => false,
         }
     }
@@ -1119,6 +1122,37 @@ mod tests {
             ("Vale R$ 1 bi.", "Vale 1 bilhão de reais."),
             ("Fica entre R$ 40-60.", "Fica entre R$ 40 a 60."),
         ];
+        let scaled = [
+            (Lang::De, "Es sind 3,5 Mrd. €.", "Es sind 3 Komma 5 Milliarden Euro."),
+            (
+                Lang::De,
+                "Es sind 1 Mio. € und 85 Tsd. €.",
+                "Es sind 1 Million Euro und 85 Tausend Euro.",
+            ),
+            (Lang::De, "Es sind 4,2 Mio. US$.", "Es sind 4 Komma 2 Millionen Dollar."),
+            (Lang::De, "Es sind 3,5 Mio. Einwohner.", "Es sind 3 Komma 5 Mio. Einwohner."),
+            (
+                Lang::Es,
+                "Vale 1,5 M€ y 1 M€.",
+                "Vale 1 coma 5 millones de euros y 1 millón de euros.",
+            ),
+            (
+                Lang::Fr,
+                "Il vaut 12 Md€ ou 3 millions €.",
+                "Il vaut 12 milliards d'euros ou 3 millions d'euros.",
+            ),
+            (
+                Lang::Fr,
+                "Le budget est de 4,2 millions USD.",
+                "Le budget est de 4 virgule 2 millions de dollars.",
+            ),
+            (Lang::Fr, "Il y a 5 M d'arbres.", "Il y a 5 M d'arbres."),
+            (Lang::Es, "Son 4,2 millones de US$.", "Son 4 coma 2 millones de dólares."),
+            (Lang::Es, "Son 4 millones de personas.", "Son 4 millones de personas."),
+        ];
+        for (lang, input, expected) in scaled {
+            assert_eq!(normalize_text(input, lang, Rules::DEFAULT), expected, "{input:?}");
+        }
         for (input, expected) in reais {
             assert_eq!(normalize_text(input, Lang::Pt, Rules::DEFAULT), expected, "{input:?}");
         }

@@ -162,6 +162,48 @@ pub(super) fn scaled(words: &[&str], lang: Lang) -> Option<(String, usize)> {
     Some((format!("{spoken}{suffix}"), 2))
 }
 
+pub(super) fn trailing(words: &[&str], lang: Lang) -> Option<(String, usize)> {
+    let [amount, next, rest @ ..] = words else { return None };
+    let (next, end) = split_suffix(next);
+    let (scale, currency, used, suffix) = match next.strip_suffix('€') {
+        Some(scale) if !scale.is_empty() => (scale, Currency::Euro, 2, end),
+        _ if matches!(end, "" | ".") => {
+            let (rest, used) = match rest {
+                ["de", rest @ ..] if matches!(lang, Lang::Es | Lang::Pt) => (rest, 4),
+                _ => (rest, 3),
+            };
+            let (code, suffix) = split_suffix(rest.first()?);
+            let currency = match code {
+                "US$" | "USD" => Currency::Dollar,
+                "EUR" => Currency::Euro,
+                _ if code.chars().count() == 1 => Currency::from_symbol(code.chars().next()?)?,
+                _ => return None,
+            };
+            (next, currency, used, suffix)
+        }
+        _ => return None,
+    };
+    let scale = match (lang, scale, *amount == "1") {
+        (Lang::De, "Mio", true) => "Million",
+        (Lang::De, "Mio", false) => "Millionen",
+        (Lang::De, "Mrd", true) => "Milliarde",
+        (Lang::De, "Mrd", false) => "Milliarden",
+        (Lang::De, "Tsd", _) => "Tausend",
+        (Lang::Es, "M", true) => "millón",
+        (Lang::Es, "M", false) => "millones",
+        (Lang::Fr, "M", true) => "million",
+        (Lang::Fr, "M", false) => "millions",
+        (Lang::Fr, "Md" | "Mds", true) => "milliard",
+        (Lang::Fr, "Md" | "Mds", false) => "milliards",
+        _ => scale,
+    };
+    if !scale_word(scale, lang) {
+        return None;
+    }
+    let spoken = with_scale(amount, scale, currency, lang)?;
+    Some((format!("{spoken}{suffix}"), used))
+}
+
 fn split_symbol(word: &str, lang: Lang) -> Option<(Currency, &str)> {
     if lang == Lang::Pt
         && let Some(amount) = word.strip_prefix("R$")
