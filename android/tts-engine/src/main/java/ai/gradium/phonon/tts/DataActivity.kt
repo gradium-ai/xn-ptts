@@ -63,6 +63,19 @@ class DataActivity : Activity() {
             "de" to "Dies ist ein Beispiel für Sprachsynthese auf Deutsch.",
             "es" to "Este es un ejemplo de síntesis de voz en español.",
             "pt" to "Este é um exemplo de síntese de voz em português.",
+            "ar" to "هذا مثال على تركيب الكلام باللغة العربية.",
+            "hi" to "यह हिंदी में वाक् संश्लेषण का एक उदाहरण है।",
+            "ko" to "이것은 한국어 음성 합성의 예입니다.",
+            "pl" to "To jest przykład syntezy mowy w języku polskim.",
+            "sv" to "Detta är ett exempel på talsyntes på svenska.",
+            "fi" to "Tämä on esimerkki puhesynteesistä suomeksi.",
+            "no" to "Dette er et eksempel på talesyntese på norsk.",
+            "it" to "Questo è un esempio di sintesi vocale in italiano.",
+            "nl" to "Dit is een voorbeeld van spraaksynthese in het Nederlands.",
+            "ja" to "これは日本語の音声合成の例です。",
+            "zh" to "这是一个中文语音合成的示例。",
+            "da" to "Dette er et eksempel på talesyntese på dansk.",
+            "tr" to "Bu, Türkçe konuşma sentezinin bir örneğidir.",
         )
     }
 }

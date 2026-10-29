@@ -44,7 +44,8 @@ typedef struct {
     size_t n_chunks;
 } ptts_text_chunks;
 
-/* Open a tokenizer.json and normalize as `lang`: "en", "fr", "de", "es", "pt", or "none"
+/* Open a tokenizer.json and normalize as `lang`: "en", "fr", "de", "es", "pt", "ar", "hi", "ko",
+ * "pl", "sv", "fi", "no", "it", "nl", "ja", "zh", "da", "tr", or "none"
  * (text handed to the tokenizer as written). Uses the default rewrite rules. NULL on failure. */
 ptts_text* ptts_text_new(const char* tokenizer_json_path, const char* lang, char** error);
 

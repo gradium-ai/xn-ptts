@@ -27,7 +27,8 @@ typedef bool (*PttsFrameFn)(const float *pcm, size_t n, void *user);
 
 /// Load a model. On Apple, `dir` is an exported bundle, compiled for this device first if needed
 /// (once per install), and `unit` is PTTS_UNIT_ANE or PTTS_UNIT_CPU. Elsewhere, `dir` is a
-/// checkpoint folder and `unit` is PTTS_UNIT_CPU. `lang` is en, fr, de, es, pt or none. NULL on
+/// checkpoint folder and `unit` is PTTS_UNIT_CPU. `lang` is en, fr, de, es, pt, ar, hi, ko, pl, sv,
+/// fi, no, it, nl, ja, zh, da, tr or none. NULL on
 /// failure; then ptts_last_error(NULL), on the same thread, says why. A bundle without voices fails
 /// to load; a checkpoint folder without voices loads, lists none, and speaks in no particular
 /// voice.
@@ -36,7 +37,7 @@ bool ptts_speak(PttsHandle *h, const char *text, PttsFrameFn cb, void *user, Ptt
 /// NUL-separated voice names, ending in a second NUL. Borrowed.
 const char *ptts_voices(const PttsHandle *h);
 bool ptts_set_voice(PttsHandle *h, const char *name);
-/// Normalize text as `lang` (en, fr, de, es, pt or none) from the next ptts_speak on, with no reload.
+/// Normalize text as `lang` (a code ptts_new takes, or none) from the next ptts_speak on, with no reload.
 bool ptts_set_language(PttsHandle *h, const char *lang);
 /// The languages the model was trained for, NUL-separated like ptts_voices. Borrowed.
 const char *ptts_languages(const PttsHandle *h);

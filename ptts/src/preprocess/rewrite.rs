@@ -100,8 +100,13 @@ impl std::str::FromStr for Rules {
     }
 }
 
-/// Rewrite `word` under `rules`, or `None` when no rule claims it.
+/// Rewrite `word` under `rules`, or `None` when no rule claims it, or when none reads `lang`
+/// ([`Lang::has_rules`]). The rules below are gated here, so their tables may leave the
+/// languages without rules out.
 pub fn rewrite_word(word: &str, lang: Lang, rules: Rules) -> Option<String> {
+    if !lang.has_rules() {
+        return None;
+    }
     RULES
         .iter()
         .enumerate()
@@ -122,6 +127,9 @@ pub(super) fn rewrite_text(
     unclaimed: impl Fn(&str) -> String,
 ) -> String {
     let words: Vec<&str> = text.split(' ').collect();
+    if !lang.has_rules() {
+        return words.into_iter().map(unclaimed).collect::<Vec<_>>().join(" ");
+    }
     let mut out: Vec<String> = Vec::with_capacity(words.len());
     let mut i = 0;
     while i < words.len() {

@@ -84,10 +84,156 @@ pub const SPECIAL_CHARS_PT: SpecialChars = SpecialChars {
     underscore: "underscore",
 };
 
+pub const SPECIAL_CHARS_AR: SpecialChars = SpecialChars {
+    at: "آت",
+    plus: "زائد",
+    equals: "يساوي",
+    colon: "نقطتان",
+    slash: "شرطة مائلة",
+    dash: "شرطة",
+    dot: "نقطة",
+    underscore: "شرطة سفلية",
+};
+
+pub const SPECIAL_CHARS_HI: SpecialChars = SpecialChars {
+    at: "ऐट",
+    plus: "प्लस",
+    equals: "बराबर",
+    colon: "कोलन",
+    slash: "स्लैश",
+    dash: "डैश",
+    dot: "डॉट",
+    underscore: "अंडरस्कोर",
+};
+
+pub const SPECIAL_CHARS_KO: SpecialChars = SpecialChars {
+    at: "골뱅이",
+    plus: "플러스",
+    equals: "는",
+    colon: "콜론",
+    slash: "슬래시",
+    dash: "하이픈",
+    dot: "점",
+    underscore: "밑줄",
+};
+
+pub const SPECIAL_CHARS_PL: SpecialChars = SpecialChars {
+    at: "małpa",
+    plus: "plus",
+    equals: "równa się",
+    colon: "dwukropek",
+    slash: "ukośnik",
+    dash: "myślnik",
+    dot: "kropka",
+    underscore: "podkreślnik",
+};
+
+pub const SPECIAL_CHARS_SV: SpecialChars = SpecialChars {
+    at: "snabel-a",
+    plus: "plus",
+    equals: "lika med",
+    colon: "kolon",
+    slash: "snedstreck",
+    dash: "bindestreck",
+    dot: "punkt",
+    underscore: "understreck",
+};
+
+pub const SPECIAL_CHARS_FI: SpecialChars = SpecialChars {
+    at: "ät",
+    plus: "plus",
+    equals: "on yhtä kuin",
+    colon: "kaksoispiste",
+    slash: "kauttaviiva",
+    dash: "viiva",
+    dot: "piste",
+    underscore: "alaviiva",
+};
+
+pub const SPECIAL_CHARS_NO: SpecialChars = SpecialChars {
+    at: "alfakrøll",
+    plus: "pluss",
+    equals: "er lik",
+    colon: "kolon",
+    slash: "skråstrek",
+    dash: "bindestrek",
+    dot: "punktum",
+    underscore: "understrek",
+};
+
+pub const SPECIAL_CHARS_IT: SpecialChars = SpecialChars {
+    at: "chiocciola",
+    plus: "più",
+    equals: "uguale",
+    colon: "due punti",
+    slash: "slash",
+    dash: "trattino",
+    dot: "punto",
+    underscore: "trattino basso",
+};
+
+pub const SPECIAL_CHARS_NL: SpecialChars = SpecialChars {
+    at: "apenstaartje",
+    plus: "plus",
+    equals: "is gelijk aan",
+    colon: "dubbele punt",
+    slash: "slash",
+    dash: "streepje",
+    dot: "punt",
+    underscore: "laag streepje",
+};
+
+pub const SPECIAL_CHARS_JA: SpecialChars = SpecialChars {
+    at: "アットマーク",
+    plus: "プラス",
+    equals: "イコール",
+    colon: "コロン",
+    slash: "スラッシュ",
+    dash: "ハイフン",
+    dot: "ドット",
+    underscore: "アンダーバー",
+};
+
+pub const SPECIAL_CHARS_ZH: SpecialChars = SpecialChars {
+    at: "艾特",
+    plus: "加",
+    equals: "等于",
+    colon: "冒号",
+    slash: "斜杠",
+    dash: "横杠",
+    dot: "点",
+    underscore: "下划线",
+};
+
+pub const SPECIAL_CHARS_DA: SpecialChars = SpecialChars {
+    at: "snabel-a",
+    plus: "plus",
+    equals: "er lig med",
+    colon: "kolon",
+    slash: "skråstreg",
+    dash: "bindestreg",
+    dot: "punktum",
+    underscore: "understreg",
+};
+
+pub const SPECIAL_CHARS_TR: SpecialChars = SpecialChars {
+    at: "et",
+    plus: "artı",
+    equals: "eşittir",
+    colon: "iki nokta",
+    slash: "bölü",
+    dash: "tire",
+    dot: "nokta",
+    underscore: "alt çizgi",
+};
+
 /// Language driving the spoken forms used by [`normalize_text`].
 ///
 /// Deliberately has no `Default`: the spoken forms differ per language, so a caller that has not
 /// said which language it has is better off not normalizing at all. See [`Normalize`].
+///
+/// The first five have word [`Rules`] of their own; the others get the character pass alone,
+/// see [`Lang::has_rules`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lang {
     En,
@@ -95,27 +241,59 @@ pub enum Lang {
     De,
     Es,
     Pt,
+    Ar,
+    Hi,
+    Ko,
+    Pl,
+    Sv,
+    Fi,
+    No,
+    It,
+    Nl,
+    Ja,
+    Zh,
+    Da,
+    Tr,
 }
 
 impl std::str::FromStr for Lang {
     type Err = crate::Error;
 
     fn from_str(s: &str) -> crate::Result<Self> {
-        match s.trim().to_lowercase().as_str() {
-            "en" => Ok(Lang::En),
-            "fr" => Ok(Lang::Fr),
-            "de" => Ok(Lang::De),
-            "es" => Ok(Lang::Es),
-            "pt" => Ok(Lang::Pt),
-            _ => Err(crate::Error::invalid_argument(format!(
-                "unsupported language code: {s}; expected en, fr, de, es, pt, or none to skip \
-                 normalization"
-            ))),
-        }
+        let code = s.trim().to_lowercase();
+        Lang::ALL.into_iter().find(|lang| lang.as_str() == code).ok_or_else(|| {
+            crate::Error::invalid_argument(format!(
+                "unsupported language code: {s}; expected one of {}, or none to skip \
+                 normalization",
+                Lang::ALL.map(Lang::as_str).join(", ")
+            ))
+        })
     }
 }
 
 impl Lang {
+    /// Every language, in the order the frontends list them.
+    pub const ALL: [Lang; 18] = [
+        Lang::En,
+        Lang::Fr,
+        Lang::De,
+        Lang::Es,
+        Lang::Pt,
+        Lang::Ar,
+        Lang::Hi,
+        Lang::Ko,
+        Lang::Pl,
+        Lang::Sv,
+        Lang::Fi,
+        Lang::No,
+        Lang::It,
+        Lang::Nl,
+        Lang::Ja,
+        Lang::Zh,
+        Lang::Da,
+        Lang::Tr,
+    ];
+
     /// The language code this variant parses from.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -124,7 +302,27 @@ impl Lang {
             Lang::De => "de",
             Lang::Es => "es",
             Lang::Pt => "pt",
+            Lang::Ar => "ar",
+            Lang::Hi => "hi",
+            Lang::Ko => "ko",
+            Lang::Pl => "pl",
+            Lang::Sv => "sv",
+            Lang::Fi => "fi",
+            Lang::No => "no",
+            Lang::It => "it",
+            Lang::Nl => "nl",
+            Lang::Ja => "ja",
+            Lang::Zh => "zh",
+            Lang::Da => "da",
+            Lang::Tr => "tr",
         }
+    }
+
+    /// Whether the word rewrite [`Rules`] read this language. They know the five languages the
+    /// serving stack rewrites, numbers, amounts, addresses and the rest; the others get the
+    /// character pass alone, whatever rules a caller asks for.
+    pub fn has_rules(self) -> bool {
+        matches!(self, Lang::En | Lang::Fr | Lang::De | Lang::Es | Lang::Pt)
     }
 
     pub fn special_chars(self) -> &'static SpecialChars {
@@ -134,6 +332,19 @@ impl Lang {
             Lang::De => &SPECIAL_CHARS_DE,
             Lang::Es => &SPECIAL_CHARS_ES,
             Lang::Pt => &SPECIAL_CHARS_PT,
+            Lang::Ar => &SPECIAL_CHARS_AR,
+            Lang::Hi => &SPECIAL_CHARS_HI,
+            Lang::Ko => &SPECIAL_CHARS_KO,
+            Lang::Pl => &SPECIAL_CHARS_PL,
+            Lang::Sv => &SPECIAL_CHARS_SV,
+            Lang::Fi => &SPECIAL_CHARS_FI,
+            Lang::No => &SPECIAL_CHARS_NO,
+            Lang::It => &SPECIAL_CHARS_IT,
+            Lang::Nl => &SPECIAL_CHARS_NL,
+            Lang::Ja => &SPECIAL_CHARS_JA,
+            Lang::Zh => &SPECIAL_CHARS_ZH,
+            Lang::Da => &SPECIAL_CHARS_DA,
+            Lang::Tr => &SPECIAL_CHARS_TR,
         }
     }
 
@@ -143,6 +354,17 @@ impl Lang {
             Lang::Fr => "environ",
             Lang::De => "etwa",
             Lang::Es | Lang::Pt => "aproximadamente",
+            Lang::Ar => "حوالي",
+            Lang::Hi => "लगभग",
+            Lang::Ko => "약",
+            Lang::Pl => "około",
+            Lang::Sv | Lang::No | Lang::Da => "cirka",
+            Lang::Fi => "noin",
+            Lang::It => "circa",
+            Lang::Nl => "ongeveer",
+            Lang::Ja => "約",
+            Lang::Zh => "约",
+            Lang::Tr => "yaklaşık",
         }
     }
 
@@ -153,12 +375,28 @@ impl Lang {
             Lang::De => "plus minus",
             Lang::Es => "más o menos",
             Lang::Pt => "mais ou menos",
+            Lang::Ar => "زائد أو ناقص",
+            Lang::Hi => "प्लस माइनस",
+            Lang::Ko => "플러스 마이너스",
+            Lang::Pl | Lang::Sv | Lang::Da => "plus minus",
+            Lang::Tr => "artı eksi",
+            Lang::Fi => "plus miinus",
+            Lang::No => "pluss minus",
+            Lang::It => "più o meno",
+            Lang::Nl => "plus of min",
+            Lang::Ja => "プラスマイナス",
+            Lang::Zh => "正负",
         }
     }
 
     fn pi(self) -> &'static str {
         match self {
             Lang::De => "Pi",
+            Lang::Ar => "باي",
+            Lang::Hi => "पाई",
+            Lang::Ko => "파이",
+            Lang::Ja => "パイ",
+            Lang::Zh => "派",
             _ => "pi",
         }
     }
@@ -169,6 +407,19 @@ impl Lang {
             Lang::Fr => "aime",
             Lang::De => "liebe",
             Lang::Es | Lang::Pt => "amo",
+            Lang::Ar => "أحب",
+            Lang::Hi => "प्यार",
+            Lang::Ko => "사랑해",
+            Lang::Pl => "kocham",
+            Lang::Sv => "älskar",
+            Lang::Fi => "rakastan",
+            Lang::No => "elsker",
+            Lang::It => "amo",
+            Lang::Nl => "hou van",
+            Lang::Ja => "大好き",
+            Lang::Zh => "爱",
+            Lang::Da => "elsker",
+            Lang::Tr => "seviyorum",
         }
     }
 
@@ -177,7 +428,18 @@ impl Lang {
             Lang::En => "star",
             Lang::Fr => "étoile",
             Lang::De => "Stern",
-            Lang::Es | Lang::Pt => "asterisco",
+            Lang::Es | Lang::Pt | Lang::It => "asterisco",
+            Lang::Ar => "نجمة",
+            Lang::Hi => "तारा",
+            Lang::Ko => "별표",
+            Lang::Pl => "gwiazdka",
+            Lang::Sv => "stjärna",
+            Lang::Fi => "tähti",
+            Lang::No | Lang::Da => "stjerne",
+            Lang::Nl => "sterretje",
+            Lang::Tr => "yıldız",
+            Lang::Ja => "アスタリスク",
+            Lang::Zh => "星号",
         }
     }
 
@@ -188,6 +450,15 @@ impl Lang {
             Lang::Fr => "numéro",
             Lang::De => "Nummer",
             Lang::Es | Lang::Pt => "número",
+            Lang::Ar => "رقم",
+            Lang::Hi => "नंबर",
+            Lang::Ko => "번호",
+            Lang::Pl => "numer",
+            Lang::Sv | Lang::No | Lang::Nl | Lang::Da => "nummer",
+            Lang::Fi | Lang::It => "numero",
+            Lang::Tr => "numara",
+            Lang::Ja => "番号",
+            Lang::Zh => "号",
         }
     }
 
@@ -202,58 +473,82 @@ impl Lang {
             (Lang::Es, false) => "grados",
             (Lang::Pt, true) => "grau",
             (Lang::Pt, false) => "graus",
+            (Lang::Ar, true) => "درجة",
+            (Lang::Ar, false) => "درجات",
+            (Lang::Hi, _) => "डिग्री",
+            (Lang::Ko, _) => "도",
+            (Lang::Pl, true) => "stopień",
+            (Lang::Pl, false) => "stopni",
+            (Lang::Sv | Lang::No | Lang::Da, true) => "grad",
+            (Lang::Sv | Lang::No | Lang::Da, false) => "grader",
+            (Lang::Tr, _) => "derece",
+            (Lang::Fi, true) => "aste",
+            (Lang::Fi, false) => "astetta",
+            (Lang::It, true) => "grado",
+            (Lang::It, false) => "gradi",
+            (Lang::Nl, true) => "graad",
+            (Lang::Nl, false) => "graden",
+            (Lang::Ja | Lang::Zh, _) => "度",
         }
     }
 
+    /// The spoken form of `c`, one of `×`, `÷`, `≤`, `≥`, `≠`, `≈`, `√`, `∞`, `∑` and `‰`: each
+    /// language's row below reads them in that order.
     fn symbol(self, c: char) -> Option<&'static str> {
-        use Lang::*;
-        Some(match (c, self) {
-            ('×', En) => "times",
-            ('×', Fr) => "fois",
-            ('×', De) => "mal",
-            ('×', Es) => "por",
-            ('×', Pt) => "vezes",
-            ('÷', En) => "divided by",
-            ('÷', Fr) => "divisé par",
-            ('÷', De) => "geteilt durch",
-            ('÷', Es) => "dividido entre",
-            ('÷', Pt) => "dividido por",
-            ('≤', En) => "less than or equal to",
-            ('≤', Fr) => "inférieur ou égal à",
-            ('≤', De) => "kleiner oder gleich",
-            ('≤', Es) => "menor o igual que",
-            ('≤', Pt) => "menor ou igual a",
-            ('≥', En) => "greater than or equal to",
-            ('≥', Fr) => "supérieur ou égal à",
-            ('≥', De) => "größer oder gleich",
-            ('≥', Es) => "mayor o igual que",
-            ('≥', Pt) => "maior ou igual a",
-            ('≠', En) => "is not equal to",
-            ('≠', Fr) => "différent de",
-            ('≠', De) => "ungleich",
-            ('≠', Es) => "distinto de",
-            ('≠', Pt) => "diferente de",
-            ('≈', En) => "approximately",
-            ('≈', Fr) => "environ",
-            ('≈', De) => "ungefähr",
-            ('≈', Es | Pt) => "aproximadamente",
-            ('√', En) => "square root of",
-            ('√', Fr) => "racine carrée de",
-            ('√', De) => "Wurzel aus",
-            ('√', Es) => "raíz cuadrada de",
-            ('√', Pt) => "raiz quadrada de",
-            ('∞', En) => "infinity",
-            ('∞', Fr) => "infini",
-            ('∞', De) => "unendlich",
-            ('∞', Es | Pt) => "infinito",
-            ('∑', De) => "Sigma",
-            ('∑', _) => "sigma",
-            ('‰', En) => "per mille",
-            ('‰', Fr) => "pour mille",
-            ('‰', De) => "Promille",
-            ('‰', Es | Pt) => "por mil",
-            _ => return None,
-        })
+        let i = "×÷≤≥≠≈√∞∑‰".chars().position(|s| s == c)?;
+        let row = match self {
+            Lang::En => {
+                "times|divided by|less than or equal to|greater than or equal to|is not equal to|approximately|square root of|infinity|sigma|per mille"
+            }
+            Lang::Fr => {
+                "fois|divisé par|inférieur ou égal à|supérieur ou égal à|différent de|environ|racine carrée de|infini|sigma|pour mille"
+            }
+            Lang::De => {
+                "mal|geteilt durch|kleiner oder gleich|größer oder gleich|ungleich|ungefähr|Wurzel aus|unendlich|Sigma|Promille"
+            }
+            Lang::Es => {
+                "por|dividido entre|menor o igual que|mayor o igual que|distinto de|aproximadamente|raíz cuadrada de|infinito|sigma|por mil"
+            }
+            Lang::Pt => {
+                "vezes|dividido por|menor ou igual a|maior ou igual a|diferente de|aproximadamente|raiz quadrada de|infinito|sigma|por mil"
+            }
+            Lang::Ar => {
+                "ضرب|تقسيم|أصغر من أو يساوي|أكبر من أو يساوي|لا يساوي|تقريبا|الجذر التربيعي لـ|ما لا نهاية|سيغما|في الألف"
+            }
+            Lang::Hi => {
+                "गुणा|भाग|से कम या बराबर|से अधिक या बराबर|बराबर नहीं|लगभग|वर्गमूल|अनंत|सिग्मा|प्रति हज़ार"
+            }
+            Lang::Ko => {
+                "곱하기|나누기|작거나 같다|크거나 같다|같지 않다|약|루트|무한대|시그마|퍼밀"
+            }
+            Lang::Pl => {
+                "razy|podzielić przez|mniejsze lub równe|większe lub równe|różne od|około|pierwiastek z|nieskończoność|sigma|promil"
+            }
+            Lang::Sv => {
+                "gånger|delat med|mindre än eller lika med|större än eller lika med|inte lika med|ungefär|roten ur|oändligheten|sigma|promille"
+            }
+            Lang::Fi => {
+                "kertaa|jaettuna|pienempi tai yhtä suuri kuin|suurempi tai yhtä suuri kuin|eri suuri kuin|noin|neliöjuuri|ääretön|sigma|promille"
+            }
+            Lang::No => {
+                "ganger|delt på|mindre enn eller lik|større enn eller lik|ikke lik|omtrent|kvadratroten av|uendelig|sigma|promille"
+            }
+            Lang::It => {
+                "per|diviso|minore o uguale a|maggiore o uguale a|diverso da|circa|radice quadrata di|infinito|sigma|per mille"
+            }
+            Lang::Nl => {
+                "keer|gedeeld door|kleiner dan of gelijk aan|groter dan of gelijk aan|is niet gelijk aan|ongeveer|wortel van|oneindig|sigma|promille"
+            }
+            Lang::Ja => "かける|わる|以下|以上|ノットイコール|約|ルート|無限大|シグマ|パーミル",
+            Lang::Zh => "乘以|除以|小于等于|大于等于|不等于|约等于|根号|无穷大|西格玛|千分之",
+            Lang::Da => {
+                "gange|divideret med|mindre end eller lig med|større end eller lig med|ikke lig med|cirka|kvadratroden af|uendelig|sigma|promille"
+            }
+            Lang::Tr => {
+                "çarpı|bölü|küçük eşit|büyük eşit|eşit değil|yaklaşık|karekök|sonsuz|sigma|binde"
+            }
+        };
+        row.split('|').nth(i)
     }
 
     fn stars(self, n: &str, of: Option<usize>) -> String {
@@ -268,6 +563,32 @@ impl Lang {
             (Lang::Es, None) => format!("{n} estrellas"),
             (Lang::Pt, Some(of)) => format!("{n} de {of} estrelas"),
             (Lang::Pt, None) => format!("{n} estrelas"),
+            (Lang::Ar, Some(of)) => format!("{n} من {of} نجوم"),
+            (Lang::Ar, None) => format!("{n} نجوم"),
+            (Lang::Hi, Some(of)) => format!("{of} में से {n} सितारे"),
+            (Lang::Hi, None) => format!("{n} सितारे"),
+            (Lang::Ko, Some(of)) => format!("{of}개 중 별 {n}개"),
+            (Lang::Ko, None) => format!("별 {n}개"),
+            (Lang::Pl, Some(of)) => format!("{n} z {of} gwiazdek"),
+            (Lang::Pl, None) => format!("{n} gwiazdek"),
+            (Lang::Sv, Some(of)) => format!("{n} av {of} stjärnor"),
+            (Lang::Sv, None) => format!("{n} stjärnor"),
+            (Lang::Fi, Some(of)) => format!("{n} tähteä {of}:stä"),
+            (Lang::Fi, None) => format!("{n} tähteä"),
+            (Lang::No, Some(of)) => format!("{n} av {of} stjerner"),
+            (Lang::No, None) => format!("{n} stjerner"),
+            (Lang::It, Some(of)) => format!("{n} stelle su {of}"),
+            (Lang::It, None) => format!("{n} stelle"),
+            (Lang::Nl, Some(of)) => format!("{n} van de {of} sterren"),
+            (Lang::Nl, None) => format!("{n} sterren"),
+            (Lang::Ja, Some(of)) => format!("{of}つ中星{n}つ"),
+            (Lang::Ja, None) => format!("星{n}つ"),
+            (Lang::Zh, Some(of)) => format!("{of}星中的{n}星"),
+            (Lang::Zh, None) => format!("{n}星"),
+            (Lang::Da, Some(of)) => format!("{n} ud af {of} stjerner"),
+            (Lang::Da, None) => format!("{n} stjerner"),
+            (Lang::Tr, Some(of)) => format!("{of} üzerinden {n} yıldız"),
+            (Lang::Tr, None) => format!("{n} yıldız"),
         }
     }
 
@@ -286,6 +607,41 @@ impl Lang {
             (Lang::Pt, "2") => "ao quadrado".into(),
             (Lang::Pt, "3") => "ao cubo".into(),
             (Lang::Pt, n) => format!("elevado a {n}"),
+            (Lang::Ar, n) => format!("أس {n}"),
+            (Lang::Hi, "2") => "का वर्ग".into(),
+            (Lang::Hi, "3") => "का घन".into(),
+            (Lang::Hi, n) => format!("की घात {n}"),
+            (Lang::Ko, "2") => "제곱".into(),
+            (Lang::Ko, "3") => "세제곱".into(),
+            (Lang::Ko, n) => format!("{n}제곱"),
+            (Lang::Pl, "2") => "do kwadratu".into(),
+            (Lang::Pl, "3") => "do sześcianu".into(),
+            (Lang::Pl, n) => format!("do potęgi {n}"),
+            (Lang::Sv, "2") => "i kvadrat".into(),
+            (Lang::Sv, "3") => "i kubik".into(),
+            (Lang::Sv, n) => format!("upphöjt till {n}"),
+            (Lang::Fi, "2") => "toiseen".into(),
+            (Lang::Fi, "3") => "kolmanteen".into(),
+            (Lang::Fi, n) => format!("potenssiin {n}"),
+            (Lang::No, "2") => "i andre".into(),
+            (Lang::No, "3") => "i tredje".into(),
+            (Lang::No, n) => format!("opphøyd i {n}"),
+            (Lang::It, "2") => "al quadrato".into(),
+            (Lang::It, "3") => "al cubo".into(),
+            (Lang::It, n) => format!("alla {n}"),
+            (Lang::Nl, "2") => "kwadraat".into(),
+            (Lang::Nl, "3") => "tot de derde".into(),
+            (Lang::Nl, n) => format!("tot de macht {n}"),
+            (Lang::Ja, n) => format!("の{n}乗"),
+            (Lang::Zh, "2") => "的平方".into(),
+            (Lang::Zh, "3") => "的立方".into(),
+            (Lang::Zh, n) => format!("的{n}次方"),
+            (Lang::Da, "2") => "i anden".into(),
+            (Lang::Da, "3") => "i tredje".into(),
+            (Lang::Da, n) => format!("opløftet i {n}"),
+            (Lang::Tr, "2") => "kare".into(),
+            (Lang::Tr, "3") => "küp".into(),
+            (Lang::Tr, n) => format!("üzeri {n}"),
         }
     }
 
@@ -306,7 +662,7 @@ impl Lang {
         let name = NAMES[i];
         Some(match self {
             Lang::De => name[..1].to_uppercase() + &name[1..],
-            Lang::En | Lang::Fr | Lang::Es | Lang::Pt => name.to_string(),
+            _ => name.to_string(),
         })
     }
 
@@ -315,6 +671,24 @@ impl Lang {
     fn fold(self, c: char) -> Option<char> {
         match self {
             Lang::En | Lang::Fr | Lang::De | Lang::Es | Lang::Pt => unaccented(c),
+            // The table was made against the tokenizer of the five above, which has no piece
+            // for these letters; a checkpoint that speaks the language must.
+            Lang::It if "ìòÌÒ".contains(c) => None,
+            Lang::Pl if "ąćęńśźżĄĆĘŃŚŹŻ".contains(c) => None,
+            Lang::Tr if "ğşİĞŞ".contains(c) => None,
+            Lang::Ar
+            | Lang::Hi
+            | Lang::Ko
+            | Lang::Pl
+            | Lang::Sv
+            | Lang::Fi
+            | Lang::No
+            | Lang::It
+            | Lang::Nl
+            | Lang::Ja
+            | Lang::Zh
+            | Lang::Da
+            | Lang::Tr => unaccented(c),
         }
     }
 
@@ -325,6 +699,15 @@ impl Lang {
             Lang::De => "Komma",
             Lang::Es => "coma",
             Lang::Pt => "vírgula",
+            Lang::Ar => "فاصلة",
+            Lang::Hi => "दशमलव",
+            Lang::Ko => "점",
+            Lang::Pl => "przecinek",
+            Lang::Sv | Lang::No | Lang::Nl | Lang::Da => "komma",
+            Lang::Fi => "pilkku",
+            Lang::It => "virgola",
+            Lang::Ja | Lang::Zh => "点",
+            Lang::Tr => "virgül",
         }
     }
 }
@@ -681,7 +1064,9 @@ pub fn normalize_text(input: &str, lang: Lang, rules: Rules) -> String {
                 let half = chars.next_if_eq(&'½').is_some();
                 let n = match (half, lang) {
                     (false, _) => full.to_string(),
-                    (true, Lang::En) => format!("{full}.5"),
+                    (true, Lang::En | Lang::Ar | Lang::Hi | Lang::Ko | Lang::Ja | Lang::Zh) => {
+                        format!("{full}.5")
+                    }
                     (true, _) => format!("{full},5"),
                 };
                 let of = (empty > 0).then_some(full + empty + usize::from(half));
@@ -691,7 +1076,9 @@ pub fn normalize_text(input: &str, lang: Lang, rules: Rules) -> String {
                 let word = lang.number_sign();
                 res.buffer.pop_if(|c| *c == '.');
                 if res.buffer.pop() == Some('N') {
-                    res.push_spoken(&format!("{}{}", word[..1].to_uppercase(), &word[1..]));
+                    let mut chars = word.chars();
+                    let first = chars.next().map(char::to_uppercase).into_iter().flatten();
+                    res.push_spoken(&first.chain(chars).collect::<String>());
                 } else {
                     res.push_spoken(word);
                 }
@@ -797,7 +1184,31 @@ pub fn normalize_text(input: &str, lang: Lang, rules: Rules) -> String {
     }
     let text = res.into_string();
     let text = rewrite::rewrite_text(&text, lang, rules, |w| spell_symbols(w, lang, rules));
-    strip_closing_quote(&text).to_string()
+    let text = strip_closing_quote(&text);
+    if lang == Lang::Ja { space_chars(text) } else { text.to_string() }
+}
+
+/// Japanese as the checkpoints were trained on it: one space between characters, with runs of
+/// ASCII letters and digits kept whole, and a `。` after a text that ends on a character, spaced
+/// like the rest.
+fn space_chars(text: &str) -> String {
+    let mut out = String::new();
+    let mut run = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            run = false;
+            continue;
+        }
+        if !(run && c.is_ascii_alphanumeric()) && !out.is_empty() {
+            out.push(' ');
+        }
+        out.push(c);
+        run = c.is_ascii_alphanumeric();
+    }
+    if out.chars().last().is_some_and(char::is_alphanumeric) {
+        out.push_str(" 。");
+    }
+    out
 }
 
 /// How many groups of exactly three digits, each but the first after a space, `chars` starts
@@ -953,6 +1364,59 @@ mod tests {
         assert_eq!(normalize_text("a@b", Lang::De, Rules::DEFAULT), "a ät b");
         assert_eq!(normalize_text("1+1=2", Lang::Es, Rules::DEFAULT), "1 mas 1 igual 2");
         assert_eq!(normalize_text("1+1=2", Lang::Pt, Rules::DEFAULT), "1 mais 1 igual 2");
+        assert_eq!(normalize_text("a@b", Lang::It, Rules::DEFAULT), "a chiocciola b");
+        assert_eq!(normalize_text("1+1=2", Lang::Tr, Rules::DEFAULT), "1 artı 1 eşittir 2");
+        assert_eq!(
+            normalize_text("1+1=2", Lang::Ja, Rules::DEFAULT),
+            "1 プ ラ ス 1 イ コ ー ル 2 。"
+        );
+        for lang in Lang::ALL {
+            for c in "×÷≤≥≠≈√∞∑‰".chars() {
+                assert!(lang.symbol(c).is_some_and(|s| !s.is_empty()), "{lang:?} {c}");
+            }
+        }
+    }
+
+    /// The languages without rules get the character pass alone, whatever rules are asked for,
+    /// and keep the letters of their own the five with rules fold.
+    #[test]
+    fn languages_without_rules_get_the_character_pass() {
+        let it = |text| normalize_text(text, Lang::It, Rules::ALL);
+        assert_eq!(
+            it("Costa $1,234.56, ~5 ★★★☆☆ e 3²."),
+            "Costa $1,234.56, circa 5 3 stelle su 5 e 3 al quadrato."
+        );
+        assert_eq!(
+            it("jane@x.it, N°5 a 20°C"),
+            "jane chiocciola x.it, Numero 5 a 20 gradi Celsius"
+        );
+        assert_eq!(it("Così è più bello, ťuk"), "Così è più bello, tuk");
+        assert_eq!(normalize_text("Źle, więc", Lang::Pl, Rules::DEFAULT), "Źle, więc");
+        assert_eq!(normalize_text("Źle, więc", Lang::En, Rules::DEFAULT), "Zle, wiec");
+        assert_eq!(
+            normalize_text("Işık, ağaç, İzmir", Lang::Tr, Rules::DEFAULT),
+            "Işık, ağaç, İzmir"
+        );
+        assert_eq!(
+            normalize_text("Işık, ağaç, İzmir", Lang::En, Rules::DEFAULT),
+            "Isık, agaç, Izmir"
+        );
+        assert_eq!(normalize_text("n°5", Lang::Ar, Rules::DEFAULT), "رقم 5");
+        assert_eq!(normalize_text("N°5", Lang::Ar, Rules::DEFAULT), "رقم 5");
+        assert_eq!(rewrite_word("1234", Lang::Nl, Rules::ALL), None);
+        assert!(!Lang::Nl.has_rules() && Lang::Pt.has_rules());
+    }
+
+    /// Japanese is spaced one character at a time, as the checkpoints were trained, with runs of
+    /// ASCII letters and digits whole, and ends on `。`.
+    #[test]
+    fn japanese_is_spaced_by_character() {
+        let ja = |text| normalize_text(text, Lang::Ja, Rules::DEFAULT);
+        assert_eq!(ja("公文中学校2年のABC123です"), "公 文 中 学 校 2 年 の ABC123 で す 。");
+        assert_eq!(ja("「はい」と言った。次は?"), "「 は い 」 と 言 っ た 。 次 は ?");
+        assert_eq!(ja("公 文 中 学 校 2 年 。"), "公 文 中 学 校 2 年 。");
+        assert_eq!(ja("Hello world"), "Hello world 。");
+        assert_eq!(ja(""), "");
     }
 
     /// `@` and `+` reach the rules, which read them in emails and phone numbers, and are
@@ -1208,9 +1672,15 @@ mod tests {
             ("de", Lang::De),
             ("es", Lang::Es),
             ("pt", Lang::Pt),
+            ("ja", Lang::Ja),
         ] {
             assert_eq!(Lang::from_str(s).unwrap(), lang);
         }
+        for lang in Lang::ALL {
+            assert_eq!(Lang::from_str(lang.as_str()).unwrap(), lang);
+        }
+        assert_eq!(Normalize::from_str("no").unwrap(), Normalize::for_lang(Lang::No));
+        assert_eq!(Normalize::from_str("none").unwrap(), Normalize::OFF);
         assert!(Lang::from_str("klingon").is_err());
     }
 }

@@ -30,7 +30,7 @@ For a source install, use `uv add /path/to/xn-ptts/ptts-pyo3` or `pip install /p
 
 `model`, the first argument, names a local directory, a `config.json`, or a Hugging Face repo as `"hf://owner/name"` or `"hf://owner/name@revision"`. Left out, it is `ptts.DEFAULT_MODEL`. Local paths download nothing. Gated repos, such as the Phonon 40m models, need their terms accepted on the model's Hugging Face page, then `HF_TOKEN` set or `hf auth login`. Rust examples, Python, and both servers use the [shared checkpoint resolver](https://github.com/gradium-ai/xn-ptts/blob/main/ptts/src/checkpoint.rs). Every checkpoint supplies its own `config.json` and `tokenizer.json`. q8 prefers `model.q8.gguf` and q4k `model.q4k.gguf`; other formats prefer `model.safetensors`. Voices come from `voices/` or `embeddings/`, plus `default-voice.safetensors` as `default`. Hub downloads use the revision after `@` for all files. `config=` and `revision=` still work but are deprecated.
 
-`lang` is required: `en`, `fr`, `de`, `es` or `pt` picks how numbers, symbols and abbreviations are spelled out; `none` uses the text as written. `ptts.normalize("It costs $5.", lang="en")` shows that reading, "It costs 5 dollars.", without loading a model, and takes the same `rewrites`.
+`lang` is required: `en`, `fr`, `de`, `es` or `pt` picks how numbers, symbols and abbreviations are spelled out, `ar`, `hi`, `ko`, `pl`, `sv`, `fi`, `no`, `it`, `nl`, `ja`, `zh`, `da` and `tr` spell out symbols only; `none` uses the text as written. `ptts.normalize("It costs $5.", lang="en")` shows that reading, "It costs 5 dollars.", without loading a model, and takes the same `rewrites`.
 
 ## Speech and voices
 

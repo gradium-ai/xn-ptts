@@ -19,7 +19,10 @@ object Model {
     private const val TAG = "PhononModel"
 
     /** The languages the runtime normalizes text for. */
-    val SUPPORTED = listOf("en", "fr", "de", "es", "pt")
+    val SUPPORTED = listOf(
+        "en", "fr", "de", "es", "pt", "ar", "hi", "ko", "pl", "sv", "fi", "no", "it", "nl", "ja", "zh",
+        "da", "tr",
+    )
 
     /** Loaded models. Calls into one must hold its lock: the library takes one call at a time. */
     class Loaded(val tts: PhononTTS, val speakers: List<String>, val languages: List<String>) {

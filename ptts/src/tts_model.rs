@@ -447,7 +447,7 @@ pub const MAX_TOKENS_PER_CHUNK: usize = 50;
 /// Split text into sentence-aligned chunks that fit within a token budget.
 ///
 /// This mirrors the Python `split_into_best_sentences` function: it prepares the text,
-/// tokenizes it, finds sentence boundaries (after `.`, `!`, `...`, `?` tokens), then
+/// tokenizes it, finds sentence boundaries (after the tokens of [`SENTENCE_ENDS`]), then
 /// greedily groups sentences into chunks of at most `max_tokens` tokens each.
 pub fn split_into_best_sentences(
     tokenizer: &dyn crate::Tokenizer,
@@ -459,18 +459,26 @@ pub fn split_into_best_sentences(
     let prepared = prepared.trim().to_string();
     let tokens = tokenizer.encode(&prepared)?;
 
-    // Get end-of-sentence token ids by tokenizing ".!...?" and skipping the first token
-    // (the first token includes the leading space marker from sentencepiece).
-    let eos_marker_tokens = tokenizer.encode(".!...?")?;
-    let eos_tokens =
-        if eos_marker_tokens.len() > 1 { &eos_marker_tokens[1..] } else { &eos_marker_tokens[..] };
+    // A token ends a sentence when its piece is one of the marks, which the tokenizers keep as
+    // pieces of their own, and which a tokenizer without a piece for a mark never produces.
+    let mut pieces = std::collections::HashMap::new();
+    let mut is_eos = |token: u32| -> Result<bool> {
+        Ok(match pieces.get(&token) {
+            Some(&eos) => eos,
+            None => {
+                let eos = SENTENCE_ENDS.contains(&tokenizer.decode(&[token])?.trim());
+                pieces.insert(token, eos);
+                eos
+            }
+        })
+    };
 
     // Find sentence boundary indices: positions where a non-EOS token follows one or more EOS tokens.
     let mut sentence_boundaries = vec![0usize];
     let mut prev_was_eos = false;
 
     for (idx, &token) in tokens.iter().enumerate() {
-        if eos_tokens.contains(&token) {
+        if is_eos(token)? {
             prev_was_eos = true;
         } else {
             if prev_was_eos {
@@ -519,6 +527,20 @@ pub fn split_into_best_sentences(
     Ok(chunks)
 }
 
+/// The marks a sentence ends with: `.`, `!`, `...` and `?`, then `。`, `！` and `？` in Japanese
+/// and Chinese, the danda in Hindi and the question mark in Arabic.
+pub const SENTENCE_ENDS: &[&str] = &[".", "!", "...", "?", "。", "！", "？", "।", "؟"];
+
+/// The full stop of the script `c` is written in: `。` after kana and ideographs, the danda after
+/// Devanagari, `.` otherwise.
+fn full_stop(c: char) -> char {
+    match c as u32 {
+        0x0900..=0x097F => '।',
+        0x3040..=0x30FF | 0x3400..=0x9FFF => '。',
+        _ => '.',
+    }
+}
+
 /// Prepare text for generation: collapse whitespace, capitalize and end with punctuation. Also
 /// returns how many frames to generate after end of speech, more for short text.
 pub fn prepare_text_prompt(text: &str) -> (String, usize) {
@@ -535,8 +557,8 @@ pub fn prepare_text_prompt(text: &str) -> (String, usize) {
     if let Some(first) = chars.next() {
         text = first.to_uppercase().to_string() + chars.as_str();
     }
-    if text.chars().last().is_some_and(|c| c.is_alphanumeric()) {
-        text.push('.');
+    if let Some(last) = text.chars().last().filter(|c| c.is_alphanumeric()) {
+        text.push(full_stop(last));
     }
     (text, frames_after_eos)
 }
@@ -568,6 +590,12 @@ mod tests {
             // Line breaks, CRLF included, and runs of spaces become one space.
             ("one\r\ntwo   three\nfour five", "One two three four five.", 1),
             ("éclair au chocolat", "Éclair au chocolat.", 3),
+            // The full stop of the script the text ends in.
+            ("で す", "で す。", 3),
+            ("你好", "你好。", 3),
+            ("नमस्ते", "नमस्ते।", 3),
+            ("안녕하세요", "안녕하세요.", 3),
+            ("です。", "です。", 3),
         ];
         for &(input, text, frames) in cases {
             assert_eq!(prepare_text_prompt(input), (text.to_string(), frames), "{input:?}");

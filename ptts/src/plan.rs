@@ -252,7 +252,7 @@ fn cut(words: &[&str], min_side: usize, tokenizer: &dyn Tokenizer) -> Result<usi
     let inner = || ends[..words.len() - 1].iter().copied().enumerate();
     let imbalance = |&(_, end): &(usize, usize)| end.abs_diff(total - end);
     // A mark can sit inside closing quotes or brackets: `"yes,"`, `“yes,”`, `oui,»`.
-    let closers = ['"', '\'', ')', ']', '”', '’', '»'];
+    let closers = ['"', '\'', ')', ']', '”', '’', '»', '」', '』', '）'];
     let after = |marks: &[char]| {
         inner()
             .filter(|&(i, end)| {
@@ -262,8 +262,8 @@ fn cut(words: &[&str], min_side: usize, tokenizer: &dyn Tokenizer) -> Result<usi
             })
             .min_by_key(imbalance)
     };
-    let (i, _) = after(&['.', '!', '?'])
-        .or_else(|| after(&[',', ';', ':']))
+    let (i, _) = after(&['.', '!', '?', '。', '！', '？', '।', '؟'])
+        .or_else(|| after(&[',', ';', ':', '、', '，', '；', '：', '،', '؛']))
         .or_else(|| inner().min_by_key(imbalance))
         .ok_or_else(|| Error::invalid_argument("nothing to cut: fewer than two words"))?;
     Ok(i + 1)
@@ -279,7 +279,7 @@ pub fn max_tokens_for(room: usize, frame_rate: f64) -> usize {
 mod tests {
     use super::*;
 
-    /// One token per word and per `.`, `!` or `?`, so sentence ends get their own ids as
+    /// One token per word and per `.`, `!`, `?` or `。`, so sentence ends get their own ids as
     /// they do in the real tokenizer.
     #[derive(Default)]
     struct Words(std::cell::RefCell<Vec<String>>);
@@ -296,7 +296,7 @@ mod tests {
             };
             let mut ids = vec![];
             for word in text.split_whitespace() {
-                let stem = word.trim_end_matches(['.', '!', '?']);
+                let stem = word.trim_end_matches(['.', '!', '?', '。']);
                 if !stem.is_empty() {
                     ids.push(id(stem.to_string()));
                 }
@@ -310,7 +310,7 @@ mod tests {
             let mut text = String::new();
             for &t in tokens {
                 let piece = &vocab[t as usize];
-                if !text.is_empty() && !matches!(piece.as_str(), "." | "!" | "?") {
+                if !text.is_empty() && !matches!(piece.as_str(), "." | "!" | "?" | "。") {
                     text.push(' ');
                 }
                 text.push_str(piece);
@@ -357,6 +357,17 @@ mod tests {
             assert_eq!(chunk.frame_budget, frame_budget(chunk.tokens.len(), 12.5));
             assert_eq!(chunk.seq_budget(), seq_budget(chunk.tokens.len(), chunk.frame_budget));
         }
+    }
+
+    #[test]
+    fn chunks_end_sentences_at_the_other_scripts_marks() {
+        let tok = Words::default();
+        let planned = chunks(&tok, "一 二。 三 四。", Normalize::OFF, 3, 12.5).unwrap();
+        assert_eq!(texts(&planned), ["一 二。", "三 四。"]);
+        let fitted =
+            fit(chunks(&tok, "一 二。 三 四 五", Normalize::OFF, 50, 12.5).unwrap(), 4, &tok, 12.5)
+                .unwrap();
+        assert_eq!(texts(&fitted), ["一 二。", "三 四 五。"]);
     }
 
     #[test]

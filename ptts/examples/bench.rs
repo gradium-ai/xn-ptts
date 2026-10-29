@@ -90,15 +90,17 @@ struct Args {
     #[arg(long, default_value_t = false)]
     breakdown: bool,
 
-    /// Language the input is normalized as before tokenizing: `en`, `fr`, `de`, `es` or `pt`.
-    /// Required, as everywhere else: there is nothing safe to guess.
+    /// Language the input is normalized as before tokenizing: `en`, `fr`, `de`, `es`, `pt`,
+    /// `ar`, `hi`, `ko`, `pl`, `sv`, `fi`, `no`, `it`, `nl`, `ja`, `zh`, `da` or `tr`. Required,
+    /// as everywhere else: there is nothing safe to guess.
     /// `none` measures the unnormalized text, as runs that predate this flag did.
     #[arg(long)]
     lang: String,
 
     /// Which word rewrites run on the normalized text: `default` (numbers, currency,
     /// dashed-digits, emails, urls, abbreviations, elongations), `all` (those and phones, times,
-    /// dates), `none`, or a comma-separated list of rule names. Has no effect with `--lang none`.
+    /// dates), `none`, or a comma-separated list of rule names. Has no effect with `--lang none`,
+    /// and the rules only read `en`, `fr`, `de`, `es` and `pt`.
     #[arg(long, default_value = "default")]
     rewrites: String,
 }

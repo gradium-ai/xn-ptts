@@ -12,7 +12,10 @@ export { clearCache } from './fetch.js';
 export { DEFAULT_MODEL } from './hub.js';
 export { encodeWav, concatPcm } from './wav.js';
 
-const LANGS = ['en', 'fr', 'de', 'es', 'pt', 'none'];
+const LANGS = [
+  'en', 'fr', 'de', 'es', 'pt', 'ar', 'hi', 'ko', 'pl', 'sv', 'fi', 'no', 'it', 'nl', 'ja', 'zh',
+  'da', 'tr', 'none',
+];
 /** Rewrite rules the Rust side knows, beyond the whole-string values below. */
 const RULES = [
   'numbers', 'currency', 'dashed-digits', 'emails', 'urls', 'abbreviations', 'elongations',

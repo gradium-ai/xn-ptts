@@ -59,7 +59,7 @@ class PhononTTS(modelDir: String, lang: String) : AutoCloseable {
     /** Speak in [name], one of [voices], from now on. */
     fun setVoice(name: String) = check(lib.ptts_set_voice(open(), name))
 
-    /** Normalize text as [lang] (en, fr, de, es, pt or none) from now on, with no reload. */
+    /** Normalize text as [lang] (a code [load] takes, or none) from now on, with no reload. */
     fun setLanguage(lang: String) = check(lib.ptts_set_language(open(), lang))
 
     /**

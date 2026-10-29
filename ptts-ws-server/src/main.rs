@@ -63,15 +63,17 @@ struct Args {
     #[arg(long)]
     quant: Option<String>,
 
-    /// Language incoming text is normalized as before tokenizing: `en`, `fr`, `de`, `es` or
-    /// `pt`. Required: the spoken forms differ per language, so there is nothing safe to guess.
+    /// Language incoming text is normalized as before tokenizing: `en`, `fr`, `de`, `es`, `pt`,
+    /// `ar`, `hi`, `ko`, `pl`, `sv`, `fi`, `no`, `it`, `nl`, `ja`, `zh`, `da` or `tr`. Required:
+    /// the spoken forms differ per language, so there is nothing safe to guess.
     /// `none` serves the text as written, which the model reads less well.
     #[arg(long)]
     lang: String,
 
     /// Which word rewrites run on the normalized text: `default` (numbers, currency,
     /// dashed-digits, emails, urls, abbreviations, elongations), `all` (those and phones, times,
-    /// dates), `none`, or a comma-separated list of rule names. Has no effect with `--lang none`.
+    /// dates), `none`, or a comma-separated list of rule names. Has no effect with `--lang none`,
+    /// and the rules only read `en`, `fr`, `de`, `es` and `pt`.
     #[arg(long, default_value = "default")]
     rewrites: String,
 

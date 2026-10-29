@@ -10,7 +10,7 @@ pub(super) fn times(word: &str, lang: Lang) -> Option<String> {
         Lang::En => en(word),
         Lang::Fr => fr(word),
         Lang::De => de(word),
-        Lang::Es | Lang::Pt => None,
+        _ => None,
     }
 }
 
