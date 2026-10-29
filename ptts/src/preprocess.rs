@@ -109,7 +109,7 @@ pub const SPECIAL_CHARS_HI: SpecialChars = SpecialChars {
 pub const SPECIAL_CHARS_KO: SpecialChars = SpecialChars {
     at: "골뱅이",
     plus: "플러스",
-    equals: "는",
+    equals: "이퀄",
     colon: "콜론",
     slash: "슬래시",
     dash: "하이픈",
@@ -221,7 +221,7 @@ pub const SPECIAL_CHARS_TR: SpecialChars = SpecialChars {
     plus: "artı",
     equals: "eşittir",
     colon: "iki nokta",
-    slash: "bölü",
+    slash: "eğik çizgi",
     dash: "tire",
     dot: "nokta",
     underscore: "alt çizgi",
@@ -260,7 +260,9 @@ impl std::str::FromStr for Lang {
     type Err = crate::Error;
 
     fn from_str(s: &str) -> crate::Result<Self> {
-        let code = s.trim().to_lowercase();
+        let lower = s.trim().to_lowercase();
+        // Bokmål's own code too, for YAML files, where a bare `no` reads as false.
+        let code = if lower == "nb" { "no" } else { lower.as_str() };
         Lang::ALL.into_iter().find(|lang| lang.as_str() == code).ok_or_else(|| {
             crate::Error::invalid_argument(format!(
                 "unsupported language code: {s}; expected one of {}, or none to skip \
@@ -583,7 +585,7 @@ impl Lang {
             (Lang::Nl, None) => format!("{n} sterren"),
             (Lang::Ja, Some(of)) => format!("{of}つ中星{n}つ"),
             (Lang::Ja, None) => format!("星{n}つ"),
-            (Lang::Zh, Some(of)) => format!("{of}星中的{n}星"),
+            (Lang::Zh, Some(of)) => format!("{n}星，满分{of}星"),
             (Lang::Zh, None) => format!("{n}星"),
             (Lang::Da, Some(of)) => format!("{n} ud af {of} stjerner"),
             (Lang::Da, None) => format!("{n} stjerner"),
@@ -1680,6 +1682,7 @@ mod tests {
             assert_eq!(Lang::from_str(lang.as_str()).unwrap(), lang);
         }
         assert_eq!(Normalize::from_str("no").unwrap(), Normalize::for_lang(Lang::No));
+        assert_eq!(Lang::from_str("nb").unwrap(), Lang::No);
         assert_eq!(Normalize::from_str("none").unwrap(), Normalize::OFF);
         assert!(Lang::from_str("klingon").is_err());
     }

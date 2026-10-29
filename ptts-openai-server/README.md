@@ -20,7 +20,7 @@ docker run -p 8880:8880 -v "$MODEL_DIR:/models:ro" \
 
 The image contains the server and no model weights. It is built for `linux/amd64` and `linux/arm64`. On an x86 CPU without AVX2 it runs a slower build made for such CPUs, and says so when it starts. Every model supplies its own `config.json` and `tokenizer.json`.
 
-To serve another model from HF, set `PTTS_MODEL=hf://OWNER/MODEL@COMMIT_SHA`, for example `PTTS_MODEL=hf://gradium/phonon-40m-fr` with `PTTS_LANG=fr`. Set `HF_TOKEN` for a gated or private repo. The Phonon 40m models are gated: accept the terms on the model's Hugging Face page first. The image uses `/home/phonon/.cache/huggingface` as its writable `HF_HOME`. The Hub Compose file mounts a named volume there, so downloads survive container replacement.
+To serve another model from HF, set `PTTS_MODEL=hf://OWNER/MODEL@COMMIT_SHA`, for example `PTTS_MODEL=hf://gradium/phonon-40m-fr` with `PTTS_LANG=fr`. In a YAML file, quote Norwegian's code (`PTTS_LANG: "no"`) or write `nb`, since a bare `no` is YAML for false. Set `HF_TOKEN` for a gated or private repo. The Phonon 40m models are gated: accept the terms on the model's Hugging Face page first. The image uses `/home/phonon/.cache/huggingface` as its writable `HF_HOME`. The Hub Compose file mounts a named volume there, so downloads survive container replacement.
 
 The Hub Compose file serves the default model, or the one `PTTS_MODEL` names:
 
