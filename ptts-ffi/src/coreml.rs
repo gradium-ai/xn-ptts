@@ -114,6 +114,16 @@ impl Engine {
         Ok(())
     }
 
+    /// Sample at `temperature`, already checked, from the next utterance on.
+    pub fn set_temperature(&mut self, temperature: f32) {
+        self.phonon.set_temperature(temperature);
+    }
+
+    /// Seed the sampling from the next utterance on.
+    pub fn set_seed(&mut self, seed: u64) {
+        self.phonon.set_seed(seed);
+    }
+
     /// Split `text` into chunks the prefill graph takes.
     ///
     /// The chunks every frontend makes, from [`ptts::plan::chunks`], with one addition the graph

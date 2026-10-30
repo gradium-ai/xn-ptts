@@ -1,12 +1,14 @@
 // Speak a line of text into a WAV file through the C interface, ../include/ptts.h.
 //
-//     speak MODEL LANG TEXT OUT.wav [VOICE]
+//     speak MODEL LANG TEXT OUT.wav [VOICE [TEMPERATURE [SEED]]]
 //
 // MODEL is a checkpoint folder, or on Apple platforms a Core ML bundle. ../README.md shows how to
-// build the library and this program.
+// build the library and this program. A TEMPERATURE or SEED other than the model's gives another
+// take of the same text.
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "ptts.h"
@@ -53,8 +55,8 @@ static void print_names(const char *names) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 5 && argc != 6) {
-        fprintf(stderr, "usage: %s MODEL LANG TEXT OUT.wav [VOICE]\n", argv[0]);
+    if (argc < 5 || argc > 8) {
+        fprintf(stderr, "usage: %s MODEL LANG TEXT OUT.wav [VOICE [TEMPERATURE [SEED]]]\n", argv[0]);
         return 2;
     }
     const char *model = argv[1], *lang = argv[2], *text = argv[3], *path = argv[4];
@@ -70,11 +72,29 @@ int main(int argc, char **argv) {
         fprintf(stderr, "cannot load %s: %s\n", model, ptts_last_error(NULL));
         return 1;
     }
-    if (argc == 6 && !ptts_set_voice(h, argv[5])) {
+    if (argc >= 6 && !ptts_set_voice(h, argv[5])) {
         fprintf(stderr, "%s. The voices are:\n", ptts_last_error(h));
         print_names(ptts_voices(h));
         ptts_free(h);
         return 1;
+    }
+    char *end;
+    if (argc >= 7) {
+        float temperature = strtof(argv[6], &end);
+        if (*end || !ptts_set_temperature(h, temperature)) {
+            fprintf(stderr, "bad temperature %s\n", argv[6]);
+            ptts_free(h);
+            return 1;
+        }
+    }
+    if (argc == 8) {
+        unsigned long long seed = strtoull(argv[7], &end, 10);
+        if (*end) {
+            fprintf(stderr, "bad seed %s\n", argv[7]);
+            ptts_free(h);
+            return 1;
+        }
+        ptts_set_seed(h, seed);
     }
 
     FILE *out = fopen(path, "wb");

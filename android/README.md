@@ -50,7 +50,7 @@ model's license.
 
 ## 3. The interface
 
-[`ptts.h`](../ptts-ffi/include/ptts.h) has eight calls. The
+[`ptts.h`](../ptts-ffi/include/ptts.h) has ten calls. The
 [C guide](../ptts-ffi/README.md#3-the-interface) lists them, with the rules every binding follows.
 On Android, also set the thread count with the `RAYON_NUM_THREADS` environment variable before the
 first `ptts_new`. The default is one thread per core, which is too many on phones that mix fast

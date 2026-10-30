@@ -104,6 +104,7 @@ models for the device, about 10 s on an iPhone 16 Pro; later loads take about 0.
 | `tts.voices`, `tts.setVoice(_:)` | The voices in the model folder, and switching between them (about 0.6 s). |
 | `tts.languages` | The languages the model was trained for, as its config lists them. |
 | `tts.setLanguage(_:)` | Normalize text for another language from the next utterance on, with no reload. Pair it with a voice of that language. |
+| `tts.setTemperature(_:)`, `tts.setSeed(_:)` | Sampling from the next utterance on. Another seed, or a higher temperature, gives another take of the same text. |
 | `PhononPlayer` | Plays chunks as they arrive. `enqueue(_:)` and `stop()` work from any thread. |
 
 Audio is mono Float32 at 24 kHz. Every method can be called from any thread or task, and an

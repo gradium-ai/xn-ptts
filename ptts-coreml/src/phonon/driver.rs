@@ -343,6 +343,16 @@ impl Phonon {
         Ok(me)
     }
 
+    /// Sample at `temperature` from the next utterance on.
+    pub fn set_temperature(&mut self, temperature: f32) {
+        self.cfg.temperature = temperature;
+    }
+
+    /// Seed the sampling from the next utterance on.
+    pub fn set_seed(&mut self, seed: u64) {
+        self.cfg.seed = seed;
+    }
+
     /// Swap the speaker, conditioning on it now (up to about 0.6 s on a phone) so the next
     /// utterance does not pay for it.
     pub fn set_voice(&mut self, voice: Voice) -> Result<(), String> {

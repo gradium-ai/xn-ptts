@@ -41,6 +41,12 @@ bool ptts_set_voice(PttsHandle *h, const char *name);
 bool ptts_set_language(PttsHandle *h, const char *lang);
 /// The languages the model was trained for, NUL-separated like ptts_voices. Borrowed.
 const char *ptts_languages(const PttsHandle *h);
+/// Sample at `temperature` from the next ptts_speak on: higher varies more, 0 removes the
+/// randomness. The default is the model's. False for a negative or NaN temperature.
+bool ptts_set_temperature(PttsHandle *h, float temperature);
+/// Seed the sampling from the next ptts_speak on: the same seed gives the same audio, another
+/// seed another take of the same text.
+void ptts_set_seed(PttsHandle *h, uint64_t seed);
 /// The last error on `h`, or the last ptts_new failure on this thread when `h` is NULL.
 const char *ptts_last_error(const PttsHandle *h);
 void ptts_free(PttsHandle *h);
