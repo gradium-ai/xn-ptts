@@ -75,7 +75,8 @@ use xn::{Backend, BackendQ, Tensor};
 pub enum DeviceKind {
     /// The most capable compiled-in backend for the weight format: CUDA, then
     /// Vulkan, then Metal, then the CPU for f32 weights, and the CPU for
-    /// quantized ones, which only it runs.
+    /// quantized ones, which only it runs. A GPU backend that fails to start
+    /// falls back to the CPU with a warning.
     #[default]
     Auto,
     Cpu,
@@ -1568,7 +1569,10 @@ impl SynthBuilder {
     fn build_cuda(self) -> Result<Synth> {
         // `quant()` reports `self.quant`, which `check_device` keeps at F32 here.
         debug_assert_eq!(self.quant, Quant::F32);
-        let dev = xn::cuda_backend::Device::new(0)?;
+        let dev = match xn::cuda_backend::Device::new(0) {
+            Ok(dev) => dev,
+            Err(err) => return self.fall_back_to_cpu("cuda", err),
+        };
         // Event tracking costs a few percent and this workload never queries events.
         unsafe { dev.disable_event_tracking() };
         // The flow LM and the Mimi decoder share one CUDA stream and cuBLAS handle, so running
@@ -1583,7 +1587,10 @@ impl SynthBuilder {
     fn build_vulkan(self) -> Result<Synth> {
         // `quant()` reports `self.quant`, which `check_device` keeps at F32 here.
         debug_assert_eq!(self.quant, Quant::F32);
-        let dev = xn::vulkan_backend::Device::new(0)?;
+        let dev = match xn::vulkan_backend::Device::new(0) {
+            Ok(dev) => dev,
+            Err(err) => return self.fall_back_to_cpu("vulkan", err),
+        };
         let synth = self.load::<xn::Unquantized<f32, _>>(dev, false)?;
         Ok(Synth(Box::new(synth)))
     }
@@ -1592,10 +1599,28 @@ impl SynthBuilder {
     fn build_metal(self) -> Result<Synth> {
         // `quant()` reports `self.quant`, which `check_device` keeps at F32 here.
         debug_assert_eq!(self.quant, Quant::F32);
-        let dev = xn::metal_backend::Device::new(0)?;
+        let dev = match xn::metal_backend::Device::new(0) {
+            Ok(dev) => dev,
+            Err(err) => return self.fall_back_to_cpu("metal", err),
+        };
         // Same reasoning as CUDA above: one shared command queue, so decode inline.
         let synth = self.load::<xn::Unquantized<half::bf16, _>>(dev, true)?;
         Ok(Synth(Box::new(synth)))
+    }
+
+    /// Under `auto`, a GPU backend that fails to start gives way to the CPU, so
+    /// the default never fails where the CPU would work; an explicitly chosen
+    /// device still fails. Only the error's first line goes in the warning: a
+    /// kernel compilation failure carries the compiler's whole log.
+    #[cfg(any(feature = "cuda", feature = "vulkan", feature = "metal"))]
+    fn fall_back_to_cpu(self, backend: &str, err: xn::Error) -> Result<Synth> {
+        if self.device != DeviceKind::Auto {
+            return Err(err.into());
+        }
+        let reason = err.to_string();
+        let reason = reason.lines().next().unwrap_or_default();
+        tracing::warn!("{backend} failed to start, running on the CPU instead: {reason}");
+        self.build_cpu()
     }
 
     // Feature-disabled stubs keep dispatch compilable. The shared check rejects these
