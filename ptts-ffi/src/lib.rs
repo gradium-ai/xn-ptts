@@ -213,8 +213,8 @@ pub unsafe extern "C" fn ptts_set_language(h: *mut PttsHandle, lang: *const c_ch
 }
 
 /// Sample at `temperature` from the next `ptts_speak` on: higher varies more, 0 removes the
-/// randomness. The default is the model's. Returns false for a negative or NaN temperature; see
-/// `ptts_last_error`.
+/// randomness. The default is the model's. Returns false for a negative, infinite or NaN
+/// temperature; see `ptts_last_error`.
 ///
 /// # Safety
 /// `h` must come from `ptts_new`.
@@ -234,15 +234,15 @@ pub unsafe extern "C" fn ptts_set_temperature(h: *mut PttsHandle, temperature: f
 }
 
 fn check_temperature(temperature: f32) -> Result<(), String> {
-    // NaN spelled out rather than `!(t >= 0)`, which clippy rejects on partially ordered types.
-    if temperature.is_nan() || temperature < 0.0 {
-        return Err(format!("temperature must be >= 0, got {temperature}"));
+    // Not finite rules out NaN too. An infinite one would only fail at the next `ptts_speak`.
+    if !temperature.is_finite() || temperature < 0.0 {
+        return Err(format!("temperature must be finite and >= 0, got {temperature}"));
     }
     Ok(())
 }
 
-/// Seed the sampling from the next `ptts_speak` on: the same seed gives the same audio, another
-/// seed another take of the same text.
+/// Seed the sampling from every `ptts_speak` on until it is set again: on the same device and
+/// model, the same seed gives the same audio, another seed another take of the same text.
 ///
 /// # Safety
 /// `h` must come from `ptts_new`.
@@ -284,5 +284,6 @@ mod tests {
         assert!(check_temperature(0.5).is_ok());
         assert!(check_temperature(-0.1).is_err());
         assert!(check_temperature(f32::NAN).is_err());
+        assert!(check_temperature(f32::INFINITY).is_err());
     }
 }

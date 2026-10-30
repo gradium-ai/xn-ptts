@@ -103,7 +103,7 @@ writable.
 | `ptts_languages(h)` | The languages the model was trained for, in the same format. |
 | `ptts_set_language(h, lang)` | Normalize text as `lang` from now on, with no reload. |
 | `ptts_set_temperature(h, t)` | Sample at temperature `t` from now on. Higher varies more, 0 removes the randomness. |
-| `ptts_set_seed(h, seed)` | Seed the sampling from now on. Another seed gives another take of the same text. |
+| `ptts_set_seed(h, seed)` | Seed the sampling from now on. The seed stays until set again, so the same text gives the same take; another seed gives another. |
 | `ptts_speak(h, text, callback, user, &result)` | Speak `text`, passing the audio to `callback` as it is made. |
 | `ptts_last_error(h)` | Why the last call failed. Pass `NULL` after a failed `ptts_new`. |
 | `ptts_free(h)` | Free the model. Nothing else does. |

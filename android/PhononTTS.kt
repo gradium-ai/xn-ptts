@@ -64,11 +64,14 @@ class PhononTTS(modelDir: String, lang: String) : AutoCloseable {
 
     /**
      * Sample at [temperature] from now on: higher varies more, 0 removes the randomness. The
-     * default is the model's. Throws for a negative temperature.
+     * default is the model's. Throws for a negative or infinite temperature.
      */
     fun setTemperature(temperature: Float) = check(lib.ptts_set_temperature(open(), temperature))
 
-    /** Seed the sampling from now on: the same seed gives the same audio, a new one another take. */
+    /**
+     * Seed the sampling from now on, until set again: the same seed gives the same audio, a new
+     * one another take.
+     */
     fun setSeed(seed: Long) = lib.ptts_set_seed(open(), seed)
 
     /**

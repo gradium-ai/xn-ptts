@@ -56,7 +56,8 @@ static void print_names(const char *names) {
 
 int main(int argc, char **argv) {
     if (argc < 5 || argc > 8) {
-        fprintf(stderr, "usage: %s MODEL LANG TEXT OUT.wav [VOICE [TEMPERATURE [SEED]]]\n", argv[0]);
+        fprintf(stderr, "usage: %s MODEL LANG TEXT OUT.wav [VOICE [TEMPERATURE [SEED]]]\n",
+                argv[0]);
         return 2;
     }
     const char *model = argv[1], *lang = argv[2], *text = argv[3], *path = argv[4];
@@ -81,7 +82,7 @@ int main(int argc, char **argv) {
     char *end;
     if (argc >= 7) {
         float temperature = strtof(argv[6], &end);
-        if (*end || !ptts_set_temperature(h, temperature)) {
+        if (end == argv[6] || *end || !ptts_set_temperature(h, temperature)) {
             fprintf(stderr, "bad temperature %s\n", argv[6]);
             ptts_free(h);
             return 1;
@@ -89,7 +90,8 @@ int main(int argc, char **argv) {
     }
     if (argc == 8) {
         unsigned long long seed = strtoull(argv[7], &end, 10);
-        if (*end) {
+        // strtoull reads "-1" as the largest seed rather than refusing it.
+        if (end == argv[7] || *end || argv[7][0] == '-') {
             fprintf(stderr, "bad seed %s\n", argv[7]);
             ptts_free(h);
             return 1;
