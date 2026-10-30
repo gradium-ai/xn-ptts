@@ -8,7 +8,7 @@
 pub use crate::conditioners::LUTConditioner;
 use crate::mlp::SimpleMLPAdaLN;
 pub use crate::mlp::TimeRmsNorm;
-use crate::transformer::{StreamingTransformer, StreamingTransformerState};
+use crate::transformer::{DeviceStep, StreamingTransformer, StreamingTransformerState};
 use crate::tts_model::TTSConfig;
 use std::collections::HashMap;
 use xn::nn::{Linear, var_builder::Path};
@@ -299,13 +299,19 @@ impl<Q: BackendQ> FlowLM<Q> {
         text_embeddings: &Tensor<Q::T, Q::B>,
         seq_len: usize,
         state: &mut FlowLMState<Q>,
+        step: Option<&DeviceStep<Q::T, Q::B>>,
     ) -> Result<Tensor<Q::T, Q::B>> {
         let input = match state.conditions.as_ref().or(self.condition_providers.as_ref()) {
             Some(ns) => input.broadcast_add(ns)?,
             None => input.clone(),
         };
         let input = Tensor::cat(&[text_embeddings, &input], 1)?;
-        let out = self.transformer.forward(&input, &mut state.transformer_state)?;
+        let out = match step {
+            Some(step) => {
+                self.transformer.forward_step(&input, &mut state.transformer_state, step)?
+            }
+            None => self.transformer.forward(&input, &mut state.transformer_state)?,
+        };
         let out = out.layer_norm(&self.out_norm_weight, &self.out_norm_bias, 1e-5)?;
         // Remove prefix, keep only last seq_len positions
         let total = out.dim(1usize)?;
@@ -315,6 +321,12 @@ impl<Q: BackendQ> FlowLM<Q> {
             Some(z_proj) => z_proj.forward(&out),
             None => Ok(out),
         }
+    }
+
+    /// The first step's input, `[batch, 1, ldim]`.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn bos(&self, batch: usize) -> Result<Tensor<Q::T, Q::B>> {
+        self.step_embedding(StepInput::Bos { batch })
     }
 
     fn step_embedding(&self, input: StepInput<'_, Q>) -> Result<Tensor<Q::T, Q::B>> {
@@ -337,23 +349,60 @@ impl<Q: BackendQ> FlowLM<Q> {
         lsd_decode_steps: usize,
         rng: &mut impl Rng,
     ) -> Result<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>)> {
+        let noise = Tensor::from_vec(self.sample_noise(b, rng), (b, self.ldim), t_out.device())?;
+        self.sample_from_noise(t_out, &noise, lsd_decode_steps)
+    }
+
+    /// The solver's starting point for `b` rows, drawn from `rng` in the order every sampler
+    /// uses.
+    pub fn sample_noise(&self, b: usize, rng: &mut impl Rng) -> Vec<Q::T> {
+        (0..b * self.ldim).map(|_| Q::T::from_f32(rng.sample())).collect()
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn sample_from_noise(
+        &self,
+        t_out: &Tensor<Q::T, Q::B>,
+        noise: &Tensor<Q::T, Q::B>,
+        lsd_decode_steps: usize,
+    ) -> Result<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>)> {
+        let b = t_out.dim(0usize)?;
         let eos_logit = self.out_eos.forward(t_out)?;
-        let noise_data: Vec<Q::T> =
-            (0..b * self.ldim).map(|_| Q::T::from_f32(rng.sample())).collect();
-        let noise = Tensor::from_vec(noise_data, (b, self.ldim), t_out.device())?;
         let latent = match self.flow_type {
             FlowType::Lsd if lsd_decode_steps == self.lsd_time_embeddings.len() => {
-                lsd_decode(&self.flow_net, t_out, &noise, &self.lsd_time_embeddings)?
+                lsd_decode(&self.flow_net, t_out, noise, &self.lsd_time_embeddings)?
             }
             FlowType::Lsd => {
                 let time_embeddings =
                     lsd_time_embeddings(&self.flow_net, lsd_decode_steps, t_out.device())?;
-                lsd_decode(&self.flow_net, t_out, &noise, &time_embeddings)?
+                lsd_decode(&self.flow_net, t_out, noise, &time_embeddings)?
             }
-            FlowType::Drifting => self.flow_net.forward(t_out, None, &noise)?,
-            FlowType::Pointwise => noise.add(&self.flow_net.forward(t_out, None, &noise)?)?,
+            FlowType::Drifting => self.flow_net.forward(t_out, None, noise)?,
+            FlowType::Pointwise => noise.add(&self.flow_net.forward(t_out, None, noise)?)?,
         };
         Ok((latent.reshape((b, 1, self.ldim))?, eos_logit))
+    }
+
+    /// A step at the position `step` holds on the device, see [`DeviceStep`], from the previous
+    /// latent `[b, 1, ldim]` and the solver's starting point `noise`, `[b, ldim]`: every
+    /// operand is a tensor, so the step can be recorded once and replayed. Leaves the host-side
+    /// position for the caller to advance.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    pub fn sample_next_latent_step(
+        &self,
+        latent: &Tensor<Q::T, Q::B>,
+        text_embeddings: &Tensor<Q::T, Q::B>,
+        state: &mut FlowLMState<Q>,
+        step: &DeviceStep<Q::T, Q::B>,
+        noise: &Tensor<Q::T, Q::B>,
+        lsd_decode_steps: usize,
+    ) -> Result<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>)> {
+        let (b, s, _) = latent.dims3()?;
+        let input = self.input_linear.forward(latent)?;
+        let t_out = self.backbone(&input, text_embeddings, s, state, Some(step))?;
+        let t_len = t_out.dim(1usize)?;
+        let t_out = t_out.narrow(1, t_len - 1..t_len)?.contiguous()?.reshape((b, self.dim))?;
+        self.sample_from_noise(&t_out, noise, lsd_decode_steps)
     }
 
     /// Records a sampling step, returning the latent and the *raw* eos logit.
@@ -374,7 +423,7 @@ impl<Q: BackendQ> FlowLM<Q> {
         let (b, s, _) = sequence.dims3()?;
 
         let input = self.input_linear.forward(&sequence)?;
-        let t_out = self.backbone(&input, text_embeddings, s, state)?;
+        let t_out = self.backbone(&input, text_embeddings, s, state, None)?;
         let t_len = t_out.dim(1usize)?;
         let t_out = t_out.narrow(1, t_len - 1..t_len)?.contiguous()?.reshape((b, self.dim))?;
 
@@ -405,10 +454,10 @@ impl<Q: BackendQ> FlowLM<Q> {
         let (b, s, _) = sequence.dims3()?;
 
         let x = self.input_linear.forward(&sequence)?;
-        let t_out = self.backbone(&x, text_embeddings, s, state)?;
+        let t_out = self.backbone(&x, text_embeddings, s, state, None)?;
         let t_len = t_out.dim(1usize)?;
         let t_out = t_out.narrow(1, t_len - 1..t_len)?.contiguous()?.reshape((b, self.dim))?;
-        let null_out = self.backbone(&x, text_embeddings, s, null_state)?;
+        let null_out = self.backbone(&x, text_embeddings, s, null_state, None)?;
         let null_out =
             null_out.narrow(1, t_len - 1..t_len)?.contiguous()?.reshape((b, self.dim))?;
         let t_out = t_out.sub(&null_out)?.scale(Q::T::from_f32(cfg_coef))?.add(&null_out)?;

@@ -63,6 +63,7 @@ use crate::flow_lm::{NormalRng, StepInput};
 use crate::loader;
 use crate::plan::{self, Chunk, EosPolicy};
 use crate::preprocess::Normalize;
+use crate::step_graph::{GraphPool, StepGraph};
 use crate::tts_model::{MAX_TOKENS_PER_CHUNK, MimiEnc, TTSConfig, TTSModel, TTSState};
 use crate::{Error, Result};
 use std::collections::{BTreeMap, HashMap};
@@ -344,6 +345,8 @@ struct SynthOf<Q: BackendQ> {
     /// cross-thread contention over that queue; the CPU's separate cores make it a real win
     /// there. Set once per backend in [`SynthBuilder::build_cuda`] and friends.
     inline_decode: bool,
+    /// Recorded steps, kept from one generation to the next. Empty off CUDA.
+    graphs: Arc<GraphPool<Q>>,
 }
 
 /// How many primed prefixes to keep. A process that clones voices under fresh names -- which
@@ -376,6 +379,7 @@ impl<Q: BackendQ> SynthOf<Q> {
             normalize: self.normalize,
             post_process: settings.post_process.clone(),
             inline_decode: self.inline_decode,
+            graphs: Arc::clone(&self.graphs),
         })
     }
 
@@ -836,6 +840,8 @@ struct SessionOf<Q: BackendQ> {
     in_flight: Arc<std::sync::atomic::AtomicBool>,
     /// See [`SynthOf::inline_decode`].
     inline_decode: bool,
+    /// See [`SynthOf::graphs`].
+    graphs: Arc<GraphPool<Q>>,
 }
 
 impl<Q: BackendQ> SessionOf<Q> {
@@ -916,10 +922,12 @@ impl<Q: BackendQ> SessionOf<Q> {
             // unit to overlap onto, and only adds cross-thread contention for that queue. Decode
             // each frame inline, on the flow-LM's own thread, instead -- see `inline_decode`.
             let model = Arc::clone(&self.model);
+            let graphs = Arc::clone(&self.graphs);
             let handle = std::thread::spawn(move || {
                 let _in_flight = in_flight;
-                let result =
-                    run_inline(&model, chunks, base_state, cfg_base, rng, mimi_init, &pcm_tx, post);
+                let result = run_inline(
+                    &model, &graphs, chunks, base_state, cfg_base, rng, mimi_init, &pcm_tx, post,
+                );
                 if let Err(e) = result {
                     let _ = pcm_tx.send(Err(e));
                 }
@@ -1013,11 +1021,13 @@ impl<Q: BackendQ> SessionOf<Q> {
 
             // Flow-LM: text in, latents out.
             let model = Arc::clone(&self.model);
+            let graphs = Arc::clone(&self.graphs);
             let backbone_handle = std::thread::spawn(move || {
                 // Dropped when this thread ends, which is after its last write.
                 let _in_flight = in_flight;
-                let result =
-                    run_backbone(&model, chunks, base_state, cfg_base, rng, &latent_tx, first_rx);
+                let result = run_backbone(
+                    &model, &graphs, chunks, base_state, cfg_base, rng, &latent_tx, first_rx,
+                );
                 if let Err(e) = result {
                     let _ = pcm_tx.send(Err(e));
                 }
@@ -1134,9 +1144,127 @@ enum Frame<Q: BackendQ> {
     ChunkEnd,
 }
 
+/// A chunk's flow-LM state: the stream's own copy of the primed state, with its null branch
+/// under guidance, or the state of a recorded step. One per chunk, so its size is no concern.
+#[allow(clippy::large_enum_variant)]
+enum Flow<'a, Q: BackendQ> {
+    Own(TTSState<Q>, Option<(f32, TTSState<Q>)>),
+    Graph(&'a mut StepGraph<Q>),
+}
+
+impl<'a, Q: BackendQ> Flow<'a, Q> {
+    /// Start a chunk from the primed state, prompted with its tokens.
+    fn start(
+        model: &TTSModel<Q>,
+        base: &TTSState<Q>,
+        cfg_base: &Option<(f32, TTSState<Q>)>,
+        graph: Option<&'a mut StepGraph<Q>>,
+        tokens: &[u32],
+    ) -> Result<Self> {
+        if let Some(graph) = graph {
+            graph.begin(model, base, tokens)?;
+            return Ok(Self::Graph(graph));
+        }
+        let mut state = base.clone();
+        let mut cfg_state = cfg_base.clone();
+        model.prompt_text(&mut state, tokens)?;
+        if let Some((_, null_state)) = cfg_state.as_mut() {
+            model.prompt_text_null(null_state)?;
+        }
+        Ok(Self::Own(state, cfg_state))
+    }
+
+    /// One frame of the autoregressive loop, from BOS when there is no previous latent.
+    #[allow(clippy::type_complexity)]
+    fn step(
+        &mut self,
+        model: &TTSModel<Q>,
+        prev: Option<&Tensor<Q::T, Q::B>>,
+        rng: &mut Box<dyn crate::flow_lm::Rng + Send>,
+    ) -> Result<(Tensor<Q::T, Q::B>, FrameEos<Q>)> {
+        let input = match prev {
+            None => StepInput::Bos { batch: 1 },
+            Some(t) => StepInput::Latent(t),
+        };
+        Ok(match self {
+            Self::Graph(graph) => {
+                let (next, logit) = graph.step(model, prev, rng)?;
+                (next, FrameEos::Logit(logit))
+            }
+            Self::Own(state, Some((coef, null_state))) => {
+                let (next, is_eos) =
+                    model.generate_step_cfg(state, null_state, *coef, input, rng)?;
+                (next, FrameEos::Known(is_eos))
+            }
+            Self::Own(state, None) => {
+                let (next, logit) = model.generate_step_parts(state, input, rng)?;
+                (next, FrameEos::Logit(logit))
+            }
+        })
+    }
+}
+
+/// Whether a frame ends its chunk: decided already, or a logit still on the device.
+enum FrameEos<Q: BackendQ> {
+    Known(bool),
+    Logit(Tensor<Q::T, Q::B>),
+}
+
+impl<Q: BackendQ> FrameEos<Q> {
+    fn resolve(self, model: &TTSModel<Q>) -> Result<bool> {
+        match self {
+            Self::Known(is_eos) => Ok(is_eos),
+            Self::Logit(logit) => Ok(model.eos_from_logit(&logit.to_vec()?)),
+        }
+    }
+}
+
+/// The step graph a generation from `base_state` uses, if any: none under guidance.
+fn step_graph<Q: BackendQ>(
+    model: &TTSModel<Q>,
+    graphs: &GraphPool<Q>,
+    base_state: &TTSState<Q>,
+    cfg_base: &Option<(f32, TTSState<Q>)>,
+) -> Result<Option<StepGraph<Q>>> {
+    match cfg_base {
+        None => Ok(graphs.step(model, base_state)?),
+        Some(_) => Ok(None),
+    }
+}
+
 /// The autoregressive loop, shared by every frontend and every chunk.
+#[allow(clippy::too_many_arguments)]
 fn run_backbone<Q: BackendQ>(
     model: &TTSModel<Q>,
+    graphs: &GraphPool<Q>,
+    chunks: Vec<Chunk>,
+    base_state: TTSState<Q>,
+    cfg_base: Option<(f32, TTSState<Q>)>,
+    rng: Box<dyn crate::flow_lm::Rng + Send>,
+    latent_tx: &std::sync::mpsc::SyncSender<Frame<Q>>,
+    first_decoded: std::sync::mpsc::Receiver<()>,
+) -> Result<()> {
+    let mut graph = step_graph(model, graphs, &base_state, &cfg_base)?;
+    let result = backbone_chunks(
+        model,
+        graph.as_mut(),
+        chunks,
+        base_state,
+        cfg_base,
+        rng,
+        latent_tx,
+        first_decoded,
+    );
+    if let (Ok(()), Some(graph)) = (&result, graph) {
+        graphs.put_step(graph);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn backbone_chunks<Q: BackendQ>(
+    model: &TTSModel<Q>,
+    mut graph: Option<&mut StepGraph<Q>>,
     chunks: Vec<Chunk>,
     base_state: TTSState<Q>,
     cfg_base: Option<(f32, TTSState<Q>)>,
@@ -1147,27 +1275,14 @@ fn run_backbone<Q: BackendQ>(
     // Taken after the first frame: only the stream's first audio is worth the wait.
     let mut first_decoded = Some(first_decoded);
     for chunk in chunks.iter() {
-        let mut state = base_state.clone();
-        let mut cfg_state = cfg_base.clone();
-        model.prompt_text(&mut state, &chunk.tokens)?;
-        if let Some((_, null_state)) = cfg_state.as_mut() {
-            model.prompt_text_null(null_state)?;
-        }
-
+        let mut flow =
+            Flow::start(model, &base_state, &cfg_base, graph.as_deref_mut(), &chunk.tokens)?;
         let mut prev: Option<Tensor<Q::T, Q::B>> = None;
         let mut eos = EosPolicy::new(chunk.frames_after_eos);
 
         for _ in 0..chunk.frame_budget {
-            let input = match &prev {
-                None => StepInput::Bos { batch: 1 },
-                Some(t) => StepInput::Latent(t),
-            };
-            let (next, is_eos) = match cfg_state.as_mut() {
-                Some((coef, null_state)) => {
-                    model.generate_step_cfg(&mut state, null_state, *coef, input, &mut rng)?
-                }
-                None => model.generate_step(&mut state, input, &mut rng)?,
-            };
+            let (next, frame_eos) = flow.step(model, prev.as_ref(), &mut rng)?;
+            let is_eos = frame_eos.resolve(model)?;
             // A closed channel means the consumer went away; stop quietly and
             // let the decoder thread report any error of its own.
             if latent_tx.send(Frame::Latent(next.clone())).is_err() {
@@ -1198,6 +1313,37 @@ fn run_backbone<Q: BackendQ>(
 #[allow(clippy::too_many_arguments)]
 fn run_inline<Q: BackendQ>(
     model: &TTSModel<Q>,
+    graphs: &GraphPool<Q>,
+    chunks: Vec<Chunk>,
+    base_state: TTSState<Q>,
+    cfg_base: Option<(f32, TTSState<Q>)>,
+    rng: Box<dyn crate::flow_lm::Rng + Send>,
+    mimi_init: crate::mimi::MimiDecoderState<f32, Q::B>,
+    pcm_tx: &std::sync::mpsc::SyncSender<Result<Vec<f32>>>,
+    post: Chain,
+) -> Result<()> {
+    let mut graph = step_graph(model, graphs, &base_state, &cfg_base)?;
+    let result = inline_chunks(
+        model,
+        graph.as_mut(),
+        chunks,
+        base_state,
+        cfg_base,
+        rng,
+        mimi_init,
+        pcm_tx,
+        post,
+    );
+    if let (Ok(()), Some(graph)) = (&result, graph) {
+        graphs.put_step(graph);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inline_chunks<Q: BackendQ>(
+    model: &TTSModel<Q>,
+    mut graph: Option<&mut StepGraph<Q>>,
     chunks: Vec<Chunk>,
     base_state: TTSState<Q>,
     cfg_base: Option<(f32, TTSState<Q>)>,
@@ -1211,34 +1357,13 @@ fn run_inline<Q: BackendQ>(
     // was primed with, dropped here, and the stream's last are flushed below.
     let mut skip = post.latency();
     for chunk in chunks.iter() {
-        let mut state = base_state.clone();
-        let mut cfg_state = cfg_base.clone();
-        model.prompt_text(&mut state, &chunk.tokens)?;
-        if let Some((_, null_state)) = cfg_state.as_mut() {
-            model.prompt_text_null(null_state)?;
-        }
-
+        let mut flow =
+            Flow::start(model, &base_state, &cfg_base, graph.as_deref_mut(), &chunk.tokens)?;
         let mut prev: Option<Tensor<Q::T, Q::B>> = None;
         let mut eos = EosPolicy::new(chunk.frames_after_eos);
 
         for _ in 0..chunk.frame_budget {
-            let input = match &prev {
-                None => StepInput::Bos { batch: 1 },
-                Some(t) => StepInput::Latent(t),
-            };
-            // Without guidance the eos logit is read back with the frame's audio, so the frame
-            // waits on the device once instead of twice.
-            let (next, is_eos, eos_logit) = match cfg_state.as_mut() {
-                Some((coef, null_state)) => {
-                    let (next, is_eos) =
-                        model.generate_step_cfg(&mut state, null_state, *coef, input, &mut rng)?;
-                    (next, is_eos, None)
-                }
-                None => {
-                    let (next, logit) = model.generate_step_parts(&mut state, input, &mut rng)?;
-                    (next, false, Some(logit))
-                }
-            };
+            let (next, frame_eos) = flow.step(model, prev.as_ref(), &mut rng)?;
             let pcm = model
                 .decode_latent(&next, &mut mimi_state)
                 .and_then(|audio| audio.narrow(0, ..1)?.contiguous()?.to_vec())
@@ -1256,11 +1381,9 @@ fn run_inline<Q: BackendQ>(
             if pcm_tx.send(pcm).is_err() || failed {
                 return Ok(());
             }
-            let is_eos = match eos_logit {
-                Some(logit) => model.eos_from_logit(&logit.to_vec()?),
-                None => is_eos,
-            };
-            if eos.should_stop(is_eos) {
+            // Without guidance the eos logit is read back after the frame's audio, so the frame
+            // waits on the device once instead of twice.
+            if eos.should_stop(frame_eos.resolve(model)?) {
                 break;
             }
             prev = Some(next);
@@ -1670,6 +1793,7 @@ impl SynthBuilder {
             conditioners,
             conditions: None,
             inline_decode,
+            graphs: Arc::default(),
         };
 
         for (name, emb) in baked_voices {
