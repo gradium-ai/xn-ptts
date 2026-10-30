@@ -65,7 +65,7 @@ struct Args {
     seed: u64,
 
     /// Device to run on: auto, cpu, cuda, vulkan or metal. `auto` picks the GPU backend this
-    /// build was compiled with, if any, and the CPU otherwise.
+    /// build was compiled with, if any, and the CPU otherwise or when that GPU fails to start.
     #[arg(long, default_value = "auto", env = "PTTS_DEVICE")]
     device: String,
 

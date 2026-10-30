@@ -216,6 +216,18 @@ impl Tts {
             let warning = std::ffi::CString::new(warning).expect("no NUL in a warning");
             PyErr::warn(py, &py.get_type::<pyo3::exceptions::PyUserWarning>(), &warning, 1)?;
         }
+        // `SynthBuilder` falls back from a GPU that fails to start with a `tracing`
+        // warning, which Python never sees, and the error is gone by now.
+        let resolved = device.resolve_for(quant);
+        if resolved != DeviceKind::Cpu && tts.lock()?.device_name() == "cpu" {
+            let backend = format!("{resolved:?}").to_lowercase();
+            let warning = std::ffi::CString::new(format!(
+                "{backend} failed to start, running on the CPU instead; \
+                 pass device=\"{backend}\" to see why"
+            ))
+            .expect("no NUL in a warning");
+            PyErr::warn(py, &py.get_type::<pyo3::exceptions::PyUserWarning>(), &warning, 1)?;
+        }
         Ok(tts)
     }
 
