@@ -75,8 +75,8 @@ pub(crate) fn download(source: &HubSource, filename: &str) -> Result<std::path::
 }
 
 /// The token, endpoint and cache location come from the environment as `huggingface_hub` reads
-/// them, falling back to the token `hf auth login` stores. With `HF_HUB_OFFLINE`
-/// set, files come only from the cache.
+/// them, falling back to the token `hf auth login` stores. With `HF_HUB_OFFLINE` set, files come
+/// only from the cache.
 #[cfg(feature = "hub")]
 pub(crate) fn resolve(source: &HubSource, options: ResolveOptions<'_>) -> Result<Checkpoint> {
     use crate::checkpoint::{read_config, validate_relative_path, weight_candidates};
