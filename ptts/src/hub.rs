@@ -74,8 +74,9 @@ pub(crate) fn download(source: &HubSource, filename: &str) -> Result<std::path::
     Repo::open(source)?.get(filename)
 }
 
-/// The client reads `HF_TOKEN`, `HF_ENDPOINT` and the cache location from the environment,
-/// falling back to the token `hf auth login` stores.
+/// The token, endpoint and cache location come from the environment as `huggingface_hub` reads
+/// them, falling back to the token `hf auth login` stores. With `HF_HUB_OFFLINE` set, files come
+/// only from the cache.
 #[cfg(feature = "hub")]
 pub(crate) fn resolve(source: &HubSource, options: ResolveOptions<'_>) -> Result<Checkpoint> {
     use crate::checkpoint::{read_config, validate_relative_path, weight_candidates};
@@ -152,22 +153,90 @@ pub(crate) fn resolve(source: &HubSource, options: ResolveOptions<'_>) -> Result
     Ok(Checkpoint { config, weights, tokenizer: Some(tokenizer), voices, quant: options.quant })
 }
 
+/// The client's settings, read here rather than left to `hf_hub`: it looks for the cache and
+/// the stored token under `HOME`, which Windows does not set, so they landed in `\tmp` on the
+/// current drive, and its later releases read no environment at all.
+#[cfg(feature = "hub")]
+mod env {
+    use std::path::PathBuf;
+
+    fn var(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|value| !value.is_empty())
+    }
+
+    fn flag(name: &str) -> bool {
+        var(name).is_some_and(|value| {
+            ["1", "on", "yes", "true"].iter().any(|t| value.eq_ignore_ascii_case(t))
+        })
+    }
+
+    /// `HF_HOME`, else `huggingface` under `XDG_CACHE_HOME` or the home folder's `.cache`.
+    fn hf_home() -> PathBuf {
+        var("HF_HOME").map(PathBuf::from).unwrap_or_else(|| {
+            let cache = var("XDG_CACHE_HOME").map(PathBuf::from).unwrap_or_else(|| {
+                std::env::home_dir().unwrap_or_else(std::env::temp_dir).join(".cache")
+            });
+            cache.join("huggingface")
+        })
+    }
+
+    pub(super) fn cache_dir() -> PathBuf {
+        var("HF_HUB_CACHE")
+            .or_else(|| var("HUGGINGFACE_HUB_CACHE"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| hf_home().join("hub"))
+    }
+
+    /// `HF_TOKEN`, else the file `HF_TOKEN_PATH` names, else the one `hf auth login` writes.
+    pub(super) fn token() -> Option<String> {
+        if flag("HF_HUB_DISABLE_IMPLICIT_TOKEN") {
+            return None;
+        }
+        let token = match var("HF_TOKEN") {
+            Some(token) => token,
+            None => {
+                let path = var("HF_TOKEN_PATH")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| hf_home().join("token"));
+                std::fs::read_to_string(path).ok()?
+            }
+        };
+        Some(token.trim().to_string()).filter(|token| !token.is_empty())
+    }
+
+    pub(super) fn endpoint() -> Option<String> {
+        var("HF_ENDPOINT").map(|endpoint| endpoint.trim_end_matches('/').to_string())
+    }
+
+    pub(super) fn offline() -> bool {
+        flag("HF_HUB_OFFLINE")
+    }
+}
+
 #[cfg(feature = "hub")]
 struct Repo<'a> {
     repo: hf_hub::HFRepositorySync<hf_hub::repository::RepoTypeModel>,
     source: &'a HubSource,
+    offline: bool,
 }
 
 #[cfg(feature = "hub")]
 impl<'a> Repo<'a> {
     fn open(source: &'a HubSource) -> Result<Self> {
+        let mut builder = hf_hub::HFClientBuilder::new().cache_dir(env::cache_dir());
+        if let Some(token) = env::token() {
+            builder = builder.token(token);
+        }
+        if let Some(endpoint) = env::endpoint() {
+            builder = builder.endpoint(endpoint);
+        }
         // Not `NotFound`: a client that will not start is an environment failure, not a name
         // that failed to resolve.
-        let client = hf_hub::HFClientSync::new().map_err(|e| {
+        let client = builder.build_sync().map_err(|e| {
             Error::Io(std::io::Error::other(format!("cannot reach the Hugging Face Hub: {e}")))
         })?;
         let (owner, name) = hf_hub::split_id(&source.repo);
-        Ok(Self { repo: client.model(owner, name), source })
+        Ok(Self { repo: client.model(owner, name), source, offline: env::offline() })
     }
 
     /// Download `filename`, or find it in the local cache.
@@ -180,11 +249,17 @@ impl<'a> Repo<'a> {
             .download_file()
             .filename(filename)
             .maybe_revision(self.source.revision.clone())
+            .local_files_only(self.offline)
             .send()
             .map_err(|e| match e {
                 hf_hub::HFError::EntryNotFound { .. }
                 | hf_hub::HFError::LocalEntryNotFound { .. } => {
-                    Error::NotFound(format!("`{filename}` is not in {}: {e}", self.source))
+                    let only_cache =
+                        if self.offline { " (HF_HUB_OFFLINE: cache only)" } else { "" };
+                    Error::NotFound(format!(
+                        "`{filename}` is not in {}{only_cache}: {e}",
+                        self.source
+                    ))
                 }
                 other => Error::Io(std::io::Error::other(format!(
                     "cannot fetch `{filename}` from {}: {other}. If the repo is gated, accept \
@@ -195,6 +270,9 @@ impl<'a> Repo<'a> {
     }
 
     fn list(&self) -> Result<Vec<String>> {
+        if self.offline {
+            return Err(Error::Io(std::io::Error::other("HF_HUB_OFFLINE is set")));
+        }
         let entries = self
             .repo
             .list_tree()
