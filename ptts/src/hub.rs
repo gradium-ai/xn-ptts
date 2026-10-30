@@ -254,7 +254,12 @@ impl<'a> Repo<'a> {
             .map_err(|e| match e {
                 hf_hub::HFError::EntryNotFound { .. }
                 | hf_hub::HFError::LocalEntryNotFound { .. } => {
-                    Error::NotFound(format!("`{filename}` is not in {}: {e}", self.source))
+                    let only_cache =
+                        if self.offline { " (HF_HUB_OFFLINE: cache only)" } else { "" };
+                    Error::NotFound(format!(
+                        "`{filename}` is not in {}{only_cache}: {e}",
+                        self.source
+                    ))
                 }
                 other => Error::Io(std::io::Error::other(format!(
                     "cannot fetch `{filename}` from {}: {other}. If the repo is gated, accept \
