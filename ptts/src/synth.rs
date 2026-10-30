@@ -63,7 +63,7 @@ use crate::flow_lm::{NormalRng, StepInput};
 use crate::loader;
 use crate::plan::{self, Chunk, EosPolicy};
 use crate::preprocess::Normalize;
-use crate::step_graph::{GraphPool, StepGraph};
+use crate::step_graph::{GraphPool, MimiGraph, StepGraph};
 use crate::tts_model::{MAX_TOKENS_PER_CHUNK, MimiEnc, MimiLatent, TTSConfig, TTSModel, TTSState};
 use crate::{Error, Result};
 use std::collections::{BTreeMap, HashMap};
@@ -945,17 +945,34 @@ impl<Q: BackendQ> SessionOf<Q> {
             // Decoder: latents in, PCM out. Reset between chunks so each chunk
             // starts from a clean codec state, matching the pre-refactor behavior.
             let decode_model = Arc::clone(&self.model);
+            let decode_graphs = Arc::clone(&self.graphs);
             let decode_tx = pcm_tx.clone();
             let decode_handle = std::thread::spawn(move || {
                 let mut first_tx = Some(first_tx);
                 let mut state = mimi_init.clone();
+                let mut graph = match decode_graphs.mimi(&decode_model) {
+                    Ok(graph) => graph,
+                    Err(e) => {
+                        let _ = decode_tx.send(Err(e.into()));
+                        return;
+                    }
+                };
+                // Reset the stream's state, and the graph's, for a new chunk.
+                let reset = |state: &mut crate::mimi::MimiDecoderState<f32, Q::B>,
+                             graph: &mut Option<MimiGraph<Q>>| {
+                    *state = mimi_init.clone();
+                    graph.as_mut().map_or(Ok(()), |g| g.reset())
+                };
                 // The post-processing chain delays its output: its first `skip` samples are the
                 // zeros it was primed with, dropped here, and the stream's last are flushed below.
                 let mut skip = post.latency();
                 while let Ok(frame) = latent_rx.recv() {
                     let first = match frame {
                         Frame::ChunkEnd => {
-                            state = mimi_init.clone();
+                            if let Err(e) = reset(&mut state, &mut graph) {
+                                let _ = decode_tx.send(Err(e.into()));
+                                return;
+                            }
                             continue;
                         }
                         Frame::Latent(latent) => match decode_model.mimi_latent(latent) {
@@ -991,19 +1008,7 @@ impl<Q: BackendQ> SessionOf<Q> {
                             },
                         }
                     }
-                    let latent = match batch.len() {
-                        1 => batch.pop().expect("just checked"),
-                        _ => match Tensor::cat(&batch.iter().collect::<Vec<_>>(), 1) {
-                            Ok(latent) => latent,
-                            Err(e) => {
-                                let _ = decode_tx.send(Err(e.into()));
-                                return;
-                            }
-                        },
-                    };
-                    let pcm = decode_model
-                        .decode_latent(&latent, &mut state)
-                        .and_then(|audio| audio.narrow(0, ..1)?.contiguous()?.to_vec())
+                    let pcm = decode_frames(&decode_model, graph.as_mut(), &mut state, batch)
                         .map(|mut pcm| {
                             post.process(&mut pcm);
                             let n = skip.min(pcm.len());
@@ -1019,9 +1024,13 @@ impl<Q: BackendQ> SessionOf<Q> {
                     if let Some(first_tx) = first_tx.take() {
                         let _ = first_tx.send(());
                     }
-                    if reset_after {
-                        state = mimi_init.clone();
+                    if reset_after && let Err(e) = reset(&mut state, &mut graph) {
+                        let _ = decode_tx.send(Err(e.into()));
+                        return;
                     }
+                }
+                if let Some(graph) = graph {
+                    decode_graphs.put_mimi(graph);
                 }
                 let latency = post.latency();
                 if latency > skip {
@@ -1155,6 +1164,28 @@ const DECODE_BATCH: usize = LATENT_QUEUE;
 enum Frame<Q: BackendQ> {
     Latent(MimiLatent<Q>),
     ChunkEnd,
+}
+
+/// Decode latents to the first batch row's PCM, all in one call, which the decoder computes
+/// exactly as it would frame by frame. With a Mimi graph, a single frame replays it, the shape
+/// it was recorded for, and several run as one ordinary call on the graph's state.
+fn decode_frames<Q: BackendQ>(
+    model: &TTSModel<Q>,
+    graph: Option<&mut MimiGraph<Q>>,
+    state: &mut crate::mimi::MimiDecoderState<f32, Q::B>,
+    mut latents: Vec<Tensor<Q::T, Q::B>>,
+) -> xn::Result<Vec<f32>> {
+    let row = |audio: Tensor<f32, Q::B>| audio.narrow(0, ..1)?.contiguous()?.to_vec();
+    let frames = latents.len();
+    let latent = match frames {
+        1 => latents.pop().expect("just checked"),
+        _ => Tensor::cat(&latents.iter().collect::<Vec<_>>(), 1)?,
+    };
+    match graph {
+        Some(graph) if frames == 1 => row(graph.decode(model, &latent)?),
+        Some(graph) => row(model.decode_latent(&latent, graph.state_mut())?),
+        None => row(model.decode_latent(&latent, state)?),
+    }
 }
 
 /// A chunk's flow-LM state: the stream's own copy of the primed state, with its null branch
@@ -1336,9 +1367,11 @@ fn run_inline<Q: BackendQ>(
     post: Chain,
 ) -> Result<()> {
     let mut graph = step_graph(model, graphs, &base_state, &cfg_base)?;
+    let mut mimi_graph = graphs.mimi(model)?;
     let result = inline_chunks(
         model,
         graph.as_mut(),
+        mimi_graph.as_mut(),
         chunks,
         base_state,
         cfg_base,
@@ -1347,8 +1380,13 @@ fn run_inline<Q: BackendQ>(
         pcm_tx,
         post,
     );
-    if let (Ok(()), Some(graph)) = (&result, graph) {
-        graphs.put_step(graph);
+    if result.is_ok() {
+        if let Some(graph) = graph {
+            graphs.put_step(graph);
+        }
+        if let Some(graph) = mimi_graph {
+            graphs.put_mimi(graph);
+        }
     }
     result
 }
@@ -1357,6 +1395,7 @@ fn run_inline<Q: BackendQ>(
 fn inline_chunks<Q: BackendQ>(
     model: &TTSModel<Q>,
     mut graph: Option<&mut StepGraph<Q>>,
+    mut mimi_graph: Option<&mut MimiGraph<Q>>,
     chunks: Vec<Chunk>,
     base_state: TTSState<Q>,
     cfg_base: Option<(f32, TTSState<Q>)>,
@@ -1377,17 +1416,20 @@ fn inline_chunks<Q: BackendQ>(
 
         for _ in 0..chunk.frame_budget {
             let (next, frame_eos) = flow.step(model, prev.as_ref(), &mut rng)?;
-            let pcm = model
-                .decode_latent(&next, &mut mimi_state)
-                .and_then(|audio| audio.narrow(0, ..1)?.contiguous()?.to_vec())
-                .map(|mut pcm| {
-                    post.process(&mut pcm);
-                    let n = skip.min(pcm.len());
-                    skip -= n;
-                    pcm.drain(..n);
-                    pcm
-                })
-                .map_err(Error::from);
+            let pcm = decode_frames(
+                model,
+                mimi_graph.as_deref_mut(),
+                &mut mimi_state,
+                vec![next.clone()],
+            )
+            .map(|mut pcm| {
+                post.process(&mut pcm);
+                let n = skip.min(pcm.len());
+                skip -= n;
+                pcm.drain(..n);
+                pcm
+            })
+            .map_err(Error::from);
             let failed = pcm.is_err();
             // A closed channel means the consumer went away; stop quietly and let the caller
             // report any error of its own.
@@ -1402,6 +1444,9 @@ fn inline_chunks<Q: BackendQ>(
             prev = Some(next);
         }
         mimi_state = mimi_init.clone();
+        if let Some(graph) = mimi_graph.as_deref_mut() {
+            graph.reset()?;
+        }
     }
     let latency = post.latency();
     if latency > skip {

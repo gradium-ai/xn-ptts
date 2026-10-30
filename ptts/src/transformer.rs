@@ -210,11 +210,69 @@ pub struct KvCache<T: WithDTypeF, B: Backend> {
     v: Option<Tensor<T, B>>,
     context: usize,
     absolute_offset: usize,
+    /// Trim into the existing buffers rather than replace them, see [`Self::zeros_in_place`].
+    in_place: bool,
+    /// In place, what [`Self::append`] returned, for [`Self::trim`] to take its window from.
+    pending: Option<(Tensor<T, B>, Tensor<T, B>)>,
 }
 
 impl<T: WithDTypeF, B: Backend> KvCache<T, B> {
     pub fn new(context: usize) -> Self {
-        Self { k: None, v: None, context, absolute_offset: 0 }
+        Self { k: None, v: None, context, absolute_offset: 0, in_place: false, pending: None }
+    }
+
+    /// A cache whose window is allocated in full from the start, `context - 1` positions of
+    /// zeros for `(b, h, d)`, and updated in place, so that its shapes never change: the slots
+    /// not filled yet are masked out (see [`Self::padding`]).
+    pub fn zeros_in_place(
+        context: usize,
+        (b, h, d): (usize, usize, usize),
+        dev: &B,
+    ) -> Result<Self> {
+        let window = context.saturating_sub(1);
+        Ok(Self {
+            k: Some(Tensor::zeros((b, h, window, d), dev)?),
+            v: Some(Tensor::zeros((b, h, window, d), dev)?),
+            context,
+            absolute_offset: 0,
+            in_place: true,
+            pending: None,
+        })
+    }
+
+    /// Leading slots of the window that hold no position yet.
+    pub fn padding(&self) -> usize {
+        if !self.in_place {
+            return 0;
+        }
+        let window = self.context.saturating_sub(1);
+        window - self.absolute_offset.min(window)
+    }
+
+    /// Back to an empty cache, in the same buffers when in place.
+    pub fn reset(&mut self) -> Result<()> {
+        self.absolute_offset = 0;
+        self.pending = None;
+        if self.in_place {
+            for t in [&self.k, &self.v].into_iter().flatten() {
+                t.fill_(T::zero())?;
+            }
+        } else {
+            (self.k, self.v) = (None, None);
+        }
+        Ok(())
+    }
+
+    pub fn context(&self) -> usize {
+        self.context
+    }
+
+    pub fn absolute_offset(&self) -> usize {
+        self.absolute_offset
+    }
+
+    pub fn set_absolute_offset(&mut self, offset: usize) {
+        self.absolute_offset = offset;
     }
 
     pub fn current_seq_len(&self) -> Result<usize> {
@@ -243,12 +301,25 @@ impl<T: WithDTypeF, B: Backend> KvCache<T, B> {
 
         let new_tokens = new_k.dim(2)?;
         self.absolute_offset += new_tokens;
-        self.k = Some(k.clone());
-        self.v = Some(v.clone());
+        if self.in_place {
+            self.pending = Some((k.clone(), v.clone()));
+        } else {
+            self.k = Some(k.clone());
+            self.v = Some(v.clone());
+        }
         Ok((k, v))
     }
 
     pub fn trim(&mut self) -> Result<()> {
+        if self.in_place {
+            let (Some((k, v)), Some(kc), Some(vc)) = (self.pending.take(), &self.k, &self.v) else {
+                xn::bail!("trimming an in-place KV cache with nothing appended")
+            };
+            let (seq_len, keep) = (k.dim(2)?, kc.dim(2)?);
+            kc.copy_(&k.narrow(2, seq_len - keep..seq_len)?.contiguous()?)?;
+            vc.copy_(&v.narrow(2, seq_len - keep..seq_len)?.contiguous()?)?;
+            return Ok(());
+        }
         let (k, v) = match (&self.k, &self.v) {
             (Some(k), Some(v)) => (k, v),
             _ => return Ok(()),
@@ -359,6 +430,12 @@ impl<T: WithDTypeF, B: Backend> MimiStreamingMultiheadAttention<T, B> {
 
     pub fn init_state(&self) -> Result<KvCache<T, B>> {
         Ok(KvCache::new(self.context))
+    }
+
+    /// As [`Self::init_state`], see [`KvCache::zeros_in_place`].
+    pub fn init_state_in_place(&self, batch_size: usize) -> Result<KvCache<T, B>> {
+        let hd = (self.num_heads, self.embed_dim / self.num_heads);
+        KvCache::zeros_in_place(self.context, (batch_size, hd.0, hd.1), self.in_proj.device())
     }
 
     pub(crate) fn forward(
@@ -619,6 +696,27 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
         Ok(Self { layers, head_dim, max_period })
     }
 
+    /// The state of a Mimi transformer whose caches never change shape, see
+    /// [`KvCache::zeros_in_place`].
+    pub fn init_state_in_place(
+        &self,
+        batch_size: usize,
+    ) -> Result<StreamingTransformerState<Q::T, Q::B>> {
+        let layer_states = self
+            .layers
+            .iter()
+            .map(|l| match &l.self_attn {
+                AttentionKind::Mimi(a) => {
+                    Ok(LayerAttentionState::Mimi(a.init_state_in_place(batch_size)?))
+                }
+                AttentionKind::FlowLm(_) => {
+                    xn::bail!("only a Mimi transformer has in-place caches")
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(StreamingTransformerState { layer_states })
+    }
+
     pub fn init_state(
         &self,
         batch_size: usize,
@@ -637,6 +735,19 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
         x: &Tensor<Q::T, Q::B>,
         state: &mut StreamingTransformerState<Q::T, Q::B>,
     ) -> Result<Tensor<Q::T, Q::B>> {
+        self.forward_with(x, state, None, None)
+    }
+
+    /// As [`Self::forward`], with the RoPE table and the attention mask given rather than built
+    /// from the position, for a recorded step whose caller refreshes them in place before each
+    /// replay.
+    pub(crate) fn forward_with(
+        &self,
+        x: &Tensor<Q::T, Q::B>,
+        state: &mut StreamingTransformerState<Q::T, Q::B>,
+        rope: Option<RotaryEmbedding<Q::T, Q::B>>,
+        mask: Option<Tensor<Q::T, Q::B>>,
+    ) -> Result<Tensor<Q::T, Q::B>> {
         let mut x = x.clone();
         let (_, seq_len, _) = x.dims3()?;
         // At single-token decode every cached key is visible, so the causal mask is identically
@@ -647,35 +758,19 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
         let mask = if seq_len == 1 {
             None
         } else {
-            match state.layer_states.first() {
-                Some(LayerAttentionState::Mimi(kv_cache)) => {
+            match (mask, state.layer_states.first()) {
+                (Some(mask), _) => Some(mask),
+                (None, Some(LayerAttentionState::Mimi(kv_cache))) => {
                     let kv_seq_len = kv_cache.current_seq_len()?;
-                    let context = kv_cache.context;
-                    // Causal mask of shape (1, 1, seq_len, kv_seq_len + seq_len) with -inf in upper triangle
-                    let mask_data = (0..seq_len)
-                        .flat_map(|seq_idx| {
-                            let seq_idx = seq_idx + kv_seq_len;
-                            (0..kv_seq_len + seq_len).map(move |attn_idx| {
-                                // delta = seq_idx - attn_idx in 0..context
-                                if attn_idx <= seq_idx && seq_idx < attn_idx + context {
-                                    Q::T::from_f32(0.0)
-                                } else {
-                                    Q::T::from_f32(f32::NEG_INFINITY)
-                                }
-                            })
-                        })
-                        .collect::<Vec<_>>();
-                    let mask = Tensor::from_vec(
-                        mask_data,
-                        (1, 1, seq_len, kv_seq_len + seq_len),
-                        x.device(),
-                    )?;
-                    Some(mask)
+                    let pad = kv_cache.padding();
+                    let mask_data = mimi_mask(seq_len, kv_seq_len, kv_cache.context, pad);
+                    let shape = (1, 1, seq_len, kv_seq_len + seq_len);
+                    Some(Tensor::from_vec(mask_data, shape, x.device())?)
                 }
-                Some(LayerAttentionState::FlowLm(kv_cache)) => {
+                (None, Some(LayerAttentionState::FlowLm(kv_cache))) => {
                     Some(kv_cache.materialize_causal_mask(seq_len)?)
                 }
-                _ => None,
+                (None, None) => None,
             }
         };
         let offset = state
@@ -686,7 +781,10 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
                 LayerAttentionState::FlowLm(mha_state) => mha_state.current_end,
             })
             .unwrap_or(0);
-        let rope = self.rope_at(offset, seq_len, x.device())?;
+        let rope = match rope {
+            Some(rope) => rope,
+            None => self.rope_at(offset, seq_len, x.device())?,
+        };
         for (layer, layer_state) in self.layers.iter().zip(state.layer_states.iter_mut()) {
             x = layer.forward(&x, &rope, layer_state, mask.as_ref(), None)?;
         }
@@ -736,6 +834,30 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
         }
         Ok(x)
     }
+}
+
+/// The mask of a multi-position Mimi step, `seq_len` queries by the `kv_len` cached keys and
+/// themselves: each query sees the `context` positions ending at its own, and nothing in the
+/// `pad` leading slots that hold no position yet.
+pub(crate) fn mimi_mask<T: WithDTypeF>(
+    seq_len: usize,
+    kv_len: usize,
+    context: usize,
+    pad: usize,
+) -> Vec<T> {
+    (0..seq_len)
+        .flat_map(|seq_idx| {
+            let seq_idx = seq_idx + kv_len;
+            (0..kv_len + seq_len).map(move |attn_idx| {
+                // delta = seq_idx - attn_idx in 0..context
+                if attn_idx >= pad && attn_idx <= seq_idx && seq_idx < attn_idx + context {
+                    T::from_f32(0.0)
+                } else {
+                    T::from_f32(f32::NEG_INFINITY)
+                }
+            })
+        })
+        .collect()
 }
 
 // ---- ProjectedTransformer ----
@@ -800,11 +922,22 @@ impl<Q: BackendQ> ProjectedTransformer<Q> {
     }
 
     /// Forward pass. Input x is [B, C, T] (conv layout).
-    #[tracing::instrument(name = "transformer", skip_all)]
     pub fn forward(
         &self,
         x: &Tensor<Q::T, Q::B>,
         state: &mut StreamingTransformerState<Q::T, Q::B>,
+    ) -> Result<Vec<Tensor<Q::T, Q::B>>> {
+        self.forward_with(x, state, None, None)
+    }
+
+    /// As [`Self::forward`], see [`StreamingTransformer::forward_with`].
+    #[tracing::instrument(name = "transformer", skip_all)]
+    pub(crate) fn forward_with(
+        &self,
+        x: &Tensor<Q::T, Q::B>,
+        state: &mut StreamingTransformerState<Q::T, Q::B>,
+        rope: Option<RotaryEmbedding<Q::T, Q::B>>,
+        mask: Option<Tensor<Q::T, Q::B>>,
     ) -> Result<Vec<Tensor<Q::T, Q::B>>> {
         // [B, C, T] -> [B, T, C]
         let x = x.transpose(1, 2)?.contiguous()?;
@@ -814,7 +947,7 @@ impl<Q: BackendQ> ProjectedTransformer<Q> {
             None => x,
         };
 
-        let z = self.transformer.forward(&x, state)?;
+        let z = self.transformer.forward_with(&x, state, rope, mask)?;
 
         let mut ys = Vec::with_capacity(self.output_projs.len());
         for proj in &self.output_projs {

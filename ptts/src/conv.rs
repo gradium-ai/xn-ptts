@@ -82,6 +82,22 @@ impl<T: WithDTypeF, B: Backend> ConvTranspose1d<T, B> {
 pub struct StreamingConv1dState<T: WithDTypeF, B: Backend> {
     pub previous: Tensor<T, B>,
     pub first: bool,
+    /// Update `previous` in place rather than replace it, so its buffer stays where a recorded
+    /// step expects it.
+    pub in_place: bool,
+}
+
+impl<T: WithDTypeF, B: Backend> StreamingConv1dState<T, B> {
+    /// Update in place from now on.
+    pub fn into_in_place(self) -> Self {
+        Self { in_place: true, ..self }
+    }
+
+    /// Back to the state [`StreamingConv1d::init_state`] gives, in the same buffer.
+    pub fn reset(&mut self) -> Result<()> {
+        self.first = true;
+        self.previous.fill_(T::zero())
+    }
 }
 
 /// Streaming Conv1d with causal padding.
@@ -133,7 +149,7 @@ impl<T: WithDTypeF, B: Backend> StreamingConv1d<T, B> {
             (batch_size, self.conv.in_channels, prev_len),
             self.conv.weight.device(),
         )?;
-        Ok(StreamingConv1dState { previous, first: true })
+        Ok(StreamingConv1dState { previous, first: true, in_place: false })
     }
 
     pub fn forward(
@@ -146,12 +162,17 @@ impl<T: WithDTypeF, B: Backend> StreamingConv1d<T, B> {
         // On first call with replicate padding, fill previous with first sample
         if tp > 0 && matches!(self.pad_mode, PadMode::Replicate) && state.first {
             let init = x.narrow(2, 0..1)?.contiguous()?;
-            state.previous = if tp == 1 {
+            let previous = if tp == 1 {
                 init
             } else {
                 let refs: Vec<&Tensor<T, B>> = (0..tp).map(|_| &init).collect();
                 Tensor::cat(&refs, 2)?
             };
+            if state.in_place {
+                state.previous.copy_(&previous)?;
+            } else {
+                state.previous = previous;
+            }
         }
 
         // Prepend previous state
@@ -163,7 +184,12 @@ impl<T: WithDTypeF, B: Backend> StreamingConv1d<T, B> {
         // Update state
         if tp > 0 {
             let xlen = x.dim(2usize)?;
-            state.previous = x.narrow(2, xlen - tp..xlen)?.contiguous()?;
+            let previous = x.narrow(2, xlen - tp..xlen)?.contiguous()?;
+            if state.in_place {
+                state.previous.copy_(&previous)?;
+            } else {
+                state.previous = previous;
+            }
             if matches!(self.pad_mode, PadMode::Replicate) {
                 state.first = false;
             }
@@ -177,6 +203,20 @@ impl<T: WithDTypeF, B: Backend> StreamingConv1d<T, B> {
 #[derive(Debug, Clone)]
 pub struct StreamingConvTr1dState<T: WithDTypeF, B: Backend> {
     pub partial: Tensor<T, B>,
+    /// As [`StreamingConv1dState::in_place`].
+    pub in_place: bool,
+}
+
+impl<T: WithDTypeF, B: Backend> StreamingConvTr1dState<T, B> {
+    /// Update in place from now on.
+    pub fn into_in_place(self) -> Self {
+        Self { in_place: true, ..self }
+    }
+
+    /// Back to the state [`StreamingConvTranspose1d::init_state`] gives, in the same buffer.
+    pub fn reset(&mut self) -> Result<()> {
+        self.partial.fill_(T::zero())
+    }
 }
 
 /// Streaming ConvTranspose1d.
@@ -210,7 +250,7 @@ impl<T: WithDTypeF, B: Backend> StreamingConvTranspose1d<T, B> {
         let pt = self.convtr.kernel_size - self.convtr.stride;
         let partial =
             Tensor::zeros((batch_size, self.convtr.out_channels, pt), self.convtr.weight.device())?;
-        Ok(StreamingConvTr1dState { partial })
+        Ok(StreamingConvTr1dState { partial, in_place: false })
     }
 
     pub fn forward(
@@ -234,7 +274,11 @@ impl<T: WithDTypeF, B: Backend> StreamingConvTranspose1d<T, B> {
                 let bias = bias.reshape((1, bias.elem_count(), 1))?;
                 for_partial = for_partial.broadcast_sub(&bias)?;
             }
-            state.partial = for_partial;
+            if state.in_place {
+                state.partial.copy_(&for_partial)?;
+            } else {
+                state.partial = for_partial;
+            }
 
             // Return without the partial tail
             y = y.narrow(2, 0..y_len - pt)?.contiguous()?;

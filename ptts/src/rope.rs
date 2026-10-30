@@ -39,6 +39,13 @@ impl<T: WithDTypeF, B: Backend> RotaryEmbedding<T, B> {
     }
 
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    /// Take `other`'s table, of the same size, into this one's buffers.
+    pub fn copy_from(&self, other: &Self) -> Result<()> {
+        self.cos.copy_(&other.cos)?;
+        self.sin.copy_(&other.sin)
+    }
+
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     /// The rows of the table at `positions`, a `[n]` index tensor on the device.
     pub fn rows(&self, positions: &Tensor<i64, B>) -> Result<Self> {
         let cos = self.cos.index_select(positions, 0)?;
