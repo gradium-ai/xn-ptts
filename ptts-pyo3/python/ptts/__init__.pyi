@@ -218,7 +218,8 @@ def set_num_threads(num_threads: int) -> None:
     """
 
 def available_devices() -> list[str]:
-    """The device names this build accepts, most capable first. `"auto"` picks the first."""
+    """The device names this build accepts, most capable first. `"auto"` picks the first,
+    and the CPU if that one fails to start."""
 
 def available_quants() -> list[str]:
     """The weight formats `quant=` accepts. All are CPU-only."""

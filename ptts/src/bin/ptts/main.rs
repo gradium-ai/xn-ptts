@@ -72,7 +72,8 @@ struct Args {
     #[arg(long)]
     weights: Option<String>,
 
-    /// Device to run on: auto, cpu, cuda, vulkan or metal.
+    /// Device to run on: auto, cpu, cuda, vulkan or metal. `auto` picks the GPU backend this
+    /// build was compiled with, if any, and the CPU otherwise or when that GPU fails to start.
     #[arg(long, default_value = "auto")]
     device: String,
 

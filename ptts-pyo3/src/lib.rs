@@ -612,7 +612,7 @@ fn set_num_threads(num_threads: usize) {
 }
 
 /// The device names this build accepts, most capable first. `"auto"` picks the
-/// first of these.
+/// first of these, and the CPU if that one fails to start.
 #[pyfunction]
 fn available_devices() -> Vec<&'static str> {
     let mut devices = vec![];
