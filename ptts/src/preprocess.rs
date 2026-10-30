@@ -264,11 +264,11 @@ impl std::str::FromStr for Lang {
         let lower = s.trim().to_lowercase();
         // Bokmål's own code too, for YAML files, where a bare `no` reads as false.
         let code = if lower == "nb" { "no" } else { lower.as_str() };
-        Lang::ALL.into_iter().find(|lang| lang.as_str() == code).ok_or_else(|| {
+        Lang::ALL.iter().copied().find(|lang| lang.as_str() == code).ok_or_else(|| {
             crate::Error::invalid_argument(format!(
                 "unsupported language code: {s}; expected one of {}, or none to skip \
                  normalization",
-                Lang::ALL.map(Lang::as_str).join(", ")
+                Lang::ALL.iter().map(|lang| lang.as_str()).collect::<Vec<_>>().join(", ")
             ))
         })
     }
@@ -276,7 +276,7 @@ impl std::str::FromStr for Lang {
 
 impl Lang {
     /// Every language, in the order the frontends list them.
-    pub const ALL: [Lang; 18] = [
+    pub const ALL: &'static [Lang] = &[
         Lang::En,
         Lang::Fr,
         Lang::De,
@@ -1428,7 +1428,7 @@ mod tests {
         assert_eq!(normalize_text("Δ, ρ, π", Lang::Fi, Rules::DEFAULT), "delta, rhoo, pii");
         assert_eq!(normalize_text("π, Ω", Lang::It, Rules::DEFAULT), "pi greco, omega");
         assert_eq!(normalize_text("π≈3", Lang::De, Rules::DEFAULT), "Pi ungefähr 3");
-        for lang in Lang::ALL {
+        for &lang in Lang::ALL {
             for c in 'α'..='ω' {
                 assert!(lang.greek(c).is_some_and(|s| !s.is_empty()), "{lang:?} {c}");
             }
@@ -1441,7 +1441,7 @@ mod tests {
             normalize_text("★★★★☆ α", Lang::Ja, Rules::DEFAULT),
             "5 つ 星 の う ち 4 つ ア ル フ ァ 。"
         );
-        for lang in Lang::ALL {
+        for &lang in Lang::ALL {
             for c in "×÷≤≥≠≈√∞∑‰".chars() {
                 assert!(lang.symbol(c).is_some_and(|s| !s.is_empty()), "{lang:?} {c}");
             }
@@ -1747,7 +1747,7 @@ mod tests {
         ] {
             assert_eq!(Lang::from_str(s).unwrap(), lang);
         }
-        for lang in Lang::ALL {
+        for &lang in Lang::ALL {
             assert_eq!(Lang::from_str(lang.as_str()).unwrap(), lang);
         }
         assert_eq!(Normalize::from_str("no").unwrap(), Normalize::for_lang(Lang::No));
