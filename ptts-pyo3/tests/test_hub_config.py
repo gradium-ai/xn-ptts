@@ -116,6 +116,6 @@ def test_unavailable_device_is_rejected_before_hub_access(hub, device):
 
 
 def test_quantized_gpu_is_rejected_before_hub_access(hub):
-    with pytest.raises(NotImplementedError, match="CPU-only"):
-        ptts.TTS(f"hf://{hub.repo}", device="cuda", quant="q8", lang="en")
+    with pytest.raises(NotImplementedError, match="runs on the CPU"):
+        ptts.TTS(f"hf://{hub.repo}", device="cuda", quant="q4_0", lang="en")
     assert hub.requests == []

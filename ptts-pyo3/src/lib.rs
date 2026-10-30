@@ -617,7 +617,7 @@ fn available_devices() -> Vec<&'static str> {
     devices
 }
 
-/// The weight formats `quant=` accepts. All are CPU-only.
+/// The weight formats `quant=` accepts. They run on the CPU, and q8_0 on CUDA too.
 #[pyfunction]
 fn available_quants() -> Vec<&'static str> {
     vec!["f32", "q8_0", "q8_1", "q8k", "q6k", "q5_0", "q5_1", "q5k", "q4_0", "q4_1", "q4k"]
