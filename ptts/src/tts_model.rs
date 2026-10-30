@@ -125,6 +125,24 @@ pub struct TTSModel<Q: BackendQ> {
     cfg_null_text_empty: bool,
     speaker_sink: Option<PrefixSink<Q>>,
     text_sink: Option<PrefixSink<Q>>,
+    /// Set by [`Self::move_mimi_to`].
+    mimi_on: Option<MimiOn<Q>>,
+}
+
+/// The device handle Mimi runs on, when not the flow LM's, with the latent denormalization on
+/// it.
+struct MimiOn<Q: BackendQ> {
+    device: Q::B,
+    emb_std: Tensor<Q::T, Q::B>,
+    emb_mean: Tensor<Q::T, Q::B>,
+}
+
+/// A latent on its way from the flow LM to Mimi. With Mimi on a device handle of its own it
+/// crosses through the host, and the decoding side uploads it: an upload from pageable memory
+/// waits for the stream it goes to, and the flow LM must not wait for Mimi's.
+pub enum MimiLatent<Q: BackendQ> {
+    Device(Tensor<Q::T, Q::B>),
+    Host(Vec<Q::T>, Vec<usize>),
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -196,12 +214,48 @@ impl<Q: BackendQ> TTSModel<Q> {
             cfg_null_text_empty: cfg.cfg_null_text_empty,
             speaker_sink,
             text_sink,
+            mimi_on: None,
         })
     }
 
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn lsd_decode_steps(&self) -> usize {
         self.lsd_decode_steps
+    }
+
+    /// Run Mimi from weights in `vb`, on its device rather than the flow LM's.
+    pub fn move_mimi_to(&mut self, vb: &Path<Q::B>, cfg: &TTSConfig) -> Result<()> {
+        self.mimi = MimiDecoder::load(&vb.pp("mimi"), &cfg.mimi_with_gelu(&cfg.mimi))?;
+        let ldim = cfg.flow_lm.ldim;
+        let emb_std = vb.tensor("flow_lm.emb_std", (ldim,))?;
+        let emb_mean = vb.tensor("flow_lm.emb_mean", (ldim,))?;
+        self.mimi_on = Some(MimiOn { device: vb.device().clone(), emb_std, emb_mean });
+        Ok(())
+    }
+
+    /// The device Mimi runs on.
+    pub fn mimi_device(&self) -> &Q::B {
+        match &self.mimi_on {
+            Some(on) => &on.device,
+            None => self.device(),
+        }
+    }
+
+    /// A latent from [`Self::generate_step`], to hand to the thread that decodes it, which
+    /// takes it with [`Self::mimi_latent`].
+    pub fn latent_for_mimi(&self, latent: &Tensor<Q::T, Q::B>) -> Result<MimiLatent<Q>> {
+        match &self.mimi_on {
+            None => Ok(MimiLatent::Device(latent.clone())),
+            Some(_) => Ok(MimiLatent::Host(latent.to_vec()?, latent.dims().to_vec())),
+        }
+    }
+
+    /// The latent, on the device [`Self::decode_latent`] wants it on.
+    pub fn mimi_latent(&self, latent: MimiLatent<Q>) -> Result<Tensor<Q::T, Q::B>> {
+        match latent {
+            MimiLatent::Device(latent) => Ok(latent),
+            MimiLatent::Host(data, dims) => Tensor::from_vec(data, dims, self.mimi_device()),
+        }
     }
 
     pub fn with_eos_threshold(mut self, eos_threshold: f32) -> Self {
@@ -362,8 +416,11 @@ impl<Q: BackendQ> TTSModel<Q> {
         latent: &Tensor<Q::T, Q::B>,
         mimi_state: &mut MimiDecoderState<f32, Q::B>,
     ) -> Result<Tensor<f32, Q::B>> {
-        let denorm =
-            latent.broadcast_mul(&self.flow_lm.emb_std)?.broadcast_add(&self.flow_lm.emb_mean)?;
+        let (std, mean) = match &self.mimi_on {
+            Some(on) => (&on.emb_std, &on.emb_mean),
+            None => (&self.flow_lm.emb_std, &self.flow_lm.emb_mean),
+        };
+        let denorm = latent.broadcast_mul(std)?.broadcast_add(mean)?;
 
         // [B, T, C] -> [B, C, T]
         let transposed = denorm.transpose(1, 2)?.contiguous()?;
