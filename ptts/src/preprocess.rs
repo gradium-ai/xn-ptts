@@ -235,6 +235,7 @@ pub const SPECIAL_CHARS_TR: SpecialChars = SpecialChars {
 /// The first five have word [`Rules`] of their own; the others get the character pass alone,
 /// see [`Lang::has_rules`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Lang {
     En,
     Fr,
