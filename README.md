@@ -369,7 +369,7 @@ Start the speech server, which downloads the default model on first start:
 docker run --rm -p 127.0.0.1:8880:8880 -e PTTS_LANG=en -e PTTS_QUANT=q8 ghcr.io/gradium-ai/ptts-openai-server:latest
 ```
 
-`latest` follows the newest release; for a repeatable deployment, use a version tag such as `0.5.0`.
+`latest` follows the newest release; for a repeatable deployment, use a version tag such as `0.6.0`.
 
 In a second terminal:
 
