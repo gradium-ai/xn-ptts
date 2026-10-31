@@ -174,6 +174,22 @@ public final class Phonon: @unchecked Sendable {
         currentLanguage.withLock { $0 = language }
     }
 
+    /// Sample at `temperature` from the next utterance on: higher varies more, 0 removes the
+    /// randomness. The default is the model's. Throws for a negative or infinite temperature.
+    public func setTemperature(_ temperature: Float) async throws {
+        let h = Pointer(p: handle)
+        try await Self.run(on: queue) {
+            guard ptts_set_temperature(h.p, temperature) else { throw Self.lastError(h.p) }
+        }
+    }
+
+    /// Seed the sampling from the next utterance on, until set again: the same seed gives the same
+    /// audio, another seed another take of the same text.
+    public func setSeed(_ seed: UInt64) async {
+        let h = Pointer(p: handle)
+        _ = try? await Self.run(on: queue) { ptts_set_seed(h.p, seed) }
+    }
+
     private final class Sink: @unchecked Sendable {
         let onAudio: ([Float]) -> Void
         let stop = Atomic<Bool>(false)

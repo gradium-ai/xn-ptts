@@ -20,6 +20,9 @@ pub struct Engine {
     voices: Vec<String>,
     languages: Vec<String>,
     voice: Option<String>,
+    /// Left `None`, the builder's defaults.
+    temperature: Option<f32>,
+    seed: Option<u64>,
     /// Applied here rather than by `synth`, which is built with `Normalize::OFF`, so that
     /// `set_language` can change it without a reload. `Synth` applies it first thing anyway.
     normalize: Normalize,
@@ -57,6 +60,8 @@ impl Engine {
             voices: synth.voices(),
             languages: synth.languages().to_vec(),
             voice: synth.default_voice(),
+            temperature: None,
+            seed: None,
             normalize,
             synth,
             frame_size,
@@ -83,13 +88,28 @@ impl Engine {
         Ok(())
     }
 
+    /// Sample at `temperature`, already checked, from the next utterance on.
+    pub fn set_temperature(&mut self, temperature: f32) {
+        self.temperature = Some(temperature);
+    }
+
+    /// Seed the sampling from the next utterance on.
+    pub fn set_seed(&mut self, seed: u64) {
+        self.seed = Some(seed);
+    }
+
     pub fn speak(
         &mut self,
         text: &str,
         sink: &mut dyn FnMut(&[f32]) -> bool,
     ) -> Result<PttsResult, String> {
         let start = std::time::Instant::now();
-        let opts = SpeechOptions { voice: self.voice.clone(), ..Default::default() };
+        let opts = SpeechOptions {
+            voice: self.voice.clone(),
+            temperature: self.temperature,
+            seed: self.seed,
+            ..Default::default()
+        };
         let text = self.normalize.apply(text);
         let stream = self.synth.stream_with(&text, &opts).map_err(|e| e.to_string())?;
         let (mut samples, mut ttfa) = (0, None);

@@ -212,6 +212,45 @@ pub unsafe extern "C" fn ptts_set_language(h: *mut PttsHandle, lang: *const c_ch
     }
 }
 
+/// Sample at `temperature` from the next `ptts_speak` on: higher varies more, 0 removes the
+/// randomness. The default is the model's. Returns false for a negative, infinite or NaN
+/// temperature; see `ptts_last_error`.
+///
+/// # Safety
+/// `h` must come from `ptts_new`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ptts_set_temperature(h: *mut PttsHandle, temperature: f32) -> bool {
+    let h = unsafe { &mut *h };
+    match check_temperature(temperature) {
+        Ok(()) => {
+            h.engine.set_temperature(temperature);
+            true
+        }
+        Err(e) => {
+            h.last_error = Some(c_string(&e));
+            false
+        }
+    }
+}
+
+fn check_temperature(temperature: f32) -> Result<(), String> {
+    // Not finite rules out NaN too. An infinite one would only fail at the next `ptts_speak`.
+    if !temperature.is_finite() || temperature < 0.0 {
+        return Err(format!("temperature must be finite and >= 0, got {temperature}"));
+    }
+    Ok(())
+}
+
+/// Seed the sampling from every `ptts_speak` on until it is set again: on the same device and
+/// model, the same seed gives the same audio, another seed another take of the same text.
+///
+/// # Safety
+/// `h` must come from `ptts_new`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ptts_set_seed(h: *mut PttsHandle, seed: u64) {
+    unsafe { (*h).engine.set_seed(seed) }
+}
+
 /// The last error on `h`, or, when `h` is null, the last `ptts_new` failure on this thread.
 /// Borrowed until the next failing call.
 ///
@@ -232,5 +271,19 @@ pub unsafe extern "C" fn ptts_last_error(h: *const PttsHandle) -> *const c_char 
 pub unsafe extern "C" fn ptts_free(h: *mut PttsHandle) {
     if !h.is_null() {
         drop(unsafe { Box::from_raw(h) });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_temperature;
+
+    #[test]
+    fn temperature_is_not_negative() {
+        assert!(check_temperature(0.0).is_ok());
+        assert!(check_temperature(0.5).is_ok());
+        assert!(check_temperature(-0.1).is_err());
+        assert!(check_temperature(f32::NAN).is_err());
+        assert!(check_temperature(f32::INFINITY).is_err());
     }
 }

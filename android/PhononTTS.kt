@@ -63,6 +63,18 @@ class PhononTTS(modelDir: String, lang: String) : AutoCloseable {
     fun setLanguage(lang: String) = check(lib.ptts_set_language(open(), lang))
 
     /**
+     * Sample at [temperature] from now on: higher varies more, 0 removes the randomness. The
+     * default is the model's. Throws for a negative or infinite temperature.
+     */
+    fun setTemperature(temperature: Float) = check(lib.ptts_set_temperature(open(), temperature))
+
+    /**
+     * Seed the sampling from now on, until set again: the same seed gives the same audio, a new
+     * one another take.
+     */
+    fun setSeed(seed: Long) = lib.ptts_set_seed(open(), seed)
+
+    /**
      * Speak [text], handing [onAudio] each piece of audio as soon as it is made: 24 kHz mono
      * floats in [-1, 1]. Return false from [onAudio] to stop early. Returns once all the audio
      * has been handed over, with the utterance's timings. What [onAudio] throws, [speak] rethrows.
@@ -110,6 +122,8 @@ class PhononTTS(modelDir: String, lang: String) : AutoCloseable {
         fun ptts_set_voice(h: Pointer, name: String): Byte
         fun ptts_set_language(h: Pointer, lang: String): Byte
         fun ptts_languages(h: Pointer): Pointer
+        fun ptts_set_temperature(h: Pointer, temperature: Float): Byte
+        fun ptts_set_seed(h: Pointer, seed: Long)
         fun ptts_last_error(h: Pointer?): String?
         fun ptts_free(h: Pointer)
 
