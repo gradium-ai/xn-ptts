@@ -220,6 +220,9 @@ void Phonon::generate_chunk(const Chunk& chunk, const Voice& voice,
   const size_t plane = size_t(cache_slots_) * row;  // one (layer, k/v, head)
   f16* kv = buf_.kv;
   std::fill(kv, kv + buf_.kv_count, f16(0));
+  if (voice.length < 0 || size_t(voice.length) > size_t(cache_slots_) ||
+      size_t(layers2_) * size_t(heads_) * plane > buf_.kv_count)
+    throw std::runtime_error("voice '" + voice.name + "' does not fit the model's kv cache");
   for (int lh = 0; lh < layers2_ * heads_; lh++)
     std::memcpy(&kv[lh * plane], &voice.kv[size_t(lh) * voice.length * row], voice.length * row * sizeof(f16));
   int pos = voice.length;
