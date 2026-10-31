@@ -4426,6 +4426,7 @@ dependencies = [
  "http",
  "http-body",
  "iri-string",
+ "mime",
  "pin-project-lite",
  "tower",
  "tower-layer",

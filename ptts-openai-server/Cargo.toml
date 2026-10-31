@@ -19,7 +19,7 @@ ptts = { workspace = true, features = ["hf", "hub"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "net"] }
-tower-http = { workspace = true }
+tower-http = { workspace = true, features = ["validate-request"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 xn = { workspace = true }

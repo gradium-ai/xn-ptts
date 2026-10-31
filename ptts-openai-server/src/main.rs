@@ -121,6 +121,12 @@ struct Args {
     /// always send a speed. Without it, such a request is an error.
     #[arg(long, env = "PTTS_IGNORE_SPEED")]
     ignore_speed: bool,
+
+    /// Require this value as a bearer token (`Authorization: Bearer <key>`) on every request.
+    /// Off when not set, which leaves the server reachable without authentication: only do
+    /// that behind a trusted network or a gateway that authenticates for it.
+    #[arg(long, env = "PTTS_API_KEY")]
+    api_key: Option<String>,
 }
 
 impl Args {
@@ -188,13 +194,38 @@ async fn main() -> Result<()> {
         tokio::spawn(wyoming::serve(listener, server));
     }
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/v1/audio/speech", post(api::speech))
         .route("/v1/audio/voices", get(api::voices))
         .route("/v1/models", get(api::models))
         .route("/health", get(api::health))
         .with_state(app_state)
         .layer(tower_http::trace::TraceLayer::new_for_http());
+    match &args.api_key {
+        Some(api_key) => {
+            let expected = format!("Bearer {api_key}");
+            app = app.layer(tower_http::validate_request::ValidateRequestHeaderLayer::custom(
+                move |request: &mut axum::http::Request<axum::body::Body>| {
+                    let authorized = request
+                        .headers()
+                        .get(axum::http::header::AUTHORIZATION)
+                        .is_some_and(|value| value.as_bytes() == expected.as_bytes());
+                    if authorized {
+                        return Ok(());
+                    }
+                    Err(axum::response::Response::builder()
+                        .status(axum::http::StatusCode::UNAUTHORIZED)
+                        .body(axum::body::Body::empty())
+                        .expect("a static response is always valid"))
+                },
+            ));
+        }
+        None => {
+            tracing::warn!(
+                "PTTS_API_KEY is not set: the HTTP routes are reachable without authentication"
+            );
+        }
+    }
 
     let listener = tokio::net::TcpListener::bind(&args.addr).await?;
     tracing::info!(addr = %args.addr, "listening on /v1/audio/speech");
