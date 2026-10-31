@@ -78,29 +78,33 @@ impl Rng for ReplayRng {
     }
 }
 
+/// The flow net's time conditioning for each of `num_steps` solver steps, `[1, flow_dim]` each.
+fn lsd_time_embeddings<T: WithDTypeF, B: Backend>(
+    flow_net: &SimpleMLPAdaLN<T, B>,
+    num_steps: usize,
+    dev: &B,
+) -> Result<Vec<Tensor<T, B>>> {
+    (0..num_steps)
+        .map(|i| {
+            let s = Tensor::full(T::from_f32(i as f32 / num_steps as f32), (1, 1), dev)?;
+            let t = Tensor::full(T::from_f32((i + 1) as f32 / num_steps as f32), (1, 1), dev)?;
+            flow_net.time_embedding(&[&s, &t])
+        })
+        .collect()
+}
+
 /// Lagrangian Self Distillation decode.
-/// Rebuilds the data sample from starting point x_0.
+/// Rebuilds the data sample from starting point x_0, one solver step per time embedding.
 fn lsd_decode<T: WithDTypeF, B: Backend>(
     flow_net: &SimpleMLPAdaLN<T, B>,
     transformer_out: &Tensor<T, B>,
     x_0: &Tensor<T, B>,
-    num_steps: usize,
+    time_embeddings: &[Tensor<T, B>],
 ) -> Result<Tensor<T, B>> {
     let mut current = x_0.clone();
-    let dev = x_0.device();
-
-    for i in 0..num_steps {
-        let s_val = i as f32 / num_steps as f32;
-        let t_val = (i + 1) as f32 / num_steps as f32;
-
-        // Create s and t tensors matching x_0 shape but with last dim = 1
-        let shape: Vec<usize> =
-            x_0.dims().iter().copied().take(x_0.rank() - 1).chain([1]).collect();
-        let s = Tensor::full(T::from_f32(s_val), shape.clone(), dev)?;
-        let t = Tensor::full(T::from_f32(t_val), shape, dev)?;
-
-        let flow_dir = flow_net.forward(transformer_out, &[&s, &t], &current)?;
-        let step_scale = T::from_f32(1.0 / num_steps as f32);
+    let step_scale = T::from_f32(1.0 / time_embeddings.len() as f32);
+    for t_emb in time_embeddings {
+        let flow_dir = flow_net.forward(transformer_out, Some(t_emb), &current)?;
         current = current.add(&flow_dir.scale(step_scale)?)?;
     }
     Ok(current)
@@ -170,6 +174,8 @@ pub struct FlowLM<Q: BackendQ> {
     out_eos: Linear<Q::T, Q::B>,
     z_proj: Option<Linear<Q::T, Q::B>>,
     flow_type: FlowType,
+    /// [`lsd_time_embeddings`] for the checkpoint's own number of solver steps.
+    lsd_time_embeddings: Vec<Tensor<Q::T, Q::B>>,
     /// Width of the backbone output the flow net and the EOS head read.
     pub dim: usize,
     pub ldim: usize,
@@ -256,6 +262,10 @@ impl<Q: BackendQ> FlowLM<Q> {
         let out_norm_weight = vb.pp("out_norm").tensor("weight", (cfg.d_model,))?;
         let out_norm_bias = vb.pp("out_norm").tensor("bias", (cfg.d_model,))?;
         let out_eos = Linear::load_b(vb.pp("out_eos"), dim, 1)?;
+        let lsd_time_embeddings = match cfg.flow_type {
+            FlowType::Lsd => lsd_time_embeddings(&flow_net, config.lsd_decode_steps, vb.device())?,
+            FlowType::Drifting | FlowType::Pointwise => vec![],
+        };
 
         Ok(Self {
             conditioner,
@@ -271,6 +281,7 @@ impl<Q: BackendQ> FlowLM<Q> {
             out_eos,
             z_proj,
             flow_type: cfg.flow_type,
+            lsd_time_embeddings,
             dim,
             ldim: cfg.ldim,
         })
@@ -331,9 +342,16 @@ impl<Q: BackendQ> FlowLM<Q> {
             (0..b * self.ldim).map(|_| Q::T::from_f32(rng.sample())).collect();
         let noise = Tensor::from_vec(noise_data, (b, self.ldim), t_out.device())?;
         let latent = match self.flow_type {
-            FlowType::Lsd => lsd_decode(&self.flow_net, t_out, &noise, lsd_decode_steps)?,
-            FlowType::Drifting => self.flow_net.forward(t_out, &[], &noise)?,
-            FlowType::Pointwise => noise.add(&self.flow_net.forward(t_out, &[], &noise)?)?,
+            FlowType::Lsd if lsd_decode_steps == self.lsd_time_embeddings.len() => {
+                lsd_decode(&self.flow_net, t_out, &noise, &self.lsd_time_embeddings)?
+            }
+            FlowType::Lsd => {
+                let time_embeddings =
+                    lsd_time_embeddings(&self.flow_net, lsd_decode_steps, t_out.device())?;
+                lsd_decode(&self.flow_net, t_out, &noise, &time_embeddings)?
+            }
+            FlowType::Drifting => self.flow_net.forward(t_out, None, &noise)?,
+            FlowType::Pointwise => noise.add(&self.flow_net.forward(t_out, None, &noise)?)?,
         };
         Ok((latent.reshape((b, 1, self.ldim))?, eos_logit))
     }
