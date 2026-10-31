@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ptts-litert"
+version = "0.0.0"
+description = "Export ptts checkpoints to LiteRT for Android NPUs, and check them against ptts."
+requires-python = ">=3.10"
+license = "MIT OR Apache-2.0"
+dependencies = ["numpy", "safetensors", "ai-edge-litert>=2.2"]
+
+[project.optional-dependencies]
+# litert-torch pins ai-edge-litert to 2.2.x and does not support torch 2.14 yet.
+export = ["torch>=2.4,<2.14", "litert-torch==0.9.4"]
+# The vendor compilers, Linux x86_64 only. A compiled model needs the same LiteRT release on
+# the device. Installing the Qualcomm package downloads and unpacks the whole QAIRT SDK.
+compile = ["ai-edge-litert==2.3.0", "ai-edge-litert-sdk-qualcomm==2.3.0", "ai-edge-litert-sdk-mediatek==2.3.0"]
+
+[project.scripts]
+ptts-litert = "ptts_litert.__main__:main"
+
+[tool.uv]
+conflicts = [[{ extra = "export" }, { extra = "compile" }]]
+
+[tool.ruff]
+line-length = 120
