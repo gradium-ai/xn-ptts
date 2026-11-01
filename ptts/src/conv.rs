@@ -279,3 +279,53 @@ impl<T: WithDTypeF, B: Backend> StreamingConvTranspose1d<T, B> {
         Ok(y)
     }
 }
+
+#[cfg(test)]
+mod packed_tests {
+    use super::*;
+    use xn::CpuDevice;
+
+    #[test]
+    fn packed_and_fallback_chunks_preserve_streaming_state_and_bias() -> Result<()> {
+        let weight = Tensor::from_vec(
+            (0..35 * 3 * 7).map(|i| (i as f32 * 0.13).sin() * 0.1).collect(),
+            (35, 3, 7),
+            &CpuDevice,
+        )?;
+        let Some(packed) = crate::packed_f32::PackedF32::from_weight(&weight, 35, 21)? else {
+            return Ok(());
+        };
+        let bias = Tensor::from_vec((0..35).map(|i| i as f32 * 0.01).collect(), (35,), &CpuDevice)?;
+        let conv = |packed| Conv1d {
+            packed,
+            weight: weight.clone(),
+            bias: Some(bias.clone()),
+            stride: 1,
+            dilation: 1,
+            kernel_size: 7,
+            in_channels: 3,
+            groups: 1,
+        };
+        let baseline = StreamingConv1d { conv: conv(None), pad_mode: PadMode::Replicate };
+        let candidate = StreamingConv1d { conv: conv(Some(packed)), pad_mode: PadMode::Replicate };
+        let mut reference_state = baseline.init_state(2)?;
+        let mut candidate_state = candidate.init_state(2)?;
+        // Cross the dispatch boundary in both directions, including exactly 16.
+        for length in [1, 2, 16, 17, 32, 8] {
+            let input = Tensor::from_vec(
+                (0..2 * 3 * length).map(|i| (i as f32 * 0.07).cos()).collect(),
+                (2, 3, length),
+                &CpuDevice,
+            )?;
+            let expected = baseline.forward(&input, &mut reference_state)?;
+            let actual = candidate.forward(&input, &mut candidate_state)?;
+            assert_eq!(expected.dims(), actual.dims());
+            for (a, b) in expected.to_vec()?.into_iter().zip(actual.to_vec()?) {
+                assert!(b.is_finite() && (a - b).abs() < 1e-5, "{a} != {b}");
+            }
+            assert_eq!(reference_state.previous.to_vec()?, candidate_state.previous.to_vec()?);
+            assert_eq!(reference_state.first, candidate_state.first);
+        }
+        Ok(())
+    }
+}

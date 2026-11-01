@@ -171,3 +171,64 @@ impl PackedF32 {
         Ok(output)
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xn::{CpuDevice, Tensor};
+    #[test]
+    fn lowered_convolution_matches_dense_backend_for_strides_and_dilations() -> xn::Result<()> {
+        for (batch, channels, n, length, kernel, stride, dilation) in [
+            (1, 3, 35, 23, 7, 1, 1),
+            (2, 5, 37, 31, 3, 2, 2),
+            (1, 3, 33, 1, 1, 1, 1),
+            (2, 7, 32, 17, 1, 2, 1),
+        ] {
+            let weight = Tensor::from_vec(
+                (0..n * channels * kernel).map(|i| (i as f32 * 0.13).sin() * 0.1).collect(),
+                (n, channels, kernel),
+                &CpuDevice,
+            )?;
+            let Some(packed) = PackedF32::from_weight(&weight, n, channels * kernel)? else {
+                return Ok(());
+            };
+            let input = Tensor::from_vec(
+                (0..batch * channels * length).map(|i| (i as f32 * 0.07).cos()).collect(),
+                (batch, channels, length),
+                &CpuDevice,
+            )?;
+            let expected = input.conv1d(&weight, None, stride, 0, dilation, 1)?;
+            let actual = packed.conv1d(&input, kernel, stride, dilation)?;
+            assert_eq!(expected.dims(), actual.dims());
+            for (a, b) in expected.to_vec()?.into_iter().zip(actual.to_vec()?) {
+                assert!(b.is_finite() && (a - b).abs() < 1e-5, "{a} != {b}");
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn linear_matches_reference_across_row_counts_and_rejects_other_dtypes() -> xn::Result<()> {
+        let weight = Tensor::from_vec(
+            (0..19 * 37).map(|i| (i as f32 * 0.13).sin() * 0.1).collect(),
+            (19, 37),
+            &CpuDevice,
+        )?;
+        assert!(PackedF32::from_weight(&weight.to::<half::f16>()?, 19, 37)?.is_none());
+        let Some(packed) = PackedF32::from_weight(&weight, 19, 37)? else {
+            return Ok(());
+        };
+        for rows in [1, 2, 8, 17, 1] {
+            let x = Tensor::from_vec(
+                (0..rows * 37).map(|i| (i as f32 * 0.07).cos()).collect(),
+                (rows, 37),
+                &CpuDevice,
+            )?;
+            let expected = x.matmul_t(&weight)?.to_vec()?;
+            let actual = packed.forward(&x)?.to_vec()?;
+            for (a, b) in expected.into_iter().zip(actual) {
+                assert!(b.is_finite() && (a - b).abs() < 1e-5, "{a} != {b}");
+            }
+        }
+        assert!(packed.forward(&Tensor::<f32, _>::zeros((2, 36), &CpuDevice)?).is_err());
+        Ok(())
+    }
+}
