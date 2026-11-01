@@ -1,7 +1,7 @@
 # Phonon serving optimization: voice cache
 
-This fork starts with a bounded LRU cache and a reproducible HTTP benchmark. Upstream
-already caches voice conditioning. At revision
+This benchmark accompanies a bounded LRU cache for retained voice prefixes. The
+baseline already caches voice conditioning. At revision
 `31e4e9f80275e432b570e17f5ccbefa895eff109`, inserting a seventeenth retained voice
 prefix clears the whole cache. This change evicts only the least recently used
 prefixes needed to fit the configured entry and KV-byte budgets.
@@ -130,25 +130,32 @@ The checkpoint test disables KleidiAI for stable numerical comparison and checks
 waveform error below `1e-5`, equal length, and finite samples. It downloads nothing.
 Run the cache tests on each GPU backend before claiming validation there.
 
-## Next optimization layers
+## Measured example and reference material
 
-1. **Measure request stages.** Extend the timing approach used in the existing vLLM/
-   SGLang work: admission, normalization, voice prime, session setup, flow generation,
-   Mimi decode, encoding and first PCM. Add cancellation, failure and memory telemetry
-   with bounded labels. The current endpoint provides aggregate cache counters only;
-   full OpenTelemetry tracing is not implemented.
-2. **Reuse session capacity and workers.** Profile allocation, KV growth/copy and thread
-   startup. Prototype a bounded session pool with exclusive ownership and complete
-   per-request RNG, voice, condition, decoder and cancellation reset. Prove isolation
-   before enabling reuse; the cache added here stores immutable prefixes only.
-3. **Integrate upstream GPU work selectively.** Evaluate upstream flow/Mimi CUDA graphs,
-   conditioning and stream changes on a fixed GPU and revision. Benchmark cold/warm
-   TTFA, streaming gaps and concurrency before accepting a kernel speedup.
-4. **Add scheduling only after profiling.** Continuous batching, admission queues and
-   separate flow/Mimi scheduling need TTS-aware state and playback deadlines. Borrow
-   vLLM/SGLang scheduling ideas; this Rust flow-matching/codec stack is not a drop-in
-   Hugging Face causal-language-model backend for either server.
+A paired M4 Pro CPU Q8 experiment with `accelerate,kai`, four Rayon threads and
+concurrency one found the following medians across three per-trial statistics:
 
-Keep changes that improve the target workload without audio regressions. CPU HTTP
-results here cannot establish a win over upstream's published native M5 numbers,
-which use different hardware and measurement boundaries.
+| Workload | Client first-audio p50, original → LRU | Audio seconds/wall second, original → LRU |
+|---|---:|---:|
+| One warm voice | 4.445 → 4.445 ms | 63.52 → 64.34 |
+| Controlled voice pressure | 9.856 → 4.479 ms | 56.65 → 63.40 |
+| Round-robin 17 voices | 9.882 → 10.057 ms | 56.90 → 56.01 |
+
+The gain applies to the constructed pressure workload; the controls do not show
+a consistent benefit. Trials were on a shared desktop, and small differences
+should not be treated as statistically established. All 1,764 measured requests
+and 204 warm-ups completed without errors.
+
+[Complete environment, raw trials and numerical checks](https://github.com/rudrakshkarpe/xn-ptts/tree/ff32bd9019c84b83e01953dee3b78ffe7d182722/benchmarks/voice-cache/results/m4-pro-2026-11-01) and
+[graphs with paired audio samples](https://github.com/rudrakshkarpe/xn-ptts/tree/ff32bd9019c84b83e01953dee3b78ffe7d182722/benchmarks/voice-cache/results/m4-pro-2026-11-01/showcase) are pinned external evidence.
+They identify original runtime `31e4e9f80275e432b570e17f5ccbefa895eff109` and optimized
+runtime `df6aeaa68d318c9ec5684dc6658eb8c0b5304ece`; this branch carries the same Rust
+runtime changes, with the benchmark evidence hosted separately.
+
+Gradium's [Phonon release benchmarks](https://gradium.ai/blog/release-phonon-open-weight)
+exclude the one-off voice conditioning stage. This HTTP experiment includes
+conditioning when a request misses the cache. Hardware, text and timing boundaries
+also differ, so these results are not directly comparable with the release figures.
+
+The audio evidence checks sample counts and numerical differences. It does not
+establish WER, naturalness, speaker similarity, production throughput or GPU behavior.
