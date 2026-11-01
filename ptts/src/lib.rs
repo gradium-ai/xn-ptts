@@ -111,6 +111,8 @@ pub mod transformer;
 pub mod tts_model;
 pub mod utils;
 #[cfg(not(target_arch = "wasm32"))]
+mod voice_cache;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod voice_catalog;
 pub mod wav;
 

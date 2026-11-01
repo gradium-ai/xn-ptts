@@ -64,6 +64,8 @@ use crate::loader;
 use crate::plan::{self, Chunk, EosPolicy};
 use crate::preprocess::Normalize;
 use crate::tts_model::{MAX_TOKENS_PER_CHUNK, MimiEnc, TTSConfig, TTSModel, TTSState};
+use crate::voice_cache::VoiceCache;
+pub use crate::voice_cache::{VoiceCacheConfig, VoiceCacheStats};
 use crate::{Error, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path as FsPath, PathBuf};
@@ -336,7 +338,7 @@ struct SynthOf<Q: BackendQ> {
     /// Each voice's primed KV prefix, keyed by name and by whether guidance is on: the null
     /// branch's prefix differs, the coefficient does not enter the state. Sized to the prompt;
     /// copied out to each generation's budget.
-    primed: Mutex<HashMap<(String, bool), Primed<Q>>>,
+    primed: Mutex<VoiceCache<Primed<Q>>>,
     conditioners: Conditioners<Q::T, Q::B>,
     conditions: Option<Tensor<Q::T, Q::B>>,
     /// Whether a session should decode each frame on the flow-LM's own thread rather than
@@ -347,15 +349,29 @@ struct SynthOf<Q: BackendQ> {
     inline_decode: bool,
 }
 
-/// How many primed prefixes to keep. A process that clones voices under fresh names -- which
-/// `ptts-pyo3` exposes -- would otherwise grow the map without bound. Past the cap it is cleared;
-/// generation still works, it just re-primes.
-const MAX_PRIMED: usize = 16;
-
 /// A voice's conditioning, run through the transformer once.
 struct Primed<Q: BackendQ> {
     state: TTSState<Q>,
     null_state: Option<TTSState<Q>>,
+}
+
+impl<Q: BackendQ> Primed<Q> {
+    /// Count only retained flow-LM K/V payloads, without device reads. Shared conditions and
+    /// weights are excluded; active sessions allocate their own larger caches in `grow`.
+    fn kv_bytes(&self) -> usize {
+        std::iter::once(&self.state)
+            .chain(self.null_state.iter())
+            .flat_map(|state| &state.flow_lm_state.transformer_state.layer_states)
+            .map(|layer| match layer {
+                crate::transformer::LayerAttentionState::FlowLm(mha) => {
+                    (mha.k_cache.dims().iter().product::<usize>()
+                        + mha.v_cache.dims().iter().product::<usize>())
+                        * std::mem::size_of::<Q::T>()
+                }
+                crate::transformer::LayerAttentionState::Mimi(_) => 0,
+            })
+            .sum()
+    }
 }
 
 impl<Q: BackendQ> SynthOf<Q> {
@@ -384,7 +400,7 @@ impl<Q: BackendQ> SynthOf<Q> {
     /// from the old conditioning.
     fn forget_primed(&self, name: &str) {
         let mut primed = self.primed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        primed.retain(|(voice, _), _| voice != name);
+        primed.invalidate_voice(name);
     }
 
     /// The voice a request speaks in: the one it names, else the default. `None` when there
@@ -434,9 +450,9 @@ impl<Q: BackendQ> SynthOf<Q> {
 
         let key = (name.to_string(), cfg_coef.is_some());
         // Prime outside the lock so first callers for different voices do not serialise; a
-        // same-voice race primes twice and the second insert wins, harmlessly.
+        // same-voice race can prime twice; insertion retains only one immutable prefix.
         let cached = {
-            let primed = self.primed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut primed = self.primed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             primed.get(&key).map(|p| (p.state.clone(), p.null_state.clone()))
         };
         let (prefix, null_prefix) = match cached {
@@ -446,10 +462,8 @@ impl<Q: BackendQ> SynthOf<Q> {
                 let out = (fresh.state.clone(), fresh.null_state.clone());
                 let mut primed =
                     self.primed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                if primed.len() >= MAX_PRIMED {
-                    primed.clear();
-                }
-                primed.insert(key, fresh);
+                let kv_bytes = fresh.kv_bytes();
+                primed.insert(key, fresh, kv_bytes);
                 out
             }
         };
@@ -534,6 +548,10 @@ impl<Q: BackendQ> SynthOf<Q> {
 }
 
 impl<Q: BackendQ> SynthApi for SynthOf<Q> {
+    fn voice_cache_stats(&self) -> VoiceCacheStats {
+        self.primed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).stats()
+    }
+
     fn sample_rate(&self) -> u32 {
         self.model.sample_rate() as u32
     }
@@ -1388,6 +1406,7 @@ pub struct SynthBuilder {
     voices: Vec<(String, PathBuf)>,
     normalize: Normalize,
     conditions: HashMap<String, String>,
+    voice_cache: VoiceCacheConfig,
 }
 
 impl SynthBuilder {
@@ -1440,7 +1459,15 @@ impl SynthBuilder {
             post_process: vec![],
             voices: vec![],
             conditions: HashMap::new(),
+            voice_cache: VoiceCacheConfig::default(),
         }
+    }
+
+    /// Set retained voice-prefix limits. Defaults to 16 entries and 64 MiB of KV payloads.
+    /// Either zero limit disables retention, for memory-constrained callers or baselines.
+    pub fn voice_cache(mut self, config: VoiceCacheConfig) -> Self {
+        self.voice_cache = config;
+        self
     }
 
     /// The `tokenizer.json` the checkpoint ships, read by [`crate::tok::Tok`].
@@ -1682,7 +1709,7 @@ impl SynthBuilder {
             mimi_enc,
             cfg: config,
             voices: BTreeMap::new(),
-            primed: Mutex::new(HashMap::new()),
+            primed: Mutex::new(VoiceCache::new(self.voice_cache)),
             defaults: Defaults {
                 voice: self.voice.clone(),
                 temperature: self.temperature,
@@ -1751,6 +1778,9 @@ mod sealed {
 ///
 /// [`Synth`] dereferences to this, so these are called on a `Synth` directly, with no import.
 pub trait SynthApi: sealed::Sealed + Send + Sync {
+    /// Retained voice-prefix occupancy and cumulative cache counters for this Synth.
+    fn voice_cache_stats(&self) -> VoiceCacheStats;
+
     /// Sample rate of the audio this model produces, in Hz.
     fn sample_rate(&self) -> u32;
 
