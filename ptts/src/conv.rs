@@ -16,6 +16,7 @@ pub fn pad_for_conv1d<T: WithDTypeF, B: Backend>(
 
 /// Conv1d wrapper with weight and optional bias.
 pub struct Conv1d<T: WithDTypeF, B: Backend> {
+    packed: Option<Box<crate::packed_f32::PackedF32>>,
     weight: Tensor<T, B>,
     bias: Option<Tensor<T, B>>,
     pub stride: usize,
@@ -39,10 +40,45 @@ impl<T: WithDTypeF, B: Backend> Conv1d<T, B> {
     ) -> Result<Self> {
         let weight = vb.tensor("weight", (out_channels, in_channels / groups, kernel_size))?;
         let bias = if bias { Some(vb.tensor("bias", (out_channels,))?) } else { None };
-        Ok(Self { weight, bias, stride, dilation, kernel_size, in_channels, groups })
+        // Opt in only to the measured initial waveform convolution. Broad packing
+        // loses time to lowering/layout conversion in later decoder stages.
+        let selected = std::env::var("PTTS_EXPERIMENT_PACKED_CONV").as_deref()
+            == Ok("initial-small")
+            && vb.prefix().ends_with("decoder.model.0.conv");
+        let packed = if selected && groups == 1 && out_channels >= 32 {
+            crate::packed_f32::PackedF32::from_weight(
+                &weight,
+                out_channels,
+                in_channels * kernel_size,
+            )?
+        } else {
+            None
+        };
+        Ok(Self { packed, weight, bias, stride, dilation, kernel_size, in_channels, groups })
     }
 
     pub fn forward(&self, x: &Tensor<T, B>) -> Result<Tensor<T, B>> {
+        if let Some(packed) = &self.packed {
+            let extent = self
+                .kernel_size
+                .checked_sub(1)
+                .and_then(|n| n.checked_mul(self.dilation))
+                .and_then(|n| n.checked_add(1))
+                .ok_or_else(|| xn::Error::msg("invalid packed convolution extent"))?;
+            let steps = x
+                .dim(2usize)?
+                .checked_sub(extent)
+                .and_then(|n| n.checked_div(self.stride))
+                .map(|n| n + 1);
+            // Larger queued batches retain the original convolution path.
+            if steps.is_some_and(|n| n <= 16) {
+                let output = packed.conv1d(x, self.kernel_size, self.stride, self.dilation)?;
+                return match &self.bias {
+                    Some(b) => output.broadcast_add(&b.reshape((1, (), 1))?),
+                    None => Ok(output),
+                };
+            }
+        }
         x.conv1d(&self.weight, self.bias.as_ref(), self.stride, 0, self.dilation, self.groups)
     }
 }

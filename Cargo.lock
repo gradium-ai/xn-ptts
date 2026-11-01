@@ -5622,8 +5622,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 [[package]]
 name = "xn"
 version = "0.2.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1850cabc72c4a1975227a00ab892ee56deaa21a1befd172fb70a4d54a13cb777"
+source = "git+https://github.com/rudrakshkarpe/xn.git?rev=7363979dd2c8ff1c0beb3a023bd176901872922f#7363979dd2c8ff1c0beb3a023bd176901872922f"
 dependencies = [
  "ash",
  "bindgen_cuda",

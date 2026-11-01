@@ -91,6 +91,7 @@ mod layer_scale;
 pub mod loader;
 pub mod mimi;
 mod mlp;
+mod packed_f32;
 pub mod plan;
 pub mod preprocess;
 mod resample;
