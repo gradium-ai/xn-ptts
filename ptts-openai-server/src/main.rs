@@ -10,7 +10,7 @@ use axum::Router;
 use axum::routing::{get, post};
 use clap::Parser;
 use ptts::preprocess::{Normalize, Rules};
-use ptts::synth::{DeviceKind, Quant};
+use ptts::synth::{DeviceKind, Quant, VoiceCacheConfig};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
@@ -29,6 +29,14 @@ struct Args {
     /// Maximum simultaneous speech generations. Excess requests receive HTTP 429.
     #[arg(long, default_value = "1", env = "PTTS_MAX_CONCURRENT_REQUESTS", value_parser = parse_request_limit)]
     max_concurrent_requests: std::num::NonZeroUsize,
+
+    /// Maximum retained voice prefixes. Zero disables retention.
+    #[arg(long, default_value_t = 16, env = "PTTS_VOICE_CACHE_ENTRIES")]
+    voice_cache_entries: usize,
+
+    /// Maximum retained flow-LM KV payload bytes (not total process/device memory).
+    #[arg(long, default_value_t = 64 * 1024 * 1024, env = "PTTS_VOICE_CACHE_BYTES")]
+    voice_cache_bytes: usize,
 
     /// Model to load: a local checkpoint folder or a `config.json` in one, or a Hugging Face repo as
     /// `hf://owner/name` or `hf://owner/name@revision`. Use a commit as the revision to reproduce a
@@ -191,6 +199,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/v1/audio/speech", post(api::speech))
         .route("/v1/audio/voices", get(api::voices))
+        .route("/v1/audio/cache", get(api::cache_stats))
         .route("/v1/models", get(api::models))
         .route("/health", get(api::health))
         .with_state(app_state)
@@ -235,6 +244,10 @@ async fn build_app_state(args: &Args) -> Result<model::AppState> {
         normalize,
         &conditions,
         args.max_concurrent_requests,
+        VoiceCacheConfig {
+            max_entries: args.voice_cache_entries,
+            max_kv_bytes: args.voice_cache_bytes,
+        },
         &compat::Compat {
             voice_aliases: args.voice_aliases.clone(),
             // Compose files pass `PTTS_OPENAI_VOICES=` for none.
@@ -253,6 +266,25 @@ async fn build_app_state(args: &Args) -> Result<model::AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_cache_limits_accept_disabled_retention_and_reject_negative_values() {
+        let args = Args::try_parse_from([
+            "server",
+            "--lang",
+            "en",
+            "--voice-cache-entries",
+            "0",
+            "--voice-cache-bytes",
+            "1024",
+        ])
+        .unwrap();
+        assert_eq!(args.voice_cache_entries, 0);
+        assert_eq!(args.voice_cache_bytes, 1024);
+        assert!(
+            Args::try_parse_from(["server", "--lang", "en", "--voice-cache-entries=-1",]).is_err()
+        );
+    }
 
     #[test]
     fn without_a_model_the_default_loads() {

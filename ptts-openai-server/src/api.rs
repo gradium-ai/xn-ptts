@@ -270,6 +270,11 @@ pub async fn voices(State(app): State<AppState>) -> Response {
     json(StatusCode::OK, body)
 }
 
+/// A coherent engine cache snapshot. KV bytes exclude active sessions and shared weights.
+pub async fn cache_stats(State(app): State<AppState>) -> Response {
+    json(StatusCode::OK, serde_json::json!(app.synth.voice_cache_stats()))
+}
+
 pub async fn health() -> Response {
     json(StatusCode::OK, serde_json::json!({ "status": "ok" }))
 }
@@ -359,6 +364,7 @@ mod tests {
             "en".parse().unwrap(),
             &[],
             std::num::NonZeroUsize::new(1).unwrap(),
+            Default::default(),
             &Default::default(),
         )
         .await

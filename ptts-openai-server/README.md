@@ -59,6 +59,21 @@ It listens on `0.0.0.0:8880` (`--addr` to change it). There is no authentication
 
 By default, one speech generation runs at a time. `--max-concurrent-requests N` (or `PTTS_MAX_CONCURRENT_REQUESTS=N`) sets a positive limit. Excess speech requests immediately receive HTTP 429 with OpenAI error code `server_busy`; retry when an active generation finishes. Slots are released after generation and worker cleanup, including after a disconnect or failure. Health, model, and voice endpoints remain available while generation is busy.
 
+Voice conditioning is retained in an LRU cache, defaulting to 16 prefixes and 64 MiB of
+flow-LM KV payloads. Set `--voice-cache-entries` / `PTTS_VOICE_CACHE_ENTRIES` and
+`--voice-cache-bytes` / `PTTS_VOICE_CACHE_BYTES` to change those limits. Either zero disables
+retention. A prefix exceeding the byte budget is used for its request without evicting
+other voices. Eviction removes only as many least-recently-used prefixes as needed.
+
+`GET /v1/audio/cache` returns `entries`, `kv_bytes`, `max_entries`, `max_kv_bytes`, `hits`,
+`misses`, `insertions`, `evictions`, `invalidations` and `bypasses`. Counters are cumulative
+since model load and snapshots do not reset them. Hits/misses count prefix lookups, not
+HTTP requests: sentence/session reuse can avoid lookups, while concurrent cold requests
+can independently miss for the same voice. A voice and its guidance-enabled variant are
+separate entries. Byte counts cover retained K/V tensor payloads only, including guidance's
+null branch; they exclude weights, allocator overhead and active sessions. This is not an
+RSS or VRAM cap. The endpoint shares the server's existing access policy.
+
 ## The OpenAI-compatible API
 
 ```bash

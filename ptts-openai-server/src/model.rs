@@ -105,6 +105,7 @@ pub async fn load_ptts(
     normalize: Normalize,
     conditions: &[(String, String)],
     max_concurrent_requests: std::num::NonZeroUsize,
+    voice_cache: ptts::synth::VoiceCacheConfig,
     compat: &Compat,
 ) -> Result<AppState> {
     anyhow::ensure!(
@@ -134,7 +135,12 @@ pub async fn load_ptts(
         }
     }
     let frame_rate = m.config.mimi.frame_rate;
-    let mut builder = m.builder(normalize).device(device).quant(quant).temperature(temperature);
+    let mut builder = m
+        .builder(normalize)
+        .device(device)
+        .quant(quant)
+        .temperature(temperature)
+        .voice_cache(voice_cache);
     for (name, value) in conditions {
         builder = builder.condition(name, value);
     }
@@ -238,6 +244,7 @@ mod checkpoint_tests {
             Normalize::OFF,
             &[],
             std::num::NonZeroUsize::new(1).unwrap(),
+            Default::default(),
             &Default::default(),
         )
         .await;
