@@ -1,0 +1,22 @@
+name: Serving benchmark harness
+
+on:
+  pull_request:
+    paths:
+      - scripts/bench-serving.py
+      - scripts/tests/test_bench_serving.py
+      - .github/workflows/benchmark-harness.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s scripts/tests -v
