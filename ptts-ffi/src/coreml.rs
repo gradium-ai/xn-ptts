@@ -131,10 +131,12 @@ impl Engine {
     /// [`ptts::plan::fit`].
     fn plan(&self, text: &str) -> Result<Vec<Chunk>, String> {
         let max = self.phonon.max_tokens();
+        // Sentences are grouped as `Synth` groups them, whatever room the graph has.
+        let group = max.min(ptts::tts_model::MAX_TOKENS_PER_CHUNK);
         // A bundle exported with a large `--max-tokens` would otherwise let through pieces
         // longer than the model says in one go.
         let fit_max = max.min(ptts::plan::MAX_FIT_TOKENS);
-        let planned = ptts::plan::chunks(&self.tokenizer, text, self.normalize, max, FRAME_RATE)
+        let planned = ptts::plan::chunks(&self.tokenizer, text, self.normalize, group, FRAME_RATE)
             .and_then(|chunks| {
                 ptts::plan::fit_with_word_limit(chunks, fit_max, max, &self.tokenizer, FRAME_RATE)
             })
