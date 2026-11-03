@@ -1,38 +1,53 @@
 # Contributing to Phonon
 
-Thank you for helping. Bug fixes, ports and small improvements are very
-welcome. For a larger change, please open an issue first so we can agree on
-the approach before you spend time on it.
+## Pull Requests
 
-## Pull requests
+Bug fixes, ports and small improvements are very welcome. For a larger change,
+please open an issue first so we can agree on the approach before you spend
+time on it.
 
-1. Fork the repository and branch from `main`.
-2. Build and test as described in [docs/development.md](docs/development.md),
-   and run the checks listed under
-   [Checks](docs/development.md#checks) for the code you changed.
-3. If you change a public API or a command line flag, update the docs that
-   describe it.
-4. Sign the Contributor License Agreement (see below).
+1. Fork the repo and create your branch from `main`.
+2. If you have changed APIs or command line flags, update the documentation accordingly.
+3. Run the [checks](docs/development.md#checks) for the code you changed.
+4. Accept the Contributor License Agreement (see after).
 
-## Contributor License Agreement
+## Contributor License Agreement ("CLA")
 
-We can only merge a pull request once its author has signed our
-[Contributor License Agreement](CLA.md). You sign it once, and it covers all
-your future contributions to Gradium's projects.
+In order to accept your pull request, we need you to submit a Contributor License Agreement.
 
-When you open your first pull request, the CLA Assistant bot posts a comment
-with a link. Sign in with GitHub, tick the box and you are done. The check on
-the pull request turns green.
+If you agree with the full CLA provided in the next paragraph, copy the following statement in your PR, changing your Github Handle:
 
-The agreement says that you keep the copyright of your contribution, and that
-you grant Gradium a license to use, change and distribute it, under any
-license, along with a license to any of your patents it needs. It is adapted
-from the Apache Software Foundation's individual CLA.
+> I, {your GitHub handle}, confirm that I have read and understood the terms of the CLA of Gradium, as outlined in the repository's CONTRIBUTING.md, and I agree to be bound by these terms.
 
-If you contribute on behalf of your employer, make sure you are allowed to.
+The full CLA is provided as follows:
+
+> I, {your GitHub handle}, hereby grant to Gradium a perpetual, worldwide, non-exclusive, royalty-free,
+> irrevocable license to use, modify, distribute, and sublicense my Contributions.
+
+> I understand and accept that Contributions are limited to modifications, improvements, or changes
+> to the project’s source code submitted via pull requests. I accept that Gradium has full discretion to
+> review, accept, reject, or request changes to any Contributions I submit, and that submitting
+> a pull request does not guarantee its inclusion in the project.
+
+> By submitting a Contribution, I grant Gradium a perpetual, worldwide license to use, modify,
+> reproduce, distribute, and create derivative works based on my Contributions.
+> I also agree to assign all patent rights for any inventions or improvements that arise from my Contributions,
+> giving Gradium full rights to file for and enforce patents.
+> I understand that Gradium may commercialize, relicense, or exploit the project and my Contributions without further notice or obligation to me.
+> I confirm that my Contributions are original and that I have the legal right to grant this license.
+> If my Contributions include third-party materials, I will ensure that I have the necessary permissions
+> and will disclose this information. I accept that once my Contributions are integrated, they may be altered or removed at Gradium’s discretion.
+
+> I acknowledge that I am making these Contributions voluntarily and will not receive any compensation.
+> Furthermore, I understand that all Contributions, including mine, are provided on an "as-is" basis, with no warranties.
+> By submitting a pull request, I agree to be bound by these terms.
+
+## Issues
+
+Please submit issues on our Github repository.
 
 ## License
 
-The code is licensed under MIT OR Apache-2.0 (see [LICENSE-MIT](LICENSE-MIT)
-and [LICENSE-APACHE](LICENSE-APACHE)), and your contribution is released under
-both, in addition to the license you grant Gradium in the CLA.
+By contributing to Phonon, you agree that your contributions will be licensed
+under the LICENSE-* files in the root directory of this source tree: MIT OR
+Apache-2.0, at the user's option.
