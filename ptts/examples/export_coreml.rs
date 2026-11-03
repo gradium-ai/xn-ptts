@@ -51,8 +51,9 @@ struct Args {
     tokenizer: Option<PathBuf>,
     /// Longest sentence, in tokens, the prefill graph takes; a longer one is cut into pieces,
     /// each spoken as a sentence of its own. The default is the longest piece the other
-    /// frontends cut to. It also sizes the KV cache, and every prompt runs the prefill graph's
-    /// full length, so a smaller value starts speaking sooner and cuts more sentences.
+    /// frontends cut to. It also sizes the KV cache every step attends over, and every prompt
+    /// runs the prefill graph's full length, so a smaller value starts speaking sooner and makes
+    /// each step cheaper on the CPU, but cuts more sentences.
     #[arg(long, default_value_t = ptts::plan::MAX_FIT_TOKENS)]
     max_tokens: usize,
     /// Sampling temperature the app speaks at. The default matches the other frontends.

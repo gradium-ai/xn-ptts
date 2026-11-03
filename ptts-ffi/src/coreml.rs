@@ -131,7 +131,7 @@ impl Engine {
     /// [`ptts::plan::fit`].
     fn plan(&self, text: &str) -> Result<Vec<Chunk>, String> {
         let max = self.phonon.max_tokens();
-        // Sentences are grouped as `Synth` groups them, whatever room the graph has.
+        // Sentences are grouped as `Synth` groups them, or at the graph's length when shorter.
         let group = max.min(ptts::tts_model::MAX_TOKENS_PER_CHUNK);
         // A bundle exported with a large `--max-tokens` would otherwise let through pieces
         // longer than the model says in one go.
