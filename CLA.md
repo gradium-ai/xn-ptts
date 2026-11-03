@@ -1,8 +1,11 @@
 # Individual Contributor License Agreement
 
 Thank you for your interest in contributing to Phonon. This agreement is
-between you and [LEGAL ENTITY NAME] ("Gradium"). It is adapted from the Apache
-Software Foundation's Individual Contributor License Agreement.
+between you and Gradium, a French simplified joint-stock company (société par
+actions simplifiée), registered at the trade register of Paris under number
+989 284 955, having its registered office at 151bis rue Saint-Honoré, 75001
+Paris, France ("Gradium"). It is adapted from the Apache Software Foundation's
+Individual Contributor License Agreement.
 
 You accept and agree to the following terms and conditions for your present
 and future Contributions submitted to Gradium. Except for the license granted
