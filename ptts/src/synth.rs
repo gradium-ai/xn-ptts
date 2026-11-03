@@ -1185,7 +1185,7 @@ impl<'a, Q: BackendQ> Flow<'a, Q> {
         prev: Option<&Tensor<Q::T, Q::B>>,
         rng: &mut Box<dyn crate::flow_lm::Rng + Send>,
     ) -> Result<(Tensor<Q::T, Q::B>, FrameEos<Q>)> {
-        let input = match prev {
+        let input = || match prev {
             None => StepInput::Bos { batch: 1 },
             Some(t) => StepInput::Latent(t),
         };
@@ -1196,11 +1196,11 @@ impl<'a, Q: BackendQ> Flow<'a, Q> {
             }
             Self::Own(state, Some((coef, null_state))) => {
                 let (next, is_eos) =
-                    model.generate_step_cfg(state, null_state, *coef, input, rng)?;
+                    model.generate_step_cfg(state, null_state, *coef, input(), rng)?;
                 (next, FrameEos::Known(is_eos))
             }
             Self::Own(state, None) => {
-                let (next, logit) = model.generate_step_parts(state, input, rng)?;
+                let (next, logit) = model.generate_step_parts(state, input(), rng)?;
                 (next, FrameEos::Logit(logit))
             }
         })

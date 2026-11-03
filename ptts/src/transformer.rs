@@ -73,9 +73,9 @@ pub(crate) struct DeviceStep<T: WithDTypeF, B: Backend> {
 }
 
 impl<T: WithDTypeF, B: Backend> DeviceStep<T, B> {
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     /// Records the per-step work: `pos` is `[1]`, `mask` the persistent `[1, kv]` mask (its
     /// slot at `pos` is opened here), `rope` the full-length table of the transformer.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn new(
         pos: &Tensor<i64, B>,
         mask: &Tensor<T, B>,
@@ -537,7 +537,10 @@ impl<Q: BackendQ> StreamingTransformerLayer<Q> {
         // Self-attention block: x + layer_scale_1(attn(norm1(x)))
         let norm1 = self.norm1.forward(x)?;
         let mut attn_out = match (&self.self_attn, state) {
-            (AttentionKind::Mimi(attn), LayerAttentionState::Mimi(cache)) if step.is_none() => {
+            (AttentionKind::Mimi(_), _) if step.is_some() => {
+                xn::bail!("a device-position step runs only flow-LM attention, not Mimi's")
+            }
+            (AttentionKind::Mimi(attn), LayerAttentionState::Mimi(cache)) => {
                 attn.forward(&norm1, rope, cache, mask)?
             }
             (AttentionKind::FlowLm(attn), LayerAttentionState::FlowLm(mha_state)) => {
@@ -695,8 +698,8 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
         Ok(x)
     }
 
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     /// The RoPE table for positions `0..len`, for [`DeviceStep::new`].
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn rope_table(
         &self,
         len: usize,
@@ -950,6 +953,67 @@ mod grouped_query_tests {
         assert_eq!(grouped.len(), 5 * embed);
         for (a, b) in grouped.iter().zip(&full) {
             assert!((a - b).abs() < 1e-6, "{grouped:?}\n{full:?}");
+        }
+        Ok(())
+    }
+
+    /// A step that keeps its position on the device ([`DeviceStep`], the step a CUDA graph
+    /// replays) gives what the host-side step gives at the same position, over grouped k/v
+    /// heads: the scatter, the mask over the whole cache and the RoPE row agree with the rest.
+    #[test]
+    fn a_device_step_is_the_host_step() -> Result<()> {
+        let (embed, h, kvh, d, kv) = (6, 4, 2, 2, 8);
+        let mut seed = 7u64;
+        let mut rand = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+                })
+                .collect()
+        };
+        let in_w = rand((h + 2 * kvh) * d * embed);
+        let m = StreamingMultiheadAttention::<Q> {
+            in_proj: Linear::new(Tensor::from_vec(in_w, ((h + 2 * kvh) * d, embed), &CpuDevice)?),
+            out_proj: Linear::new(Tensor::from_vec(
+                rand(embed * h * d),
+                (embed, h * d),
+                &CpuDevice,
+            )?),
+            embed_dim: embed,
+            num_heads: h,
+            attn_dim: h * d,
+            num_kv_heads: kvh,
+            device: CpuDevice,
+        };
+        let x = rand(5 * embed);
+        let token = |p: usize| {
+            Tensor::from_vec(x[p * embed..(p + 1) * embed].to_vec(), (1, 1, embed), &CpuDevice)
+        };
+
+        // Both caches hold the same three-token prompt, written the usual way.
+        let (mut host, mut device) = (m.init_state(1, kv)?, m.init_state(1, kv)?);
+        let prompt = Tensor::from_vec(x[..3 * embed].to_vec(), (1, 3, embed), &CpuDevice)?;
+        for state in [&mut host, &mut device] {
+            let mask = state.materialize_causal_mask(3)?;
+            let rope = RotaryEmbedding::new(d, 0, 3, 10_000., &CpuDevice)?;
+            m.forward(&prompt, &rope, state, Some(&mask), None)?;
+        }
+
+        let table = RotaryEmbedding::new(d, 0, kv, 10_000., &CpuDevice)?;
+        let mask = (0..kv).map(|j| if j < 3 { 0. } else { f32::NEG_INFINITY }).collect();
+        let mask = Tensor::from_vec(mask, (1, kv), &CpuDevice)?;
+        for p in 3..5 {
+            let rope = RotaryEmbedding::new(d, p, 1, 10_000., &CpuDevice)?;
+            let want = m.forward(&token(p)?, &rope, &mut host, None, None)?.to_vec()?;
+            let pos = Tensor::from_vec(vec![p as i64], 1, &CpuDevice)?;
+            let step = DeviceStep::new(&pos, &mask, &table, (1, h, d))?;
+            let got = m.forward(&token(p)?, &step.rope, &mut device, None, Some(&step))?;
+            let got = got.to_vec()?;
+            device.current_end += 1;
+            for (a, b) in got.iter().zip(&want) {
+                assert!((a - b).abs() < 1e-6, "position {p}:\n{got:?}\n{want:?}");
+            }
         }
         Ok(())
     }
