@@ -926,9 +926,10 @@ impl<Q: BackendQ> SessionOf<Q> {
             let graphs = Arc::clone(&self.graphs);
             let handle = std::thread::spawn(move || {
                 let _in_flight = in_flight;
-                let result = run_inline(
-                    &model, &graphs, chunks, base_state, cfg_base, rng, mimi_init, &pcm_tx, post,
-                );
+                let result = with_step_graph(&model, &graphs, &base_state, &cfg_base, |graph| {
+                    let (base, cfg) = (&base_state, &cfg_base);
+                    run_inline(&model, graph, chunks, base, cfg, rng, mimi_init, &pcm_tx, post)
+                });
                 if let Err(e) = result {
                     let _ = pcm_tx.send(Err(e));
                 }
@@ -1026,9 +1027,10 @@ impl<Q: BackendQ> SessionOf<Q> {
             let backbone_handle = std::thread::spawn(move || {
                 // Dropped when this thread ends, which is after its last write.
                 let _in_flight = in_flight;
-                let result = run_backbone(
-                    &model, &graphs, chunks, base_state, cfg_base, rng, &latent_tx, first_rx,
-                );
+                let result = with_step_graph(&model, &graphs, &base_state, &cfg_base, |graph| {
+                    let (base, cfg) = (&base_state, &cfg_base);
+                    run_backbone(&model, graph, chunks, base, cfg, rng, &latent_tx, first_rx)
+                });
                 if let Err(e) = result {
                     let _ = pcm_tx.send(Err(e));
                 }
@@ -1220,55 +1222,35 @@ impl<Q: BackendQ> FrameEos<Q> {
     }
 }
 
-/// The step graph a generation from `base_state` uses, if any: none under guidance.
-fn step_graph<Q: BackendQ>(
+/// Run a generation from `base_state` with the step graph it uses, if any (none under
+/// guidance), and give the graph back to the pool once the generation has ended without an
+/// error.
+fn with_step_graph<Q: BackendQ>(
     model: &TTSModel<Q>,
     graphs: &GraphPool<Q>,
     base_state: &TTSState<Q>,
     cfg_base: &Option<(f32, TTSState<Q>)>,
-) -> Result<Option<StepGraph<Q>>> {
-    match cfg_base {
-        None => Ok(graphs.step(model, base_state)?),
-        Some(_) => Ok(None),
-    }
-}
-
-/// The autoregressive loop, shared by every frontend and every chunk.
-#[allow(clippy::too_many_arguments)]
-fn run_backbone<Q: BackendQ>(
-    model: &TTSModel<Q>,
-    graphs: &GraphPool<Q>,
-    chunks: Vec<Chunk>,
-    base_state: TTSState<Q>,
-    cfg_base: Option<(f32, TTSState<Q>)>,
-    rng: Box<dyn crate::flow_lm::Rng + Send>,
-    latent_tx: &std::sync::mpsc::SyncSender<Frame<Q>>,
-    first_decoded: std::sync::mpsc::Receiver<()>,
+    run: impl FnOnce(Option<&mut StepGraph<Q>>) -> Result<()>,
 ) -> Result<()> {
-    let mut graph = step_graph(model, graphs, &base_state, &cfg_base)?;
-    let result = backbone_chunks(
-        model,
-        graph.as_mut(),
-        chunks,
-        base_state,
-        cfg_base,
-        rng,
-        latent_tx,
-        first_decoded,
-    );
+    let mut graph = match cfg_base {
+        None => graphs.step(model, base_state)?,
+        Some(_) => None,
+    };
+    let result = run(graph.as_mut());
     if let (Ok(()), Some(graph)) = (&result, graph) {
         graphs.put_step(graph);
     }
     result
 }
 
+/// The autoregressive loop, shared by every frontend and every chunk.
 #[allow(clippy::too_many_arguments)]
-fn backbone_chunks<Q: BackendQ>(
+fn run_backbone<Q: BackendQ>(
     model: &TTSModel<Q>,
     mut graph: Option<&mut StepGraph<Q>>,
     chunks: Vec<Chunk>,
-    base_state: TTSState<Q>,
-    cfg_base: Option<(f32, TTSState<Q>)>,
+    base_state: &TTSState<Q>,
+    cfg_base: &Option<(f32, TTSState<Q>)>,
     mut rng: Box<dyn crate::flow_lm::Rng + Send>,
     latent_tx: &std::sync::mpsc::SyncSender<Frame<Q>>,
     first_decoded: std::sync::mpsc::Receiver<()>,
@@ -1277,7 +1259,7 @@ fn backbone_chunks<Q: BackendQ>(
     let mut first_decoded = Some(first_decoded);
     for chunk in chunks.iter() {
         let mut flow =
-            Flow::start(model, &base_state, &cfg_base, graph.as_deref_mut(), &chunk.tokens)?;
+            Flow::start(model, base_state, cfg_base, graph.as_deref_mut(), &chunk.tokens)?;
         let mut prev: Option<Tensor<Q::T, Q::B>> = None;
         let mut eos = EosPolicy::new(chunk.frames_after_eos);
 
@@ -1314,40 +1296,10 @@ fn backbone_chunks<Q: BackendQ>(
 #[allow(clippy::too_many_arguments)]
 fn run_inline<Q: BackendQ>(
     model: &TTSModel<Q>,
-    graphs: &GraphPool<Q>,
-    chunks: Vec<Chunk>,
-    base_state: TTSState<Q>,
-    cfg_base: Option<(f32, TTSState<Q>)>,
-    rng: Box<dyn crate::flow_lm::Rng + Send>,
-    mimi_init: crate::mimi::MimiDecoderState<f32, Q::B>,
-    pcm_tx: &std::sync::mpsc::SyncSender<Result<Vec<f32>>>,
-    post: Chain,
-) -> Result<()> {
-    let mut graph = step_graph(model, graphs, &base_state, &cfg_base)?;
-    let result = inline_chunks(
-        model,
-        graph.as_mut(),
-        chunks,
-        base_state,
-        cfg_base,
-        rng,
-        mimi_init,
-        pcm_tx,
-        post,
-    );
-    if let (Ok(()), Some(graph)) = (&result, graph) {
-        graphs.put_step(graph);
-    }
-    result
-}
-
-#[allow(clippy::too_many_arguments)]
-fn inline_chunks<Q: BackendQ>(
-    model: &TTSModel<Q>,
     mut graph: Option<&mut StepGraph<Q>>,
     chunks: Vec<Chunk>,
-    base_state: TTSState<Q>,
-    cfg_base: Option<(f32, TTSState<Q>)>,
+    base_state: &TTSState<Q>,
+    cfg_base: &Option<(f32, TTSState<Q>)>,
     mut rng: Box<dyn crate::flow_lm::Rng + Send>,
     mimi_init: crate::mimi::MimiDecoderState<f32, Q::B>,
     pcm_tx: &std::sync::mpsc::SyncSender<Result<Vec<f32>>>,
@@ -1359,7 +1311,7 @@ fn inline_chunks<Q: BackendQ>(
     let mut skip = post.latency();
     for chunk in chunks.iter() {
         let mut flow =
-            Flow::start(model, &base_state, &cfg_base, graph.as_deref_mut(), &chunk.tokens)?;
+            Flow::start(model, base_state, cfg_base, graph.as_deref_mut(), &chunk.tokens)?;
         let mut prev: Option<Tensor<Q::T, Q::B>> = None;
         let mut eos = EosPolicy::new(chunk.frames_after_eos);
 

@@ -64,7 +64,7 @@ impl<T: WithDTypeF, B: Backend> StreamingMHAState<T, B> {
 ///
 /// The keys and values are scattered to the position, the attention runs over the whole
 /// cache with `mask` hiding the unfilled slots, and RoPE reads its row of a full-length table.
-pub struct DeviceStep<T: WithDTypeF, B: Backend> {
+pub(crate) struct DeviceStep<T: WithDTypeF, B: Backend> {
     /// `[b, 1, h, d]`, every entry the position: the scatter index for the new key and value.
     kv_idx: Tensor<i64, B>,
     /// `[1, kv]`: `0` for the filled slots, the current one included, `-inf` for the others.
@@ -161,11 +161,13 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
         let k = heads(projected.narrow(2, ad..ad + kd)?.contiguous()?)?;
         let v = heads(projected.narrow(2, ad + kd..ad + 2 * kd)?.contiguous()?)?;
 
+        // Apply RoPE: q, k are [b, t, h, d]
+        let (q, k) = rope.forward(&q, &k)?;
         let inv_sqrt_d = 1.0 / (d as f32).sqrt();
         if let Some(step) = step {
-            let (q, k) = step.rope.forward(&q, &k)?;
             state.k_cache.scatter_set(&step.kv_idx, &k, 1)?;
             state.v_cache.scatter_set(&step.kv_idx, &v, 1)?;
+            // The whole cache, as the views `sdpa_decode` takes; the mask hides what is unfilled.
             let kv = state.k_cache.dim(1usize)?;
             let keys = state.k_cache.narrow(1, 0..kv)?;
             let values = state.v_cache.narrow(1, 0..kv)?;
@@ -173,8 +175,6 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
             return self.out_proj.forward(&x);
         }
 
-        // Apply RoPE: q, k are [b, t, h, d]
-        let (q, k) = rope.forward(&q, &k)?;
         let (k, v) = state.complete_kv(&k, &v)?;
 
         let x = if t == 1 {
@@ -284,7 +284,8 @@ pub struct StreamingTransformerState<T: WithDTypeF, B: Backend> {
 impl<T: WithDTypeF, B: Backend> StreamingTransformerState<T, B> {
     /// Count `n` more filled positions in every flow-LM layer, after a step that wrote them
     /// without moving the host-side position (see [`DeviceStep`]).
-    pub fn advance(&mut self, n: usize) {
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn advance(&mut self, n: usize) {
         for layer in self.layer_states.iter_mut() {
             if let LayerAttentionState::FlowLm(mha) = layer {
                 mha.current_end += n;
@@ -686,21 +687,12 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
                 LayerAttentionState::FlowLm(mha_state) => mha_state.current_end,
             })
             .unwrap_or(0);
-        let rope = self.rope_at(offset, seq_len, x.device())?;
+        let rope =
+            RotaryEmbedding::new(self.head_dim, offset, seq_len, self.max_period, x.device())?;
         for (layer, layer_state) in self.layers.iter().zip(state.layer_states.iter_mut()) {
             x = layer.forward(&x, &rope, layer_state, mask.as_ref(), None)?;
         }
         Ok(x)
-    }
-
-    /// The RoPE table for positions `offset..offset + len`.
-    pub(crate) fn rope_at(
-        &self,
-        offset: usize,
-        len: usize,
-        device: &Q::B,
-    ) -> Result<RotaryEmbedding<Q::T, Q::B>> {
-        RotaryEmbedding::new(self.head_dim, offset, len, self.max_period, device)
     }
 
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -710,21 +702,12 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
         len: usize,
         device: &Q::B,
     ) -> Result<RotaryEmbedding<Q::T, Q::B>> {
-        self.rope_at(0, len, device)
-    }
-
-    /// The attention's number of heads and its head dim.
-    pub fn heads(&self) -> (usize, usize) {
-        let h = self.layers.first().map_or(0, |l| match &l.self_attn {
-            AttentionKind::FlowLm(a) => a.num_heads,
-            AttentionKind::Mimi(a) => a.num_heads,
-        });
-        (h, self.head_dim)
+        RotaryEmbedding::new(self.head_dim, 0, len, self.max_period, device)
     }
 
     /// One token at the position `step` holds, see [`DeviceStep`]. Leaves the host-side
     /// position alone: the caller advances it.
-    pub fn forward_step(
+    pub(crate) fn forward_step(
         &self,
         x: &Tensor<Q::T, Q::B>,
         state: &mut StreamingTransformerState<Q::T, Q::B>,

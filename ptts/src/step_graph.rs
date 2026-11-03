@@ -14,8 +14,14 @@ use xn::{BackendQ, Result, Tensor};
 #[cfg(feature = "cuda")]
 pub use cuda::StepGraph;
 
-/// Most step graphs a pool keeps: one per sequence budget and conditioning in use.
+/// Most step graphs a pool keeps: one per cache size and conditioning in use.
 const MAX_STEP_GRAPHS: usize = 4;
+
+/// What a step graph's cache size is rounded up to. A one-shot generation's sequence budget
+/// follows its text, and a graph serves any budget up to its own, so rounding lets texts of
+/// similar length share one recording, at the cost of attending over a few more masked slots.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const KV_ROUNDING: usize = 512;
 
 /// Recorded steps, taken by a generation and given back when it ends.
 pub struct GraphPool<Q: BackendQ> {
@@ -29,12 +35,13 @@ impl<Q: BackendQ> Default for GraphPool<Q> {
 }
 
 impl<Q: BackendQ> GraphPool<Q> {
-    /// A step graph for generations from `base`, recorded before if one fits it. `None` where
-    /// there are no graphs.
+    /// A step graph for generations from `base`: the smallest recorded one that fits it, or a
+    /// new one. `None` where there are no graphs.
     pub fn step(&self, model: &TTSModel<Q>, base: &TTSState<Q>) -> Result<Option<StepGraph<Q>>> {
         let reused = {
             let mut steps = self.steps.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            steps.iter().position(|g| g.fits(base)).map(|i| steps.swap_remove(i))
+            let fitting = steps.iter().enumerate().filter(|(_, g)| g.fits(base));
+            fitting.min_by_key(|(_, g)| g.kv()).map(|(i, _)| i).map(|i| steps.swap_remove(i))
         };
         match reused {
             Some(graph) => Ok(Some(graph)),
@@ -63,6 +70,10 @@ impl<Q: BackendQ> StepGraph<Q> {
     }
 
     fn fits(&self, _: &TTSState<Q>) -> bool {
+        match self.0 {}
+    }
+
+    fn kv(&self) -> usize {
         match self.0 {}
     }
 
@@ -111,12 +122,11 @@ mod cuda {
         dev.capture_end()
     }
 
-    /// The filled length of a flow-LM state, its capacity and its batch size.
-    fn positions<Q: BackendQ>(state: &TTSState<Q>) -> Option<(usize, usize, usize)> {
+    /// The filled length of a flow-LM state and the shape of its caches, `[b, kv, h, d]`.
+    fn cache<Q: BackendQ>(state: &TTSState<Q>) -> Option<(usize, [usize; 4])> {
         state.flow_lm_state.transformer_state.layer_states.iter().find_map(|l| match l {
             LayerAttentionState::FlowLm(mha) => {
-                let (b, kv) = (mha.k_cache.dim(0usize).ok()?, mha.k_cache.dim(1usize).ok()?);
-                Some((mha.current_end, kv, b))
+                Some((mha.current_end, mha.k_cache.dims().try_into().ok()?))
             }
             LayerAttentionState::Mimi(_) => None,
         })
@@ -148,10 +158,11 @@ mod cuda {
         pub(super) fn new(model: &TTSModel<Q>, base: &TTSState<Q>) -> Result<Option<Self>> {
             let any: &dyn std::any::Any = model.device();
             let Some(dev) = any.downcast_ref::<Device>() else { return Ok(None) };
-            let Some((_, kv, 1)) = positions(base) else { return Ok(None) };
+            let Some((_, [1, budget, _, _])) = cache(base) else { return Ok(None) };
             if !enabled() {
                 return Ok(None);
             }
+            let kv = budget.next_multiple_of(KV_ROUNDING);
             let d = model.device();
             let ldim = model.flow_lm.ldim;
             let neg_inf = Q::T::from_f32(f32::NEG_INFINITY);
@@ -179,11 +190,18 @@ mod cuda {
             }))
         }
 
-        /// Whether generations from `base` can run in this graph's state.
+        /// Whether generations from `base` can run in this graph's state: one of at most this
+        /// graph's size, since the mask hides the slots it leaves unfilled.
         pub(super) fn fits(&self, base: &TTSState<Q>) -> bool {
             let ours = self.state.flow_lm_state.conditions.as_ref().map(|c| c.dims().to_vec());
             let theirs = base.flow_lm_state.conditions.as_ref().map(|c| c.dims().to_vec());
-            matches!(positions(base), Some((_, kv, 1)) if kv == self.kv) && ours == theirs
+            matches!(cache(base), Some((_, [1, budget, _, _])) if budget <= self.kv)
+                && ours == theirs
+        }
+
+        /// The number of positions this graph's caches hold.
+        pub(super) fn kv(&self) -> usize {
+            self.kv
         }
 
         /// Start a chunk from the primed state `base`: load its prefix and conditioning into
@@ -214,9 +232,10 @@ mod cuda {
             rng: &mut impl Rng,
         ) -> Result<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>)> {
             let d = model.device();
-            let Some((pos, kv, _)) = positions(&self.state) else {
+            let Some((pos, _)) = cache(&self.state) else {
                 xn::bail!("the state has no flow LM layers")
             };
+            let kv = self.kv;
             if pos >= kv {
                 xn::bail!("no room left: the step graph holds {kv} positions")
             }
@@ -247,8 +266,10 @@ mod cuda {
         }
 
         fn body(&self, model: &TTSModel<Q>) -> Result<()> {
-            let heads = model.flow_lm.transformer.heads();
-            let step = DeviceStep::new(&self.pos, &self.mask, &self.rope, (1, heads.0, heads.1))?;
+            let Some((_, [b, _, h, d])) = cache(&self.state) else {
+                xn::bail!("the state has no flow LM layers")
+            };
+            let step = DeviceStep::new(&self.pos, &self.mask, &self.rope, (b, h, d))?;
             // The step writes the caches in place and leaves the host-side position alone, so a
             // copy of the state's handles is as good as the state.
             let mut state = self.state.flow_lm_state.clone();
