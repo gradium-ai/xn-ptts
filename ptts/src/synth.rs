@@ -65,7 +65,7 @@ use crate::plan::{self, Chunk, EosPolicy};
 use crate::preprocess::Normalize;
 use crate::tts_model::{MAX_TOKENS_PER_CHUNK, MimiEnc, TTSConfig, TTSModel, TTSState};
 use crate::{Error, Result};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex};
 use xn::{Backend, BackendQ, Tensor};
@@ -361,12 +361,12 @@ struct Primed<Q: BackendQ> {
 /// Primed prefixes by (voice, guidance), least recently used first. A linear scan, since
 /// there are at most [`MAX_PRIMED`] of them.
 struct Recent<V> {
-    entries: std::collections::VecDeque<((String, bool), V)>,
+    entries: VecDeque<((String, bool), V)>,
 }
 
 impl<V> Recent<V> {
     fn new() -> Self {
-        Self { entries: std::collections::VecDeque::new() }
+        Self { entries: VecDeque::new() }
     }
 
     /// The entry for `key`, now the most recently used.
@@ -2106,28 +2106,48 @@ mod tests {
         assert_eq!(DeviceKind::Metal.resolve_for(Quant::Q80), DeviceKind::Metal);
     }
 
-    #[test]
-    fn a_full_primed_cache_evicts_only_the_least_recently_used_voice() {
-        let key = |i: usize| (i.to_string(), false);
+    fn primed_key(i: usize) -> (String, bool) {
+        (i.to_string(), false)
+    }
+
+    /// A cache holding `0..MAX_PRIMED`, each voice's value its index.
+    fn full_primed_cache() -> Recent<usize> {
         let mut recent = Recent::new();
         for i in 0..MAX_PRIMED {
-            recent.insert(key(i), i);
+            recent.insert(primed_key(i), i);
         }
+        recent
+    }
+
+    #[test]
+    fn a_full_primed_cache_evicts_only_the_least_recently_used_voice() {
+        let mut recent = full_primed_cache();
         // Touch the oldest, so the next insert evicts the second oldest instead.
-        assert_eq!(recent.get(&key(0)), Some(&0));
-        recent.insert(key(MAX_PRIMED), MAX_PRIMED);
-        assert_eq!(recent.get(&key(1)), None);
+        assert_eq!(recent.get(&primed_key(0)), Some(&0));
+        recent.insert(primed_key(MAX_PRIMED), MAX_PRIMED);
+        assert_eq!(recent.get(&primed_key(1)), None);
         for i in (0..=MAX_PRIMED).filter(|&i| i != 1) {
-            assert_eq!(recent.get(&key(i)), Some(&i));
+            assert_eq!(recent.get(&primed_key(i)), Some(&i));
         }
-        // A same-voice race inserts twice; the second replaces the first.
-        recent.insert(key(0), 100);
+    }
+
+    #[test]
+    fn priming_a_cached_voice_again_replaces_its_entry() {
+        // What a same-voice race does: both prime, both insert.
+        let mut recent = full_primed_cache();
+        recent.insert(primed_key(0), 100);
         assert_eq!(recent.entries.len(), MAX_PRIMED);
-        assert_eq!(recent.get(&key(0)), Some(&100));
-        // Forgetting a voice drops both its guidance keys.
-        recent.insert((MAX_PRIMED.to_string(), true), 0);
-        recent.forget(&MAX_PRIMED.to_string());
-        assert!(recent.entries.iter().all(|((name, _), _)| *name != MAX_PRIMED.to_string()));
+        assert_eq!(recent.get(&primed_key(0)), Some(&100));
+        assert_eq!(recent.get(&primed_key(1)), Some(&1));
+    }
+
+    #[test]
+    fn forgetting_a_voice_drops_both_its_guidance_keys() {
+        let mut recent = full_primed_cache();
+        recent.insert(("0".into(), true), 0);
+        recent.forget("0");
+        assert!(recent.entries.iter().all(|((name, _), _)| name != "0"));
+        assert_eq!(recent.get(&primed_key(1)), Some(&1));
     }
 
     fn defaults() -> Defaults {
