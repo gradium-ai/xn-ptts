@@ -63,7 +63,7 @@ use crate::flow_lm::{NormalRng, StepInput};
 use crate::loader;
 use crate::plan::{self, Chunk, EosPolicy};
 use crate::preprocess::Normalize;
-use crate::step_graph::{GraphPool, StepGraph};
+use crate::step_graph::{GRAPH_SIZES, GraphPool, StepGraph};
 use crate::tts_model::{MAX_TOKENS_PER_CHUNK, MimiEnc, TTSConfig, TTSModel, TTSState};
 use crate::{Error, Result};
 use std::collections::{BTreeMap, HashMap};
@@ -781,6 +781,28 @@ impl<Q: BackendQ> SynthApi for SynthOf<Q> {
     }
 }
 
+/// A step graph for each of [`GRAPH_SIZES`], from the default voice's primed state at that
+/// size. One the voice prompt does not leave room in is skipped; a failure ends the recording
+/// with a warning, as generation runs without graphs too.
+fn record_step_graphs<Q: BackendQ>(synth: &SynthOf<Q>) -> Vec<StepGraph<Q>> {
+    let mut steps = Vec::new();
+    for size in GRAPH_SIZES {
+        let recorded = match synth.primed_state(None, size, None) {
+            Ok((base, _)) => StepGraph::record(&synth.model, &base).map_err(Error::from),
+            Err(Error::VoicePromptTooLong { .. }) => continue,
+            Err(e) => Err(e),
+        };
+        match recorded {
+            Ok(step) => steps.push(step),
+            Err(e) => {
+                tracing::warn!("no CUDA graph for {size} positions or more: {e}");
+                break;
+            }
+        }
+    }
+    steps
+}
+
 /// A fresh, independently-owned state at `seq_budget`, seeded with `prefix`'s filled positions.
 fn grow<Q: BackendQ>(prefix: &TTSState<Q>, seq_budget: usize) -> Result<TTSState<Q>> {
     let transformer_state = prefix.flow_lm_state.transformer_state.with_seq_budget(seq_budget)?;
@@ -926,7 +948,7 @@ impl<Q: BackendQ> SessionOf<Q> {
             let graphs = Arc::clone(&self.graphs);
             let handle = std::thread::spawn(move || {
                 let _in_flight = in_flight;
-                let result = with_step_graph(&model, &graphs, &base_state, &cfg_base, |graph| {
+                let result = with_step_graph(&graphs, &base_state, &cfg_base, |graph| {
                     let (base, cfg) = (&base_state, &cfg_base);
                     run_inline(&model, graph, chunks, base, cfg, rng, mimi_init, &pcm_tx, post)
                 });
@@ -1027,7 +1049,7 @@ impl<Q: BackendQ> SessionOf<Q> {
             let backbone_handle = std::thread::spawn(move || {
                 // Dropped when this thread ends, which is after its last write.
                 let _in_flight = in_flight;
-                let result = with_step_graph(&model, &graphs, &base_state, &cfg_base, |graph| {
+                let result = with_step_graph(&graphs, &base_state, &cfg_base, |graph| {
                     let (base, cfg) = (&base_state, &cfg_base);
                     run_backbone(&model, graph, chunks, base, cfg, rng, &latent_tx, first_rx)
                 });
@@ -1222,23 +1244,21 @@ impl<Q: BackendQ> FrameEos<Q> {
     }
 }
 
-/// Run a generation from `base_state` with the step graph it uses, if any (none under
-/// guidance), and give the graph back to the pool once the generation has ended without an
-/// error.
+/// Run a generation from `base_state` with a recorded step graph if one is free and fits it,
+/// never under guidance, and give the graph back to the pool afterwards.
 fn with_step_graph<Q: BackendQ>(
-    model: &TTSModel<Q>,
     graphs: &GraphPool<Q>,
     base_state: &TTSState<Q>,
     cfg_base: &Option<(f32, TTSState<Q>)>,
     run: impl FnOnce(Option<&mut StepGraph<Q>>) -> Result<()>,
 ) -> Result<()> {
     let mut graph = match cfg_base {
-        None => graphs.step(model, base_state)?,
+        None => graphs.take(base_state),
         Some(_) => None,
     };
     let result = run(graph.as_mut());
-    if let (Ok(()), Some(graph)) = (&result, graph) {
-        graphs.put_step(graph);
+    if let Some(graph) = graph {
+        graphs.put(graph);
     }
     result
 }
@@ -1788,6 +1808,10 @@ impl SynthBuilder {
         {
             let known = synth.voices();
             return Err(Error::UnknownVoice { name: name.clone(), known });
+        }
+        // Now, while nothing else can use the device: see `step_graph`.
+        if StepGraph::wanted(&synth.model) {
+            synth.graphs = Arc::new(GraphPool::new(record_step_graphs(&synth)));
         }
         Ok(synth)
     }

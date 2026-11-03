@@ -2,9 +2,13 @@
 //!
 //! Launching a step's few hundred small kernels one at a time costs the host more than the GPU
 //! takes to run them. A graph records the step once, against buffers of its own, and from then
-//! on launches it with one call per frame. [`GraphPool`] keeps the graphs from one generation to
-//! the next, so recording happens once rather than per request. Off CUDA none is ever built,
-//! and generation runs as before.
+//! on launches it with one call per frame.
+//!
+//! Every graph is recorded while the [`Synth`](crate::synth::Synth) is built, before anything
+//! else can use its device, and only replayed afterwards. A capture takes in whatever the
+//! device's one stream runs meanwhile, from any thread and frees included, so recording next to
+//! another generation could put that generation's work into the graph; replaying next to it is
+//! safe. Off CUDA none is ever built, and generation runs as before.
 
 use crate::flow_lm::Rng;
 use crate::tts_model::{TTSModel, TTSState};
@@ -14,48 +18,39 @@ use xn::{BackendQ, Result, Tensor};
 #[cfg(feature = "cuda")]
 pub use cuda::StepGraph;
 
-/// Most step graphs a pool keeps: one per cache size and conditioning in use.
-const MAX_STEP_GRAPHS: usize = 4;
+/// The cache sizes a graph is recorded for; a generation takes the smallest that holds its
+/// sequence budget. A one-shot generation's budget is its text plus at least
+/// [`PROMPT_SEQ_HEADROOM`](crate::plan::PROMPT_SEQ_HEADROOM), so always above 512, and stays
+/// under 2048 with a voice prompt of up to 512 frames. Every slot is attended over, masked or
+/// not, so steps of 512 keep the unused ones, which cost time per frame, to fewer than 512.
+pub const GRAPH_SIZES: [usize; 3] = [1024, 1536, 2048];
 
-/// What a step graph's cache size is rounded up to. A one-shot generation's sequence budget
-/// follows its text, and a graph serves any budget up to its own, so rounding lets texts of
-/// similar length share one recording, at the cost of attending over a few more masked slots.
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-const KV_ROUNDING: usize = 512;
-
-/// Recorded steps, taken by a generation and given back when it ends.
+/// The step graphs a `Synth` recorded, each taken by one generation at a time.
 pub struct GraphPool<Q: BackendQ> {
     steps: Mutex<Vec<StepGraph<Q>>>,
 }
 
 impl<Q: BackendQ> Default for GraphPool<Q> {
     fn default() -> Self {
-        Self { steps: Mutex::new(Vec::new()) }
+        Self::new(Vec::new())
     }
 }
 
 impl<Q: BackendQ> GraphPool<Q> {
-    /// A step graph for generations from `base`: the smallest recorded one that fits it, or a
-    /// new one. `None` where there are no graphs.
-    pub fn step(&self, model: &TTSModel<Q>, base: &TTSState<Q>) -> Result<Option<StepGraph<Q>>> {
-        let reused = {
-            let mut steps = self.steps.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let fitting = steps.iter().enumerate().filter(|(_, g)| g.fits(base));
-            fitting.min_by_key(|(_, g)| g.kv()).map(|(i, _)| i).map(|i| steps.swap_remove(i))
-        };
-        match reused {
-            Some(graph) => Ok(Some(graph)),
-            None => StepGraph::new(model, base),
-        }
+    pub fn new(steps: Vec<StepGraph<Q>>) -> Self {
+        Self { steps: Mutex::new(steps) }
     }
 
-    /// Give back a step graph, once the generation using it has ended without an error.
-    pub fn put_step(&self, graph: StepGraph<Q>) {
+    /// The smallest free step graph that generations from `base` fit, if any.
+    pub fn take(&self, base: &TTSState<Q>) -> Option<StepGraph<Q>> {
         let mut steps = self.steps.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if steps.len() >= MAX_STEP_GRAPHS {
-            steps.remove(0);
-        }
-        steps.push(graph);
+        let fitting = steps.iter().enumerate().filter(|(_, g)| g.fits(base));
+        fitting.min_by_key(|(_, g)| g.kv()).map(|(i, _)| i).map(|i| steps.swap_remove(i))
+    }
+
+    /// Give back a step graph once the generation using it has ended.
+    pub fn put(&self, graph: StepGraph<Q>) {
+        self.steps.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(graph);
     }
 }
 
@@ -65,8 +60,12 @@ pub struct StepGraph<Q: BackendQ>(std::convert::Infallible, std::marker::Phantom
 
 #[cfg(not(feature = "cuda"))]
 impl<Q: BackendQ> StepGraph<Q> {
-    fn new(_: &TTSModel<Q>, _: &TTSState<Q>) -> Result<Option<Self>> {
-        Ok(None)
+    pub fn wanted(_: &TTSModel<Q>) -> bool {
+        false
+    }
+
+    pub fn record(_: &TTSModel<Q>, _: &TTSState<Q>) -> Result<Self> {
+        xn::bail!("CUDA graphs need the cuda feature")
     }
 
     fn fits(&self, _: &TTSState<Q>) -> bool {
@@ -135,7 +134,6 @@ mod cuda {
     /// The flow LM's recorded step, with a state of its own that every generation it serves
     /// loads its primed prefix into, and the buffers the step reads and writes.
     pub struct StepGraph<Q: BackendQ> {
-        dev: Device,
         state: TTSState<Q>,
         /// `[1]`, the position the step writes.
         pos: Tensor<i64, Q::B>,
@@ -148,21 +146,28 @@ mod cuda {
         rope: RotaryEmbedding<Q::T, Q::B>,
         empty_text: Tensor<Q::T, Q::B>,
         kv: usize,
+        /// Set by [`Self::record`] before the graph is handed out.
         graph: Option<CaptureGraph>,
         /// Whether `mask` matches the state's filled prefix. Prompting fills more.
         mask_ready: bool,
     }
 
     impl<Q: BackendQ> StepGraph<Q> {
-        /// `None` off CUDA, for a batch of more than one, or when disabled.
-        pub(super) fn new(model: &TTSModel<Q>, base: &TTSState<Q>) -> Result<Option<Self>> {
+        /// Whether to record step graphs for `model`: on CUDA, unless `PTTS_CUDA_GRAPHS=0`.
+        pub fn wanted(model: &TTSModel<Q>) -> bool {
             let any: &dyn std::any::Any = model.device();
-            let Some(dev) = any.downcast_ref::<Device>() else { return Ok(None) };
-            let Some((_, [1, budget, _, _])) = cache(base) else { return Ok(None) };
-            if !enabled() {
-                return Ok(None);
-            }
-            let kv = budget.next_multiple_of(KV_ROUNDING);
+            any.is::<Device>() && enabled()
+        }
+
+        /// Allocate a graph's state and buffers for generations from `base`, a primed state of
+        /// one stream, and record its step. Only while nothing else uses the device: see the
+        /// module docs.
+        pub fn record(model: &TTSModel<Q>, base: &TTSState<Q>) -> Result<Self> {
+            let any: &dyn std::any::Any = model.device();
+            let Some(dev) = any.downcast_ref::<Device>() else { xn::bail!("not a CUDA device") };
+            let Some((_, [1, kv, _, _])) = cache(base) else {
+                xn::bail!("a step graph serves one stream of the flow LM")
+            };
             let d = model.device();
             let ldim = model.flow_lm.ldim;
             let neg_inf = Q::T::from_f32(f32::NEG_INFINITY);
@@ -173,8 +178,7 @@ mod cuda {
                     conditions: fl.conditions.as_ref().map(|c| c.copy()).transpose()?,
                 },
             };
-            Ok(Some(Self {
-                dev: dev.clone(),
+            let mut step = Self {
                 state,
                 pos: Tensor::zeros(1, d)?,
                 latent_in: Tensor::zeros((1, 1, ldim), d)?,
@@ -187,7 +191,9 @@ mod cuda {
                 kv,
                 graph: None,
                 mask_ready: false,
-            }))
+            };
+            step.graph = Some(record(dev, || step.body(model))?);
+            Ok(step)
         }
 
         /// Whether generations from `base` can run in this graph's state: one of at most this
@@ -254,13 +260,8 @@ mod cuda {
                 Some(prev) => self.latent_in.copy_(prev)?,
                 None => self.latent_in.copy_(&model.flow_lm.bos(1)?)?,
             }
-            match &self.graph {
-                Some(graph) => graph.launch()?,
-                None => {
-                    let graph = record(&self.dev, || self.body(model))?;
-                    self.graph = Some(graph);
-                }
-            }
+            let Some(graph) = &self.graph else { xn::bail!("the step graph was never recorded") };
+            graph.launch()?;
             self.state.flow_lm_state.transformer_state.advance(1);
             Ok((self.latent_out.copy()?, self.eos_out.copy()?))
         }
