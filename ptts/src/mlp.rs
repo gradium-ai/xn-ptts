@@ -102,9 +102,10 @@ impl<T: WithDTypeF, B: Backend> ResBlock<T, B> {
         Ok(Self { in_ln, mlp_linear1, mlp_linear2, ada_ln_silu_linear })
     }
 
+    /// `y_act` is the conditioning after its SiLU, which every block shares.
     #[tracing::instrument(name = "resblock", skip_all)]
-    pub fn forward(&self, x: &Tensor<T, B>, y: &Tensor<T, B>) -> Result<Tensor<T, B>> {
-        let ada = self.ada_ln_silu_linear.forward(&y.silu()?)?;
+    pub fn forward(&self, x: &Tensor<T, B>, y_act: &Tensor<T, B>) -> Result<Tensor<T, B>> {
+        let ada = self.ada_ln_silu_linear.forward(y_act)?;
         let channels = x.dim(xn::D::Minus1)?;
         let shift_mlp = ada.narrow(ada.rank() - 1, 0..channels)?.contiguous()?;
         let scale_mlp = ada.narrow(ada.rank() - 1, channels..2 * channels)?.contiguous()?;
@@ -141,8 +142,9 @@ impl<T: WithDTypeF, B: Backend> FinalLayer<T, B> {
         Ok(Self { norm_final, linear, ada_ln_silu_linear })
     }
 
-    pub fn forward(&self, x: &Tensor<T, B>, c: &Tensor<T, B>) -> Result<Tensor<T, B>> {
-        let ada = self.ada_ln_silu_linear.forward(&c.silu()?)?;
+    /// `c_act` is the conditioning after its SiLU, as for [`ResBlock::forward`].
+    pub fn forward(&self, x: &Tensor<T, B>, c_act: &Tensor<T, B>) -> Result<Tensor<T, B>> {
+        let ada = self.ada_ln_silu_linear.forward(c_act)?;
         let model_channels = x.dim(D::Minus1)?;
         let shift = ada.narrow(D::Minus1, 0..model_channels)?.contiguous()?;
         let scale = ada.narrow(D::Minus1, model_channels..2 * model_channels)?.contiguous()?;
@@ -195,35 +197,43 @@ impl<T: WithDTypeF, B: Backend> SimpleMLPAdaLN<T, B> {
         Ok(Self { time_embeds, cond_embed, input_proj, res_blocks, final_layer, num_time_conds })
     }
 
+    /// The time conditioning, from one time tensor per time embedding, e.g. the start and
+    /// target times. It depends on nothing else, so a sampler that runs the same times every
+    /// frame computes it once.
+    pub fn time_embedding(&self, ts: &[&Tensor<T, B>]) -> Result<Tensor<T, B>> {
+        let mut t_combined = self.time_embeds[0].forward(ts[0])?;
+        for (embed, &t_input) in self.time_embeds[1..].iter().zip(ts[1..].iter()) {
+            t_combined = t_combined.add(&embed.forward(t_input)?)?;
+        }
+        let scale = T::from_f32(1.0 / self.num_time_conds as f32);
+        t_combined.scale(scale)
+    }
+
     /// Forward pass.
     /// c: conditioning from AR transformer
-    /// ts: one time tensor per time embedding, e.g. the start and target times
+    /// t_emb: [`Self::time_embedding`] of the step's times, one row or one per row of `c`, or
+    /// `None` for a head without time conditions
     /// x: input tensor [N, C]
     #[tracing::instrument(name = "mlp-adaln", skip_all)]
     pub fn forward(
         &self,
         c: &Tensor<T, B>,
-        ts: &[&Tensor<T, B>],
+        t_emb: Option<&Tensor<T, B>>,
         x: &Tensor<T, B>,
     ) -> Result<Tensor<T, B>> {
         let mut x = self.input_proj.forward(x)?;
         let c = self.cond_embed.forward(c)?;
         // A head without time conditions (drifting, pointwise) is conditioned on `c` alone.
-        let y = match self.time_embeds.split_first() {
+        let y = match t_emb {
             None => c,
-            Some((first, rest)) => {
-                let mut t_combined = first.forward(ts[0])?;
-                for (embed, &t_input) in rest.iter().zip(ts[1..].iter()) {
-                    t_combined = t_combined.add(&embed.forward(t_input)?)?;
-                }
-                let scale = T::from_f32(1.0 / self.num_time_conds as f32);
-                t_combined.scale(scale)?.add(&c)?
-            }
+            Some(t) if t.dims() == c.dims() => t.add(&c)?,
+            Some(t) => t.broadcast_add(&c)?,
         };
+        let y_act = y.silu()?;
         for block in &self.res_blocks {
-            x = block.forward(&x, &y)?;
+            x = block.forward(&x, &y_act)?;
         }
-        self.final_layer.forward(&x, &y)
+        self.final_layer.forward(&x, &y_act)
     }
 }
 
