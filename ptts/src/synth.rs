@@ -336,7 +336,7 @@ struct SynthOf<Q: BackendQ> {
     /// Each voice's primed KV prefix, keyed by name and by whether guidance is on: the null
     /// branch's prefix differs, the coefficient does not enter the state. Sized to the prompt;
     /// copied out to each generation's budget.
-    primed: Mutex<HashMap<(String, bool), Primed<Q>>>,
+    primed: Mutex<Recent<Primed<Q>>>,
     conditioners: Conditioners<Q::T, Q::B>,
     conditions: Option<Tensor<Q::T, Q::B>>,
     /// Whether a session should decode each frame on the flow-LM's own thread rather than
@@ -348,14 +348,52 @@ struct SynthOf<Q: BackendQ> {
 }
 
 /// How many primed prefixes to keep. A process that clones voices under fresh names -- which
-/// `ptts-pyo3` exposes -- would otherwise grow the map without bound. Past the cap it is cleared;
-/// generation still works, it just re-primes.
+/// `ptts-pyo3` exposes -- would otherwise grow the cache without bound. Past the cap the least
+/// recently used prefix goes; generation still works, that voice just re-primes.
 const MAX_PRIMED: usize = 16;
 
 /// A voice's conditioning, run through the transformer once.
 struct Primed<Q: BackendQ> {
     state: TTSState<Q>,
     null_state: Option<TTSState<Q>>,
+}
+
+/// Primed prefixes by (voice, guidance), least recently used first. A linear scan, since
+/// there are at most [`MAX_PRIMED`] of them.
+struct Recent<V> {
+    entries: std::collections::VecDeque<((String, bool), V)>,
+}
+
+impl<V> Recent<V> {
+    fn new() -> Self {
+        Self { entries: std::collections::VecDeque::new() }
+    }
+
+    /// The entry for `key`, now the most recently used.
+    fn get(&mut self, key: &(String, bool)) -> Option<&V> {
+        let i = self.entries.iter().position(|(k, _)| k == key)?;
+        let entry = self.entries.remove(i)?;
+        self.entries.push_back(entry);
+        self.entries.back().map(|(_, v)| v)
+    }
+
+    /// Insert `value`, evicting the least recently used entry when full. Replaces an entry
+    /// already under `key`, which a same-voice race leaves.
+    fn insert(&mut self, key: (String, bool), value: V) {
+        self.entries.retain(|(k, _)| *k != key);
+        if self.entries.len() >= MAX_PRIMED {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((key, value));
+    }
+
+    fn forget(&mut self, voice: &str) {
+        self.entries.retain(|((name, _), _)| name != voice);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 
 impl<Q: BackendQ> SynthOf<Q> {
@@ -384,7 +422,7 @@ impl<Q: BackendQ> SynthOf<Q> {
     /// from the old conditioning.
     fn forget_primed(&self, name: &str) {
         let mut primed = self.primed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        primed.retain(|(voice, _), _| voice != name);
+        primed.forget(name);
     }
 
     /// The voice a request speaks in: the one it names, else the default. `None` when there
@@ -436,7 +474,7 @@ impl<Q: BackendQ> SynthOf<Q> {
         // Prime outside the lock so first callers for different voices do not serialise; a
         // same-voice race primes twice and the second insert wins, harmlessly.
         let cached = {
-            let primed = self.primed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut primed = self.primed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             primed.get(&key).map(|p| (p.state.clone(), p.null_state.clone()))
         };
         let (prefix, null_prefix) = match cached {
@@ -446,9 +484,6 @@ impl<Q: BackendQ> SynthOf<Q> {
                 let out = (fresh.state.clone(), fresh.null_state.clone());
                 let mut primed =
                     self.primed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                if primed.len() >= MAX_PRIMED {
-                    primed.clear();
-                }
                 primed.insert(key, fresh);
                 out
             }
@@ -1682,7 +1717,7 @@ impl SynthBuilder {
             mimi_enc,
             cfg: config,
             voices: BTreeMap::new(),
-            primed: Mutex::new(HashMap::new()),
+            primed: Mutex::new(Recent::new()),
             defaults: Defaults {
                 voice: self.voice.clone(),
                 temperature: self.temperature,
@@ -2069,6 +2104,30 @@ mod tests {
         assert!(Quant::Q80.check_device(DeviceKind::Auto).is_ok());
         assert_eq!(DeviceKind::Auto.resolve_for(Quant::F32), DeviceKind::Auto.resolve());
         assert_eq!(DeviceKind::Metal.resolve_for(Quant::Q80), DeviceKind::Metal);
+    }
+
+    #[test]
+    fn a_full_primed_cache_evicts_only_the_least_recently_used_voice() {
+        let key = |i: usize| (i.to_string(), false);
+        let mut recent = Recent::new();
+        for i in 0..MAX_PRIMED {
+            recent.insert(key(i), i);
+        }
+        // Touch the oldest, so the next insert evicts the second oldest instead.
+        assert_eq!(recent.get(&key(0)), Some(&0));
+        recent.insert(key(MAX_PRIMED), MAX_PRIMED);
+        assert_eq!(recent.get(&key(1)), None);
+        for i in (0..=MAX_PRIMED).filter(|&i| i != 1) {
+            assert_eq!(recent.get(&key(i)), Some(&i));
+        }
+        // A same-voice race inserts twice; the second replaces the first.
+        recent.insert(key(0), 100);
+        assert_eq!(recent.entries.len(), MAX_PRIMED);
+        assert_eq!(recent.get(&key(0)), Some(&100));
+        // Forgetting a voice drops both its guidance keys.
+        recent.insert((MAX_PRIMED.to_string(), true), 0);
+        recent.forget(&MAX_PRIMED.to_string());
+        assert!(recent.entries.iter().all(|((name, _), _)| *name != MAX_PRIMED.to_string()));
     }
 
     fn defaults() -> Defaults {
