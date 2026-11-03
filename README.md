@@ -489,9 +489,10 @@ Phonon 31m is under Apache 2.0, and Phonon 40m and Phonon 40m multilingual are
 under CC BY-NC 4.0. Check each model's page on Hugging Face before
 redistribution.
 
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in this repository is dual licensed as above, without additional
-terms or conditions.
+Contributions are welcome. Pull requests need a signed [Contributor License
+Agreement](CLA.md); see [CONTRIBUTING.md](CONTRIBUTING.md). Unless you
+explicitly state otherwise, any contribution intentionally submitted for
+inclusion in this repository is dual licensed as above.
 
 <img src="docs/readme/divider.svg" alt="" width="100%">
 
