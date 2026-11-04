@@ -1,0 +1,35 @@
+[package]
+name = "graphon"
+version.workspace = true
+edition = "2024"
+autoexamples = false
+publish = false
+description = "Graphon streaming speech-to-text inference"
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+ptts = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+xn = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+ptts = { workspace = true, features = ["audio"] }
+
+[features]
+default = []
+accelerate = ["xn/accelerate", "ptts/accelerate"]
+metal = ["xn/metal", "ptts/metal"]
+kai = ["xn/kai", "ptts/kai"]
+
+[[example]]
+name = "transcribe"
+path = "examples/transcribe.rs"
+
+[[example]]
+name = "bench"
+path = "examples/bench.rs"
