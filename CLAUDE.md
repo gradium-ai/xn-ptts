@@ -189,6 +189,14 @@ run the flow LM and the Mimi decoder on two threads. `Synth` erases the `Q` para
 dereferences to) so a CLI flag can pick the weight format; the generic `SynthOf<Q>` is
 private. `ptts-wasm` still drives `TTSModel` directly.
 
+On CUDA, `Synth` replays the flow LM's per-frame step as a CUDA graph (`step_graph.rs`): the
+step keeps its position on the device (`transformer::DeviceStep`), so one recording serves every
+position. The graphs, for caches of 1024, 1536 and 2048 positions, are recorded in
+`SynthBuilder::build` and only replayed after, because a capture takes in everything the
+device's one stream runs meanwhile, from any thread, frees included: never record one while
+anything else can use the device. A generation with guidance, or whose budget is larger, or that
+finds no free graph, runs without one. `PTTS_CUDA_GRAPHS=0` turns them off.
+
 Generation is streaming and stateful: callers `init_flow_lm_state(batch, seq_len)`, then `prompt_text*` / `prompt_audio` to seed the state, then step-decode latents and feed them into `MimiDecoderState`. `lsd_decode_steps` controls flow-matching solver steps; `eos_threshold` controls termination. Every frontend reads the supplied checkpoint's own model config.
 
 A config can list `conditioners` (`lut` or `continuous`), which are summed into one vector added to every generated frame's input. Their values are given by name: `--condition NAME=VALUE` on the CLI and examples (`bench`, `export_coreml`) and both servers (`PTTS_CONDITION` for the OpenAI one), `conditions=` on `ptts-pyo3`, `conditions` on `PhononTTS.load`. Those not given take their defaults (`num_speakers` 1, `padding_bonus` and `duration_delta` 0); one with no default is an error. A config's baked-in `voices` each carry their own values, which win over those given. `loader::load_conditions` computes the vector for frontends that keep it themselves: the Core ML export fixes it in the bundle, in `host.safetensors` and, for a baked-in voice, in its voice file. The browser build refuses checkpoints with baked-in voices.

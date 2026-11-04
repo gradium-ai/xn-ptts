@@ -59,6 +59,37 @@ impl<T: WithDTypeF, B: Backend> StreamingMHAState<T, B> {
     }
 }
 
+/// A single-token flow-LM step whose position lives on the device, so that its kernels take
+/// no position argument and one recorded step replays at any position (a CUDA graph).
+///
+/// The keys and values are scattered to the position, the attention runs over the whole
+/// cache with `mask` hiding the unfilled slots, and RoPE reads its row of a full-length table.
+pub(crate) struct DeviceStep<T: WithDTypeF, B: Backend> {
+    /// `[b, 1, h, d]`, every entry the position: the scatter index for the new key and value.
+    kv_idx: Tensor<i64, B>,
+    /// `[1, kv]`: `0` for the filled slots, the current one included, `-inf` for the others.
+    mask: Tensor<T, B>,
+    rope: RotaryEmbedding<T, B>,
+}
+
+impl<T: WithDTypeF, B: Backend> DeviceStep<T, B> {
+    /// Records the per-step work: `pos` is `[1]`, `mask` the persistent `[1, kv]` mask (its
+    /// slot at `pos` is opened here), `rope` the full-length table of the transformer.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn new(
+        pos: &Tensor<i64, B>,
+        mask: &Tensor<T, B>,
+        rope: &RotaryEmbedding<T, B>,
+        (b, h, d): (usize, usize, usize),
+    ) -> Result<Self> {
+        let kv_idx = pos.reshape((1, 1, 1, 1))?.broadcast_as((b, 1, h, d))?.contiguous()?;
+        let zero = Tensor::zeros((1, 1), mask.device())?;
+        mask.scatter_set(&pos.reshape((1, 1))?, &zero, 1)?;
+        let rope = rope.rows(pos)?;
+        Ok(Self { kv_idx, mask: mask.clone(), rope })
+    }
+}
+
 /// Streaming multi-head attention (used by the flow LM transformer).
 pub struct StreamingMultiheadAttention<Q: BackendQ> {
     in_proj: Q::LinearQ,
@@ -106,6 +137,7 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
         rope: &RotaryEmbedding<Q::T, Q::B>,
         state: &mut StreamingMHAState<Q::T, Q::B>,
         mask: Option<&Tensor<Q::T, Q::B>>,
+        step: Option<&DeviceStep<Q::T, Q::B>>,
     ) -> Result<Tensor<Q::T, Q::B>> {
         use xn::ModuleT;
         let (b, t, _) = query.dims3()?;
@@ -131,9 +163,19 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
 
         // Apply RoPE: q, k are [b, t, h, d]
         let (q, k) = rope.forward(&q, &k)?;
-        let (k, v) = state.complete_kv(&k, &v)?;
-
         let inv_sqrt_d = 1.0 / (d as f32).sqrt();
+        if let Some(step) = step {
+            state.k_cache.scatter_set(&step.kv_idx, &k, 1)?;
+            state.v_cache.scatter_set(&step.kv_idx, &v, 1)?;
+            // The whole cache, as the views `sdpa_decode` takes; the mask hides what is unfilled.
+            let kv = state.k_cache.dim(1usize)?;
+            let keys = state.k_cache.narrow(1, 0..kv)?;
+            let values = state.v_cache.narrow(1, 0..kv)?;
+            let x = q.sdpa_decode(&keys, &values, Some(&step.mask), inv_sqrt_d)?;
+            return self.out_proj.forward(&x);
+        }
+
+        let (k, v) = state.complete_kv(&k, &v)?;
 
         let x = if t == 1 {
             q.sdpa_decode(&k, &v, mask, inv_sqrt_d)?
@@ -240,6 +282,17 @@ pub struct StreamingTransformerState<T: WithDTypeF, B: Backend> {
 }
 
 impl<T: WithDTypeF, B: Backend> StreamingTransformerState<T, B> {
+    /// Count `n` more filled positions in every flow-LM layer, after a step that wrote them
+    /// without moving the host-side position (see [`DeviceStep`]).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn advance(&mut self, n: usize) {
+        for layer in self.layer_states.iter_mut() {
+            if let LayerAttentionState::FlowLm(mha) = layer {
+                mha.current_end += n;
+            }
+        }
+    }
+
     /// A fresh state with room for `seq_budget` positions, holding a copy of the filled prefix.
     ///
     /// Use this rather than `Clone`: cloning an `xn` tensor shares its storage, so two
@@ -477,17 +530,21 @@ impl<Q: BackendQ> StreamingTransformerLayer<Q> {
         rope: &RotaryEmbedding<Q::T, Q::B>,
         state: &mut LayerAttentionState<Q::T, Q::B>,
         mask: Option<&Tensor<Q::T, Q::B>>,
+        step: Option<&DeviceStep<Q::T, Q::B>>,
     ) -> Result<Tensor<Q::T, Q::B>> {
         use xn::ModuleT;
 
         // Self-attention block: x + layer_scale_1(attn(norm1(x)))
         let norm1 = self.norm1.forward(x)?;
         let mut attn_out = match (&self.self_attn, state) {
+            (AttentionKind::Mimi(_), _) if step.is_some() => {
+                xn::bail!("a device-position step runs only flow-LM attention, not Mimi's")
+            }
             (AttentionKind::Mimi(attn), LayerAttentionState::Mimi(cache)) => {
                 attn.forward(&norm1, rope, cache, mask)?
             }
             (AttentionKind::FlowLm(attn), LayerAttentionState::FlowLm(mha_state)) => {
-                attn.forward(&norm1, rope, mha_state, mask)?
+                attn.forward(&norm1, rope, mha_state, mask, step)?
             }
             _ => xn::bail!("attention kind and state type mismatch"),
         };
@@ -636,7 +693,32 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
         let rope =
             RotaryEmbedding::new(self.head_dim, offset, seq_len, self.max_period, x.device())?;
         for (layer, layer_state) in self.layers.iter().zip(state.layer_states.iter_mut()) {
-            x = layer.forward(&x, &rope, layer_state, mask.as_ref())?;
+            x = layer.forward(&x, &rope, layer_state, mask.as_ref(), None)?;
+        }
+        Ok(x)
+    }
+
+    /// The RoPE table for positions `0..len`, for [`DeviceStep::new`].
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn rope_table(
+        &self,
+        len: usize,
+        device: &Q::B,
+    ) -> Result<RotaryEmbedding<Q::T, Q::B>> {
+        RotaryEmbedding::new(self.head_dim, 0, len, self.max_period, device)
+    }
+
+    /// One token at the position `step` holds, see [`DeviceStep`]. Leaves the host-side
+    /// position alone: the caller advances it.
+    pub(crate) fn forward_step(
+        &self,
+        x: &Tensor<Q::T, Q::B>,
+        state: &mut StreamingTransformerState<Q::T, Q::B>,
+        step: &DeviceStep<Q::T, Q::B>,
+    ) -> Result<Tensor<Q::T, Q::B>> {
+        let mut x = x.clone();
+        for (layer, layer_state) in self.layers.iter().zip(state.layer_states.iter_mut()) {
+            x = layer.forward(&x, &step.rope, layer_state, None, Some(step))?;
         }
         Ok(x)
     }
@@ -862,7 +944,7 @@ mod grouped_query_tests {
                 let xs = Tensor::from_vec(xs, (1, len, embed), &CpuDevice)?;
                 let mask = (len > 1).then(|| state.materialize_causal_mask(len)).transpose()?;
                 let rope = RotaryEmbedding::new(d, start, len, 10_000., &CpuDevice)?;
-                out.extend(m.forward(&xs, &rope, &mut state, mask.as_ref())?.to_vec()?);
+                out.extend(m.forward(&xs, &rope, &mut state, mask.as_ref(), None)?.to_vec()?);
             }
             Ok(out)
         };
@@ -871,6 +953,67 @@ mod grouped_query_tests {
         assert_eq!(grouped.len(), 5 * embed);
         for (a, b) in grouped.iter().zip(&full) {
             assert!((a - b).abs() < 1e-6, "{grouped:?}\n{full:?}");
+        }
+        Ok(())
+    }
+
+    /// A step that keeps its position on the device ([`DeviceStep`], the step a CUDA graph
+    /// replays) gives what the host-side step gives at the same position, over grouped k/v
+    /// heads: the scatter, the mask over the whole cache and the RoPE row agree with the rest.
+    #[test]
+    fn a_device_step_is_the_host_step() -> Result<()> {
+        let (embed, h, kvh, d, kv) = (6, 4, 2, 2, 8);
+        let mut seed = 7u64;
+        let mut rand = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+                })
+                .collect()
+        };
+        let in_w = rand((h + 2 * kvh) * d * embed);
+        let m = StreamingMultiheadAttention::<Q> {
+            in_proj: Linear::new(Tensor::from_vec(in_w, ((h + 2 * kvh) * d, embed), &CpuDevice)?),
+            out_proj: Linear::new(Tensor::from_vec(
+                rand(embed * h * d),
+                (embed, h * d),
+                &CpuDevice,
+            )?),
+            embed_dim: embed,
+            num_heads: h,
+            attn_dim: h * d,
+            num_kv_heads: kvh,
+            device: CpuDevice,
+        };
+        let x = rand(5 * embed);
+        let token = |p: usize| {
+            Tensor::from_vec(x[p * embed..(p + 1) * embed].to_vec(), (1, 1, embed), &CpuDevice)
+        };
+
+        // Both caches hold the same three-token prompt, written the usual way.
+        let (mut host, mut device) = (m.init_state(1, kv)?, m.init_state(1, kv)?);
+        let prompt = Tensor::from_vec(x[..3 * embed].to_vec(), (1, 3, embed), &CpuDevice)?;
+        for state in [&mut host, &mut device] {
+            let mask = state.materialize_causal_mask(3)?;
+            let rope = RotaryEmbedding::new(d, 0, 3, 10_000., &CpuDevice)?;
+            m.forward(&prompt, &rope, state, Some(&mask), None)?;
+        }
+
+        let table = RotaryEmbedding::new(d, 0, kv, 10_000., &CpuDevice)?;
+        let mask = (0..kv).map(|j| if j < 3 { 0. } else { f32::NEG_INFINITY }).collect();
+        let mask = Tensor::from_vec(mask, (1, kv), &CpuDevice)?;
+        for p in 3..5 {
+            let rope = RotaryEmbedding::new(d, p, 1, 10_000., &CpuDevice)?;
+            let want = m.forward(&token(p)?, &rope, &mut host, None, None)?.to_vec()?;
+            let pos = Tensor::from_vec(vec![p as i64], 1, &CpuDevice)?;
+            let step = DeviceStep::new(&pos, &mask, &table, (1, h, d))?;
+            let got = m.forward(&token(p)?, &step.rope, &mut device, None, Some(&step))?;
+            let got = got.to_vec()?;
+            device.current_end += 1;
+            for (a, b) in got.iter().zip(&want) {
+                assert!((a - b).abs() < 1e-6, "position {p}:\n{got:?}\n{want:?}");
+            }
         }
         Ok(())
     }
