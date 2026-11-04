@@ -63,6 +63,24 @@ against the 80 ms a step has in real time, the time to flush the last words, and
 factor. `--encoder-chunk N` encodes N steps per encoder call, as a caller holding buffered audio
 could.
 
+## Evaluate
+
+Lay an evaluation set out as `<root>/<set>/<id>.wav`, with the reference beside each file as
+`<id>.transcribe.json` (its `text`) or `<id>.txt`, transcribe it, then score it:
+
+```
+cargo run -r -p graphon --features accelerate --example transcribe -- \
+    --model <export> --quant q8_0 <root>/*/*.wav > out.tsv
+uv run graphon/scripts/wer.py out.tsv
+```
+
+`wer.py` prints each set's corpus WER and their mean, after Whisper's English normalizer
+(`scripts/whisper_norm/`, pinned to the version the training validation uses).
+
+To compare with a training run's validation, export with the conditions that validation feeds
+the model, for an English set `--condition lang=en --condition languages_in_segment=en
+--condition is_start=True`.
+
 ## Test
 
 ```
