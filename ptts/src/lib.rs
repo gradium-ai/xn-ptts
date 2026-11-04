@@ -81,7 +81,7 @@ pub mod audio;
 pub mod checkpoint;
 pub mod comp;
 mod conditioners;
-mod conv;
+pub mod conv;
 mod dummy_quantizer;
 pub mod error;
 pub mod flow_lm;
@@ -96,7 +96,7 @@ pub mod preprocess;
 mod q8;
 mod resample;
 mod rope;
-mod seanet;
+pub mod seanet;
 // Not on wasm: `Synth` runs the flow LM and the Mimi decoder on two `std::thread`s, and
 // `wasm32-unknown-unknown` has none -- `spawn` there compiles and then panics. Browser
 // frontends drive `tts_model::TTSModel` directly instead.
