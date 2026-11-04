@@ -103,14 +103,18 @@ impl<Q: BackendQ, C: BackendQ<T = Q::T, B = Q::B>> Stream<'_, Q, C> {
         model.trunk.step(&latent, &mut self.trunk)
     }
 
-    /// End the stream: pads the last partial frame, then feeds silence until the text has caught
-    /// up with the audio.
+    /// End the stream: pads the last partial frame, then feeds [`config::Config::flush_steps`]
+    /// steps of silence, enough for the last words to come out.
     pub fn flush(&mut self) -> Result<Vec<u32>> {
+        self.flush_steps(self.model.config.flush_steps())
+    }
+
+    /// [`Stream::flush`] with `steps` steps of silence after the last partial frame.
+    pub fn flush_steps(&mut self, steps: usize) -> Result<Vec<u32>> {
         let frame = self.model.config.frame_size();
         let pad = (frame - self.pending.len() % frame) % frame;
-        let silence = (self.model.config.delay_steps + 1) * frame;
         let mut tail = std::mem::take(&mut self.pending);
-        tail.resize(tail.len() + pad + silence, 0.0);
+        tail.resize(tail.len() + pad + steps * frame, 0.0);
         self.push(&tail)
     }
 

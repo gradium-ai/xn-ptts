@@ -149,15 +149,14 @@ where
     );
     println!("  load        {:8.1} ms", ms(load));
     let mean = |xs: &[Duration]| ms(xs.iter().sum::<Duration>() / xs.len() as u32);
-    let delay = model.config.delay_steps;
     println!(
         "  first step  {:8.1} ms   compute on top of the model's fixed text delay",
         mean(&first)
     );
     println!(
-        "  flush       {:8.1} ms   end of speech to the last word: {} silent steps back to back",
+        "  flush       {:8.1} ms   end of speech to the end of the flush: {} silent steps back to back",
         mean(&flush),
-        delay + 1
+        model.config.flush_steps()
     );
     println!("  stage          mean      p50      p95      p99      max   (ms per step)");
     let rows = STAGES

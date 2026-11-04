@@ -6,8 +6,7 @@ use std::collections::HashMap;
 pub struct Config {
     pub sample_rate: usize,
     pub frame_rate: f64,
-    /// How many steps the text runs behind the audio: the steps of silence a stream needs at its
-    /// end for its last words to come out.
+    /// How many steps the text runs behind the audio.
     pub delay_steps: usize,
     pub text: TextConfig,
     pub trunk: TrunkConfig,
@@ -23,6 +22,12 @@ impl Config {
             .map_err(|e| xn::Error::msg(format!("reading {}: {e}", path.display())))?;
         serde_json::from_str(&json)
             .map_err(|e| xn::Error::msg(format!("parsing {}: {e}", path.display())))
+    }
+
+    /// Steps of silence a stream needs at its end for its last words to come out: the text delay
+    /// plus a second, since the model writes a word's last pieces a few steps after the delay.
+    pub fn flush_steps(&self) -> usize {
+        self.delay_steps + self.frame_rate.ceil() as usize
     }
 
     /// Audio samples per step.

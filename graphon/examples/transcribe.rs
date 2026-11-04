@@ -29,6 +29,10 @@ struct Args {
     #[arg(long)]
     tokens: bool,
 
+    /// Steps of silence fed after the audio for the last words, instead of the stream's default.
+    #[arg(long)]
+    flush_steps: Option<usize>,
+
     /// Also write each file's audio, as the model reads it, to `<dir>/<stem>.f32`: raw
     /// little-endian f32 at the model's sample rate.
     #[arg(long)]
@@ -50,7 +54,10 @@ fn transcribe<Q: xn::BackendQ<B = xn::CpuDevice>>(args: &Args) -> Result<()> {
         }
         let mut stream = model.stream()?;
         let mut tokens = stream.push(&pcm)?;
-        tokens.extend(stream.flush()?);
+        tokens.extend(match args.flush_steps {
+            Some(steps) => stream.flush_steps(steps)?,
+            None => stream.flush()?,
+        });
         if args.tokens {
             println!("{tokens:?}");
         }
