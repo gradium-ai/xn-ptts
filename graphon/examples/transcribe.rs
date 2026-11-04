@@ -19,8 +19,13 @@ struct Args {
     model: std::path::PathBuf,
 
     /// Weights of both the trunk and the encoder transformer: f32 or q8_0, quantized at load.
+    /// The GPU takes f32 only.
     #[arg(long, default_value = "f32")]
     quant: String,
+
+    /// cpu, or cuda (with the `cuda` feature).
+    #[arg(long, default_value = "cpu")]
+    device: String,
 
     #[arg(long)]
     threads: Option<usize>,
@@ -41,8 +46,8 @@ struct Args {
     files: Vec<std::path::PathBuf>,
 }
 
-fn transcribe<Q: xn::BackendQ<B = xn::CpuDevice>>(args: &Args) -> Result<()> {
-    let model = Graphon::<Q>::load(&args.model, xn::CPU)?;
+fn transcribe<Q: xn::BackendQ>(args: &Args, device: Q::B) -> Result<()> {
+    let model = Graphon::<Q>::load(&args.model, device)?;
     let pieces = Pieces::load(&args.model.join("tokenizer.json"))?;
     let sample_rate = model.config.sample_rate as u32;
     for file in args.files.iter() {
@@ -72,9 +77,14 @@ fn main() -> Result<()> {
     if let Some(threads) = args.threads {
         xn::set_num_threads(threads);
     }
-    match args.quant.as_str() {
-        "f32" => transcribe::<xn::Unquantized<f32, xn::CpuDevice>>(&args),
-        "q8_0" | "q8" => transcribe::<xn::quantized::Q80F32>(&args),
-        other => anyhow::bail!("unsupported --quant {other}"),
+    match (args.device.as_str(), args.quant.as_str()) {
+        ("cpu", "f32") => transcribe::<xn::Unquantized<f32, xn::CpuDevice>>(&args, xn::CPU),
+        ("cpu", "q8_0" | "q8") => transcribe::<xn::quantized::Q80F32>(&args, xn::CPU),
+        #[cfg(feature = "cuda")]
+        ("cuda", "f32") => {
+            let device = xn::cuda_backend::Device::new(0)?;
+            transcribe::<xn::Unquantized<f32, xn::cuda_backend::Device>>(&args, device)
+        }
+        (device, quant) => anyhow::bail!("unsupported --device {device} with --quant {quant}"),
     }
 }

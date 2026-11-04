@@ -25,6 +25,7 @@ default = []
 accelerate = ["xn/accelerate", "ptts/accelerate"]
 metal = ["xn/metal", "ptts/metal"]
 kai = ["xn/kai", "ptts/kai"]
+cuda = ["xn/cuda", "ptts/cuda"]
 
 [[example]]
 name = "transcribe"
