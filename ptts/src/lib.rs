@@ -104,6 +104,7 @@ mod seanet;
 // Deliberately `//` and not `///`: an outer doc comment here is concatenated ahead of
 // `synth.rs`'s own `//!` header, whose intra-doc links then resolve in this scope and all
 // come out unresolved.
+pub mod s2s;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod synth;
 #[cfg(feature = "hf")]

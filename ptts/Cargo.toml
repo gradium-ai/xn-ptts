@@ -105,4 +105,8 @@ name = "create_voice"
 required-features = ["audio"]
 
 [[example]]
+name = "s2s"
+required-features = ["audio"]
+
+[[example]]
 name = "export_coreml"
