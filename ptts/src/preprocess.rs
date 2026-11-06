@@ -113,8 +113,8 @@ pub const SPECIAL_CHARS_KO: SpecialChars = SpecialChars {
     colon: "콜론",
     slash: "슬래시",
     dash: "하이픈",
-    dot: "점",
-    underscore: "밑줄",
+    dot: "닷",
+    underscore: "언더바",
 };
 
 pub const SPECIAL_CHARS_PL: SpecialChars = SpecialChars {
@@ -1630,6 +1630,7 @@ mod tests {
             (Lang::It, "Visita rai.it.", "Visita rai punto I-T."),
             (Lang::Ko, "번호는 48213907입니다.", "번호는 사 팔 이 일 삼 구 공 칠 입니다."),
             (Lang::Ja, "バグ#2093", "バ グ # 2093 。"),
+            (Lang::Hi, "5G तकनीक और 3D प्रिंटिंग।", "5G तकनीक और 3D प्रिंटिंग।"),
             (Lang::Ko, "나나크(1469–1539)가 1,000파운드", "나나크, 1469-1539, 가 1,000파운드"),
             (Lang::It, "I B&B più alti", "I B&B più alti"),
             (Lang::Sv, "Ärende nummer 773102.", "Ärende nummer 773102."),

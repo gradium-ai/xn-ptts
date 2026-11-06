@@ -4,12 +4,14 @@
 use super::Lang;
 
 mod abbreviations;
+mod codes;
 mod currency;
 mod dashed_digits;
 mod dates;
 mod elongations;
 mod emails;
 mod hindi;
+mod letters;
 mod local_dates;
 mod numbers;
 mod phones;
@@ -43,6 +45,7 @@ const RULES: &[Rule] = &[
     Rule { name: "numbers", rewrite: numbers::numbers, default: true },
     Rule { name: "currency", rewrite: currency::currency, default: true },
     Rule { name: "dashed-digits", rewrite: dashed_digits::dashed_digits, default: true },
+    Rule { name: "codes", rewrite: codes::codes, default: true },
     Rule { name: "emails", rewrite: emails::emails, default: true },
     Rule { name: "urls", rewrite: urls::urls, default: true },
     Rule { name: "abbreviations", rewrite: abbreviations::abbreviations, default: true },
@@ -110,7 +113,7 @@ pub fn rewrite_word(word: &str, lang: Lang, rules: Rules) -> Option<String> {
     // Japanese and Korean join a number to the word around it, "12345人", "5,000원입니다": the
     // rules read each run of digits inside such a word on its own.
     if matches!(lang, Lang::Ja | Lang::Ko) && !word.is_ascii() {
-        return rewrite_runs(word, lang, rules);
+        return codes::within(word, lang, rules).or_else(|| rewrite_runs(word, lang, rules));
     }
     // A plain run of seven digits or more on its own is a code there too.
     if matches!(lang, Lang::Ja | Lang::Ko) && rules.has("numbers") {
@@ -370,10 +373,10 @@ mod tests {
     fn rules_pick_what_runs() {
         assert_eq!("all".parse::<Rules>().unwrap(), Rules::ALL);
         assert_eq!("default".parse::<Rules>().unwrap(), Rules::DEFAULT);
-        let default =
-            "numbers,currency,dashed-digits,emails,urls,abbreviations,elongations,local-dates"
-                .parse::<Rules>()
-                .unwrap();
+        let default = "numbers,currency,dashed-digits,codes,emails,urls,abbreviations,elongations,\
+                       local-dates"
+            .parse::<Rules>()
+            .unwrap();
         assert_eq!(default, Rules::DEFAULT);
         let opt_in = "phones,times,dates".parse::<Rules>().unwrap();
         assert_eq!(Rules(default.0 | opt_in.0), Rules::ALL);
