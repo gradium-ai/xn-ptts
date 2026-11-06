@@ -9,6 +9,7 @@ mod dashed_digits;
 mod dates;
 mod elongations;
 mod emails;
+mod hindi;
 mod local_dates;
 mod numbers;
 mod phones;
@@ -281,7 +282,10 @@ pub(super) fn rewrite_text(
                 rules.has("currency").then(|| currency::unit_after(&words[i..], lang)).flatten()
             })
             .or_else(|| {
-                rules.has("numbers").then(|| numbers::hindi_time(&words[i..], lang)).flatten()
+                let before = i.checked_sub(1).map(|j| words[j]);
+                (lang == Lang::Hi && rules.has("numbers"))
+                    .then(|| hindi::span(before, &words[i..]))
+                    .flatten()
             })
             .or_else(|| {
                 rules.has("numbers").then(|| numbers::hindi_fraction(&words[i..], lang)).flatten()
