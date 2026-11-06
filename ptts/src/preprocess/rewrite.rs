@@ -9,6 +9,7 @@ mod dashed_digits;
 mod dates;
 mod elongations;
 mod emails;
+mod local_dates;
 mod numbers;
 mod phones;
 mod times;
@@ -35,6 +36,8 @@ struct Rule {
 /// out: "1/2" is as often a fraction as a date, and a run of digits as often a quantity as a phone
 /// number. Numbers and times are the only rules that claim the same words, German ones like
 /// "1.234", and numbers come first so that those read as a thousand rather than a time.
+/// Swedish and Norwegian dates and times have a rule of their own, on by default, which reads
+/// only the shapes that cannot be anything else.
 const RULES: &[Rule] = &[
     Rule { name: "numbers", rewrite: numbers::numbers, default: true },
     Rule { name: "currency", rewrite: currency::currency, default: true },
@@ -43,6 +46,7 @@ const RULES: &[Rule] = &[
     Rule { name: "urls", rewrite: urls::urls, default: true },
     Rule { name: "abbreviations", rewrite: abbreviations::abbreviations, default: true },
     Rule { name: "elongations", rewrite: elongations::elongations, default: true },
+    Rule { name: "local-dates", rewrite: local_dates::local_dates, default: true },
     Rule { name: "phones", rewrite: phones::phones, default: false },
     Rule { name: "times", rewrite: times::times, default: false },
     Rule { name: "dates", rewrite: dates::dates, default: false },
@@ -293,6 +297,12 @@ pub(super) fn rewrite_text(
                     .has("abbreviations")
                     .then(|| abbreviations::ranks(&words[i..], lang))
                     .flatten()
+            })
+            .or_else(|| {
+                rules
+                    .has("local-dates")
+                    .then(|| local_dates::span(prev, &words[i..], lang))
+                    .flatten()
             });
         if let Some((rewritten, used)) = span {
             out.push(rewritten);
@@ -356,9 +366,10 @@ mod tests {
     fn rules_pick_what_runs() {
         assert_eq!("all".parse::<Rules>().unwrap(), Rules::ALL);
         assert_eq!("default".parse::<Rules>().unwrap(), Rules::DEFAULT);
-        let default = "numbers,currency,dashed-digits,emails,urls,abbreviations,elongations"
-            .parse::<Rules>()
-            .unwrap();
+        let default =
+            "numbers,currency,dashed-digits,emails,urls,abbreviations,elongations,local-dates"
+                .parse::<Rules>()
+                .unwrap();
         assert_eq!(default, Rules::DEFAULT);
         let opt_in = "phones,times,dates".parse::<Rules>().unwrap();
         assert_eq!(Rules(default.0 | opt_in.0), Rules::ALL);

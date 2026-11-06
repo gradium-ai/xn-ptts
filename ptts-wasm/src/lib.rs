@@ -455,8 +455,8 @@ impl Model {
     /// and `=` differ per language, so there is nothing safe to default to.
     ///
     /// `rewrites` is optional and picks which word rewrites run on the
-    /// normalized text: `"default"` (numbers, currency, dashed-digits, emails,
-    /// urls, abbreviations, elongations), `"all"` (those and phones, times,
+    /// normalized text: `"default"` (numbers, currency, dashed-digits,
+    /// emails, urls, abbreviations, elongations, local-dates), `"all"` (those and phones, times,
     /// dates), `"none"`, or a comma-separated list of rule names.
     ///
     /// `conditions` is optional and sets the config's conditioners, each as `"NAME=VALUE"`,

@@ -1597,7 +1597,7 @@ mod tests {
             (Lang::Fi, "Kokous on klo 10.30.", "Kokous on klo 10.30."),
             (Lang::Sv, "Det bor 12 345 personer där.", "Det bor 12 tusen 345 personer där."),
             (Lang::Sv, "Priset är 5,99 kr.", "Priset är 5 kronor och 99 öre."),
-            (Lang::Sv, "Öppet 20–25 maj.", "Öppet 20 till 25 maj."),
+            (Lang::Sv, "Öppet 20–25 maj.", "Öppet tjugonde till tjugofemte maj."),
             (
                 Lang::No,
                 "Budsjettet er 1 234 567 kroner.",
