@@ -80,6 +80,8 @@ pub struct TTSConfig {
     pub languages: Vec<String>,
     #[serde(default)]
     pub embeddings_ext: Option<Vec<String>>,
+    #[serde(default)]
+    pub audio_delay: usize,
 }
 
 impl TTSConfig {
@@ -90,7 +92,7 @@ impl TTSConfig {
         if self.model_id.is_some() { Gelu::Erf } else { Gelu::Tanh }
     }
 
-    fn mimi_with_gelu(&self, mimi: &MimiConfig) -> MimiConfig {
+    pub(crate) fn mimi_with_gelu(&self, mimi: &MimiConfig) -> MimiConfig {
         MimiConfig { gelu: Some(mimi.gelu.unwrap_or_else(|| self.default_gelu())), ..mimi.clone() }
     }
 
