@@ -4,22 +4,21 @@ The browser build of [Phonon](../ptts/), published to npm as [`phonon-tts`](http
 
 ## Layout
 
-- `src/lib.rs`: the raw `wasm-bindgen` surface. It takes bytes that are already fetched and generates a few 80 ms frames per call, because the worker it runs in must yield to its event loop between calls to hear a cancel. One engine, generic over the device, serves the CPU and, with the `webgpu` feature, WebGPU: loading, voices, normalization, chunking and the end-of-speech rule are shared, and only reading a result back differs. A call makes one frame on the CPU and up to four on WebGPU, which reads them back in one round trip. With the `threads` feature it also exports `initThreadPool` and `start_cpu_pool`, which split the work inside a frame across Web Workers. Text is normalized, split into sentence-aligned chunks and tokenized in Rust, with the same rules as `ptts::synth`. Voices can be `emb` embeddings, which are run through the model once when they are added, or the precomputed KV caches of `embeddings_v2/`.
-- `js/`: the package's public API. `index.js` exports `PhononTTS`, which runs the model in a worker (`worker.js`), downloads and caches its files (`fetch.js`, via the Cache API), and turns requests into async iterators. The worker loads the threaded build on a cross-origin isolated page and the single-threaded one elsewhere, and `threads.js` picks how many threads. `index.d.ts` holds the types. `test/` holds node tests for the wrapper's own logic.
+- `src/lib.rs`: the raw `wasm-bindgen` surface, CPU only. `Model` runs the whole model, taking bytes that are already fetched and generating one 80 ms frame per call, because the worker it runs in must yield to its event loop between calls to hear a cancel. With the `threads` feature it also exports `initThreadPool` and `start_cpu_pool`, which split the work inside a frame across Web Workers. Text is normalized, split into sentence-aligned chunks and tokenized in Rust, with the same rules as `ptts::synth`. Voices can be `emb` embeddings or `speaker_wavs` latents, which are run through the model once when they are added, or the precomputed KV caches of `embeddings_v2/`. `Preparer` is the same text and voice handling without the model, for the WebGPU engine: it holds the tokenizer, the config and the few tensors of the conditioners and the speaker projection, and hands out token ids, voice prompt rows and the conditioner sum.
+- `js/gpu/`: the WebGPU engine, in JS and WGSL. It reads the q8 GGUF itself and runs the flow LM and the Mimi decoder on the device, with nothing read back but the audio; `engine.js` starts with how it fits together (dispatch lists, the state buffer, the submit pipeline, subgroups), and `support.js` says which checkpoints it runs. The weights never enter wasm memory.
+- `js/`: the package's public API. `index.js` exports `PhononTTS`, which runs the model in a worker (`worker.js`), downloads and caches its files (`fetch.js`, via the Cache API), and turns requests into async iterators. The worker runs either the CPU `Model` (the threaded build on a cross-origin isolated page and the single-threaded one elsewhere, `threads.js` picking how many threads) or the WebGPU engine with the single-threaded build's `Preparer` (`device.js` picks). `index.d.ts` holds the types. `test/` holds node tests for the wrapper's own logic and the engine's host-side logic.
 - `scripts/pack.mjs`: assembles the npm package around the wasm-pack outputs: `pkg/wasm/` and `pkg/wasm-threads/`, plus the `.wasm` of `pkg/wasm-simd/` and `pkg/wasm-threads-simd/`, the builds without Relaxed SIMD, kept as `phonon_tts_simd_bg.wasm`. It also patches `wasm-bindgen-rayon`'s worker helper, whose bare `'../../..'` import resolves for neither a bundler nor a browser here.
 - `scripts/serve.mjs`: serves the demo with the headers that make it cross-origin isolated.
 - `www/index.html`: the demo page, built on the package the way a consumer would use it.
 
 ### Driving `src/lib.rs` directly
 
-`js/worker.js` is the only caller, and this is the loop it runs, on either device. Text is split in Rust, so prompting is per chunk and generation is per step, which makes it two levels deep:
+`js/worker.js` is the only caller. On the CPU this is the loop it runs. Text is split in Rust, so prompting is per chunk and generation is per frame, which makes it two levels deep:
 
 ```js
-// device is 'cpu' or 'webgpu'; WebGPU needs q8 weights in a GGUF file.
-const model = await Model.load(modelWeights, tokenizerJson, configJson, quant, lang, rewrites, conditions, device);
+// device must be 'cpu': WebGPU runs in the package's own engine (js/gpu/).
+const model = await Model.load(modelWeights, tokenizerJson, configJson, quant, lang, rewrites, conditions, 'cpu');
 const voiceIndex = model.add_voice(voiceBytes);
-// On WebGPU the voice's prompt is only recorded; this runs it now rather than in the first step.
-await model.flush();
 
 // Splits and tokenizes. Runs no model, and returns the number of chunks.
 model.start_generation(voiceIndex, text, temperature, seed);
@@ -29,8 +28,8 @@ while (true) {
   if (model.next_chunk() === undefined) break;
 
   while (true) {
-    // Whole 80 ms frames of mono PCM at model.sample_rate(), model.frame_size() samples
-    // each, or undefined at the end of the chunk. One frame on the CPU, up to four on WebGPU.
+    // One 80 ms frame of mono PCM at model.sample_rate(), model.frame_size() samples, or
+    // undefined at the end of the chunk.
     const pcm = await model.generation_step();
     if (!pcm) break;
     // ... play or buffer pcm ...
@@ -38,7 +37,11 @@ while (true) {
 }
 ```
 
-`stop_generation()` drops a generation in progress. An error thrown by `next_chunk` or `generation_step` also drops it, so a caller that swallows one cannot carry on and silently lose a sentence -- every later call reports the end instead. One noise source covers every chunk, so `seed` fixes the whole utterance. Calls must not overlap: `generation_step` holds the model while it waits for the GPU, and a call that arrives meanwhile is refused. `stop_generation` is the exception: it takes effect when the pending step returns. This API changed in 0.4: `Model` used to be built with `new Model(...)`, with no `device`, and `generation_step` returned one frame directly rather than a promise of one or more. See the rustdoc on `Model::load` for `quant`, `lang`, `conditions`, `device` and what a supplied `config.json` does not change.
+`stop_generation()` drops a generation in progress. An error thrown by `next_chunk` or `generation_step` also drops it, so a caller that swallows one cannot carry on and silently lose a sentence -- every later call reports the end instead. One noise source covers every chunk, so `seed` fixes the whole utterance. Calls must not overlap: a call that arrives while `generation_step` holds the model is refused. `stop_generation` is the exception: it takes effect when the pending step returns. See the rustdoc on `Model::load` for `quant`, `lang`, `conditions` and what a supplied `config.json` does not change.
+
+This API changed in 0.4: `Model` used to be built with `new Model(...)`, with no `device`, and `generation_step` returned one frame directly rather than a promise. Since the WebGPU engine moved out of this module, `device: 'webgpu'` is an error here and `flush()` resolves at once.
+
+The WebGPU engine's side is `new Preparer(tokenizerJson, configJson, tensors, lang, rewrites, conditions)`, where `tensors` is a safetensors file of the GGUF's `flow_lm.condition_provider.conditioners.*` tensors: `plan(text)` gives the chunks (`{ tokens, framesAfterEos, frameBudget }`), `voice(bytes)` a voice's prompt rows or KV cache, and `conditions()` the vector every frame's input adds. `js/worker.js` shows it driving `js/gpu/engine.js`.
 
 ## Build
 
@@ -46,7 +49,7 @@ Needs [wasm-pack](https://github.com/drager/wasm-pack) 0.12 or later, for `--no-
 
 ```bash
 make threads-toolchain                   # once: the pinned nightly, with rust-src
-make build                               # the npm package, in pkg/: both builds
+make build                               # the npm package, in pkg/: both builds and the WebGPU engine
 make test                                # the wrapper's tests: no browser, no model
 make serve                               # build, then serve the demo from site/ on http://localhost:8080
 ```
@@ -71,3 +74,5 @@ Supply the checkpoint URLs through `ModelSpec`, or name a public Hugging Face re
 - No voice cloning: the Mimi encoder is not in the browser build.
 - Threads need a cross-origin isolated page. Elsewhere generation runs on one thread.
 - WebGPU needs `q8` weights in a GGUF file: quantizing `f32` weights on the GPU would read each one back to the host.
+- The WebGPU engine runs the published Phonon checkpoints (`gradium/phonon-31m-en` and the `gradium/phonon-40m-*` models): a 512-wide flow LM of any depth with a one-step LSD flow head and the exact GELU, and their Mimi decoder. Other configs (more LSD steps, the drifting or pointwise heads, grouped-query attention, tanh GELU, `z_dim`, a low-rank text table, prefix sinks, other Mimi shapes) run on the CPU; `js/gpu/support.js` lists the checks. Under `device: 'auto'` such a checkpoint goes to the CPU with a warning, under `'webgpu'` the load fails with the reason.
+- The WebGPU engine's fast kernels use 32-wide subgroups; on adapters without them (or with another width, such as Intel, AMD's wave64 or SwiftShader) it runs equivalent shared-memory kernels.
