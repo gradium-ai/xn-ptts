@@ -3,11 +3,13 @@
 // can check the browser build end to end: the worker, the wasm, the Hub download and the device.
 //
 //   node scripts/speak-in-chrome.mjs --pkg pkg --text "Hello." --out hello.wav \
-//     [--device cpu|webgpu] [--no-isolation] [--chrome PATH] [-- CHROME_FLAGS...]
+//     [--device cpu|webgpu] [--no-isolation] [--headed] [--chrome PATH] [-- CHROME_FLAGS...]
 //
 // The page loads the package's default model. It is served cross-origin isolated, so it runs
 // the threaded build, unless --no-isolation asks for the single-threaded one. Flags after `--`
-// go to Chrome, e.g. what a machine without a GPU needs for WebGPU.
+// go to Chrome, e.g. what a machine without a GPU needs for WebGPU. Chrome runs headless, which
+// gives WebGPU a software adapter on some systems; `--headed` (under xvfb-run on a machine
+// without a display) lets it use the real GPU.
 
 import { spawn } from 'node:child_process';
 import { createReadStream, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -25,6 +27,7 @@ const { values: args } = parseArgs({
     out: { type: 'string' },
     device: { type: 'string', default: 'cpu' },
     'no-isolation': { type: 'boolean', default: false },
+    headed: { type: 'boolean', default: false },
     chrome: { type: 'string' },
     timeout: { type: 'string', default: '600' },
   },
@@ -87,7 +90,7 @@ const finished = new Promise((done, fail) => {
     const profile = mkdtempSync(join(tmpdir(), 'speak-in-chrome-'));
     const url = `http://127.0.0.1:${server.address().port}/`;
     const browser = spawn(chrome, [
-      '--headless=new', '--no-first-run', '--no-default-browser-check', `--user-data-dir=${profile}`,
+      ...(args.headed ? [] : ['--headless=new']), '--no-first-run', '--no-default-browser-check', `--user-data-dir=${profile}`,
       '--enable-logging=stderr', '--v=0', ...chromeFlags, url,
     ], { stdio: ['ignore', 'ignore', 'pipe'] });
     let log = '';
