@@ -1,16 +1,18 @@
 //! The raw WebAssembly surface of the browser build.
 //!
 //! This is what `wasm-bindgen` exports, and it is deliberately low level: it takes bytes the
-//! caller has already fetched and generates a few frames per call, because the worker it
-//! runs in must yield to its event loop between calls to hear a cancel. The `phonon-tts` npm
-//! package runs it in a worker and handles downloads, caching and voices by name. Most
-//! callers want that, not this.
+//! caller has already fetched. The `phonon-tts` npm package runs it in a worker and handles
+//! downloads, caching and voices by name. Most callers want that, not this.
 //!
-//! One engine serves every backend. Loading, voices, text normalization, sentence chunking
-//! and the end-of-speech rule are written once, generic over the device; what differs is how
-//! a result comes back to the host (see [`Readback`]) and how many frames a call produces
-//! (see [`CPU_FRAMES_PER_STEP`]). The CPU runs on one thread or, in the `threads` build, on
-//! several (see `start_cpu_pool`); the `webgpu` feature adds the GPU.
+//! Two things are exported:
+//!
+//! - [`Model`] runs the whole model on the CPU, one 80 ms frame per call, because the worker it
+//!   runs in must yield to its event loop between calls to hear a cancel. It runs on one
+//!   thread or, in the `threads` build, on several (see `start_cpu_pool`).
+//! - [`Preparer`] is everything the package's WebGPU engine (`js/gpu/` in the package) needs
+//!   from Rust, without the model: text normalization, sentence chunking and tokenization,
+//!   the voice files, and the conditioner sum. The GPU engine reads the transformer and Mimi
+//!   weights from the GGUF itself, so they never enter this module's memory.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -29,21 +31,19 @@ macro_rules! console_log {
 }
 
 use ptts::flow_lm::{FlowLMState, NormalRng, StepInput};
-use ptts::loader::{load_speaker_proj, load_voice_emb_from_bytes, remap_key};
+use ptts::loader::{load_conditions, load_speaker_proj, load_voice_emb_from_bytes, remap_key};
 use ptts::mimi::MimiDecoderState;
 use ptts::plan::{self, EosPolicy};
 use ptts::preprocess::{Normalize, Rules};
 use ptts::tok::Tok;
 use ptts::transformer::{LayerAttentionState, StreamingMHAState, StreamingTransformerState};
 use ptts::tts_model::{MAX_TOKENS_PER_CHUNK, TTSConfig, TTSModel, TTSState};
-#[cfg(feature = "webgpu")]
-use xn::WebGpuDevice;
 use xn::nn::{Linear, Path, VB};
 use xn::quantized::Q80F32;
 use xn::{Backend, BackendQ, CPU, CpuDevice, Result, Tensor, TypedTensor, Unquantized};
 
-/// The flow LM's transformer state on device `B`: what a voice prompt leaves behind, and
-/// what every chunk of an utterance starts from.
+/// The flow LM's transformer state: what a voice prompt leaves behind, and what every chunk of
+/// an utterance starts from.
 type RawState<B> = StreamingTransformerState<f32, B>;
 
 /// Slots a voice state already occupies: the voice prompt's frames. Every flow-LM layer
@@ -57,52 +57,6 @@ fn raw_len<B: Backend>(state: &RawState<B>) -> usize {
             _ => None,
         })
         .unwrap_or(0)
-}
-
-/// Frames a `generation_step` produces on the CPU. One: reading a frame back costs nothing
-/// there, and one frame is the soonest audio can start.
-const CPU_FRAMES_PER_STEP: usize = 1;
-
-/// Frames a `generation_step` produces on WebGPU. A readback there is a round trip through
-/// the browser's GPU process, answered only through the event loop. A frame's next input is
-/// its latent, which never leaves the GPU, so several frames are sampled with no readback,
-/// decoded as one batch (which also gives the vocoder's matmuls more than one row), and read
-/// back together. The next frames are recorded while these are read back, so the cost is up
-/// to twice this many frames past end-of-speech, which are dropped.
-#[cfg(feature = "webgpu")]
-const GPU_FRAMES_PER_STEP: usize = 4;
-
-/// Spare KV slots for the warm-up's throwaway chunk.
-#[cfg(feature = "webgpu")]
-const WARM_UP_SLACK: usize = 16;
-
-/// What the warm-up prompts, to build the text path's pipelines along with the frames'.
-#[cfg(feature = "webgpu")]
-const WARM_UP_TEXT: &str = "Hello.";
-
-/// How a device brings a tensor back to the host: the one thing the backends do differently.
-/// The CPU already has it. WebGPU has to wait for the GPU, which a browser reports only
-/// through its event loop, so nothing on that path may block.
-trait Readback: Backend {
-    /// Whether to record the next frames while the previous ones are read back. It pays
-    /// where a readback waits on the device; on the CPU it would only hold up the audio.
-    const OVERLAP: bool;
-    async fn read(&self, t: &Tensor<f32, Self>) -> Result<Vec<f32>>;
-}
-
-impl Readback for CpuDevice {
-    const OVERLAP: bool = false;
-    async fn read(&self, t: &Tensor<f32, Self>) -> Result<Vec<f32>> {
-        t.to_vec()
-    }
-}
-
-#[cfg(feature = "webgpu")]
-impl Readback for WebGpuDevice {
-    const OVERLAP: bool = true;
-    async fn read(&self, t: &Tensor<f32, Self>) -> Result<Vec<f32>> {
-        self.tensor_to_vec(t).await
-    }
 }
 
 /// Quantization variants exposed to JS.
@@ -122,6 +76,58 @@ impl Quant {
     }
 }
 
+/// What every frontend reads from the page's settings: the config, how text is normalized, and
+/// the conditioner values.
+struct Settings {
+    cfg: TTSConfig,
+    normalize: Normalize,
+    conditions: HashMap<String, String>,
+}
+
+impl Settings {
+    fn parse(
+        config_json: &[u8],
+        lang: &str,
+        rewrites: Option<&str>,
+        conditions: &[String],
+    ) -> Result<Self> {
+        let rules = match rewrites {
+            Some(rewrites) => rewrites.parse::<Rules>()?,
+            None => Rules::DEFAULT,
+        };
+        let normalize = lang.parse::<Normalize>()?.with_rules(rules);
+        let mut values = HashMap::new();
+        for condition in conditions {
+            let Some((name, value)) = condition.split_once('=') else {
+                xn::bail!("a condition is NAME=VALUE, got {condition:?}")
+            };
+            values.insert(name.to_string(), value.to_string());
+        }
+        let cfg: TTSConfig = serde_json::from_slice(config_json)
+            .map_err(|e| xn::Error::msg(format!("cannot parse config.json: {e}")))?;
+        // Such a checkpoint speaks only its own voices, each with its own conditioning, and
+        // voices here come from files.
+        if !cfg.voices.is_empty() {
+            xn::bail!(
+                "this checkpoint has baked-in voices, which the browser build does not support"
+            )
+        }
+        Ok(Self { cfg, normalize, conditions: values })
+    }
+}
+
+/// The same chunks `ptts::synth` makes, from [`plan::chunks`].
+fn plan_chunks(
+    tokenizer: &dyn ptts::Tokenizer,
+    text: &str,
+    normalize: Normalize,
+    cfg: &TTSConfig,
+) -> Result<Vec<plan::Chunk>> {
+    let frame_rate = cfg.mimi.frame_rate;
+    let chunks = plan::chunks(tokenizer, text, normalize, MAX_TOKENS_PER_CHUNK, frame_rate)?;
+    Ok(plan::fit_or_error(chunks, plan::MAX_FIT_TOKENS, tokenizer, frame_rate)?)
+}
+
 /// The chunk currently being generated.
 struct ChunkState<Q: BackendQ<T = f32>> {
     tts_state: TTSState<Q>,
@@ -133,8 +139,6 @@ struct ChunkState<Q: BackendQ<T = f32>> {
     /// Set once `eos` has run out: the frame that did it has been returned, and the next
     /// call ends the chunk.
     done: bool,
-    /// Frames recorded during the previous step's readback, returned by the next step.
-    in_flight: Option<Pending<Q::B>>,
 }
 
 struct GenState<Q: BackendQ<T = f32>> {
@@ -148,79 +152,26 @@ struct GenState<Q: BackendQ<T = f32>> {
     rng: NormalRng,
 }
 
-/// Frames that have been generated and decoded on the device but not yet read back.
-struct Pending<B: Backend> {
-    /// The frames' PCM followed by one end-of-speech logit per frame, in one tensor so that
-    /// a step costs a single readback however many frames it holds.
-    out: Tensor<f32, B>,
-    /// Where the PCM ends and the logits start.
-    pcm_len: usize,
-    frames: usize,
-}
-
-/// Generates `frames` frames of `chunk` and decodes them as one batch, reading nothing back.
-fn record_frames<Q: BackendQ<T = f32>>(
-    model: &TTSModel<Q>,
-    chunk: &mut ChunkState<Q>,
-    rng: &mut NormalRng,
-    frames: usize,
-) -> Result<Pending<Q::B>> {
-    let mut latents = Vec::with_capacity(frames);
-    let mut eos_logits = Vec::with_capacity(frames);
-    for _ in 0..frames {
-        let input = match &chunk.prev_latent {
-            None => StepInput::Bos { batch: 1 },
-            Some(t) => StepInput::Latent(t),
-        };
-        let (latent, eos_logit) = model.generate_step_parts(&mut chunk.tts_state, input, rng)?;
-        latent.device().synchronize()?;
-        chunk.prev_latent = Some(latent.clone());
-        latents.push(latent);
-        eos_logits.push(eos_logit);
-    }
-    let batched = Tensor::cat(&latents.iter().collect::<Vec<_>>(), 1)?;
-    let pcm = model.decode_latent(&batched, &mut chunk.mimi_state)?;
-    let pcm = pcm.narrow(0, ..1)?.contiguous()?;
-    let pcm_len = pcm.elem_count();
-    let eos = Tensor::cat(&eos_logits.iter().collect::<Vec<_>>(), 0)?;
-    let out = Tensor::cat(&[&pcm.reshape(pcm_len)?, &eos.reshape(frames)?], 0)?;
-    out.device().synchronize()?;
-    chunk.step += frames;
-    Ok(Pending { out, pcm_len, frames })
-}
-
-/// A loaded model on one device, and the generation in progress on it.
+/// A loaded model on the CPU, and the generation in progress on it.
 struct Engine<Q: BackendQ<T = f32>> {
     model: TTSModel<Q>,
     device: Q::B,
     speaker_proj: Option<Linear<f32, Q::B>>,
     voice_states: Vec<RawState<Q::B>>,
     gen_state: Option<GenState<Q>>,
-    frames_per_step: usize,
 }
 
-impl<Q: BackendQ<T = f32>> Engine<Q>
-where
-    Q::B: Readback,
-{
+impl<Q: BackendQ<T = f32>> Engine<Q> {
     fn load(
         root: &Path<Q::B>,
         tokenizer: Box<dyn ptts::Tokenizer + Send + Sync>,
         cfg: &TTSConfig,
         conditions: &HashMap<String, String>,
         device: Q::B,
-        frames_per_step: usize,
     ) -> Result<Self> {
         let speaker_proj = load_speaker_proj(root, cfg)?;
         let model = TTSModel::load(root, tokenizer, cfg, conditions)?;
-        Ok(Self {
-            model,
-            device,
-            speaker_proj,
-            voice_states: vec![],
-            gen_state: None,
-            frames_per_step,
-        })
+        Ok(Self { model, device, speaker_proj, voice_states: vec![], gen_state: None })
     }
 
     fn add_voice(&mut self, bytes: &[u8], cfg: &TTSConfig) -> Result<usize> {
@@ -268,12 +219,14 @@ where
         let Some(voice) = self.voice_states.get(voice_index) else {
             xn::bail!("invalid voice index: {voice_index}")
         };
-        let chunks = self.plan_chunks(text, normalize, cfg)?;
+        let Some(tokenizer) = self.model.flow_lm.conditioner.tokenizer.as_deref() else {
+            xn::bail!("this model was loaded without a tokenizer")
+        };
+        let chunks = plan_chunks(tokenizer, text, normalize, cfg)?;
 
         // The KV budget has to hold the voice prompt plus the longest chunk's text and audio.
         // This is `plan::seq_budget` with the voice's real length in place of its
         // `PROMPT_SEQ_HEADROOM` guess, the same bound `ptts::synth` checks a session against.
-        // A step never runs past a chunk's frame budget, however many frames it holds.
         let voice_len = raw_len(voice);
         let seq_budget =
             chunks.iter().map(|c| voice_len + c.tokens.len() + c.frame_budget).max().unwrap_or(0);
@@ -282,21 +235,6 @@ where
         let num_chunks = chunks.len();
         self.gen_state = Some(GenState { base, chunks: chunks.into_iter(), current: None, rng });
         Ok(num_chunks)
-    }
-
-    /// The same chunks `ptts::synth` makes, from [`plan::chunks`].
-    fn plan_chunks(
-        &self,
-        text: &str,
-        normalize: Normalize,
-        cfg: &TTSConfig,
-    ) -> Result<Vec<plan::Chunk>> {
-        let Some(tokenizer) = self.model.flow_lm.conditioner.tokenizer.as_deref() else {
-            xn::bail!("this model was loaded without a tokenizer")
-        };
-        let frame_rate = cfg.mimi.frame_rate;
-        let chunks = plan::chunks(tokenizer, text, normalize, MAX_TOKENS_PER_CHUNK, frame_rate)?;
-        Ok(plan::fit_or_error(chunks, plan::MAX_FIT_TOKENS, tokenizer, frame_rate)?)
     }
 
     fn next_chunk(&mut self) -> Result<Option<usize>> {
@@ -319,85 +257,35 @@ where
             eos: EosPolicy::new(chunk.frames_after_eos),
             step: 0,
             done: false,
-            in_flight: None,
         });
         Ok(Some(chunk.tokens.len()))
     }
 
-    /// Up to `frames_per_step` frames of the current chunk as PCM, or `None` once the chunk
-    /// is finished.
-    async fn step(&mut self) -> Result<Option<Vec<f32>>> {
-        let Self { model, device, gen_state, frames_per_step, .. } = self;
+    /// The next frame of the current chunk as PCM, or `None` once the chunk is finished.
+    fn step(&mut self) -> Result<Option<Vec<f32>>> {
+        let Self { model, gen_state, .. } = self;
         let Some(GenState { current, rng, .. }) = gen_state.as_mut() else { return Ok(None) };
         let Some(chunk) = current.as_mut() else { return Ok(None) };
-        let pending = match chunk.in_flight.take() {
-            Some(pending) => pending,
-            None => {
-                if chunk.done || chunk.step >= chunk.frame_budget {
-                    *current = None;
-                    return Ok(None);
-                }
-                let frames = (*frames_per_step).min(chunk.frame_budget - chunk.step);
-                record_frames(model, chunk, rng, frames)?
-            }
-        };
-        let left = chunk.frame_budget - chunk.step;
-        let (mut pcm, next) = if Q::B::OVERLAP && left > 0 {
-            let frames = (*frames_per_step).min(left);
-            let (pcm, next) = futures_util::future::join(device.read(&pending.out), async {
-                record_frames(model, chunk, rng, frames)
-            })
-            .await;
-            (pcm?, Some(next?))
-        } else {
-            (device.read(&pending.out).await?, None)
-        };
-        chunk.in_flight = next;
-        let eos = pcm.split_off(pending.pcm_len);
-
-        // Keep frames up to the one where the end-of-speech rule runs out. `should_stop` is
-        // asked after each frame, so that frame itself is part of the output, and the next
-        // call reports the end of the chunk. Frames recorded past it are dropped.
-        let per_frame = pcm.len() / pending.frames;
-        let mut keep = pending.frames;
-        for (i, logit) in eos.iter().enumerate().take(pending.frames) {
-            if chunk.eos.should_stop(model.eos_from_logit(std::slice::from_ref(logit))) {
-                chunk.done = true;
-                chunk.in_flight = None;
-                keep = i + 1;
-                break;
-            }
+        if chunk.done || chunk.step >= chunk.frame_budget {
+            *current = None;
+            return Ok(None);
         }
-        pcm.truncate(keep * per_frame);
-        Ok(Some(pcm))
-    }
-
-    /// Prompts a short text and runs one throwaway step after it, so a GPU driver compiles
-    /// its pipelines during the load rather than inside the first real utterance, where they
-    /// would hold up its first audio. The step has the shape generation uses, so the
-    /// vocoder's kernels are built at that shape.
-    #[cfg(feature = "webgpu")]
-    async fn warm_up(&self) -> Result<()> {
-        let frames = self.frames_per_step;
-        let tokens = self.model.flow_lm.conditioner.tokenize(WARM_UP_TEXT)?;
-        let mut tts_state =
-            self.model.init_flow_lm_state(1, tokens.len() + frames + WARM_UP_SLACK)?;
-        self.model.prompt_text(&mut tts_state, &tokens)?;
-        let mut chunk = ChunkState {
-            tts_state,
-            mimi_state: self.model.init_mimi_state(1)?,
-            prev_latent: None,
-            frame_budget: frames,
-            eos: EosPolicy::new(0),
-            step: 0,
-            done: false,
-            in_flight: None,
+        let input = match &chunk.prev_latent {
+            None => StepInput::Bos { batch: 1 },
+            Some(t) => StepInput::Latent(t),
         };
-        let mut rng = NormalRng::new(0.3, 0)?;
-        let pending = record_frames(&self.model, &mut chunk, &mut rng, frames)?;
-        // Read something back, so this waits for the work rather than just queuing it.
-        self.device.read(&pending.out).await?;
-        Ok(())
+        let (latent, eos_logit) = model.generate_step_parts(&mut chunk.tts_state, input, rng)?;
+        let pcm = model.decode_latent(&latent, &mut chunk.mimi_state)?;
+        let pcm = pcm.narrow(0, ..1)?.contiguous()?;
+        let pcm = pcm.reshape(pcm.elem_count())?.to_vec()?;
+        chunk.prev_latent = Some(latent);
+        chunk.step += 1;
+        // `should_stop` is asked after each frame, so that frame itself is part of the
+        // output, and the next call reports the end of the chunk.
+        if chunk.eos.should_stop(model.eos_from_logit(&eos_logit.to_vec()?)) {
+            chunk.done = true;
+        }
+        Ok(Some(pcm))
     }
 }
 
@@ -432,15 +320,13 @@ fn voice_from_kv_cache<B: Backend>(
     Ok(StreamingTransformerState { layer_states })
 }
 
-/// The engine for whichever backend and weight format was loaded.
-// There is one per loaded model and it never moves, so boxing the larger variants would
-// only add an indirection.
+/// The engine for whichever weight format was loaded.
+// There is one per loaded model and it never moves, so boxing the larger variant would only
+// add an indirection.
 #[allow(clippy::large_enum_variant)]
 enum AnyEngine {
     CpuF32(Engine<Unquantized<f32, CpuDevice>>),
     CpuQ8(Engine<Q80F32>),
-    #[cfg(feature = "webgpu")]
-    WebGpuQ8(Engine<xn::webgpu_backend::quantization::Q8F32>),
 }
 
 /// Run a block against the loaded engine. Within the block, `$e` is the `Engine<Q>`.
@@ -449,8 +335,6 @@ macro_rules! with_engine {
         match $engine {
             AnyEngine::CpuF32($e) => $body,
             AnyEngine::CpuQ8($e) => $body,
-            #[cfg(feature = "webgpu")]
-            AnyEngine::WebGpuQ8($e) => $body,
         }
     };
 }
@@ -461,108 +345,48 @@ struct Loaded {
     cfg: TTSConfig,
     /// How `start_generation` normalizes, named by the page when it loaded the model.
     normalize: Normalize,
-    device: &'static str,
 }
 
 impl Loaded {
     #[allow(clippy::too_many_arguments)]
-    async fn load(
+    fn load(
         model_weights: Vec<u8>,
         tokenizer_json: &[u8],
-        config_json: Vec<u8>,
+        config_json: &[u8],
         quant: &str,
         lang: &str,
         rewrites: Option<&str>,
         conditions: &[String],
         device: &str,
     ) -> Result<Self> {
+        match device {
+            "cpu" => {}
+            "webgpu" => xn::bail!(
+                "this module runs on the CPU only: WebGPU runs in phonon-tts's own engine \
+                 (`PhononTTS.load({{ device: 'webgpu' }})`), which takes the weights itself"
+            ),
+            other => xn::bail!("unknown device '{other}', expected 'cpu'"),
+        }
         let quant = Quant::parse(quant)?;
-        let rules = match rewrites {
-            Some(rewrites) => rewrites.parse::<Rules>()?,
-            None => Rules::DEFAULT,
-        };
-        let normalize = lang.parse::<Normalize>()?.with_rules(rules);
-        let mut values = HashMap::new();
-        for condition in conditions {
-            let Some((name, value)) = condition.split_once('=') else {
-                xn::bail!("a condition is NAME=VALUE, got {condition:?}")
-            };
-            values.insert(name.to_string(), value.to_string());
-        }
-        let cfg: TTSConfig = serde_json::from_slice(&config_json)
-            .map_err(|e| xn::Error::msg(format!("cannot parse config.json: {e}")))?;
-        // Such a checkpoint speaks only its own voices, each with its own conditioning, and
-        // voices here come from files.
-        if !cfg.voices.is_empty() {
-            xn::bail!(
-                "this checkpoint has baked-in voices, which the browser build does not support"
-            )
-        }
+        let Settings { cfg, normalize, conditions } =
+            Settings::parse(config_json, lang, rewrites, conditions)?;
         let tokenizer: Box<dyn ptts::Tokenizer + Send + Sync> =
             Box::new(Tok::from_bytes(tokenizer_json)?);
         let is_gguf = model_weights.len() >= 4 && &model_weights[..4] == b"GGUF";
-        console_log!("[phonon] loading model with quant={quant:?} on {device}");
-
-        let (engine, device) = match device {
-            "cpu" => {
-                let vb = if is_gguf {
-                    VB::load_gguf_with_key_map(std::io::Cursor::new(model_weights), CPU, remap_key)?
-                } else {
-                    VB::from_bytes_with_key_map(vec![model_weights], CPU, remap_key)?
-                };
-                let root = vb.root();
-                let engine = match quant {
-                    Quant::F32 => AnyEngine::CpuF32(Engine::load(
-                        &root,
-                        tokenizer,
-                        &cfg,
-                        &values,
-                        CPU,
-                        CPU_FRAMES_PER_STEP,
-                    )?),
-                    Quant::Q8 => AnyEngine::CpuQ8(Engine::load(
-                        &root,
-                        tokenizer,
-                        &cfg,
-                        &values,
-                        CPU,
-                        CPU_FRAMES_PER_STEP,
-                    )?),
-                };
-                (engine, "cpu")
-            }
-            #[cfg(feature = "webgpu")]
-            "webgpu" => {
-                // q8 weights go to the GPU as they are. Quantizing dense weights would read
-                // every one back to the host, which a browser cannot do.
-                if quant != Quant::Q8 || !is_gguf {
-                    xn::bail!("WebGPU needs q8 weights in a GGUF file")
-                }
-                let dev = WebGpuDevice::new_async(0).await?;
-                let vb = VB::load_gguf_with_key_map(
-                    std::io::Cursor::new(model_weights),
-                    dev.clone(),
-                    remap_key,
-                )?;
-                let root = vb.root();
-                let engine = Engine::load(
-                    &root,
-                    tokenizer,
-                    &cfg,
-                    &values,
-                    dev.clone(),
-                    GPU_FRAMES_PER_STEP,
-                )?;
-                // The weight upload is recorded, not yet executed.
-                dev.flush_async().await?;
-                engine.warm_up().await?;
-                (AnyEngine::WebGpuQ8(engine), "webgpu")
-            }
-            #[cfg(not(feature = "webgpu"))]
-            "webgpu" => xn::bail!("this build has no WebGPU support"),
-            other => xn::bail!("unknown device '{other}', expected 'cpu' or 'webgpu'"),
+        console_log!("[phonon] loading model with quant={quant:?} on cpu");
+        let vb = if is_gguf {
+            VB::load_gguf_with_key_map(std::io::Cursor::new(model_weights), CPU, remap_key)?
+        } else {
+            VB::from_bytes_with_key_map(vec![model_weights], CPU, remap_key)?
         };
-        Ok(Self { engine, cfg, normalize, device })
+        let root = vb.root();
+        let engine = match quant {
+            Quant::F32 => {
+                AnyEngine::CpuF32(Engine::load(&root, tokenizer, &cfg, &conditions, CPU)?)
+            }
+            Quant::Q8 => AnyEngine::CpuQ8(Engine::load(&root, tokenizer, &cfg, &conditions, CPU)?),
+        };
+        Ok(Self { engine, cfg, normalize })
     }
 }
 
@@ -574,11 +398,11 @@ fn js_err(e: xn::Error) -> JsError {
     JsError::new(&e.to_string())
 }
 
-/// A loaded model, on the CPU or on WebGPU.
+/// A loaded model, on the CPU.
 ///
-/// The state sits behind an `Rc<RefCell<Option<_>>>` because `generation_step` is async and a
-/// `RefCell` borrow may not be held across an await: the step takes the state out for its
-/// duration and puts it back after. A call that arrives meanwhile finds it missing and is
+/// The state sits behind an `Rc<RefCell<Option<_>>>` because `generation_step` returns a
+/// promise and a `RefCell` borrow may not be held across one: the step takes the state out for
+/// its duration and puts it back after. A call that arrives meanwhile finds it missing and is
 /// refused, so calls must not overlap; `phonon-tts`'s worker awaits each one. The exception
 /// is `stop_generation`, which the step applies when it puts the state back.
 #[wasm_bindgen]
@@ -638,8 +462,8 @@ impl Model {
     /// `conditions` is optional and sets the config's conditioners, each as `"NAME=VALUE"`,
     /// e.g. `["duration_delta=0.5"]`. Those left out take their defaults.
     ///
-    /// `device` is `"cpu"` or `"webgpu"`. WebGPU needs `q8` weights in a GGUF file, and a
-    /// build with the `webgpu` feature.
+    /// `device` must be `"cpu"`. WebGPU is not in this module: `phonon-tts` runs its own
+    /// engine for it, with a [`Preparer`] for the text and the voices.
     #[allow(clippy::too_many_arguments)]
     pub async fn load(
         model_weights: Vec<u8>,
@@ -654,14 +478,13 @@ impl Model {
         let loaded = Loaded::load(
             model_weights,
             &tokenizer_json,
-            config_json,
+            &config_json,
             &quant,
             &lang,
             rewrites.as_deref(),
             &conditions.unwrap_or_default(),
             &device,
         )
-        .await
         .map_err(js_err)?;
         Ok(Model { loaded: Rc::new(RefCell::new(Some(loaded))), stop_requested: Rc::default() })
     }
@@ -707,9 +530,9 @@ impl Model {
         .map_err(js_err)
     }
 
-    /// Generates and decodes the next frames of the current chunk: a promise of mono PCM at
-    /// `sample_rate`, a whole number of `frame_size`-sample frames, or of `undefined` when the
-    /// chunk is finished. One frame per call on the CPU, several on WebGPU.
+    /// Generates and decodes the next frame of the current chunk: a promise of mono PCM at
+    /// `sample_rate`, one `frame_size`-sample frame, or of `undefined` when the chunk is
+    /// finished.
     pub fn generation_step(&self) -> js_sys::Promise {
         let cell = Rc::clone(&self.loaded);
         let stop_requested = Rc::clone(&self.stop_requested);
@@ -719,7 +542,7 @@ impl Model {
                     JsError::new("the model is busy: a generation step is still running").into()
                 );
             };
-            let result = with_engine!(&mut loaded.engine, |e| e.step().await);
+            let result = with_engine!(&mut loaded.engine, |e| e.step());
             Self::drop_generation_on_error(&mut loaded, &result);
             if stop_requested.take() {
                 with_engine!(&mut loaded.engine, |e| e.gen_state = None);
@@ -733,31 +556,14 @@ impl Model {
         })
     }
 
-    /// Waits for the work the device has queued. On WebGPU, `add_voice` only records a voice's
-    /// prompt, and the GPU runs it here rather than inside the first step that speaks. The CPU
-    /// has nothing queued. Resolves at once while a `generation_step` holds the model, which
-    /// waits for the GPU itself.
+    /// Kept for callers written when this module also ran on WebGPU, where a voice's prompt
+    /// was only recorded until flushed. The CPU has nothing queued: resolves at once.
     pub fn flush(&self) -> js_sys::Promise {
-        let cell = Rc::clone(&self.loaded);
-        wasm_bindgen_futures::future_to_promise(async move {
-            #[cfg(feature = "webgpu")]
-            {
-                let device = cell.borrow().as_ref().and_then(|l| match &l.engine {
-                    AnyEngine::WebGpuQ8(e) => Some(e.device.clone()),
-                    _ => None,
-                });
-                if let Some(device) = device {
-                    device.flush_async().await.map_err(js_err)?;
-                }
-            }
-            #[cfg(not(feature = "webgpu"))]
-            let _ = cell;
-            Ok(JsValue::UNDEFINED)
-        })
+        js_sys::Promise::resolve(&JsValue::UNDEFINED)
     }
 
     /// Drops the generation in progress, if any. Called while a `generation_step` is pending,
-    /// it takes effect when that step returns: the step still delivers its frames, and the
+    /// it takes effect when that step returns: the step still delivers its frame, and the
     /// next one reports the end.
     pub fn stop_generation(&self) {
         match self.loaded.borrow_mut().as_mut() {
@@ -785,9 +591,164 @@ impl Model {
         self.with(|l| Ok(l.cfg.languages.clone())).map_err(js_err)
     }
 
-    /// `"cpu"` or `"webgpu"`: where this model runs.
+    /// `"cpu"`: where this model runs.
     pub fn device(&self) -> std::result::Result<String, JsError> {
-        self.with(|l| Ok(l.device.to_string())).map_err(js_err)
+        Ok("cpu".to_string())
+    }
+}
+
+/// The parts of a checkpoint the WebGPU engine needs from Rust, without the model itself: the
+/// tokenizer and the text normalization ([`plan::chunks`], as every other frontend splits
+/// text), the voice files, and the sum of the config's conditioners.
+///
+/// Its tensors are the few the conditioners and the speaker projection need, which the caller
+/// takes out of the checkpoint (`flow_lm.condition_provider.conditioners.*` in the GGUF, under
+/// their GGUF names, as a safetensors file). The transformer and Mimi weights never come here.
+#[wasm_bindgen]
+pub struct Preparer {
+    tok: Tok,
+    cfg: TTSConfig,
+    normalize: Normalize,
+    conditions: Vec<f32>,
+    speaker_proj: Option<Linear<f32, CpuDevice>>,
+}
+
+#[wasm_bindgen]
+impl Preparer {
+    /// `tokenizer_json`, `config_json`, `lang`, `rewrites` and `conditions` as for
+    /// [`Model::load`]; `tensors` a safetensors file with the conditioner tensors.
+    #[wasm_bindgen(constructor)]
+    pub fn new(
+        tokenizer_json: &[u8],
+        config_json: &[u8],
+        tensors: Vec<u8>,
+        lang: &str,
+        rewrites: Option<String>,
+        conditions: Option<Vec<String>>,
+    ) -> std::result::Result<Preparer, JsError> {
+        Self::build(tokenizer_json, config_json, tensors, lang, rewrites, conditions)
+            .map_err(js_err)
+    }
+
+    /// The vector every frame's input adds: the conditioners at their values, `d_model` long
+    /// (zeros for a checkpoint without conditioners).
+    pub fn conditions(&self) -> Vec<f32> {
+        self.conditions.clone()
+    }
+
+    /// `text` as the model is prompted with it: an array of chunks, each
+    /// `{ tokens: Uint32Array, framesAfterEos, frameBudget }`.
+    pub fn plan(&self, text: &str) -> std::result::Result<js_sys::Array, JsError> {
+        let chunks = plan_chunks(&self.tok, text, self.normalize, &self.cfg).map_err(js_err)?;
+        // The text table's rows, as `LUTConditioner::embed_tokens` checks them: an id past it is
+        // a tokenizer from another checkpoint.
+        let rows = self.cfg.flow_lm.n_bins + 1;
+        let out = js_sys::Array::new();
+        for c in chunks {
+            if let Some(&id) = c.tokens.iter().find(|&&id| id as usize >= rows) {
+                return Err(JsError::new(&format!(
+                    "token id {id} is past this checkpoint's {rows}-entry embedding table: the \
+                     tokenizer.json does not belong to this checkpoint"
+                )));
+            }
+            let o = js_sys::Object::new();
+            let set = |k: &str, v: JsValue| js_sys::Reflect::set(&o, &k.into(), &v).map(|_| ());
+            set("tokens", js_sys::Uint32Array::from(c.tokens.as_slice()).into())
+                .and_then(|_| set("framesAfterEos", (c.frames_after_eos as f64).into()))
+                .and_then(|_| set("frameBudget", (c.frame_budget as f64).into()))
+                .map_err(|_| JsError::new("cannot build a chunk"))?;
+            out.push(&o);
+        }
+        Ok(out)
+    }
+
+    /// A voice file's prompt: `{ kind: 'rows', frames, rows }`, the rows the flow LM is
+    /// prompted with (`[frames, d_model]`, for an `emb` voice or `speaker_wavs` latents through
+    /// the speaker projection), or `{ kind: 'kv', frames, k, v }` for a voice stored as the KV
+    /// cache (`embeddings_v2/`): one `[frames, heads * head_dim]` array per layer in `k` and `v`.
+    pub fn voice(&self, bytes: &[u8]) -> std::result::Result<js_sys::Object, JsError> {
+        self.voice_inner(bytes).map_err(js_err)
+    }
+
+    /// The languages the model was trained for, as listed in its config.
+    pub fn languages(&self) -> Vec<String> {
+        self.cfg.languages.clone()
+    }
+
+    pub fn sample_rate(&self) -> usize {
+        self.cfg.mimi.sample_rate
+    }
+
+    /// Samples in one 80 ms frame.
+    pub fn frame_size(&self) -> usize {
+        (self.cfg.mimi.sample_rate as f64 / self.cfg.mimi.frame_rate).round() as usize
+    }
+}
+
+impl Preparer {
+    fn build(
+        tokenizer_json: &[u8],
+        config_json: &[u8],
+        tensors: Vec<u8>,
+        lang: &str,
+        rewrites: Option<String>,
+        conditions: Option<Vec<String>>,
+    ) -> Result<Self> {
+        let Settings { cfg, normalize, conditions } = Settings::parse(
+            config_json,
+            lang,
+            rewrites.as_deref(),
+            &conditions.unwrap_or_default(),
+        )?;
+        let tok = Tok::from_bytes(tokenizer_json)?;
+        let vb = VB::from_bytes_with_key_map(vec![tensors], CPU, remap_key)?;
+        let root = vb.root();
+        let summed: Option<Tensor<f32, CpuDevice>> = load_conditions(&root, &cfg, &conditions)?;
+        let conditions = match summed {
+            Some(t) => t.flatten_all()?.to_vec()?,
+            None => vec![0.0; cfg.flow_lm.d_model],
+        };
+        let speaker_proj = load_speaker_proj(&root, &cfg)?;
+        Ok(Self { tok, cfg, normalize, conditions, speaker_proj })
+    }
+
+    fn voice_inner(&self, bytes: &[u8]) -> Result<js_sys::Object> {
+        let o = js_sys::Object::new();
+        let set = |k: &str, v: JsValue| {
+            js_sys::Reflect::set(&o, &k.into(), &v)
+                .map(|_| ())
+                .map_err(|_| xn::Error::msg("cannot build the voice"))
+        };
+        let tensors = xn::safetensors::load_from_buffer(bytes, &CPU)?;
+        if tensors.contains_key(&kv_cache_name(0)) {
+            let state = voice_from_kv_cache(&tensors, &self.cfg)?;
+            let (k, v) = (js_sys::Array::new(), js_sys::Array::new());
+            for layer in &state.layer_states {
+                let LayerAttentionState::FlowLm(m) = layer else {
+                    xn::bail!("unexpected attention state")
+                };
+                k.push(&js_sys::Float32Array::from(m.k_cache.flatten_all()?.to_vec()?.as_slice()));
+                v.push(&js_sys::Float32Array::from(m.v_cache.flatten_all()?.to_vec()?.as_slice()));
+            }
+            set("kind", "kv".into())?;
+            set("frames", (raw_len(&state) as f64).into())?;
+            set("k", k.into())?;
+            set("v", v.into())?;
+        } else {
+            let emb = load_voice_emb_from_bytes(
+                bytes,
+                self.cfg.embeddings_ext.as_deref(),
+                self.speaker_proj.as_ref(),
+                &CPU,
+            )?;
+            set("kind", "rows".into())?;
+            set("frames", (emb.dim(1usize)? as f64).into())?;
+            set(
+                "rows",
+                js_sys::Float32Array::from(emb.flatten_all()?.to_vec()?.as_slice()).into(),
+            )?;
+        }
+        Ok(o)
     }
 }
 
