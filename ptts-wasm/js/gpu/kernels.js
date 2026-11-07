@@ -411,23 +411,23 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 export function gemm({ K, N, wmode = 'f16', phases = 1, eluA = false, bias = false, act: a = 'none', res = 'none', rowsFromState = false, gate = false }) {
   if (K % 32) throw new Error(`gemm K=${K}`);
   const loadA = eluA ? 'let v0 = select(exp(v) - vec4<f32>(1.0), v, v > vec4<f32>(0.0));' : 'let v0 = v;';
+  // Each tile thread writes whole vec4s, four rows (or columns) at one k: on Metal, threads
+  // writing different components of one workgroup vec4 overwrite each other's.
   const loadW = wmode === 'q8'
-    ? `if (li < 128u) {
-      let nrow = li / 2u; let part = li % 2u;
-      let n = tn + nrow;
-      var q = vec4<u32>(0u); var sc = 0.0;
-      if (n < ${N}u) { q = wq[p.wo + n * ${K / 16}u + k0 / 16u + part]; sc = wh(p.so * 2u + n * ${K / 32}u + k0 / 32u); }
-      let f = array<vec4<f32>, 4>(i8x4(q.x) * sc, i8x4(q.y) * sc, i8x4(q.z) * sc, i8x4(q.w) * sc);
-      for (var c = 0u; c < 16u; c++) { Ws[(part * 16u + c) * 16u + nrow / 4u][nrow % 4u] = f[c / 4u][c % 4u]; }
-    }`
-    : `{
-      let nrow = li / 4u; let part = li % 4u;
-      let n = tn + nrow;
-      var q = vec4<u32>(0u);
-      if (n < ${N}u) { q = wq[p.wo + p.wph * ph + n * ${K / 8}u + k0 / 8u + part]; }
-      let h = h8(q);
-      for (var c = 0u; c < 8u; c++) { Ws[(part * 8u + c) * 16u + nrow / 4u][nrow % 4u] = h[c / 4u][c % 4u]; }
-    }`;
+    ? `for (var i = 0u; i < 4u; i++) {
+        let n = tn + g * 4u + i;
+        if (n < ${N}u) {
+          let q = wq[p.wo + n * ${K / 16}u + k0 / 16u + kq / 4u][kq % 4u];
+          ld[i] = i8x4(q) * wh(p.so * 2u + n * ${K / 32}u + k0 / 32u);
+        }
+      }`
+    : `for (var i = 0u; i < 4u; i++) {
+        let n = tn + g * 4u + i;
+        if (n < ${N}u) {
+          let q = wq[p.wo + p.wph * ph + n * ${K / 8}u + k0 / 8u + kq / 2u];
+          ld[i] = select(vec4<f32>(unpack2x16float(q.x), unpack2x16float(q.y)), vec4<f32>(unpack2x16float(q.z), unpack2x16float(q.w)), (kq & 1u) == 1u);
+        }
+      }`;
   const resid = { none: '', add: `v += r[p.rb + orow * ${N}u + n];`, addy: 'v += y[o];', ls: 'v = y[o] + wf(p.lso + n) * v;' }[res];
   return `${STRUCT_P}
 @group(0) @binding(0) var<storage, read> a: array<vec4<f32>>;
@@ -449,16 +449,24 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
   let li = lid.y * 16u + lid.x;
   var acc: array<vec4<f32>, 4>;
   for (var k0 = 0u; k0 < ${K}u; k0 += 32u) {
-    for (var e = 0u; e < 2u; e++) {
-      let idx = li + e * 256u;
-      let row = idx / 8u; let kq = idx % 8u;
-      let m = tm + row;
-      var v = vec4<f32>(0.0);
-      if (m < M) { v = a[(p.ab + m * p.arow + k0) / 4u + kq]; }
-      ${loadA}
-      for (var c = 0u; c < 4u; c++) { As[(kq * 4u + c) * 16u + row / 4u][row % 4u] = v0[c]; }
+    // Threads 0-127 load A, 128-255 W: group g of 4 rows (columns), k from 4 * kq.
+    let g = (li % 128u) / 8u; let kq = li % 8u;
+    var ld: array<vec4<f32>, 4>;
+    if (li < 128u) {
+      for (var i = 0u; i < 4u; i++) {
+        let m = tm + g * 4u + i;
+        var v = vec4<f32>(0.0);
+        if (m < M) { v = a[(p.ab + m * p.arow + k0) / 4u + kq]; }
+        ${loadA}
+        ld[i] = v0;
+      }
+    } else {
+      ${loadW}
     }
-    ${loadW}
+    for (var c = 0u; c < 4u; c++) {
+      let t = vec4<f32>(ld[0][c], ld[1][c], ld[2][c], ld[3][c]);
+      if (li < 128u) { As[(kq * 4u + c) * 16u + g] = t; } else { Ws[(kq * 4u + c) * 16u + g] = t; }
+    }
     workgroupBarrier();
     for (var kk = 0u; kk < 32u; kk++) {
       let av = As[kk * 16u + lid.y];
