@@ -230,20 +230,12 @@ jobs:
         env:
           RUSTFLAGS: -C target-feature=+simd128,+relaxed-simd
         run: cargo check -p ptts-wasm --target wasm32-unknown-unknown --all-targets
-      # The same with the `webgpu` feature. It did not compile for this target before `xn 0.2.6`,
-      # whose webgpu backend no longer asks wasm32 storage to be `Send + Sync`; `wgpu`'s browser
-      # backend holds a `RefCell` and is `!Sync` there. The feature builds fine for the host,
-      # which is why nothing noticed until this job checked the real target.
-      - name: Check the browser build with WebGPU
-        env:
-          RUSTFLAGS: -C target-feature=+simd128,+relaxed-simd
-        run: cargo check -p ptts-wasm --target wasm32-unknown-unknown --all-targets --features webgpu
       # The same without Relaxed SIMD, which Safari lacks, and so every browser on iOS: the
       # package ships these modules too, and xn's kernels must keep building without it.
       - name: Check the browser build without Relaxed SIMD
         env:
           RUSTFLAGS: -C target-feature=+simd128
-        run: cargo check -p ptts-wasm --target wasm32-unknown-unknown --all-targets --features webgpu
+        run: cargo check -p ptts-wasm --target wasm32-unknown-unknown --all-targets
       # The JS wrapper that `phonon-tts` ships around this build. Its tests need neither a
       # browser nor a model; building the package itself is `npm-publish.yml`'s job.
       #
@@ -452,8 +444,9 @@ jobs:
           retention-days: 14
 
   # The npm package `wasm` built, in headless Chrome: the threaded build on a cross-origin
-  # isolated page, the single-threaded one without isolation, and WebGPU on SwiftShader, the
-  # software adapter Chrome ships.
+  # isolated page, the single-threaded one without isolation, and the package's WebGPU engine
+  # (`js/gpu/`) on SwiftShader, the software adapter Chrome ships. SwiftShader's subgroups are 4
+  # wide, so that leg runs the engine's shared-memory kernels rather than its subgroup ones.
   speech-browser:
     name: Speech in the browser
     needs: [changes, wasm]

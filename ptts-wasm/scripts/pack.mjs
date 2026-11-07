@@ -6,7 +6,7 @@
 //
 // Usage: node scripts/pack.mjs [out]
 
-import { copyFileSync, existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -43,12 +43,15 @@ const fromJs = manifest.files.filter(
     !f.startsWith('wasm/') &&
     !f.startsWith('wasm-threads/') &&
     !f.startsWith('LICENSE') &&
+    f !== 'NOTICE' &&
     f !== 'THIRD_PARTY_LICENSES.md',
 );
 for (const file of [...fromJs, 'README.md']) {
+  mkdirSync(dirname(join(out, file)), { recursive: true });
   copyFileSync(join(js, file), join(out, file));
 }
-for (const file of ['LICENSE-MIT', 'LICENSE-APACHE']) {
+// NOTICE carries the Apache-2.0 attribution for code adapted into gpu/kernels.js.
+for (const file of ['LICENSE-MIT', 'LICENSE-APACHE', 'NOTICE']) {
   copyFileSync(join(repoDir, file), join(out, file));
 }
 

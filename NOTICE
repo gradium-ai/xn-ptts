@@ -1,0 +1,11 @@
+Third-party code in this repository
+
+ptts-wasm/js/gpu/kernels.js (shipped in the phonon-tts npm package as gpu/kernels.js) contains
+code adapted from blixt/phonon (https://github.com/blixt/phonon), which carries this notice:
+
+  Phonon on WebGPU
+  Copyright 2026 Blixt
+
+That code is licensed under the Apache License, Version 2.0 (LICENSE-APACHE), and that file is
+available under the Apache License 2.0 only. The design of the WebGPU engine in
+ptts-wasm/js/gpu/ follows blixt/phonon.

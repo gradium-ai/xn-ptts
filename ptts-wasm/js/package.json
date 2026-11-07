@@ -30,6 +30,14 @@
     "threads.js",
     "device.js",
     "simd.js",
+    "gpu/engine.js",
+    "gpu/lm.js",
+    "gpu/codec.js",
+    "gpu/kernels.js",
+    "gpu/dispatch.js",
+    "gpu/weights.js",
+    "gpu/gguf.js",
+    "gpu/support.js",
     "wasm/phonon_tts.js",
     "wasm/phonon_tts.d.ts",
     "wasm/phonon_tts_bg.wasm",
@@ -38,6 +46,7 @@
     "wasm-threads/",
     "LICENSE-MIT",
     "LICENSE-APACHE",
+    "NOTICE",
     "THIRD_PARTY_LICENSES.md"
   ],
   "sideEffects": [

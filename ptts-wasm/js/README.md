@@ -85,7 +85,7 @@ Cancellation discards unread stream chunks. Stop any audio already scheduled in 
 - `tts.threads`: the CPU threads generation runs on, and `tts.threadsReason` why that many.
 - `tts.dispose()` stops the worker and frees the model's memory.
 
-`temperature` defaults to `0.3` and `seed` to `4242424242424242`, the same defaults as the Rust and Python packages. The same text, voice, temperature and seed always give the same audio. A seed above `Number.MAX_SAFE_INTEGER` has to be a `bigint`.
+`temperature` defaults to `0.3` and `seed` to `4242424242424242`, the same defaults as the Rust and Python packages. The same text, voice, temperature and seed always give the same audio on the same device. On WebGPU it differs from the CPU's, which matches the Rust and Python packages (see below). A seed above `Number.MAX_SAFE_INTEGER` has to be a `bigint`.
 
 Requests on one instance run one at a time, in the order they were made.
 
@@ -139,7 +139,7 @@ How close to real time it gets depends on the device, on [WebGPU](#webgpu) and o
 
 The model runs on the CPU unless asked otherwise. WebGPU is opt in, because it is not faster than the CPU on every device: on phones the threaded CPU build can beat it. Pass `device: 'webgpu'` to run on the GPU, and `load` rejects if it cannot start. Pass `device: 'auto'` to use the GPU when the browser hands out a WebGPU adapter and the weights are `q8` in a GGUF file, and the CPU otherwise. Under `'auto'` a software fallback adapter counts as none, since it would run slower than the CPU. `q8` weights go to the GPU as they are; other weights would have to be quantized there, which means reading each one back to the host, and a browser cannot wait for that. WebGPU needs no cross-origin isolation, and it works in the same secure contexts as the cache.
 
-On the GPU the model generates several frames per round trip to the GPU and hands them over together, so its chunks of audio are longer than the CPU's 80 ms. If WebGPU fails to start, `'auto'` falls back to the CPU and `tts.deviceReason` says why. That CPU run stays on one thread: it uses the build WebGPU was loaded in, rather than copying the weights into a second one. The GPU computes in a different order from the CPU, so its audio is not bit-identical to the CPU's.
+On the GPU the whole model runs on the device, the flow LM and the audio decoder both, and only the audio comes back. The first piece of audio is one 80 ms frame, then 2, 4 and 8 frames at a time, so later chunks are longer than the CPU's 80 ms. It runs the published Phonon checkpoints (`gradium/phonon-31m-en` and the `gradium/phonon-40m-*` models). A checkpoint with a config it does not run (more than one flow-matching step, another flow head, grouped-query attention, the tanh GELU, other model widths or another audio decoder) goes to the CPU under `'auto'`, with a console warning, and fails to load under `'webgpu'`, naming what the GPU engine lacks. If WebGPU fails to start, `'auto'` falls back to the CPU too, and `tts.deviceReason` says why in each case. It needs no optional WebGPU feature: it uses subgroups where the adapter has them 32 wide, and workgroup memory elsewhere. The GPU samples its own noise, so its audio is not bit-identical to the CPU's for the same seed, but a seed still fixes it on the GPU.
 
 ## Threads
 
