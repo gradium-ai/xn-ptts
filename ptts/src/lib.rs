@@ -94,6 +94,7 @@ mod mlp;
 mod packed_f32;
 pub mod plan;
 pub mod preprocess;
+mod q8;
 mod resample;
 mod rope;
 mod seanet;
@@ -104,6 +105,7 @@ mod seanet;
 // Deliberately `//` and not `///`: an outer doc comment here is concatenated ahead of
 // `synth.rs`'s own `//!` header, whose intra-doc links then resolve in this scope and all
 // come out unresolved.
+pub mod s2s;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod synth;
 #[cfg(feature = "hf")]
