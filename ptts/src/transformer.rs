@@ -293,6 +293,8 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformerState<T, B> {
 pub struct MimiStreamingMultiheadAttention<T: WithDTypeF, B: Backend> {
     in_proj: Linear<T, B>,
     out_proj: Linear<T, B>,
+    packed_in: Option<Box<crate::packed_f32::PackedF32>>,
+    packed_out: Option<Box<crate::packed_f32::PackedF32>>,
     /// q8_0 versions of `in_proj` and `out_proj`, used instead when set.
     q8: Option<(Q8Linear, Q8Linear)>,
     embed_dim: usize,
@@ -305,7 +307,26 @@ impl<T: WithDTypeF, B: Backend> MimiStreamingMultiheadAttention<T, B> {
         let out_dim = 3 * embed_dim;
         let in_proj = Linear::load(vb.pp("in_proj"), embed_dim, out_dim)?;
         let out_proj = Linear::load(vb.pp("out_proj"), embed_dim, embed_dim)?;
-        Ok(Self { in_proj, out_proj, q8: None, embed_dim, num_heads, context })
+        let packed_in = crate::packed_f32::PackedF32::load::<xn::Unquantized<T, B>>(
+            &vb.pp("in_proj"),
+            out_dim,
+            embed_dim,
+        )?;
+        let packed_out = crate::packed_f32::PackedF32::load::<xn::Unquantized<T, B>>(
+            &vb.pp("out_proj"),
+            embed_dim,
+            embed_dim,
+        )?;
+        Ok(Self {
+            in_proj,
+            out_proj,
+            packed_in,
+            packed_out,
+            q8: None,
+            embed_dim,
+            num_heads,
+            context,
+        })
     }
 
     pub fn init_state(&self) -> Result<KvCache<T, B>> {
@@ -322,9 +343,12 @@ impl<T: WithDTypeF, B: Backend> MimiStreamingMultiheadAttention<T, B> {
         let (b, t, _) = query.dims3()?;
         let d = self.embed_dim / self.num_heads;
 
-        let projected = match &self.q8 {
-            Some((in_proj, _)) => in_proj.forward(query)?,
-            None => self.in_proj.forward(query)?,
+        let projected = if let Some((in_proj, _)) = &self.q8 {
+            in_proj.forward(query)?
+        } else if let Some(p) = &self.packed_in {
+            p.forward(query)?
+        } else {
+            self.in_proj.forward(query)?
         };
         let packed = projected.reshape((b, t, 3, self.num_heads, d))?;
         let q = packed.narrow(2, 0..1)?.contiguous()?.reshape((b, t, self.num_heads, d))?;
@@ -355,9 +379,12 @@ impl<T: WithDTypeF, B: Backend> MimiStreamingMultiheadAttention<T, B> {
         state.trim()?;
 
         let x = x.transpose(1, 2)?.reshape((b, t, self.embed_dim))?;
-        match &self.q8 {
-            Some((_, out_proj)) => out_proj.forward(&x.contiguous()?),
-            None => self.out_proj.forward(&x),
+        if let Some((_, out_proj)) = &self.q8 {
+            out_proj.forward(&x.contiguous()?)
+        } else if let Some(p) = &self.packed_out {
+            p.forward(&x.contiguous()?)
+        } else {
+            self.out_proj.forward(&x)
         }
     }
 }
@@ -404,6 +431,8 @@ pub struct StreamingTransformerLayer<Q: BackendQ> {
     norm2: LayerNorm<Q::T, Q::B>,
     linear1: Q::LinearQ,
     linear2: Q::LinearQ,
+    packed_linear1: Option<Box<crate::packed_f32::PackedF32>>,
+    packed_linear2: Option<Box<crate::packed_f32::PackedF32>>,
     /// q8_0 versions of `linear1` and `linear2`, used instead when set.
     q8: Option<(Q8Linear, Q8Linear)>,
     layer_scale_1: Option<LayerScale<Q::T, Q::B>>,
@@ -443,6 +472,22 @@ impl<Q: BackendQ> StreamingTransformerLayer<Q> {
         let norm2 = LayerNorm::load(vb.pp("norm2"), d_model, 1e-5)?;
         let linear1 = Q::linear_load(vb.pp("linear1"), d_model, dim_feedforward)?;
         let linear2 = Q::linear_load(vb.pp("linear2"), dim_feedforward, d_model)?;
+        let (packed_linear1, packed_linear2) = if matches!(kind, Kind::Mimi) {
+            (
+                crate::packed_f32::PackedF32::load::<Q>(
+                    &vb.pp("linear1"),
+                    dim_feedforward,
+                    d_model,
+                )?,
+                crate::packed_f32::PackedF32::load::<Q>(
+                    &vb.pp("linear2"),
+                    d_model,
+                    dim_feedforward,
+                )?,
+            )
+        } else {
+            (None, None)
+        };
 
         let layer_scale_1 = if layer_scale.is_some() {
             Some(LayerScale::load(&vb.pp("layer_scale_1"), d_model)?)
@@ -461,6 +506,8 @@ impl<Q: BackendQ> StreamingTransformerLayer<Q> {
             norm2,
             linear1,
             linear2,
+            packed_linear1,
+            packed_linear2,
             q8: None,
             layer_scale_1,
             layer_scale_2,
@@ -514,9 +561,13 @@ impl<Q: BackendQ> StreamingTransformerLayer<Q> {
             Gelu::Tanh => gelu_tanh(&x),
             Gelu::Erf => x.gelu_erf(),
         };
-        let mut ff_out = match &self.q8 {
-            Some((linear1, linear2)) => linear2.forward(&gelu(linear1.forward(&norm2)?)?)?,
-            None => self.linear2.forward(&gelu(self.linear1.forward(&norm2)?)?)?,
+        let mut ff_out = if let Some((linear1, linear2)) = &self.q8 {
+            linear2.forward(&gelu(linear1.forward(&norm2)?)?)?
+        } else if let (Some(linear1), Some(linear2)) = (&self.packed_linear1, &self.packed_linear2)
+        {
+            linear2.forward(&gelu(linear1.forward(&norm2)?)?)?
+        } else {
+            self.linear2.forward(&gelu(self.linear1.forward(&norm2)?)?)?
         };
         if let Some(ls) = &self.layer_scale_2 {
             ff_out = ls.forward(&ff_out)?;

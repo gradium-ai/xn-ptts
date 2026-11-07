@@ -17,6 +17,7 @@ pub fn pad_for_conv1d<T: WithDTypeF, B: Backend>(
 
 /// Conv1d wrapper with weight and optional bias.
 pub struct Conv1d<T: WithDTypeF, B: Backend> {
+    packed: Option<Box<crate::packed_f32::PackedF32>>,
     weight: Tensor<T, B>,
     /// The weight as `[out, in * kernel]` in q8_0, used instead when set.
     pub(crate) q8: Option<Q8Linear>,
@@ -42,7 +43,31 @@ impl<T: WithDTypeF, B: Backend> Conv1d<T, B> {
     ) -> Result<Self> {
         let weight = vb.tensor("weight", (out_channels, in_channels / groups, kernel_size))?;
         let bias = if bias { Some(vb.tensor("bias", (out_channels,))?) } else { None };
-        Ok(Self { weight, q8: None, bias, stride, dilation, kernel_size, in_channels, groups })
+        // Opt in only to the measured initial waveform convolution. Broad packing
+        // loses time to lowering/layout conversion in later decoder stages.
+        let selected = std::env::var("PTTS_EXPERIMENT_PACKED_CONV").as_deref()
+            == Ok("initial-small")
+            && vb.prefix().ends_with("decoder.model.0.conv");
+        let packed = if selected && groups == 1 && out_channels >= 32 {
+            crate::packed_f32::PackedF32::from_weight(
+                &weight,
+                out_channels,
+                in_channels * kernel_size,
+            )?
+        } else {
+            None
+        };
+        Ok(Self {
+            packed,
+            weight,
+            q8: None,
+            bias,
+            stride,
+            dilation,
+            kernel_size,
+            in_channels,
+            groups,
+        })
     }
 
     /// The q8_0 weight that runs this convolution as a matmul over its input windows, for
@@ -60,6 +85,29 @@ impl<T: WithDTypeF, B: Backend> Conv1d<T, B> {
     }
 
     pub fn forward(&self, x: &Tensor<T, B>) -> Result<Tensor<T, B>> {
+        if self.q8.is_none() {
+            if let Some(packed) = &self.packed {
+                let extent = self
+                    .kernel_size
+                    .checked_sub(1)
+                    .and_then(|n| n.checked_mul(self.dilation))
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or_else(|| xn::Error::msg("invalid packed convolution extent"))?;
+                let steps = x
+                    .dim(2usize)?
+                    .checked_sub(extent)
+                    .and_then(|n| n.checked_div(self.stride))
+                    .map(|n| n + 1);
+                // Larger queued batches retain the original convolution path.
+                if steps.is_some_and(|n| n <= 16) {
+                    let output = packed.conv1d(x, self.kernel_size, self.stride, self.dilation)?;
+                    return match &self.bias {
+                        Some(b) => output.broadcast_add(&b.reshape((1, (), 1))?),
+                        None => Ok(output),
+                    };
+                }
+            }
+        }
         if let Some(q8) = &self.q8 {
             let (b, c, l) = x.dims3()?;
             let (k, dil) = (self.kernel_size, self.dilation);
@@ -318,6 +366,57 @@ impl<T: WithDTypeF, B: Backend> StreamingConvTranspose1d<T, B> {
 }
 
 #[cfg(test)]
+mod packed_tests {
+    use super::*;
+    use xn::CpuDevice;
+
+    #[test]
+    fn packed_and_fallback_chunks_preserve_streaming_state_and_bias() -> Result<()> {
+        let weight = Tensor::from_vec(
+            (0..35 * 3 * 7).map(|i| (i as f32 * 0.13).sin() * 0.1).collect(),
+            (35, 3, 7),
+            &CpuDevice,
+        )?;
+        let Some(packed) = crate::packed_f32::PackedF32::from_weight(&weight, 35, 21)? else {
+            return Ok(());
+        };
+        let bias = Tensor::from_vec((0..35).map(|i| i as f32 * 0.01).collect(), (35,), &CpuDevice)?;
+        let conv = |packed| Conv1d {
+            packed,
+            weight: weight.clone(),
+            q8: None,
+            bias: Some(bias.clone()),
+            stride: 1,
+            dilation: 1,
+            kernel_size: 7,
+            in_channels: 3,
+            groups: 1,
+        };
+        let baseline = StreamingConv1d { conv: conv(None), pad_mode: PadMode::Replicate };
+        let candidate = StreamingConv1d { conv: conv(Some(packed)), pad_mode: PadMode::Replicate };
+        let mut reference_state = baseline.init_state(2)?;
+        let mut candidate_state = candidate.init_state(2)?;
+        // Cross the dispatch boundary in both directions, including exactly 16.
+        for length in [1, 2, 16, 17, 32, 8] {
+            let input = Tensor::from_vec(
+                (0..2 * 3 * length).map(|i| (i as f32 * 0.07).cos()).collect(),
+                (2, 3, length),
+                &CpuDevice,
+            )?;
+            let expected = baseline.forward(&input, &mut reference_state)?;
+            let actual = candidate.forward(&input, &mut candidate_state)?;
+            assert_eq!(expected.dims(), actual.dims());
+            for (a, b) in expected.to_vec()?.into_iter().zip(actual.to_vec()?) {
+                assert!(b.is_finite() && (a - b).abs() < 1e-5, "{a} != {b}");
+            }
+            assert_eq!(reference_state.previous.to_vec()?, candidate_state.previous.to_vec()?);
+            assert_eq!(reference_state.first, candidate_state.first);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use xn::CpuDevice;
@@ -343,6 +442,7 @@ mod tests {
         for (c_in, c_out, k, dil) in [(64, 48, 7, 1), (32, 16, 3, 2), (32, 8, 1, 1)] {
             let mut conv = Conv1d {
                 weight: tensor(&[c_out, c_in, k], 1),
+                packed: None,
                 q8: None,
                 bias: Some(tensor(&[c_out], 2)),
                 stride: 1,

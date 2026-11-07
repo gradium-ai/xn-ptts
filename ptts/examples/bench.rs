@@ -52,6 +52,14 @@ struct Args {
     #[arg(long, default_value_t = false)]
     cpu: bool,
 
+    /// Save per-request timings and PCM chunk arrivals after the measured iterations.
+    #[arg(long, conflicts_with = "breakdown")]
+    metrics_json: Option<std::path::PathBuf>,
+
+    /// Capture the last iteration as little-endian f32 PCM; use separately from timing runs.
+    #[arg(long, conflicts_with_all = ["breakdown", "metrics_json"])]
+    pcm_output: Option<std::path::PathBuf>,
+
     /// Number of CPU threads for tensor ops.
     #[arg(long)]
     threads: Option<usize>,
@@ -124,6 +132,8 @@ struct Run {
     nframes: usize,
     total: Duration,
     samples: usize,
+    arrivals: Vec<(f64, usize)>,
+    pcm: Vec<f32>,
 }
 
 /// Generates the utterance once through `Synth`, as any caller would.
@@ -131,10 +141,19 @@ fn one_synth(tts: &Synth, opts: &SpeechOptions, args: &Args) -> Result<Run> {
     let start = Instant::now();
     let mut ttfa = None;
     let mut samples = 0usize;
+    let mut arrivals = Vec::new();
+    let mut captured = Vec::new();
     for pcm in tts.stream_with(&args.input, opts)? {
         let pcm = pcm?;
         if !pcm.is_empty() {
-            ttfa.get_or_insert_with(|| start.elapsed());
+            let elapsed = start.elapsed();
+            ttfa.get_or_insert(elapsed);
+            if args.metrics_json.is_some() {
+                arrivals.push((ms(elapsed), pcm.len()));
+            }
+            if args.pcm_output.is_some() {
+                captured.extend_from_slice(&pcm);
+            }
             samples += pcm.len();
         }
     }
@@ -142,7 +161,17 @@ fn one_synth(tts: &Synth, opts: &SpeechOptions, args: &Args) -> Result<Run> {
     let ttfa = ttfa.context("no audio produced")?;
     let frame_samples = tts.sample_rate() as f64 / tts.config().mimi.frame_rate;
     let nframes = (samples as f64 / frame_samples).round() as usize;
-    Ok(Run { ttfa, frames: vec![], sample_t: vec![], decode_t: vec![], nframes, total, samples })
+    Ok(Run {
+        ttfa,
+        frames: vec![],
+        sample_t: vec![],
+        decode_t: vec![],
+        nframes,
+        total,
+        samples,
+        arrivals,
+        pcm: captured,
+    })
 }
 
 /// Generates the utterance once, reusing the voice-conditioned state.
@@ -198,7 +227,17 @@ fn one<Q: BackendQ>(
     let total = start.elapsed();
     let ttfa = ttfa.context("no audio produced")?;
     let nframes = frames.len();
-    Ok(Run { ttfa, frames, sample_t, decode_t, nframes, total, samples })
+    Ok(Run {
+        ttfa,
+        frames,
+        sample_t,
+        decode_t,
+        nframes,
+        total,
+        samples,
+        arrivals: vec![],
+        pcm: vec![],
+    })
 }
 
 fn ms(d: Duration) -> f64 {
@@ -468,6 +507,30 @@ fn bench_synth(args: &Args, normalize: Normalize, quant: Quant) -> Result<()> {
 
     let runs = measure(args, || one_synth(&tts, &opts, args))?;
     report(args, normalize, &runs, tts.sample_rate() as f64, load_ms, voice_ms);
+    if let Some(path) = &args.metrics_json {
+        let rows: Vec<_> = runs
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "ttfa_ms": ms(r.ttfa), "total_ms": ms(r.total), "samples": r.samples,
+                    "arrivals": r.arrivals,
+                })
+            })
+            .collect();
+        let output = serde_json::json!({
+            "sample_rate": tts.sample_rate(), "load_ms": load_ms,
+            "voice_ms": voice_ms, "runs": rows,
+        });
+        std::fs::write(path, serde_json::to_vec_pretty(&output)?)?;
+    }
+    if let Some(path) = &args.pcm_output {
+        use std::io::Write;
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(path)?);
+        for value in &runs.last().context("no measured iterations")?.pcm {
+            writer.write_all(&value.to_le_bytes())?;
+        }
+        writer.flush()?;
+    }
     Ok(())
 }
 

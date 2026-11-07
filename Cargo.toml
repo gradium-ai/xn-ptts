@@ -52,7 +52,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-xn = "0.2.13"
+xn = { git = "https://github.com/rudrakshkarpe/xn.git", rev = "7363979dd2c8ff1c0beb3a023bd176901872922f", version = "0.2.13" }
 
 # `release` stays lean: it is what the wheels, the xcframework and `cargo install --path` ship.
 # For a profiler, build with `--profile profiling`, which is release plus debug info.
