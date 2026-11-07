@@ -139,6 +139,9 @@ pub(super) fn rewrite_text(
                 rules.has("currency").then(|| currency::scaled(&words[i..], lang)).flatten()
             })
             .or_else(|| {
+                rules.has("currency").then(|| currency::trailing(&words[i..], lang)).flatten()
+            })
+            .or_else(|| {
                 rules.has("numbers").then(|| numbers::digit_run(&words[i..], lang)).flatten()
             })
             .or_else(|| {
