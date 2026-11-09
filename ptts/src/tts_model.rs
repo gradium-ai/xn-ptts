@@ -229,6 +229,11 @@ impl<Q: BackendQ> TTSModel<Q> {
         self.mimi.quantize_q8()
     }
 
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn lsd_decode_steps(&self) -> usize {
+        self.lsd_decode_steps
+    }
+
     /// Run Mimi from weights in `vb`, on its device rather than the flow LM's.
     pub fn move_mimi_to(&mut self, vb: &Path<Q::B>, cfg: &TTSConfig) -> Result<()> {
         self.mimi = MimiDecoder::load(&vb.pp("mimi"), &cfg.mimi_with_gelu(&cfg.mimi))?;
