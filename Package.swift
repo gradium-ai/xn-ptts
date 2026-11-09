@@ -15,8 +15,8 @@ let package = Package(
     targets: [
         .binaryTarget(
             name: "PhononCore",
-            url: "https://github.com/gradium-ai/xn-ptts/releases/download/v0.6.0/PhononCore.xcframework.zip",
-            checksum: "1c7e5a77d4f051f064eebe73b39ff1025ee41e1263503d14cabdd927d90514aa"
+            url: "https://github.com/gradium-ai/xn-ptts/releases/download/v0.7.0/PhononCore.xcframework.zip",
+            checksum: "dfc50de08b15f32e2b18157ce83eff622a01ea2353d902593c1f823514fd8579"
         ),
         .target(
             name: "PhononTTS",
