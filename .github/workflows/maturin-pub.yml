@@ -170,7 +170,7 @@ jobs:
       fail-fast: false
       matrix:
         platform:
-          - { runner: macos-14, target: aarch64, rustflags: -C target-cpu=apple-m1, features: 'accelerate,kai,metal' }
+          - { runner: macos-15, target: aarch64, rustflags: -C target-cpu=apple-m1, features: 'accelerate,kai,metal' }
           # `-avx,-avx2` is what `.cargo/config.toml` sets for this target; see the note in
           # CLAUDE.md about benchmarking macOS x86_64.
           - { runner: macos-15-intel, target: x86_64, rustflags: -C target-feature=-avx,-avx2, features: 'accelerate' }
