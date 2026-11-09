@@ -39,7 +39,7 @@ impl<T: WithDTypeF, B: Backend> RotaryEmbedding<T, B> {
     }
 
     /// The rows of the table at `positions`, a `[n]` index tensor on the device.
-    #[allow(dead_code)] // for the CUDA step graph
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub fn rows(&self, positions: &Tensor<i64, B>) -> Result<Self> {
         let cos = self.cos.index_select(positions, 0)?;
         let sin = self.sin.index_select(positions, 0)?;

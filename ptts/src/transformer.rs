@@ -76,7 +76,7 @@ pub(crate) struct DeviceStep<T: WithDTypeF, B: Backend> {
 impl<T: WithDTypeF, B: Backend> DeviceStep<T, B> {
     /// Records the per-step work: `pos` is `[1]`, `mask` the persistent `[1, kv]` mask (its
     /// slot at `pos` is opened here), `rope` the full-length table of the transformer.
-    #[allow(dead_code)] // for the CUDA step graph
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn new(
         pos: &Tensor<i64, B>,
         mask: &Tensor<T, B>,
@@ -285,7 +285,7 @@ pub struct StreamingTransformerState<T: WithDTypeF, B: Backend> {
 impl<T: WithDTypeF, B: Backend> StreamingTransformerState<T, B> {
     /// Count `n` more filled positions in every flow-LM layer, after a step that wrote them
     /// without moving the host-side position (see [`DeviceStep`]).
-    #[allow(dead_code)] // for the CUDA step graph
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn advance(&mut self, n: usize) {
         for layer in self.layer_states.iter_mut() {
             if let LayerAttentionState::FlowLm(mha) = layer {
@@ -750,7 +750,7 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
     }
 
     /// The RoPE table for positions `0..len`, for [`DeviceStep::new`].
-    #[allow(dead_code)] // for the CUDA step graph
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn rope_table(
         &self,
         len: usize,

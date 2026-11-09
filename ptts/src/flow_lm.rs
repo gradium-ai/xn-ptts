@@ -324,7 +324,7 @@ impl<Q: BackendQ> FlowLM<Q> {
     }
 
     /// The first step's input, `[batch, 1, ldim]`.
-    #[allow(dead_code)] // for the CUDA step graph
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn bos(&self, batch: usize) -> Result<Tensor<Q::T, Q::B>> {
         self.step_embedding(StepInput::Bos { batch })
     }
@@ -388,7 +388,7 @@ impl<Q: BackendQ> FlowLM<Q> {
     /// operand is a tensor, so the step can be recorded once and replayed. Leaves the host-side
     /// position for the caller to advance.
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-    #[allow(dead_code)] // for the CUDA step graph
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn sample_next_latent_step(
         &self,
         latent: &Tensor<Q::T, Q::B>,
