@@ -63,7 +63,7 @@ use crate::flow_lm::{NormalRng, StepInput};
 use crate::loader;
 use crate::plan::{self, Chunk, EosPolicy};
 use crate::preprocess::Normalize;
-use crate::tts_model::{MAX_TOKENS_PER_CHUNK, MimiEnc, TTSConfig, TTSModel, TTSState};
+use crate::tts_model::{MAX_TOKENS_PER_CHUNK, MimiEnc, MimiLatent, TTSConfig, TTSModel, TTSState};
 use crate::{Error, Result};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path as FsPath, PathBuf};
@@ -343,10 +343,11 @@ struct SynthOf<Q: BackendQ> {
     conditioners: Conditioners<Q::T, Q::B>,
     conditions: Option<Tensor<Q::T, Q::B>>,
     /// Whether a session should decode each frame on the flow-LM's own thread rather than
-    /// handing it to a second thread. Devices with one shared command queue (CUDA, Metal) have
-    /// no second execution unit for a second thread to overlap onto, so the split only adds
-    /// cross-thread contention over that queue; the CPU's separate cores make it a real win
-    /// there. Set once per backend in [`SynthBuilder::build_cuda`] and friends.
+    /// handing it to a second thread. A device with one shared command queue (Metal) has no
+    /// second execution unit for a second thread to overlap onto, so the split only adds
+    /// cross-thread contention over that queue; the CPU's separate cores, and CUDA's second
+    /// stream for Mimi, make it a real win there. Set once per backend in
+    /// [`SynthBuilder::build_cuda`] and friends.
     inline_decode: bool,
 }
 
@@ -951,7 +952,7 @@ impl<Q: BackendQ> SessionOf<Q> {
         let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<Result<Vec<f32>>>(PCM_QUEUE);
 
         let workers = if self.inline_decode {
-            // One shared command queue (CUDA, Metal): a second thread has no second execution
+            // One shared command queue (Metal): a second thread has no second execution
             // unit to overlap onto, and only adds cross-thread contention for that queue. Decode
             // each frame inline, on the flow-LM's own thread, instead -- see `inline_decode`.
             let model = Arc::clone(&self.model);
@@ -988,7 +989,13 @@ impl<Q: BackendQ> SessionOf<Q> {
                             state = mimi_init.clone();
                             continue;
                         }
-                        Frame::Latent(latent) => latent,
+                        Frame::Latent(latent) => match decode_model.mimi_latent(latent) {
+                            Ok(latent) => latent,
+                            Err(e) => {
+                                let _ = decode_tx.send(Err(e.into()));
+                                return;
+                            }
+                        },
                     };
                     // Decode every latent the flow-LM has already queued in one
                     // call: the decoder is exact for any number of frames, and one
@@ -1006,7 +1013,13 @@ impl<Q: BackendQ> SessionOf<Q> {
                                 reset_after = true;
                                 break;
                             }
-                            Frame::Latent(latent) => batch.push(latent),
+                            Frame::Latent(latent) => match decode_model.mimi_latent(latent) {
+                                Ok(latent) => batch.push(latent),
+                                Err(e) => {
+                                    let _ = decode_tx.send(Err(e.into()));
+                                    return;
+                                }
+                            },
                         }
                     }
                     let latent = match batch.len() {
@@ -1169,7 +1182,7 @@ const DECODE_BATCH: usize = LATENT_QUEUE;
 
 /// Messages from the flow-LM thread to the decoder thread.
 enum Frame<Q: BackendQ> {
-    Latent(Tensor<Q::T, Q::B>),
+    Latent(MimiLatent<Q>),
     ChunkEnd,
 }
 
@@ -1209,7 +1222,7 @@ fn run_backbone<Q: BackendQ>(
             };
             // A closed channel means the consumer went away; stop quietly and
             // let the decoder thread report any error of its own.
-            if latent_tx.send(Frame::Latent(next.clone())).is_err() {
+            if latent_tx.send(Frame::Latent(model.latent_for_mimi(&next)?)).is_err() {
                 return Ok(());
             }
             // A closed channel here means the decoder stopped, for the same reasons.
@@ -1619,21 +1632,27 @@ impl SynthBuilder {
 
     #[cfg(feature = "cuda")]
     fn build_cuda(self) -> Result<Synth> {
-        let dev = match xn::cuda_backend::Device::new(0) {
-            Ok(dev) => dev,
+        use xn::cuda_backend::Device;
+        // Mimi gets a device handle of its own, so a stream and a cuBLAS handle of its own, and
+        // decodes on its own thread, overlapping the flow LM. Both handles share the context.
+        let (dev, mimi_dev) = match Device::new(0).and_then(|d| Ok((d, Device::new(0)?))) {
+            Ok(devs) => devs,
             Err(err) => return self.fall_back_to_cpu("cuda", err),
         };
         // Event tracking costs a few percent and this workload never queries events.
         unsafe { dev.disable_event_tracking() };
-        // The flow LM and the Mimi decoder share one CUDA stream and cuBLAS handle, so running
-        // them on separate threads does not overlap GPU work the way it does on the CPU's
-        // separate cores -- it only adds cross-thread contention for that shared stream. Decode
-        // inline on the flow LM's thread instead; see `inline_decode`.
-        //
         // `check_device` lets only these two through to CUDA.
         let synth: Box<dyn SynthApi> = match self.quant {
-            Quant::Q80 => Box::new(self.load::<xn::cuda_backend::q8::Q8<half::bf16>>(dev, true)?),
-            _ => Box::new(self.load::<xn::Unquantized<half::bf16, _>>(dev, true)?),
+            Quant::Q80 => Box::new(self.load_on::<xn::cuda_backend::q8::Q8<half::bf16>>(
+                dev,
+                Some(mimi_dev),
+                false,
+            )?),
+            _ => Box::new(self.load_on::<xn::Unquantized<half::bf16, _>>(
+                dev,
+                Some(mimi_dev),
+                false,
+            )?),
         };
         Ok(Synth(synth))
     }
@@ -1658,7 +1677,7 @@ impl SynthBuilder {
             Ok(dev) => dev,
             Err(err) => return self.fall_back_to_cpu("metal", err),
         };
-        // Same reasoning as CUDA above: one shared command queue, so decode inline.
+        // One shared command queue, so decode inline; see `inline_decode`.
         let synth = self.load::<xn::Unquantized<half::bf16, _>>(dev, true)?;
         Ok(Synth(Box::new(synth)))
     }
@@ -1699,7 +1718,17 @@ impl SynthBuilder {
 
     /// Load the weights and register the voices. `inline_decode` is forwarded to
     /// [`SynthOf`]; see its field doc.
-    fn load<Q: BackendQ>(mut self, device: Q::B, inline_decode: bool) -> Result<SynthOf<Q>> {
+    fn load<Q: BackendQ>(self, device: Q::B, inline_decode: bool) -> Result<SynthOf<Q>> {
+        self.load_on::<Q>(device, None, inline_decode)
+    }
+
+    /// As [`Self::load`], with Mimi on `mimi_device` when given.
+    fn load_on<Q: BackendQ>(
+        mut self,
+        device: Q::B,
+        mimi_device: Option<Q::B>,
+        inline_decode: bool,
+    ) -> Result<SynthOf<Q>> {
         if !self.weights.is_file() {
             return Err(Error::not_found(format!(
                 "weights file not found: {}",
@@ -1716,14 +1745,19 @@ impl SynthBuilder {
                 conditions.entry(k.clone()).or_insert_with(|| v.clone());
             }
         }
-        let mut model = TTSModel::<Q>::load(&vb, tokenizer, &config, &conditions)?;
-        if self.quantize_mimi {
-            model.quantize_mimi()?;
-        }
-        let model = match self.eos_threshold {
+        let model = TTSModel::<Q>::load(&vb, tokenizer, &config, &conditions)?;
+        let mut model = match self.eos_threshold {
             Some(threshold) => model.with_eos_threshold(threshold),
             None => model,
         };
+        if let Some(mimi_device) = mimi_device {
+            let mimi_vb = loader::load_weights::<Q>(&self.weights, &mimi_device)?;
+            model.move_mimi_to(&mimi_vb, &config)?;
+        }
+        // After the move, so it quantizes the Mimi that decodes.
+        if self.quantize_mimi {
+            model.quantize_mimi()?;
+        }
         // A dedicated speaker codec ships its encoder under its own prefix, so
         // probe there rather than assuming `mimi.encoder.*`.
         let probe = format!("{}.encoder.model.0.conv.weight", config.speaker_mimi_prefix());
