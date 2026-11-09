@@ -136,7 +136,7 @@ fn quantization_on_a_gpu_is_rejected_before_the_weights_are_touched() {
     // what proves the order rather than which words came out.
     assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
     let err = err.to_string();
-    assert!(err.contains("CPU-only"), "{err}");
+    assert!(err.contains("runs on the CPU"), "{err}");
     assert!(err.contains("q4_0"), "the error should name the format: {err}");
 }
 
