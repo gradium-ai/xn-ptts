@@ -11,7 +11,7 @@ const HUB = 'https://huggingface.co';
  * The model `PhononTTS.load` uses when none is given, pinned to a commit. A copy of
  * `DEFAULT_MODEL` in `ptts/src/checkpoint.rs`; the tests hold the two together.
  */
-export const DEFAULT_MODEL = 'hf://gradium/phonon-31m-en@8c64b55ec301728e2d1695bfea87a08a267d0c2d';
+export const DEFAULT_MODEL = 'hf://gradium/phonon-31m-en@92741c5b07d085ff840e26fea8ce43110b87852f';
 
 /** Weights per quant, in the order the native `weight_candidates` tries them. */
 const WEIGHTS = {
