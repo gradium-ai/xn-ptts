@@ -8,7 +8,8 @@
 // takes it when the browser has a hardware adapter. It needs `q8` weights in a GGUF file,
 // which go to the GPU as they are: quantizing other weights there would read every one back
 // to the host, which a browser cannot do. Under `'auto'` the CPU is used instead of a
-// software fallback adapter, and when WebGPU fails to start.
+// software fallback adapter, when the WebGPU engine cannot run the checkpoint (`settleDevice`),
+// and when WebGPU fails to start.
 
 /**
  * @param {object} env
@@ -27,6 +28,22 @@ export function chooseDevice({ requested, quant, hasWebGpu, fallbackAdapter = fa
   if (!hasWebGpu) return { device: 'cpu', reason: 'this browser offers no WebGPU adapter' };
   if (fallbackAdapter) return { device: 'cpu', reason: "the browser's WebGPU adapter is a software fallback" };
   return { device: 'webgpu', reason: "'auto', and the browser has a WebGPU adapter" };
+}
+
+/**
+ * The device once the WebGPU engine has read the checkpoint's config.
+ * @param {object} env
+ * @param {'auto' | 'webgpu' | 'cpu'} [env.requested] `LoadOptions.device`.
+ * @param {{ device: 'webgpu' | 'cpu', reason: string }} env.choice `chooseDevice`'s answer.
+ * @param {string | null} env.unsupported Why the engine cannot run this checkpoint, or null.
+ * @returns {{ device: 'webgpu' | 'cpu', reason: string, warning?: string } | { error: string }}
+ *   Under `'webgpu'` a checkpoint the engine cannot run is an error naming what it lacks;
+ *   under `'auto'` the CPU runs it instead, with a warning to log.
+ */
+export function settleDevice({ requested, choice, unsupported }) {
+  if (choice.device !== 'webgpu' || unsupported === null) return choice;
+  if (requested === 'webgpu') return { error: unsupported };
+  return { device: 'cpu', reason: unsupported, warning: `${unsupported}; generating on the CPU instead` };
 }
 
 /** Whether `bytes` is a GGUF file: the only weights WebGPU can load. */

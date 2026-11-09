@@ -103,8 +103,9 @@ export interface SpeechOptions {
   /** Sampling temperature. Default `0.3`. */
   temperature?: number;
   /**
-   * Noise seed: the same text, voice, temperature and seed give the same audio, here and in
-   * the Rust and Python packages. Default `4242424242424242`, as there. Above
+   * Noise seed: the same text, voice, temperature and seed give the same audio. On the CPU that
+   * is the audio the Rust and Python packages give too; on WebGPU the GPU draws its own noise,
+   * so the audio differs from the CPU's. Default `4242424242424242`, as there. Above
    * `Number.MAX_SAFE_INTEGER`, pass a `bigint`.
    */
   seed?: number | bigint;
@@ -120,14 +121,15 @@ export interface SpeechStats {
   frames?: number;
   samples?: number;
   /**
-   * Time spent prompting the model with each chunk's text, summed. On WebGPU the prompt is
-   * only queued here and runs with the chunk's first step, so this reads near zero there.
+   * Time spent prompting the model with each chunk's text, summed. On WebGPU the prompt runs
+   * on the GPU with the chunk's first frames, so this reads zero there.
    */
   promptMs?: number;
   /**
    * Generation time per frame: each step's time divided by its frames. A step is one frame on
-   * the CPU and up to four on WebGPU, so there `min` and `max` are averages over a step,
-   * and the first step of each chunk also runs that chunk's prompt.
+   * the CPU; on WebGPU it is a piece of audio as it arrives, 1, 2, 4 or 8 frames, so there
+   * `min` and `max` are averages over a piece, and each chunk's first piece also covers its
+   * prompt.
    */
   stepMs?: { avg: number; min: number; max: number };
   /** From the request starting in the worker to its first audio. */
