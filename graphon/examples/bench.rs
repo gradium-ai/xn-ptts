@@ -12,6 +12,9 @@
 //! as f32 safetensors and `--quant` / `--encoder-quant` quantize the linears at load: all of the
 //! trunk's and the encoder transformer's.
 //!
+//! Steps run back to back by default; `--realtime` paces them like live audio, one per 80 ms,
+//! which lets a phone's CPU clock down between steps as it would in an app.
+//!
 //! Model load and the first `--warmup` iterations are left out of the statistics.
 
 use std::time::{Duration, Instant};
@@ -50,6 +53,11 @@ struct Args {
 
     #[arg(long)]
     threads: Option<usize>,
+
+    /// Start each step when its audio would have arrived from a live microphone, so the device
+    /// idles between steps as it does in an app, instead of running them back to back.
+    #[arg(long)]
+    realtime: bool,
 
     #[arg(long, default_value_t = 3)]
     iters: usize,
@@ -95,7 +103,12 @@ where
     for iter in 0..args.warmup + args.iters {
         let mut stream = model.stream()?;
         let measured = iter >= args.warmup;
+        let start = Instant::now();
         for (c, samples) in pcm.chunks_exact(chunk).enumerate() {
+            if args.realtime {
+                let due = start + budget * (c * args.encoder_chunk) as u32;
+                std::thread::sleep(due.saturating_duration_since(Instant::now()));
+            }
             let first_step = Instant::now();
             let data = samples.iter().map(|&s| Q::T::from_f32(s)).collect();
             let t0 = Instant::now();
@@ -139,13 +152,14 @@ where
     let encoder: Vec<Duration> =
         (0..times[0].len()).map(|i| times[..3].iter().map(|t| t[i]).sum()).collect();
     println!(
-        "graphon bench: {} steps ({audio:.1} s of audio) x {} iters, {} threads, trunk {}, encoder {}, encoder chunk {}",
+        "graphon bench: {} steps ({audio:.1} s of audio) x {} iters, {} threads, trunk {}, encoder {}, encoder chunk {}{}",
         steps,
         args.iters,
         xn::get_num_threads(),
         args.quant,
         args.encoder_quant,
-        args.encoder_chunk
+        args.encoder_chunk,
+        if args.realtime { ", real time" } else { "" }
     );
     println!("  load        {:8.1} ms", ms(load));
     let mean = |xs: &[Duration]| ms(xs.iter().sum::<Duration>() / xs.len() as u32);
@@ -158,7 +172,7 @@ where
         mean(&flush),
         model.config.flush_steps()
     );
-    println!("  stage          mean      p50      p95      p99      max   (ms per step)");
+    println!("  stage          mean      p50      p90      p99      max   (ms per step)");
     let rows = STAGES
         .iter()
         .map(|s| s.to_string())
@@ -171,7 +185,7 @@ where
             "  {name:<9} {:8.2} {:8.2} {:8.2} {:8.2} {:8.2}",
             ms(mean),
             ms(percentile(&xs, 0.5)),
-            ms(percentile(&xs, 0.95)),
+            ms(percentile(&xs, 0.9)),
             ms(percentile(&xs, 0.99)),
             ms(*xs.last().unwrap())
         );
