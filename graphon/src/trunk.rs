@@ -38,11 +38,17 @@ pub struct TrunkState<T: WithDTypeF, B: Backend> {
     step: usize,
     /// The token the next step reads: the initial token, then each step's own output.
     prev_token: u32,
+    /// The last step's outputs of the tapped layers ([`Trunk::set_taps`]), in their order.
+    taps: Vec<Tensor<T, B>>,
 }
 
 impl<T: WithDTypeF, B: Backend> TrunkState<T, B> {
     pub fn step(&self) -> usize {
         self.step
+    }
+
+    pub fn taps(&self) -> &[Tensor<T, B>] {
+        &self.taps
     }
 }
 
@@ -56,6 +62,8 @@ pub struct Trunk<Q: BackendQ> {
     layers: Vec<Layer<Q>>,
     out_norm: RmsNorm<Q::T, Q::B>,
     text_linear: Q::LinearQ,
+    /// Layers whose outputs each step keeps in the state, increasing.
+    taps: Vec<usize>,
     cfg: TrunkConfig,
     card: usize,
     device: Q::B,
@@ -111,6 +119,7 @@ impl<Q: BackendQ> Trunk<Q> {
             layers,
             out_norm,
             text_linear,
+            taps: Vec::new(),
             cfg: cfg.clone(),
             card,
             device: vb.device().clone(),
@@ -125,7 +134,16 @@ impl<Q: BackendQ> Trunk<Q> {
         let layers = (0..self.cfg.num_layers)
             .map(|_| RingKv::new(context, kv, hd, &self.device))
             .collect::<Result<Vec<_>>>()?;
-        Ok(TrunkState { layers, step: 0, prev_token: self.card as u32 })
+        Ok(TrunkState { layers, step: 0, prev_token: self.card as u32, taps: Vec::new() })
+    }
+
+    /// Keep the outputs of these layers, counted from 0, at every step ([`TrunkState::taps`]).
+    pub fn set_taps(&mut self, layers: &[usize]) -> Result<()> {
+        if !layers.is_sorted_by(|a, b| a < b) || layers.last() >= Some(&self.cfg.num_layers) {
+            xn::bail!("taps must be increasing layer indices below {}", self.cfg.num_layers)
+        }
+        self.taps = layers.to_vec();
+        Ok(())
     }
 
     /// One step: a `[1, 1, latent_dim]` Gemimi frame in, the text token out.
@@ -163,7 +181,8 @@ impl<Q: BackendQ> Trunk<Q> {
         x = x.add(&cond)?;
 
         let (cos, sin) = rope_tables(hd, self.cfg.max_period, state.step, &self.device)?;
-        for (layer, kv) in self.layers.iter().zip(state.layers.iter_mut()) {
+        state.taps.clear();
+        for (i, (layer, kv)) in self.layers.iter().zip(state.layers.iter_mut()).enumerate() {
             let y = layer.norm1.forward(&x)?;
             let qkv = layer.in_proj.forward(&y)?;
             let q = qkv.narrow(2, 0..h * hd)?.contiguous()?.reshape((1, h, 1, hd))?;
@@ -180,6 +199,9 @@ impl<Q: BackendQ> Trunk<Q> {
             let gate = g.narrow(2, 0..hidden)?.contiguous()?.silu()?;
             let up = g.narrow(2, hidden..2 * hidden)?.contiguous()?;
             x = x.add(&layer.gate_out.forward(&gate.mul(&up)?)?)?;
+            if self.taps.contains(&i) {
+                state.taps.push(x.clone());
+            }
         }
         state.step += 1;
         let x = self.out_norm.forward(&x)?;

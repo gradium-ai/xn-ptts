@@ -49,7 +49,19 @@ tokens (`Stream::is_text` is false for both):
 
 A word's marker comes `delay_steps` steps after the word starts in the audio, so its start time
 is `(step - delay_steps) * 80 ms`. Words have no end marker, and the model has no end-of-turn
-token: a run of padding after the last word is the only sign of silence.
+token: a run of padding after the last word is the only sign of silence, unless the checkpoint
+has voice activity heads.
+
+## End of turn
+
+A checkpoint trained with voice activity heads (`vad` in its `config.json`) also gives, after
+every step, the probability that the speaker stays silent for each of a few windows:
+`Stream::inactivity`, in the order of `Vad::windows`. The heads read a mix of some trunk layers'
+outputs and leave the text alone. As in the serving API, a turn has ended when the probability
+for a long window passes a threshold, 0.5 to start with. `Stream::set_vad(false)` skips them.
+
+`transcribe --vad <dir>` writes each file's probabilities, one row per step, to
+`<dir>/<stem>.tsv`.
 
 ## Benchmark
 
@@ -58,7 +70,8 @@ cargo run -r -p graphon --features accelerate --example bench -- \
     --model <export> --threads 1 --quant q8_0 --encoder-quant q8_0
 ```
 
-It reports the time per step of each stage (SEANet, encoder transformer, latent head, trunk)
+It reports the time per step of each stage (SEANet, encoder transformer, latent head, trunk,
+and the voice activity heads when the export has them)
 against the 80 ms a step has in real time, the time to flush the last words, and the real-time
 factor. `--encoder-chunk N` encodes N steps per encoder call, as a caller holding buffered audio
 could.

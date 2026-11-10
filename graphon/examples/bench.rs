@@ -1,5 +1,5 @@
-//! Benchmark Graphon on the CPU: time per 80 ms step, split into the Gemimi encoder and the
-//! trunk, against the step's real-time budget.
+//! Benchmark Graphon on the CPU: time per 80 ms step, split into the Gemimi encoder, the trunk
+//! and, for a model that has them, the voice activity heads, against the step's real-time budget.
 //!
 //! ```bash
 //! cargo run -r -p graphon --features accelerate --example bench -- \
@@ -67,7 +67,7 @@ struct Args {
 }
 
 /// What a step's time is split into, in order.
-const STAGES: [&str; 4] = ["seanet", "enc-xfmr", "latent", "trunk"];
+const STAGES: [&str; 5] = ["seanet", "enc-xfmr", "latent", "trunk", "vad"];
 
 fn percentile(sorted: &[Duration], p: f64) -> Duration {
     sorted[((sorted.len() - 1) as f64 * p).round() as usize]
@@ -127,8 +127,13 @@ where
                 let t4 = Instant::now();
                 model.trunk.step(&row, &mut stream.trunk)?;
                 let trunk = t4.elapsed();
+                let t5 = Instant::now();
+                if let Some(vad) = &model.vad {
+                    vad.inactivity(stream.trunk.taps())?;
+                }
+                let vad = t5.elapsed();
                 if measured {
-                    for (stage, d) in shares.iter().chain([&trunk]).enumerate() {
+                    for (stage, d) in shares.iter().chain([&trunk, &vad]).enumerate() {
                         times[stage].push(*d);
                     }
                 }
@@ -177,6 +182,7 @@ where
         .iter()
         .map(|s| s.to_string())
         .zip(times)
+        .filter(|(name, _)| name != "vad" || model.vad.is_some())
         .chain([("encoder".to_string(), encoder), ("total".to_string(), total.clone())]);
     for (name, mut xs) in rows {
         let mean = xs.iter().sum::<Duration>() / xs.len() as u32;

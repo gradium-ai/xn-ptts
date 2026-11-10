@@ -3,17 +3,21 @@
 //! 24 kHz audio goes through the Gemimi encoder ([`gemimi`]), one latent frame per 80 ms step,
 //! and each frame is summed into the input of a text decoder ([`trunk`]) that emits one text
 //! token per step, a fixed number of steps ([`config::Config::delay_steps`]) behind the audio.
-//! [`Graphon`] holds both and [`Stream`] drives them over a stream of samples.
+//! [`Graphon`] holds both and [`Stream`] drives them over a stream of samples. A checkpoint with
+//! voice activity heads ([`vad`]) also gives, at every step, the probability that the speaker
+//! stays silent for each of a few windows.
 
 mod attention;
 pub mod config;
 pub mod gemimi;
 pub mod tokenizer;
 pub mod trunk;
+pub mod vad;
 
 use config::Config;
 use gemimi::{Gemimi, GemimiState};
 use trunk::{Trunk, TrunkState};
+use vad::Vad;
 use xn::nn::VB;
 use xn::{BackendQ, Result, Tensor, WithDTypeF};
 
@@ -22,6 +26,7 @@ pub struct Graphon<Q: BackendQ, C: BackendQ<T = Q::T, B = Q::B> = Q> {
     pub config: Config,
     pub gemimi: Gemimi<C>,
     pub trunk: Trunk<Q>,
+    pub vad: Option<Vad<Q>>,
     device: Q::B,
 }
 
@@ -45,9 +50,16 @@ impl<Q: BackendQ, C: BackendQ<T = Q::T, B = Q::B>> Graphon<Q, C> {
     ) -> Result<Self> {
         let vb = VB::load(&[gemimi], device.clone())?;
         let gemimi = Gemimi::load(&vb.root(), &config.gemimi)?;
-        let vb = VB::load(&[model], device.clone())?;
-        let trunk =
-            Trunk::load(&vb.root(), &config.trunk, config.text.card, config.gemimi.latent_dim)?;
+        let vb = VB::load(&[model], device.clone())?.root();
+        let mut trunk =
+            Trunk::load(&vb, &config.trunk, config.text.card, config.gemimi.latent_dim)?;
+        let vad = match &config.vad {
+            Some(cfg) => {
+                trunk.set_taps(&cfg.layers)?;
+                Some(Vad::load(&vb, cfg, config.trunk.dim)?)
+            }
+            None => None,
+        };
         if gemimi.frame_size() != config.frame_size() {
             xn::bail!(
                 "the encoder makes one frame per {} samples, the config steps every {}",
@@ -55,7 +67,7 @@ impl<Q: BackendQ, C: BackendQ<T = Q::T, B = Q::B>> Graphon<Q, C> {
                 config.frame_size()
             )
         }
-        Ok(Self { config, gemimi, trunk, device })
+        Ok(Self { config, gemimi, trunk, vad, device })
     }
 
     pub fn device(&self) -> &Q::B {
@@ -68,6 +80,8 @@ impl<Q: BackendQ, C: BackendQ<T = Q::T, B = Q::B>> Graphon<Q, C> {
             gemimi: self.gemimi.init_state(1)?,
             trunk: self.trunk.init_state(1)?,
             pending: Vec::new(),
+            vad: self.vad.is_some(),
+            inactivity: Vec::new(),
         })
     }
 }
@@ -78,6 +92,9 @@ pub struct Stream<'a, Q: BackendQ, C: BackendQ<T = Q::T, B = Q::B>> {
     pub gemimi: GemimiState<Q::T, Q::B>,
     pub trunk: TrunkState<Q::T, Q::B>,
     pending: Vec<f32>,
+    /// Whether steps run the voice activity heads.
+    vad: bool,
+    inactivity: Vec<f32>,
 }
 
 impl<Q: BackendQ, C: BackendQ<T = Q::T, B = Q::B>> Stream<'_, Q, C> {
@@ -100,7 +117,23 @@ impl<Q: BackendQ, C: BackendQ<T = Q::T, B = Q::B>> Stream<'_, Q, C> {
         let samples = frame.iter().map(|&s| Q::T::from_f32(s)).collect();
         let pcm = Tensor::from_vec(samples, (1, 1, frame.len()), &model.device)?;
         let latent = model.gemimi.step(&pcm, &mut self.gemimi)?;
-        model.trunk.step(&latent, &mut self.trunk)
+        let token = model.trunk.step(&latent, &mut self.trunk)?;
+        if let (true, Some(vad)) = (self.vad, &model.vad) {
+            self.inactivity = vad.inactivity(self.trunk.taps())?;
+        }
+        Ok(token)
+    }
+
+    /// Run the voice activity heads at every step (the default when the model has them) or not.
+    pub fn set_vad(&mut self, on: bool) {
+        self.vad = on && self.model.vad.is_some();
+        self.inactivity.clear();
+    }
+
+    /// The last step's probabilities that no speech follows within each of the model's windows
+    /// ([`vad::Vad::windows`]); empty when the heads did not run.
+    pub fn inactivity(&self) -> &[f32] {
+        &self.inactivity
     }
 
     /// End the stream: pads the last partial frame, then feeds [`config::Config::flush_steps`]

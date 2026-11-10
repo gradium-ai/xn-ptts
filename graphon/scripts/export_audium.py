@@ -12,7 +12,9 @@ Writes into `--out`:
 - `model.safetensors`: the trunk in the checkpoint's dtype, the self_wav head (output
   projection and LayerNorm), and two precomputed vectors: `initial_audio_embedding`, the sum of
   the audio embeddings of the initial token (the only audio input a masked model reads, on the
-  first step), and `condition_sum`, the per-stream constant the fuser adds to every step.
+  first step), and `condition_sum`, the per-stream constant the fuser adds to every step. A
+  student trained with VAD heads (`vad.use`) also brings them: `extra_heads.*`, one per window,
+  and the `extra_heads_mixer.*` that mixes the layers they read.
 - `gemimi.safetensors`: the codec's encoder side (SEANet with weight norms folded, encoder
   transformer, latent head) in float32.
 - `tokenizer.json`: the SentencePiece pieces, for decoding.
@@ -98,6 +100,26 @@ def rename_in_proj(key: str) -> str:
     return key.replace("self_attn.in_proj_weight", "self_attn.in_proj.weight")
 
 
+def vad_config(cfg: dict) -> dict | None:
+    """The VAD heads, as prod's serving reads them: each head is residual MLP blocks and a linear
+    over a dynamic mix of some layers' outputs, and its class 0 is "no speech in the window"."""
+    vad = cfg.get("vad") or {}
+    if not vad.get("use"):
+        return None
+    lm = cfg["transformer_lm"]
+    assert lm["extra_heads"] == len(vad["windows"]) and lm["extra_heads_card"] == 2, "one two-way head per window"
+    assert lm.get("extra_heads_residual_blocks", 0) > 0, "residual MLP heads"
+    layers = lm["extra_heads_from_layer"]
+    assert len(layers) > 1 and lm.get("extra_heads_mixer_dynamic"), "a dynamic mixer over several layers"
+    return {
+        "windows": vad["windows"],
+        "layers": layers,
+        "residual_blocks": lm["extra_heads_residual_blocks"],
+        "hidden_dim": lm.get("extra_heads_hidden_dim") or lm["dim"],
+        "mixer_affine": lm.get("extra_heads_mixer_affine", True),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--student", required=True)
@@ -129,7 +151,7 @@ def main() -> None:
     initial = sum(weights[f"emb.{i}.weight"][-1].float() for i in range(n_q))
     trunk = {}
     for key, value in weights.items():
-        if key.startswith(("transformer.", "text_emb.", "text_linear.", "out_norm.")):
+        if key.startswith(("transformer.", "text_emb.", "text_linear.", "out_norm.", "extra_heads")):
             trunk[rename_in_proj(key)] = value.contiguous()
         elif key.startswith("condition_provider.conditioners.self_wav.output_"):
             trunk[key[len("condition_provider.conditioners.") :]] = value.contiguous()
@@ -212,6 +234,7 @@ def main() -> None:
             "latent_stack": stack,
             "latent_dim": encoder["downsample.proj.weight"].shape[0],
         },
+        "vad": vad_config(cfg),
         "conditions": values,
         "exported_from": {
             "student": args.student,

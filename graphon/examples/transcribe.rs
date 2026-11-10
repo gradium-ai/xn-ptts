@@ -43,6 +43,12 @@ struct Args {
     #[arg(long)]
     save_pcm: Option<std::path::PathBuf>,
 
+    /// Write each file's voice activity to `<dir>/<stem>.tsv`, one row per step: the step, the
+    /// seconds of audio read so far, the token, then for each of the model's windows the
+    /// probability that no speech follows within it. Needs a model with voice activity heads.
+    #[arg(long)]
+    vad: Option<std::path::PathBuf>,
+
     files: Vec<std::path::PathBuf>,
 }
 
@@ -50,6 +56,15 @@ fn transcribe<Q: xn::BackendQ>(args: &Args, device: Q::B) -> Result<()> {
     let model = Graphon::<Q>::load(&args.model, device)?;
     let pieces = Pieces::load(&args.model.join("tokenizer.json"))?;
     let sample_rate = model.config.sample_rate as u32;
+    let frame = model.config.frame_size();
+    let flush = args.flush_steps.unwrap_or(model.config.flush_steps());
+    let windows = match (&args.vad, &model.vad) {
+        (Some(_), Some(vad)) => vad.windows().iter().map(|w| format!("\tsilent_{w}s")).collect(),
+        (Some(_), None) => {
+            anyhow::bail!("--vad: {} has no voice activity heads", args.model.display())
+        }
+        (None, _) => String::new(),
+    };
     for file in args.files.iter() {
         let pcm = ptts::audio::load_mono_at(file, sample_rate)?;
         if let Some(dir) = &args.save_pcm {
@@ -58,11 +73,28 @@ fn transcribe<Q: xn::BackendQ>(args: &Args, device: Q::B) -> Result<()> {
             std::fs::write(dir.join(format!("{stem}.f32")), bytes)?;
         }
         let mut stream = model.stream()?;
-        let mut tokens = stream.push(&pcm)?;
-        tokens.extend(match args.flush_steps {
-            Some(steps) => stream.flush_steps(steps)?,
-            None => stream.flush()?,
-        });
+        stream.set_vad(args.vad.is_some());
+        // The audio, its last frame padded, then the flush's silence, one step at a time.
+        let mut padded = pcm;
+        padded.resize((padded.len().div_ceil(frame) + flush) * frame, 0.0);
+        let mut tokens = Vec::with_capacity(padded.len() / frame);
+        let mut rows = format!("step\tseconds\ttoken{windows}\n");
+        for (step, samples) in padded.chunks(frame).enumerate() {
+            let token = stream.step(samples)?;
+            tokens.push(token);
+            if args.vad.is_some() {
+                let seconds = ((step + 1) * frame) as f64 / sample_rate as f64;
+                rows += &format!("{step}\t{seconds:.2}\t{token}");
+                for p in stream.inactivity() {
+                    rows += &format!("\t{p:.4}");
+                }
+                rows += "\n";
+            }
+        }
+        if let Some(dir) = &args.vad {
+            let stem = file.file_stem().unwrap_or_default().to_string_lossy();
+            std::fs::write(dir.join(format!("{stem}.tsv")), rows)?;
+        }
         if args.tokens {
             println!("{tokens:?}");
         }

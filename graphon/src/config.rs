@@ -11,6 +11,9 @@ pub struct Config {
     pub text: TextConfig,
     pub trunk: TrunkConfig,
     pub gemimi: GemimiConfig,
+    /// The voice activity heads, when the checkpoint has them.
+    #[serde(default)]
+    pub vad: Option<VadConfig>,
     /// The values `condition_sum` was computed for, as a record.
     #[serde(default)]
     pub conditions: HashMap<String, String>,
@@ -59,6 +62,18 @@ pub struct TrunkConfig {
     pub qk_norm_eps: f32,
     #[serde(default)]
     pub text_emb_low_rank: Option<usize>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct VadConfig {
+    /// One head per window, in seconds: the probability that no speech follows within it.
+    pub windows: Vec<f32>,
+    /// The trunk layers whose outputs the heads read, counted from 0.
+    pub layers: Vec<usize>,
+    pub residual_blocks: usize,
+    pub hidden_dim: usize,
+    /// Whether the mixer's LayerNorms have learnt weights and biases.
+    pub mixer_affine: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
