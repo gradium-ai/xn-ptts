@@ -81,6 +81,15 @@ export interface LoadOptions {
   simdWasmUrl?: string | URL;
   threadsSimdWasmUrl?: string | URL;
   /**
+   * The same for the JS glue module the worker imports, `wasm/phonon_tts.js`: where it is
+   * served from, when it is somewhere other than beside the worker. The worker keeps the
+   * literal import specifier when this is not given. URL objects resolve against the page,
+   * like `workerUrl`.
+   */
+  wasmGlueUrl?: string | URL;
+  /** The same for the threaded build's glue module, `wasm-threads/phonon_tts.js`. */
+  threadsWasmGlueUrl?: string | URL;
+  /**
    * CPU threads to generate on, counting the worker that owns the model. Default `'auto'`:
    * 3, or fewer if the device has fewer cores. Threads
    * need a cross-origin isolated page (see the README); elsewhere generation runs on one

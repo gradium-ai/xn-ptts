@@ -76,6 +76,8 @@ export class PhononTTS {
       threadsWasmUrl,
       simdWasmUrl,
       threadsSimdWasmUrl,
+      wasmGlueUrl,
+      threadsWasmGlueUrl,
       threads = 'auto',
       device,
     } = options ?? {};
@@ -171,6 +173,8 @@ export class PhononTTS {
             threadsWasmUrl: threadsWasmUrl ? resolveUrl(threadsWasmUrl) : undefined,
             simdWasmUrl: simdWasmUrl ? resolveUrl(simdWasmUrl) : undefined,
             threadsSimdWasmUrl: threadsSimdWasmUrl ? resolveUrl(threadsSimdWasmUrl) : undefined,
+            wasmGlueUrl: wasmGlueUrl ? resolveUrl(wasmGlueUrl) : undefined,
+            threadsWasmGlueUrl: threadsWasmGlueUrl ? resolveUrl(threadsWasmGlueUrl) : undefined,
             threads,
             device,
           },

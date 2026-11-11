@@ -117,10 +117,10 @@ beforeEach(() => {
 let instances = 0;
 
 /** Starts a fresh worker.js and sends it `init`: its reply's value, or its error thrown. */
-async function init(options) {
+async function init(options, { isolated = false } = {}) {
   const messages = [];
   globalThis.self = {
-    crossOriginIsolated: false,
+    crossOriginIsolated: isolated,
     postMessage(message, transfer = []) {
       // As a real postMessage does: what is transferred is gone from the worker.
       const copy = structuredClone(message, { transfer });
@@ -232,4 +232,23 @@ test('webgpu with no adapter is an error; auto takes the CPU', async () => {
   const r = await init({ device: 'auto' });
   assert.equal(r.device, 'cpu');
   assert.equal(r.deviceReason, 'this browser offers no WebGPU adapter');
+});
+
+test('wasmGlueUrl loads the single-threaded glue module from where it is served', async () => {
+  globalThis.phononFake.log = [];
+  const value = await init({ wasmGlueUrl: 'https://example.com/glue/phonon_tts.js' });
+  assert.ok(globalThis.phononFake.log.includes('glue.wasm.init'), globalThis.phononFake.log.join(', '));
+  assert.ok(!globalThis.phononFake.log.includes('wasm.init'), 'the bundled module was not used');
+  assert.ok(globalThis.phononFake.log.includes('GlueModel.load cpu'), globalThis.phononFake.log.join(', '));
+  assert.equal(value.device, 'cpu');
+});
+
+test('threadsWasmGlueUrl loads the threaded glue module from where it is served', async () => {
+  globalThis.phononFake.log = [];
+  const value = await init({ threadsWasmGlueUrl: 'https://example.com/glue/phonon_tts_threads.js' }, { isolated: true });
+  assert.ok(globalThis.phononFake.log.includes('glue.wasm.init'), globalThis.phononFake.log.join(', '));
+  assert.ok(globalThis.phononFake.log.includes('glue.initThreadPool 2'), globalThis.phononFake.log.join(', '));
+  assert.ok(globalThis.phononFake.log.includes('glue.start_cpu_pool 2'), globalThis.phononFake.log.join(', '));
+  assert.ok(!globalThis.phononFake.log.includes('wasm.init'), 'the bundled module was not used');
+  assert.equal(value.device, 'cpu');
 });

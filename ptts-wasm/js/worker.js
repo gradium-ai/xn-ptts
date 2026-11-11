@@ -60,7 +60,8 @@ function moduleFor(relaxedUrl, simdUrl, simdDefault) {
  * fails, so a page that cannot have threads still speaks.
  *
  * Both `import()`s name their file literally, which is what lets a bundler find and emit
- * both builds.
+ * both builds; `threadsWasmGlueUrl` overrides the threaded one and `wasmGlueUrl` the
+ * single-threaded one, for pages that serve the glue modules from elsewhere.
  */
 async function loadWasm(options) {
   const choice = chooseThreads({
@@ -71,7 +72,9 @@ async function loadWasm(options) {
   let reason = choice.reason;
   if (choice.threads > 1) {
     try {
-      const wasm = await import('./wasm-threads/phonon_tts.js');
+      // `threadsWasmGlueUrl` replaces the bundled threaded module for pages that serve it
+      // from elsewhere; both imports name their specifier literally so bundlers emit both.
+      const wasm = await (options.threadsWasmGlueUrl ? import(options.threadsWasmGlueUrl) : import('./wasm-threads/phonon_tts.js'));
       await wasm.default(
         moduleFor(
           options.threadsWasmUrl,
@@ -97,7 +100,9 @@ async function loadWasm(options) {
  * the WebGPU engine prepares its text and voices with.
  */
 async function loadSingleThreaded(options) {
-  const wasm = await import('./wasm/phonon_tts.js');
+  // `wasmGlueUrl` replaces the bundled single-threaded module, like wasmUrl replaces the
+  // bundled .wasm binary; both imports name their specifier literally so bundlers emit both.
+  const wasm = await (options.wasmGlueUrl ? import(options.wasmGlueUrl) : import('./wasm/phonon_tts.js'));
   try {
     await wasm.default(
       moduleFor(options.wasmUrl, options.simdWasmUrl, new URL('./wasm/phonon_tts_simd_bg.wasm', import.meta.url)),

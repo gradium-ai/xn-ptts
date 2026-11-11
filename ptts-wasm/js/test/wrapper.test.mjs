@@ -196,6 +196,15 @@ test('every module URL reaches the worker resolved, the SIMD-only ones too', asy
   for (const [key, value] of Object.entries(urls)) assert.equal(FakeWorker.last.init[key], String(value));
 });
 
+test('the glue module URLs reach the worker resolved too', async () => {
+  const urls = {
+    wasmGlueUrl: 'https://example.com/g/phonon_tts.js',
+    threadsWasmGlueUrl: new URL('https://example.com/gt/phonon_tts.js'),
+  };
+  await PhononTTS.load({ lang: 'en', model: MODEL, workerUrl: 'worker.js', ...urls });
+  for (const [key, value] of Object.entries(urls)) assert.equal(FakeWorker.last.init[key], String(value));
+});
+
 test('lang is required', async () => {
   await assert.rejects(PhononTTS.load({ model: MODEL }), /lang is required/);
   await assert.rejects(PhononTTS.load({ lang: 'xx', model: MODEL }), /lang is required/);

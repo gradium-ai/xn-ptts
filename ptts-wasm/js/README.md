@@ -70,7 +70,7 @@ Cancellation discards unread stream chunks. Stop any audio already scheduled in 
 | `onProgress` | | `({ file, loaded, total, cached }) => void`, for a progress bar |
 | `device` | `'cpu'` | `'cpu'`, `'webgpu'` or `'auto'`: where to generate, see [WebGPU](#webgpu) |
 | `threads` | `'auto'` | CPU threads to generate on, or `'auto'` for 3. Needs a cross-origin isolated page, see [Threads](#threads) |
-| `workerUrl`, `wasmUrl`, `threadsWasmUrl`, `simdWasmUrl`, `threadsSimdWasmUrl` | beside `index.js` | for setups that serve the package's files from elsewhere |
+| `workerUrl`, `wasmUrl`, `threadsWasmUrl`, `simdWasmUrl`, `threadsSimdWasmUrl`, `wasmGlueUrl`, `threadsWasmGlueUrl` | beside `index.js` | for setups that serve the package's files from elsewhere; the two `...GlueUrl` options point the worker's literal `import()` of the JS glue module elsewhere |
 
 ### Instance
 

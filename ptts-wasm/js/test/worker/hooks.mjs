@@ -6,6 +6,8 @@ const FAKES = {
   './wasm/phonon_tts.js': './wasm.mjs',
   './wasm-threads/phonon_tts.js': './wasm.mjs',
   './gpu/engine.js': './engine.mjs',
+  'https://example.com/glue/phonon_tts.js': './wasm-glue.mjs',
+  'https://example.com/glue/phonon_tts_threads.js': './wasm-glue.mjs',
 };
 
 export async function resolve(specifier, context, next) {
