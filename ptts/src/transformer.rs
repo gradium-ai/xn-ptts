@@ -691,6 +691,44 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
         }
         Ok(x)
     }
+
+    /// Drops the `count` cached positions from `start` on, moving the later ones back to
+    /// `start` with their keys rotated to match, so the next position is `count` lower and
+    /// every distance between kept positions is unchanged. The kept keys and values were
+    /// computed with the dropped positions in view, so this is a sliding window, not the state
+    /// a sequence without them would have reached. Flow-LM attention only.
+    pub fn drop_positions(
+        &self,
+        state: &mut StreamingTransformerState<Q::T, Q::B>,
+        start: usize,
+        count: usize,
+    ) -> Result<()> {
+        for layer in state.layer_states.iter_mut() {
+            let LayerAttentionState::FlowLm(mha) = layer else {
+                xn::bail!("only a flow-LM cache can drop positions")
+            };
+            let end = mha.current_end;
+            if start + count > end {
+                xn::bail!("cannot drop positions {start}..{} of {end}", start + count)
+            }
+            let kept = end - start - count;
+            if kept > 0 {
+                let rope = RotaryEmbedding::shift_back(
+                    self.head_dim,
+                    count,
+                    kept,
+                    self.max_period,
+                    mha.device(),
+                )?;
+                let k = mha.k_cache.narrow(1, start + count..end)?.contiguous()?;
+                let v = mha.v_cache.narrow(1, start + count..end)?.contiguous()?;
+                mha.k_cache.slice_set(&rope.rotate(&k)?, 1usize, start)?;
+                mha.v_cache.slice_set(&v, 1usize, start)?;
+            }
+            mha.current_end = end - count;
+        }
+        Ok(())
+    }
 }
 
 // ---- ProjectedTransformer ----
@@ -979,7 +1017,7 @@ mod q8_tests {
     const FF: usize = 128;
 
     /// A one-layer transformer of `kind` with random weights.
-    fn transformer(kind: Kind) -> StreamingTransformer<F32> {
+    pub(super) fn transformer(kind: Kind) -> StreamingTransformer<F32> {
         use rand::{Rng, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(0);
         let p = "layers.0";
@@ -1044,5 +1082,53 @@ mod q8_tests {
         let kind = Kind::FlowLm { attn_dim: D, num_kv_heads: 4 };
         let err = transformer(kind).prepare_q8().err().expect("a flow LM layer was quantized");
         assert!(err.to_string().contains("Mimi"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod drop_positions_tests {
+    use super::*;
+    use xn::CpuDevice;
+
+    fn rows(n: usize, phase: f32) -> Tensor<f32, CpuDevice> {
+        let d = 64;
+        let data = (0..n * d).map(|i| (i as f32 * 0.37 + phase).sin()).collect();
+        Tensor::from_vec(data, (1, n, d), &CpuDevice).unwrap()
+    }
+
+    #[test]
+    fn dropping_positions_leaves_the_cache_of_a_sequence_without_them() {
+        // In a single layer, a position's key and value depend on its own input alone, so
+        // dropping the filler must give back exactly the cache of prompt + text.
+        let t = q8_tests::transformer(Kind::FlowLm { attn_dim: 64, num_kv_heads: 4 });
+        let (prompt, filler, text, query) =
+            (rows(5, 0.0), rows(7, 1.0), rows(4, 2.0), rows(1, 3.0));
+
+        let mut state = t.init_state(1, 16).unwrap();
+        for x in [&prompt, &text] {
+            t.forward(x, &mut state).unwrap();
+        }
+        let want: Vec<f32> = t.forward(&query, &mut state).unwrap().to_vec().unwrap();
+
+        let mut state = t.init_state(1, 17).unwrap();
+        for x in [&prompt, &filler, &text] {
+            t.forward(x, &mut state).unwrap();
+        }
+        t.drop_positions(&mut state, 5, 7).unwrap();
+        let LayerAttentionState::FlowLm(mha) = &state.layer_states[0] else { panic!() };
+        assert_eq!(mha.current_end, 9);
+        let got: Vec<f32> = t.forward(&query, &mut state).unwrap().to_vec().unwrap();
+
+        let err = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(err < 1e-4, "{err}");
+    }
+
+    #[test]
+    fn dropping_past_the_end_is_refused() {
+        let t = q8_tests::transformer(Kind::FlowLm { attn_dim: 64, num_kv_heads: 4 });
+        let mut state = t.init_state(1, 8).unwrap();
+        t.forward(&rows(4, 0.0), &mut state).unwrap();
+        assert!(t.drop_positions(&mut state, 2, 3).is_err());
+        assert!(t.drop_positions(&mut state, 2, 2).is_ok());
     }
 }

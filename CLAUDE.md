@@ -180,7 +180,7 @@ Every frontend loads a `tokenizer.json` and nothing else, and none is bundled or
 Top-level orchestrator is `tts_model::TTSModel<Q>`, generic over a backend-quantization parameter `Q: BackendQ` from `xn`. It owns:
 
 - `flow_lm: FlowLM<Q>` — token-conditioned flow-matching transformer that emits Mimi latents (`flow_lm.rs`, `transformer.rs`, `rope.rs`, `mlp.rs`, `layer_scale.rs`, `conditioners.rs`).
-- `mimi: MimiDecoder<Unquantized<f32, Q::B>>` — neural audio codec decoder (`mimi.rs`, `seanet.rs`, `conv.rs`, `resample.rs`, `dummy_quantizer.rs`). The encoder side (`MimiEncoder` / `MimiEnc`) is used only for voice-prompt embedding from a 10s audio sample.
+- `mimi: MimiDecoder<Unquantized<f32, Q::B>>` — neural audio codec decoder (`mimi.rs`, `seanet.rs`, `conv.rs`, `resample.rs`, `dummy_quantizer.rs`). The encoder side (`MimiEncoder` / `MimiEnc`) embeds a voice prompt from a 10s audio sample and, frame by frame (`MimiEncoderState`), a speech-to-speech checkpoint's input.
 
 `synth::Synth` sits on top of all of it: `synth::SynthBuilder::new(config, weights)` loads a
 checkpoint whose files the caller has already located and registers voices,
@@ -188,6 +188,17 @@ checkpoint whose files the caller has already located and registers voices,
 run the flow LM and the Mimi decoder on two threads. `Synth` erases the `Q` parameter behind a trait object (`Box<dyn SynthApi>`, which it
 dereferences to) so a CLI flag can pick the weight format; the generic `SynthOf<Q>` is
 private. `ptts-wasm` still drives `TTSModel` directly.
+
+`s2s::SpeechToSpeech` runs speech-to-speech checkpoints: the flow LM with no text, conditioned
+per frame on the input's own Mimi latents (`source_latents`, through `FlowLMState.conditions`)
+and emitting its output `audio_delay` frames behind. `voice` runs the voice prompt once and
+`session` starts a stream from it; `Session::push` takes input audio in pieces of any size and
+returns the output of every frame it completes, `flush` ends it. The flow LM keeps
+`SessionOptions::context` frames after the voice prompt in view (the 30 s training windows by
+default): past that, `StreamingTransformer::drop_positions` drops the oldest third and rotates
+the kept keys back, since a context far longer than training's makes the output fall apart. The
+`s2s` example streams a file through it and reports the time per stage and per push
+(`--realtime` paces the pushes as a live input would).
 
 Generation is streaming and stateful: callers `init_flow_lm_state(batch, seq_len)`, then `prompt_text*` / `prompt_audio` to seed the state, then step-decode latents and feed them into `MimiDecoderState`. `lsd_decode_steps` controls flow-matching solver steps; `eos_threshold` controls termination. Every frontend reads the supplied checkpoint's own model config.
 

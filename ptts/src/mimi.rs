@@ -2,13 +2,14 @@
 //!
 //! [`MimiDecoder`] turns the flow LM's latents into PCM at the checkpoint's sample rate, one
 //! frame at a time, keeping its streaming state in [`MimiDecoderState`]. [`MimiEncoder`] goes
-//! the other way and is used only to embed a voice prompt from audio.
+//! the other way, to embed a voice prompt from audio or, frame by frame with its state in
+//! [`MimiEncoderState`], a speech-to-speech checkpoint's input.
 
-use crate::conv::StreamingConvTr1dState;
 use crate::conv::pad_for_conv1d;
+use crate::conv::{StreamingConv1dState, StreamingConvTr1dState};
 use crate::dummy_quantizer::DummyQuantizer;
 use crate::resample::{ConvDownsample1d, ConvTrUpsample1d};
-use crate::seanet::{SEANetDecoder, SEANetDecoderState, SEANetEncoder};
+use crate::seanet::{SEANetDecoder, SEANetDecoderState, SEANetEncoder, SEANetEncoderState};
 use crate::transformer::{ProjectedTransformer, StreamingTransformerState};
 use xn::nn::var_builder::Path;
 use xn::{Backend, BackendQ, Result, Tensor, Unquantized, WithDTypeF};
@@ -75,6 +76,13 @@ pub struct MimiDecoder<Q: BackendQ> {
 }
 
 #[derive(Debug, Clone)]
+pub struct MimiEncoderState<T: WithDTypeF, B: Backend> {
+    encoder_state: SEANetEncoderState<T, B>,
+    encoder_transformer_state: StreamingTransformerState<T, B>,
+    downsample_state: Option<StreamingConv1dState<T, B>>,
+}
+
+#[derive(Debug, Clone)]
 pub struct MimiDecoderState<T: WithDTypeF, B: Backend> {
     decoder_state: SEANetDecoderState<T, B>,
     decoder_transformer_state: StreamingTransformerState<T, B>,
@@ -135,18 +143,44 @@ impl<Q: BackendQ> MimiEncoder<Q> {
         Ok(Self { encoder, encoder_transformer, downsample, frame_size })
     }
 
+    /// Audio samples per latent frame.
+    pub fn frame_size(&self) -> usize {
+        self.frame_size
+    }
+
+    pub fn init_state(&self, batch_size: usize) -> Result<MimiEncoderState<Q::T, Q::B>> {
+        let downsample_state = self.downsample.as_ref().map(|ds| ds.init_state(batch_size));
+        Ok(MimiEncoderState {
+            encoder_state: self.encoder.init_state(batch_size)?,
+            // `sequence_length` reaches only the flow-LM attention kind, see
+            // `MimiDecoder::init_state`.
+            encoder_transformer_state: self.encoder_transformer.init_state(batch_size, 0)?,
+            downsample_state: downsample_state.transpose()?,
+        })
+    }
+
     /// Encode audio to latent (non-streaming). Returns [B, C, T'].
     pub fn encode_to_latent(&self, x: &Tensor<Q::T, Q::B>) -> Result<Tensor<Q::T, Q::B>> {
         let x = pad_for_conv1d(x, self.frame_size, self.frame_size)?;
-        let mut enc_state = self.encoder.init_state(x.dim(0usize)?)?;
-        let emb = self.encoder.forward(&x, &mut enc_state)?;
-        let mut et_state = self.encoder_transformer.init_state(x.dim(0usize)?, 8192)?;
-        let mut outs = self.encoder_transformer.forward(&emb, &mut et_state)?;
+        let mut state = self.init_state(x.dim(0usize)?)?;
+        self.encode_step(&x, &mut state)
+    }
+
+    /// Encode audio to latent (streaming). Input: [B, C, T], with T a multiple of
+    /// [`Self::frame_size`]; returns [B, C', T / frame_size].
+    pub fn encode_step(
+        &self,
+        x: &Tensor<Q::T, Q::B>,
+        state: &mut MimiEncoderState<Q::T, Q::B>,
+    ) -> Result<Tensor<Q::T, Q::B>> {
+        let emb = self.encoder.forward(x, &mut state.encoder_state)?;
+        let mut outs =
+            self.encoder_transformer.forward(&emb, &mut state.encoder_transformer_state)?;
         let emb = outs.swap_remove(0);
         // Downsample to frame rate
-        match &self.downsample {
-            Some(ds) => ds.forward_no_state(&emb),
-            None => Ok(emb),
+        match (&self.downsample, &mut state.downsample_state) {
+            (Some(ds), Some(ds_state)) => ds.forward(&emb, ds_state),
+            _ => Ok(emb),
         }
     }
 }
@@ -256,5 +290,118 @@ impl<Q: BackendQ> MimiDecoder<Q> {
 
         let outs = self.decoder_transformer.forward(&emb, &mut state.decoder_transformer_state)?;
         self.decoder.forward(&outs[0], &mut state.decoder_state)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xn::CpuDevice;
+    use xn::nn::VB;
+
+    type F32 = Unquantized<f32, CpuDevice>;
+
+    /// An encoder with random weights: 8 samples per frame, two SEANet steps per frame, a
+    /// transformer context of 6 steps, and 6-wide latents.
+    fn encoder() -> MimiEncoder<F32> {
+        use rand::{Rng, SeedableRng};
+        let cfg = MimiConfig {
+            channels: 1,
+            sample_rate: 16,
+            frame_rate: 2.0,
+            dimension: 16,
+            quantizer_dimension: 6,
+            quantizer_output_dimension: 16,
+            n_filters: 4,
+            n_residual_layers: 1,
+            ratios: vec![2, 2],
+            kernel_size: 3,
+            last_kernel_size: 3,
+            residual_kernel_size: 3,
+            dilation_base: 2,
+            compress: 2,
+            transformer_d_model: 16,
+            transformer_num_heads: 2,
+            transformer_num_layers: 1,
+            transformer_layer_scale: 0.01,
+            transformer_context: 6,
+            transformer_max_period: 10_000.,
+            transformer_dim_feedforward: 32,
+            downsample_channel_wise: false,
+            decoder_dimension: None,
+            inner_dim: Some(6),
+            gelu: None,
+        };
+        let conv = |name: &str, out: usize, inp: usize, k: usize| {
+            vec![(format!("{name}.weight"), vec![out, inp, k]), (format!("{name}.bias"), vec![out])]
+        };
+        let t = "encoder_transformer.transformer.layers.0";
+        let mut tensors = [
+            conv("encoder.model.0.conv", 4, 1, 3),
+            conv("encoder.model.1.block.1.conv", 2, 4, 3),
+            conv("encoder.model.1.block.3.conv", 4, 2, 1),
+            conv("encoder.model.3.conv", 8, 4, 4),
+            conv("encoder.model.4.block.1.conv", 4, 8, 3),
+            conv("encoder.model.4.block.3.conv", 8, 4, 1),
+            conv("encoder.model.6.conv", 16, 8, 4),
+            conv("encoder.model.8.conv", 16, 16, 3),
+        ]
+        .concat();
+        for (name, shape) in [
+            ("self_attn.in_proj.weight", vec![48, 16]),
+            ("self_attn.out_proj.weight", vec![16, 16]),
+            ("linear1.weight", vec![32, 16]),
+            ("linear2.weight", vec![16, 32]),
+            ("norm1.weight", vec![16]),
+            ("norm1.bias", vec![16]),
+            ("norm2.weight", vec![16]),
+            ("norm2.bias", vec![16]),
+            ("layer_scale_1.scale", vec![16]),
+            ("layer_scale_2.scale", vec![16]),
+        ] {
+            tensors.push((format!("{t}.{name}"), shape));
+        }
+        tensors.push(("downsample.conv.conv.weight".into(), vec![6, 16, 4]));
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0);
+        let (mut header, mut data) = (serde_json::Map::new(), Vec::new());
+        for (name, shape) in tensors {
+            let start = data.len();
+            for _ in 0..shape.iter().product::<usize>() {
+                data.extend(rng.random_range(-0.5f32..0.5).to_le_bytes());
+            }
+            header.insert(
+                name,
+                serde_json::json!({"dtype": "F32", "shape": shape, "data_offsets": [start, data.len()]}),
+            );
+        }
+        let header = serde_json::to_vec(&header).unwrap();
+        let bytes = [(header.len() as u64).to_le_bytes().as_slice(), &header, &data].concat();
+        let vb = VB::from_bytes(vec![bytes], CpuDevice).unwrap().root();
+        MimiEncoder::load(&vb, &cfg).unwrap()
+    }
+
+    #[test]
+    fn encoding_frame_by_frame_matches_encoding_the_whole_input() {
+        let enc = encoder();
+        let frames = 20;
+        let pcm: Vec<f32> = (0..frames * 8).map(|i| (i as f32 * 0.37).sin()).collect();
+        let whole = Tensor::from_vec(pcm.clone(), (1, 1, pcm.len()), &CpuDevice).unwrap();
+        let want: Vec<f32> = enc.encode_to_latent(&whole).unwrap().to_vec().unwrap();
+        assert_eq!(want.len(), 6 * frames);
+        for per in [1, 3] {
+            let mut state = enc.init_state(1).unwrap();
+            let pieces: Vec<Tensor<f32, CpuDevice>> = pcm
+                .chunks(8 * per)
+                .map(|c| {
+                    let c = Tensor::from_vec(c.to_vec(), (1, 1, c.len()), &CpuDevice).unwrap();
+                    enc.encode_step(&c, &mut state).unwrap()
+                })
+                .collect();
+            let got: Vec<f32> =
+                Tensor::cat(&pieces.iter().collect::<Vec<_>>(), 2).unwrap().to_vec().unwrap();
+            let err = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            assert!(err < 1e-4, "{per} frames at a time: {err}");
+        }
     }
 }

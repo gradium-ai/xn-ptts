@@ -36,11 +36,12 @@ impl<T: WithDTypeF, B: Backend> ConvDownsample1d<T, B> {
         self.conv.init_state(batch_size)
     }
 
-    /// Non-streaming forward (creates and discards state).
-    pub fn forward_no_state(&self, x: &Tensor<T, B>) -> Result<Tensor<T, B>> {
-        let b = x.dim(0usize)?;
-        let mut state = self.init_state(b)?;
-        self.conv.forward(x, &mut state)
+    pub fn forward(
+        &self,
+        x: &Tensor<T, B>,
+        state: &mut StreamingConv1dState<T, B>,
+    ) -> Result<Tensor<T, B>> {
+        self.conv.forward(x, state)
     }
 }
 
