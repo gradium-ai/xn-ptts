@@ -512,8 +512,12 @@ impl<Q: BackendQ> SynthOf<Q> {
         Ok((state, cfg_state))
     }
 
+    fn closed_voices(&self) -> bool {
+        self.cfg.voices.iter().any(|v| !v.conditions.is_empty())
+    }
+
     fn check_no_baked_voices(&self) -> Result<()> {
-        if self.cfg.voices.is_empty() {
+        if !self.closed_voices() {
             Ok(())
         } else {
             Err(Error::unsupported(
@@ -607,7 +611,7 @@ impl<Q: BackendQ> SynthApi for SynthOf<Q> {
     }
 
     fn supports_voice_cloning(&self) -> bool {
-        self.mimi_enc.is_some() && self.cfg.voices.is_empty()
+        self.mimi_enc.is_some() && !self.closed_voices()
     }
 
     fn voice_prompt_sample_rate(&self) -> u32 {
