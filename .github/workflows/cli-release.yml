@@ -93,12 +93,15 @@ jobs:
       # xn's build script prints `cargo:rustc-cfg=xn_kai` only when the KleidiAI kernels compiled.
       # A toolchain too old for them turns the feature off with a warning, which cargo hides for a
       # crates.io dependency, so check the recorded output of the build that ships instead.
+      # Cargo 1.100 moved that output from `build/xn-<hash>/output` to `build/xn/<hash>/run/stdout`;
+      # both are checked.
       - name: Check that the KleidiAI kernels are in the build
         if: contains(matrix.features, 'kai')
         shell: bash
         run: |
           set -euo pipefail
-          if ! grep -qs "cargo:rustc-cfg=xn_kai" target/${{ matrix.target }}/release/build/xn-*/output; then
+          build=target/${{ matrix.target }}/release/build
+          if ! grep -qs "cargo:rustc-cfg=xn_kai" $build/xn-*/output $build/xn/*/run/stdout; then
             echo "::error::the KleidiAI kernels did not build with this toolchain"
             exit 1
           fi
