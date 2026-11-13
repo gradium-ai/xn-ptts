@@ -358,6 +358,7 @@ mod tests {
             7,
             "en".parse().unwrap(),
             &[],
+            0.0,
             std::num::NonZeroUsize::new(1).unwrap(),
             &Default::default(),
         )

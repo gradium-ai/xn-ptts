@@ -7,6 +7,7 @@
 use crate::compat::{Aliases, Compat};
 use anyhow::{Context as _, Result};
 use ptts::checkpoint::{Checkpoint, ResolveOptions};
+use ptts::comp::{GainConfig, LimiterConfig, ModuleConfig};
 use ptts::hub::HubSource;
 use ptts::preprocess::Normalize;
 use ptts::synth::{DeviceKind, Quant, Synth};
@@ -92,6 +93,25 @@ async fn catalog_voices(source: &str, lang: &str) -> Result<Vec<(String, std::pa
     .await?
 }
 
+/// The audio modules that apply `--gain-db`: none at 0 dB, a gain alone when it lowers the
+/// level, and a gain followed by a limiter at -1 dBFS when it raises it, so that peaks the gain
+/// pushes over the ceiling are turned down rather than clipped.
+fn output_level(gain_db: f32) -> Result<Vec<ModuleConfig>> {
+    anyhow::ensure!(gain_db.is_finite(), "--gain-db must be a number, got {gain_db}");
+    let mut modules = Vec::new();
+    if gain_db != 0.0 {
+        modules.push(ModuleConfig::Gain(GainConfig { gain_db }));
+    }
+    if gain_db > 0.0 {
+        modules.push(ModuleConfig::Limiter(LimiterConfig {
+            lookahead_ms: 5.0,
+            headroom_db: 1.0,
+            release_ms: 50.0,
+        }));
+    }
+    Ok(modules)
+}
+
 /// Load the model named by `model`. The source is required.
 #[allow(clippy::too_many_arguments)]
 pub async fn load_ptts(
@@ -104,9 +124,11 @@ pub async fn load_ptts(
     seed_base: u64,
     normalize: Normalize,
     conditions: &[(String, String)],
+    gain_db: f32,
     max_concurrent_requests: std::num::NonZeroUsize,
     compat: &Compat,
 ) -> Result<AppState> {
+    let post_process = output_level(gain_db)?;
     anyhow::ensure!(
         max_concurrent_requests.get() <= tokio::sync::Semaphore::MAX_PERMITS,
         "--max-concurrent-requests must be at most {}",
@@ -138,7 +160,7 @@ pub async fn load_ptts(
     for (name, value) in conditions {
         builder = builder.condition(name, value);
     }
-    let mut synth = builder.build()?;
+    let mut synth = builder.post_process(post_process).build()?;
     m.register_voices(&mut synth);
     // Additional user voices remain optional and override names from the checkpoint.
     for (name, path) in extra_voices {
@@ -179,6 +201,27 @@ pub async fn load_ptts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gain_raises_the_level_without_clipping() {
+        assert!(output_level(0.0).unwrap().is_empty());
+        assert!(output_level(f32::NAN).is_err());
+        assert_eq!(output_level(-3.0).unwrap().len(), 1);
+
+        // A 440 Hz tone peaking at -3 dBFS, raised by 6 dB: the limiter holds it at -1 dBFS.
+        let rate = 24000;
+        let peak = 10f32.powf(-3.0 / 20.0);
+        let tone = |i: usize| (i as f32 * 440.0 * std::f32::consts::TAU / rate as f32).sin() * peak;
+        let mut pcm: Vec<f32> = (0..rate as usize).map(tone).collect();
+        use ptts::comp::AudioModule;
+        let mut chain = ptts::comp::Chain::from_modules(rate, &output_level(6.0).unwrap());
+        chain.process(&mut pcm);
+        let ceiling = 10f32.powf(-1.0 / 20.0);
+        assert!(pcm.iter().all(|x| x.abs() <= ceiling + 1e-6));
+        // Past the limiter's attack, the tone is louder than it went in.
+        let out_peak = pcm[rate as usize / 2..].iter().fold(0f32, |m, x| m.max(x.abs()));
+        assert!(out_peak > peak * 1.2, "{out_peak} vs {peak}");
+    }
 
     #[tokio::test]
     async fn the_catalog_voices_served_are_those_in_the_language() {
@@ -237,6 +280,7 @@ mod checkpoint_tests {
             7,
             Normalize::OFF,
             &[],
+            0.0,
             std::num::NonZeroUsize::new(1).unwrap(),
             &Default::default(),
         )

@@ -121,6 +121,11 @@ struct Args {
     /// always send a speed. Without it, such a request is an error.
     #[arg(long, env = "PTTS_IGNORE_SPEED")]
     ignore_speed: bool,
+
+    /// Raise (or lower) the output level by this many dB, for example `3`. A limiter keeps
+    /// raised peaks below -1 dBFS, so nothing clips. Applies to the HTTP API and Wyoming.
+    #[arg(long, default_value_t = 0.0, env = "PTTS_GAIN_DB", allow_negative_numbers = true)]
+    gain_db: f32,
 }
 
 impl Args {
@@ -234,6 +239,7 @@ async fn build_app_state(args: &Args) -> Result<model::AppState> {
         args.seed,
         normalize,
         &conditions,
+        args.gain_db,
         args.max_concurrent_requests,
         &compat::Compat {
             voice_aliases: args.voice_aliases.clone(),
