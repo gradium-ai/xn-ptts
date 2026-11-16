@@ -2842,6 +2842,7 @@ version = "0.7.1"
 dependencies = [
  "block2",
  "half",
+ "libc",
  "objc2",
  "objc2-core-foundation",
  "objc2-core-ml",

@@ -22,6 +22,8 @@ xn = { workspace = true, optional = true }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 block2 = "0.6"
+# The Mimi worker takes its caller's quality-of-service class.
+libc = { workspace = true }
 objc2 = "0.6"
 objc2-core-video = { version = "0.3", features = ["CVPixelBuffer", "CVBuffer", "CVImageBuffer", "CVReturn"] }
 objc2-core-foundation = "0.3"
