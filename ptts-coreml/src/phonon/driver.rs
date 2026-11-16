@@ -518,9 +518,9 @@ impl Phonon {
     }
 }
 
-/// A thread's quality-of-service class and its relative priority. A new thread starts at the default class whatever
-/// its creator's, so a worker the caller waits on must be given the caller's, or the waiting
-/// thread is held back behind a lower class (a priority inversion).
+/// A thread's quality-of-service class and its relative priority. A new thread starts at the
+/// default class whatever its creator's, so a worker the caller waits on must be given the
+/// caller's, or the waiting thread is held back behind a lower class (a priority inversion).
 #[derive(Clone, Copy)]
 struct QoS(libc::qos_class_t, libc::c_int);
 
@@ -537,7 +537,8 @@ impl QoS {
     fn apply(self) {
         if !matches!(self.0, libc::qos_class_t::QOS_CLASS_UNSPECIFIED) {
             // SAFETY: changes only the calling thread's scheduling class.
-            unsafe { libc::pthread_set_qos_class_self_np(self.0, self.1) };
+            let rc = unsafe { libc::pthread_set_qos_class_self_np(self.0, self.1) };
+            debug_assert_eq!(rc, 0, "pthread_set_qos_class_self_np failed");
         }
     }
 }
