@@ -2,7 +2,8 @@
 //!
 //! `emb -> transformer layers -> out_norm -> (eos logit, flow_net sample)`, plus each layer's
 //! new K and V rows. The same graph at `t = 1` is the decode step and at `t = prefill_len` the
-//! batched text prefill.
+//! batched text prefill. Both are functions of one program, `step` and `prefill`, which share
+//! one copy of the weights.
 //!
 //! Three things keep it on the Neural Engine, and each one fails silently when broken, by
 //! planning the whole graph back onto the CPU:
@@ -14,8 +15,7 @@
 //! It is fp16 throughout, which the ANE requires. rope cos/sin and the attention mask arrive
 //! ready-made from the host.
 
-use crate::mil::{Builder, DType, Gelu, Var};
-use crate::proto::core_ml::specification::Model;
+use crate::mil::{Builder, DType, Gelu, Var, program};
 use crate::weights::Weights;
 
 /// The flow LM's sizes, from the checkpoint's config (`ptts::flow_lm::FlowLMConfig`).
@@ -57,14 +57,23 @@ pub enum FlowType {
 
 const FP: DType = DType::Fp16;
 
-/// A graph and its weights blob.
-pub type Built = (Model, Option<Vec<u8>>);
+pub use crate::mil::Built;
 
-/// Package name of the graph for `t` rows against a `ctx`-slot ring, shared by the exporter and
-/// the driver.
-pub fn package_name(ctx: usize, t: usize) -> String {
+/// Package name of the flow LM against a `ctx`-slot ring, shared by the exporter and the driver.
+pub fn package_name(ctx: usize) -> String {
+    format!("flow-c{ctx}")
+}
+
+/// Package name of the graph for `t` rows, from bundles exported before the two graphs became
+/// functions of one package. The driver still loads them.
+pub fn legacy_package_name(ctx: usize, t: usize) -> String {
     format!("flow-c{ctx}-t{t}")
 }
+
+/// The function that takes one row, the decode step, and the program's default.
+pub const STEP: &str = "step";
+/// The function that takes `prefill_len` rows, the batched text prefill.
+pub const PREFILL: &str = "prefill";
 
 fn w(b: &mut Builder, wt: &Weights, name: &str) -> Result<Var, String> {
     let (shape, data) = wt.get(name)?;
@@ -365,6 +374,21 @@ fn flow_net(
     Ok(b.linear(&h, &fw, Some(&fb), &[1, dm.ldim]))
 }
 
+/// The flow LM program: `STEP`, one row per call, and `PREFILL`, `prefill_len` rows.
+pub fn build(
+    wt: &Weights,
+    dm: &Dims,
+    ctx: usize,
+    prefill_len: usize,
+    time_norm: TimeNorm,
+    gelu: Gelu,
+    flow: FlowType,
+) -> Result<Built, String> {
+    let step = graph(wt, dm, ctx, 1, time_norm, gelu, flow)?;
+    let prefill = graph(wt, dm, ctx, prefill_len, time_norm, gelu, flow)?;
+    program(vec![(STEP, step), (PREFILL, prefill)])
+}
+
 /// The flow LM for `t` positions against a `ctx`-slot ring cache.
 ///
 /// Inputs: `emb [1, t, D]` (the host applies `input_linear` and the speaker embedding, so the
@@ -373,7 +397,7 @@ fn flow_net(
 /// and `eos` for the last position, and `k_new`/`v_new [L, H, t, HD]` for the host to store.
 /// `time_norm` is the checkpoint's time-embedding norm, baked into the graph as a constant,
 /// `gelu` its FFN activation and `flow` its flow head.
-pub fn build(
+fn graph(
     wt: &Weights,
     dm: &Dims,
     ctx: usize,

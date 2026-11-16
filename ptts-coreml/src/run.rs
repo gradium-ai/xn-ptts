@@ -184,10 +184,19 @@ impl Model {
     }
 
     /// Load a compiled `.mlmodelc`, compiling `package` into it first if it is missing.
-    pub fn load(package: &Path, compiled: &Path, compute: Compute) -> Result<Self, String> {
+    /// `function` picks one function of a program that has several; `None` is its default.
+    pub fn load(
+        package: &Path,
+        compiled: &Path,
+        compute: Compute,
+        function: Option<&str>,
+    ) -> Result<Self, String> {
         Self::precompile(package, compiled)?;
         let cfg = unsafe { MLModelConfiguration::new() };
         unsafe { cfg.setComputeUnits(compute.units()) };
+        if let Some(f) = function {
+            unsafe { cfg.setFunctionName(Some(&NSString::from_str(f))) };
+        }
         let inner =
             unsafe { MLModel::modelWithContentsOfURL_configuration_error(&url(compiled), &cfg) }
                 .map_err(|e| format!("{}: {e:?}", compiled.display()))?;
