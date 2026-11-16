@@ -1,8 +1,9 @@
 //! Export a checkpoint as Core ML models for the iOS and macOS package (`ios/PhononTTS`).
 //!
 //! Writes one directory: the flow LM as one ML Program with two functions over one copy of the
-//! weights (one step, and the batched text prefill), the Mimi decoder, the few tensors the driver applies on the host, the tokenizer,
-//! the voices, and a `bundle.json` describing it all with every file's size and SHA-256.
+//! weights (one step, and the batched text prefill), the Mimi decoder, the few tensors the
+//! driver applies on the host, the tokenizer, the voices, and a `bundle.json` describing it all
+//! with every file's size and SHA-256.
 //!
 //! ```bash
 //! cargo run --release -p ptts --example export_coreml --features hub -- out/models

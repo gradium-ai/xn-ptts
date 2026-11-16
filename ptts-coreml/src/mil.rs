@@ -685,13 +685,14 @@ impl Builder {
 /// function of the given name, all of them reading one copy of the weights, and the first is
 /// the default. Load one with `MLModelConfiguration.functionName`.
 pub fn program(models: Vec<(&str, Built)>) -> Result<Built, String> {
-    let default_function_name = models.first().map(|(n, _)| n.to_string()).unwrap_or_default();
+    let default_function_name =
+        models.first().map(|(n, _)| n.to_string()).ok_or("a program needs a function")?;
     let (mut weights, mut functions, mut described) = (None, HashMap::new(), Vec::new());
     for (i, (name, (model, blob))) in models.into_iter().enumerate() {
         if i == 0 {
             weights = blob;
         } else if blob != weights {
-            return Err(format!("`{name}` has weights the first function lacks"));
+            return Err(format!("`{name}`'s weights differ from `{default_function_name}`'s"));
         }
         let desc = model.description.unwrap_or_default();
         let input = desc.input;
@@ -719,4 +720,39 @@ pub fn program(models: Vec<(&str, Built)>) -> Result<Built, String> {
         })),
     };
     Ok((model, weights))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn graph(w: f32, t: usize) -> Built {
+        let mut b = Builder::new();
+        let x = b.input("x", DType::Fp32, &[1, t, 64]);
+        let w = b.const_blob(&[w; 64 * 64], &[64, 64]);
+        let y = b.linear(&x, &w, None, &[1, t, 64]);
+        b.finish_with_weights(&[&y])
+    }
+
+    #[test]
+    fn functions_share_one_blob_and_the_first_is_the_default() {
+        let (model, blob) =
+            program(vec![("step", graph(1.0, 1)), ("prefill", graph(1.0, 8))]).unwrap();
+        assert_eq!(blob, graph(1.0, 1).1);
+        let desc = model.description.unwrap();
+        assert_eq!(desc.default_function_name, "step");
+        assert!(desc.input.is_empty() && desc.output.is_empty());
+        let names: Vec<_> = desc.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["step", "prefill"]);
+        let Some(spec::model::Type::MlProgram(p)) = model.r#type else { panic!("not a program") };
+        let mut functions: Vec<_> = p.functions.keys().map(String::as_str).collect();
+        functions.sort();
+        assert_eq!(functions, ["prefill", "step"]);
+    }
+
+    #[test]
+    fn different_weights_or_no_function_are_refused() {
+        assert!(program(vec![("a", graph(1.0, 1)), ("b", graph(2.0, 1))]).is_err());
+        assert!(program(vec![]).is_err());
+    }
 }

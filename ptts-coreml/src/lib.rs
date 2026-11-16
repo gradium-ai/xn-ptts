@@ -10,9 +10,9 @@
 //! `phonon::driver` through the CoreML runtime (`run`).
 //!
 //! Conventions here were taken from a model produced by coremltools and read back field by
-//! field: specification version 9, program version 1, a single `main` function with opset
-//! `CoreML8`, and `const` ops that carry their value in `attributes["val"]` rather than as an
-//! input binding.
+//! field: specification version 9, program version 1, a `main` function (the flow LM has one
+//! function per graph instead) with opset `CoreML8`, and `const` ops that carry their value in
+//! `attributes["val"]` rather than as an input binding.
 pub mod blob;
 pub mod mil;
 pub mod package;
