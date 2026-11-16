@@ -12,6 +12,9 @@ use std::collections::HashMap;
 pub const OPSET: &str = "CoreML8";
 pub const SPEC_VERSION: i32 = 9;
 
+/// A model and the weights blob it refers to.
+pub type Built = (spec::Model, Option<Vec<u8>>);
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DType {
     Fp32,
@@ -664,6 +667,7 @@ impl Builder {
                     .map(|(name, dt, shape)| feature(name, *dt, shape))
                     .collect(),
                 output: outputs.iter().map(|v| feature(&v.name, v.dtype, &v.shape)).collect(),
+                ..Default::default()
             }),
             is_updatable: false,
             r#type: Some(spec::model::Type::MlProgram(m::Program {
@@ -675,4 +679,44 @@ impl Builder {
         };
         (model, weights)
     }
+}
+
+/// One program from models built alone over identical weights: each model's `main` becomes the
+/// function of the given name, all of them reading one copy of the weights, and the first is
+/// the default. Load one with `MLModelConfiguration.functionName`.
+pub fn program(models: Vec<(&str, Built)>) -> Result<Built, String> {
+    let default_function_name = models.first().map(|(n, _)| n.to_string()).unwrap_or_default();
+    let (mut weights, mut functions, mut described) = (None, HashMap::new(), Vec::new());
+    for (i, (name, (model, blob))) in models.into_iter().enumerate() {
+        if i == 0 {
+            weights = blob;
+        } else if blob != weights {
+            return Err(format!("`{name}` has weights the first function lacks"));
+        }
+        let desc = model.description.unwrap_or_default();
+        let input = desc.input;
+        let output = desc.output;
+        described.push(spec::FunctionDescription { name: name.to_string(), input, output });
+        let Some(spec::model::Type::MlProgram(mut p)) = model.r#type else {
+            return Err(format!("`{name}` is not an ML Program"));
+        };
+        let main = p.functions.remove("main").ok_or_else(|| format!("`{name}` has no main"))?;
+        functions.insert(name.to_string(), main);
+    }
+    let model = spec::Model {
+        specification_version: SPEC_VERSION,
+        description: Some(spec::ModelDescription {
+            functions: described,
+            default_function_name,
+            ..Default::default()
+        }),
+        is_updatable: false,
+        r#type: Some(spec::model::Type::MlProgram(m::Program {
+            version: 1,
+            functions,
+            doc_string: String::new(),
+            attributes: HashMap::new(),
+        })),
+    };
+    Ok((model, weights))
 }

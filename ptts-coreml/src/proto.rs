@@ -29,11 +29,27 @@ pub mod core_ml {
             }
         }
 
+        /// A program with one function describes it in `input` and `output`; one with several
+        /// leaves those empty and describes each in `functions` instead.
         #[derive(Clone, PartialEq, prost::Message)]
         pub struct ModelDescription {
             #[prost(message, repeated, tag = "1")]
             pub input: Vec<FeatureDescription>,
             #[prost(message, repeated, tag = "10")]
+            pub output: Vec<FeatureDescription>,
+            #[prost(message, repeated, tag = "20")]
+            pub functions: Vec<FunctionDescription>,
+            #[prost(string, tag = "21")]
+            pub default_function_name: String,
+        }
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        pub struct FunctionDescription {
+            #[prost(string, tag = "1")]
+            pub name: String,
+            #[prost(message, repeated, tag = "2")]
+            pub input: Vec<FeatureDescription>,
+            #[prost(message, repeated, tag = "3")]
             pub output: Vec<FeatureDescription>,
         }
 

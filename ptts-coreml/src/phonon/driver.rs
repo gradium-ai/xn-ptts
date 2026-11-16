@@ -247,9 +247,22 @@ fn ring_write(dm: &fl::Dims, buf: &Buf, rows: &[f32], written: usize, t: usize, 
     });
 }
 
-fn load(dir: &Path, name: &str, unit: Compute) -> Result<Model, String> {
+fn load(dir: &Path, name: &str, unit: Compute, function: Option<&str>) -> Result<Model, String> {
     let package = dir.join(format!("{name}.mlpackage"));
-    Model::load(&package, &package.with_extension("mlmodelc"), unit)
+    Model::load(&package, &package.with_extension("mlmodelc"), unit, function)
+}
+
+/// The flow LM's step and prefill graphs: two functions of one package, or, in a bundle exported
+/// before that, two packages.
+fn load_flow_lm(dir: &Path, cfg: &Config) -> Result<(Model, Model), String> {
+    let (ctx, unit) = (cfg.ctx, cfg.flow_unit);
+    let name = fl::package_name(ctx);
+    if dir.join(format!("{name}.mlpackage")).exists() {
+        let step = load(dir, &name, unit, Some(fl::STEP))?;
+        return Ok((step, load(dir, &name, unit, Some(fl::PREFILL))?));
+    }
+    let step = load(dir, &fl::legacy_package_name(ctx, 1), unit, None)?;
+    Ok((step, load(dir, &fl::legacy_package_name(ctx, cfg.prefill_len), unit, None)?))
 }
 
 /// Mimi for one utterance: its session, and the streaming state it carries between frames.
@@ -300,11 +313,10 @@ impl Phonon {
         let wt = Weights::open(&dir.join("host.safetensors"))?;
         let dm = cfg.dims;
         let ring = Ring::new(&dm, cfg.ctx)?;
-        let decode = load(dir, &fl::package_name(cfg.ctx, 1), cfg.flow_unit)?;
+        let (decode, prefill) = load_flow_lm(dir, &cfg)?;
         let decode = Flow::new(decode, dm, 1, cfg.ctx, &ring)?;
-        let prefill = load(dir, &fl::package_name(cfg.ctx, cfg.prefill_len), cfg.flow_unit)?;
         let prefill = Flow::new(prefill, dm, cfg.prefill_len, cfg.ctx, &ring)?;
-        let mimi = load(dir, &cfg.mimi.package_name(cfg.mimi_window), Compute::CpuOnly)?;
+        let mimi = load(dir, &cfg.mimi.package_name(cfg.mimi_window), Compute::CpuOnly, None)?;
 
         // Bundles exported before the conditioners came from the config call it `num_speakers`,
         // the one conditioner they knew.

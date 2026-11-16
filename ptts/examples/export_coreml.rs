@@ -1,7 +1,7 @@
 //! Export a checkpoint as Core ML models for the iOS and macOS package (`ios/PhononTTS`).
 //!
-//! Writes one directory: the flow LM as two ML Programs (one step, and the batched text
-//! prefill), the Mimi decoder, the few tensors the driver applies on the host, the tokenizer,
+//! Writes one directory: the flow LM as one ML Program with two functions over one copy of the
+//! weights (one step, and the batched text prefill), the Mimi decoder, the few tensors the driver applies on the host, the tokenizer,
 //! the voices, and a `bundle.json` describing it all with every file's size and SHA-256.
 //!
 //! ```bash
@@ -238,14 +238,9 @@ fn main() -> Result<()> {
     let ctx = vlen + args.max_tokens + max_frames + 16;
     tracing::info!(?dims, vlen, max_frames, ctx, "building graphs");
     let bad = |e: String| anyhow::anyhow!(e);
-    write(
-        &args.out,
-        &fl::package_name(ctx, 1),
-        fl::build(&wt, &dims, ctx, 1, time_norm, gelu(f.gelu), flow).map_err(bad)?,
-    )?;
-    let prefill =
+    let flow_lm =
         fl::build(&wt, &dims, ctx, args.max_tokens, time_norm, gelu(f.gelu), flow).map_err(bad)?;
-    write(&args.out, &fl::package_name(ctx, args.max_tokens), prefill)?;
+    write(&args.out, &fl::package_name(ctx), flow_lm)?;
     write(
         &args.out,
         &mimi_dims.package_name(window),
