@@ -448,9 +448,12 @@ impl Phonon {
             let (lat_tx, lat_rx) = std::sync::mpsc::channel::<(usize, Vec<f32>)>();
             let (pcm_tx, pcm_rx) = std::sync::mpsc::channel::<Result<Vec<f32>, String>>();
             // Mimi owns its streaming state for the whole utterance, so frames stay in order.
+            let qos = QoS::current();
             std::thread::Builder::new()
                 .name("mimi".into())
                 .spawn_scoped(scope, move || {
+                    // This thread blocks on Mimi every frame, so Mimi runs at its QoS.
+                    qos.apply();
                     while let Ok((i, lat)) = lat_rx.recv() {
                         let r = stream.decode(i, &lat);
                         let failed = r.is_err();
@@ -515,6 +518,30 @@ impl Phonon {
     }
 }
 
+/// A thread's quality-of-service class and its relative priority. A new thread starts at the default class whatever
+/// its creator's, so a worker the caller waits on must be given the caller's, or the waiting
+/// thread is held back behind a lower class (a priority inversion).
+#[derive(Clone, Copy)]
+struct QoS(libc::qos_class_t, libc::c_int);
+
+impl QoS {
+    fn current() -> Self {
+        let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+        let mut priority = 0;
+        // SAFETY: both pointers are to live locals, and `pthread_self` is the calling thread.
+        unsafe { libc::pthread_get_qos_class_np(libc::pthread_self(), &mut class, &mut priority) };
+        Self(class, priority)
+    }
+
+    /// Give the calling thread this class. Best effort: a failure leaves it at the default.
+    fn apply(self) {
+        if !matches!(self.0, libc::qos_class_t::QOS_CLASS_UNSPECIFIED) {
+            // SAFETY: changes only the calling thread's scheduling class.
+            unsafe { libc::pthread_set_qos_class_self_np(self.0, self.1) };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,5 +565,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_worker_takes_its_callers_qos() {
+        fn class(q: QoS) -> u32 {
+            q.0 as u32
+        }
+        let user_initiated = libc::qos_class_t::QOS_CLASS_USER_INITIATED as u32;
+        std::thread::spawn(move || {
+            QoS(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0).apply();
+            let caller = QoS::current();
+            assert_eq!(class(caller), user_initiated);
+            let plain = std::thread::spawn(|| class(QoS::current())).join().unwrap();
+            assert_ne!(plain, user_initiated, "a new thread should not inherit the class");
+            let worker = std::thread::spawn(move || {
+                caller.apply();
+                class(QoS::current())
+            });
+            assert_eq!(worker.join().unwrap(), user_initiated);
+        })
+        .join()
+        .unwrap();
     }
 }
