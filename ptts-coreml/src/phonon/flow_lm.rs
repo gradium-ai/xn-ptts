@@ -389,6 +389,19 @@ pub fn build(
     program(vec![(STEP, step), (PREFILL, prefill)])
 }
 
+/// The step graph alone, as a single-function package, for a checkpoint with no text to
+/// prefill.
+pub fn build_step(
+    wt: &Weights,
+    dm: &Dims,
+    ctx: usize,
+    time_norm: TimeNorm,
+    gelu: Gelu,
+    flow: FlowType,
+) -> Result<Built, String> {
+    graph(wt, dm, ctx, 1, time_norm, gelu, flow)
+}
+
 /// The flow LM for `t` positions against a `ctx`-slot ring cache.
 ///
 /// Inputs: `emb [1, t, D]` (the host applies `input_linear` and the speaker embedding, so the

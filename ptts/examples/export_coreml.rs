@@ -13,6 +13,10 @@
 //! The graphs are built for the Neural Engine: fp16, fully static shapes, and a KV cache the
 //! host keeps. `--max-tokens` is the longest sentence the prefill graph takes; longer text is
 //! split into sentences at run time. Mimi stays f32 and runs on the CPU.
+//!
+//! A speech-to-speech checkpoint gets no prefill graph and no tokenizer: its frames take their
+//! conditions from the input audio, which `ptts_coreml::phonon::s2s` documents, and its cache
+//! holds the voice and `--context` frames.
 
 #[path = "../src/bin/ptts/model_helpers.rs"]
 mod model_helpers;
@@ -60,6 +64,9 @@ struct Args {
     /// Sampling temperature the app speaks at. The default matches the other frontends.
     #[arg(long, default_value_t = 0.3)]
     temperature: f32,
+    /// For a speech-to-speech checkpoint: input frames the cache keeps in view after the voice.
+    #[arg(long, default_value_t = ptts::s2s::DEFAULT_CONTEXT)]
+    context: usize,
 }
 
 fn write(out: &Path, name: &str, built: fl::Built) -> Result<()> {
@@ -234,14 +241,26 @@ fn main() -> Result<()> {
         )?;
     }
 
-    // `ctx` is baked into the graphs: voice, one chunk of text and its frames must fit.
+    // `ctx` is baked into the graphs: voice, one chunk of text and its frames must fit, or for
+    // speech to speech, the voice and the frames in view.
+    let s2s = wt.get("flow_lm.condition_provider.conditioners.source_latents.output_proj.weight");
+    let s2s = s2s.is_ok();
+    if s2s && !cfg.conditioners.is_empty() {
+        // A frame's condition takes the place of the conditioner vector, as in `ptts::s2s`.
+        anyhow::bail!("a speech-to-speech checkpoint with conditioners is not supported")
+    }
     let max_frames = ptts::plan::frame_budget(args.max_tokens, m.frame_rate);
-    let ctx = vlen + args.max_tokens + max_frames + 16;
-    tracing::info!(?dims, vlen, max_frames, ctx, "building graphs");
+    let (ctx, prefill_len) = match s2s {
+        true => (vlen + args.context, 0),
+        false => (vlen + args.max_tokens + max_frames + 16, args.max_tokens),
+    };
+    tracing::info!(?dims, vlen, max_frames, ctx, s2s, "building graphs");
     let bad = |e: String| anyhow::anyhow!(e);
-    let flow_lm =
-        fl::build(&wt, &dims, ctx, args.max_tokens, time_norm, gelu(f.gelu), flow).map_err(bad)?;
-    write(&args.out, &fl::package_name(ctx), flow_lm)?;
+    let flow_lm = match s2s {
+        true => fl::build_step(&wt, &dims, ctx, time_norm, gelu(f.gelu), flow),
+        false => fl::build(&wt, &dims, ctx, prefill_len, time_norm, gelu(f.gelu), flow),
+    };
+    write(&args.out, &fl::package_name(ctx), flow_lm.map_err(bad)?)?;
     write(
         &args.out,
         &mimi_dims.package_name(window),
@@ -258,25 +277,27 @@ fn main() -> Result<()> {
     let mut host: Vec<(&str, Vec<usize>, Vec<u8>)> = Vec::new();
     // The text table at the model's width: a low-rank one through its `output_proj`, as ptts
     // projects it at load.
-    let (shape, table) = get("flow_lm.conditioner.embed.weight")?;
-    let (shape, table) = match wt.get("flow_lm.conditioner.output_proj.weight") {
-        Ok((proj_shape, proj)) => {
-            let (rows, rank, d) = (shape[0], shape[1], proj_shape[0]);
-            let mut out = vec![0f32; rows * d];
-            for (row, o) in table.chunks(rank).zip(out.chunks_mut(d)) {
-                for (v, p) in o.iter_mut().zip(proj.chunks(rank)) {
-                    *v = row.iter().zip(p).map(|(a, b)| a * b).sum();
+    if !s2s {
+        let (shape, table) = get("flow_lm.conditioner.embed.weight")?;
+        let (shape, table) = match wt.get("flow_lm.conditioner.output_proj.weight") {
+            Ok((proj_shape, proj)) => {
+                let (rows, rank, d) = (shape[0], shape[1], proj_shape[0]);
+                let mut out = vec![0f32; rows * d];
+                for (row, o) in table.chunks(rank).zip(out.chunks_mut(d)) {
+                    for (v, p) in o.iter_mut().zip(proj.chunks(rank)) {
+                        *v = row.iter().zip(p).map(|(a, b)| a * b).sum();
+                    }
                 }
+                (vec![rows, d], out)
             }
-            (vec![rows, d], out)
-        }
-        Err(_) => (shape.to_vec(), table.to_vec()),
-    };
-    host.push((
-        "flow_lm.conditioner.embed.weight",
-        shape,
-        table.iter().flat_map(|v| v.to_le_bytes()).collect(),
-    ));
+            Err(_) => (shape.to_vec(), table.to_vec()),
+        };
+        host.push((
+            "flow_lm.conditioner.embed.weight",
+            shape,
+            table.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        ));
+    }
     for n in ["flow_lm.input_linear.weight", "flow_lm.bos_emb"] {
         let (shape, data) = get(n)?;
         host.push((n, shape.to_vec(), data.iter().flat_map(|v| v.to_le_bytes()).collect()));
@@ -292,17 +313,19 @@ fn main() -> Result<()> {
         .collect::<Result<_>>()?;
     safetensors::serialize_to_file(&views, None, &args.out.join("host.safetensors"))?;
 
-    let tokenizer = args
-        .tokenizer
-        .clone()
-        .or(ck.tokenizer.clone())
-        .context("no tokenizer.json: pass --tokenizer")?;
-    anyhow::ensure!(
-        tokenizer.extension().is_some_and(|e| e == "json"),
-        "{} is not a tokenizer.json; convert it with scripts/convert-tokenizer.py",
-        tokenizer.display()
-    );
-    std::fs::copy(&tokenizer, args.out.join("tokenizer.json"))?;
+    if !s2s {
+        let tokenizer = args
+            .tokenizer
+            .clone()
+            .or(ck.tokenizer.clone())
+            .context("no tokenizer.json: pass --tokenizer")?;
+        anyhow::ensure!(
+            tokenizer.extension().is_some_and(|e| e == "json"),
+            "{} is not a tokenizer.json; convert it with scripts/convert-tokenizer.py",
+            tokenizer.display()
+        );
+        std::fs::copy(&tokenizer, args.out.join("tokenizer.json"))?;
+    }
 
     // Every file with its size and SHA-256, so an app can fetch the bundle from any static host
     // and verify it. `built` changes on every export, so an installed copy can tell it is old.
@@ -313,7 +336,8 @@ fn main() -> Result<()> {
     let meta = serde_json::json!({
         "built": built,
         "ctx": ctx,
-        "prefill_len": args.max_tokens,
+        "prefill_len": prefill_len,
+        "s2s": s2s.then(|| serde_json::json!({"delay": cfg.audio_delay, "context": args.context})),
         "max_frames": max_frames,
         "mimi": mimi_dims.to_json(),
         "mimi_window": window,
