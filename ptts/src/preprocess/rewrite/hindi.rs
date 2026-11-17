@@ -41,6 +41,7 @@ fn single(word: &str, next: Option<&str>) -> Option<String> {
         return end.strip_prefix('.').map(|end| format!("नंबर{end}"));
     }
     let spoken = fraction(body)
+        .or_else(|| score(body, next))
         .or_else(|| date(body))
         .or_else(|| percent(body))
         .or_else(|| ordinal(body))
@@ -92,6 +93,14 @@ fn date(body: &str) -> Option<String> {
         [d, m] if slashed => Some(format!("{} {}", day(d)?, month(m)?)),
         _ => None,
     }
+}
+
+/// Marks out of a total before a word for marks: "7/10 अंक" is "दस में से सात अंक", not a date.
+fn score(body: &str, next: Option<&str>) -> Option<String> {
+    let marks = next.is_some_and(|w| matches!(split_suffix(w).0, "अंक" | "अंकों" | "नंबर" | "मार्क्स"));
+    let (got, of) = body.split_once('/').filter(|_| marks)?;
+    let short = |s: &str| (1..=3).contains(&s.len()) && all_digits(s);
+    (short(got) && short(of)).then(|| Some(format!("{} में से {}", quantity(of)?, quantity(got)?)))?
 }
 
 /// A fraction: "1/4" is "एक-चौथाई", "1½" "डेढ़", "¾" "तीन-चौथाई".
@@ -666,6 +675,9 @@ mod tests {
         assert_eq!(read("98765 43210 पर"), Some(("नौ आठ सात छह पाँच, चार तीन दो एक शून्य".into(), 2)));
         // A plus before a small number is not a phone number.
         assert_eq!(read("+5 अंक"), None);
+        // Marks out of a total, not a date.
+        assert_eq!(read("7/10 अंक").map(|(s, _)| s).as_deref(), Some("दस में से सात"));
+        assert_eq!(read("12/10").map(|(s, _)| s).as_deref(), Some("बारह अक्टूबर"));
         // A five-digit number before a five-letter word is a count, not a mobile number.
         assert_eq!(read("10000 steps"), None);
         assert_eq!(span(Some("कुल"), &["4471"]), None);
