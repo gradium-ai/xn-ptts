@@ -174,7 +174,7 @@ fn ordinal(body: &str) -> Option<String> {
 /// read digit by digit in its groups, "3391-8820" "तीन तीन नौ एक, आठ आठ दो शून्य". A range may
 /// run down to a smaller number before बजे: "9-5 बजे".
 fn dashed(body: &str, next: Option<&str>) -> Option<String> {
-    let hours = next.is_some_and(|w| w.starts_with("बज"));
+    let hours = next.is_some_and(|w| is_baje(split_suffix(w).0));
     if let Some(range) = range(body, hours) {
         return Some(range);
     }
@@ -265,13 +265,18 @@ const POSTPOSITIONS: [&str; 11] =
 /// The ratio words a pair of numbers with a colon follows.
 const RATIOS: [&str; 4] = ["अनुपात", "रेशियो", "रेश्यो", "ratio"];
 
+/// Whether `word` is a form of बजना that follows a time ("बजे", "बजकर"), not "बजट".
+fn is_baje(word: &str) -> bool {
+    matches!(word, "बज" | "बजे" | "बजकर" | "बजने")
+}
+
 /// A clock time, a range of them, a duration or a ratio, and the बजे after a time.
 fn time(prev: Option<&str>, words: &[&str]) -> Option<(String, usize)> {
     let (body, end) = split_suffix(words.first()?);
     let next = words.get(1).map(|w| split_suffix(w));
     let ratio = prev.is_some_and(|p| RATIOS.contains(&split_suffix(p).0));
     // Hindi writes a time with a period before बजे: "11.30 बजे".
-    let before_baje = next.is_some_and(|(n, _)| n.starts_with("बज"));
+    let before_baje = next.is_some_and(|(n, _)| is_baje(n));
     let mut clock = Clock::parse(body, ':').filter(|_| !ratio);
     if clock.is_none() && before_baje {
         clock = Clock::parse(body, '.');
@@ -377,7 +382,10 @@ fn phone(prev: Option<&str>, words: &[&str]) -> Option<(String, usize)> {
     } else if first.len() == 5
         && all_digits(first)
         && end.is_empty()
-        && words.get(1).is_some_and(|w| split_suffix(w).0.len() == 5)
+        && words.get(1).is_some_and(|w| {
+            let next = split_suffix(w).0;
+            next.len() == 5 && all_digits(next)
+        })
     {
         // A mobile number in two groups of five.
         groups.push(digits(first));
@@ -658,6 +666,8 @@ mod tests {
         assert_eq!(read("98765 43210 पर"), Some(("नौ आठ सात छह पाँच, चार तीन दो एक शून्य".into(), 2)));
         // A plus before a small number is not a phone number.
         assert_eq!(read("+5 अंक"), None);
+        // A five-digit number before a five-letter word is a count, not a mobile number.
+        assert_eq!(read("10000 steps"), None);
         assert_eq!(span(Some("कुल"), &["4471"]), None);
     }
 
