@@ -28,7 +28,7 @@ typedef bool (*PttsFrameFn)(const float *pcm, size_t n, void *user);
 /// Load a model. On Apple, `dir` is an exported bundle, compiled for this device first if needed
 /// (once per install), and `unit` is PTTS_UNIT_ANE or PTTS_UNIT_CPU. Elsewhere, `dir` is a
 /// checkpoint folder and `unit` is PTTS_UNIT_CPU. `lang` is en, fr, de, es, pt, ar, hi, ko, pl, sv,
-/// fi, no, it, nl, ja, zh, da, tr or none. NULL on
+/// fi, no, it, nl, ja or none. NULL on
 /// failure; then ptts_last_error(NULL), on the same thread, says why. A bundle without voices fails
 /// to load; a checkpoint folder without voices loads, lists none, and speaks in no particular
 /// voice.

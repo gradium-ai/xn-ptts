@@ -71,7 +71,7 @@ class PhononTTS internal constructor(private var handle: Long, private val nativ
 
         /**
          * Load an exported QNN bundle from [modelDir], using an explicit normalization [lang].
-         * Supports en, fr, de, es, pt, ar, hi, ko, pl, sv, fi, no, it, nl, ja, zh, da, tr and
+         * Supports en, fr, de, es, pt, ar, hi, ko, pl, sv, fi, no, it, nl, ja and
          * none. This engine uses QNN HTP and has no CPU fallback.
          * The bundle must declare this phone's Build.SOC_MODEL in its soc_models metadata.
          */

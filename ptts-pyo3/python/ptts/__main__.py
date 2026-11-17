@@ -33,7 +33,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument(
         "-l",
         "--lang",
-        help="required: normalize text as en, fr, de, es, pt, ar, hi, ko, pl, sv, fi, no, it, nl, ja, zh, da, tr, or none to skip",
+        help="required: normalize text as en, fr, de, es, pt, ar, hi, ko, pl, sv, fi, no, it, nl, ja, or none to skip",
     )
     p.add_argument(
         "-r",

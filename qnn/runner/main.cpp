@@ -39,7 +39,7 @@ void write_wav(const std::string& path, const std::vector<float>& audio, int sam
 
 int usage() {
   std::cerr << "usage: phonon --bundle DIR --text TEXT [--voice NAME] [--out FILE.wav]\n"
-               "              --lang CODE|none (en, fr, de, es, pt, ar, hi, ko, pl, sv, fi, no, it, nl, ja, zh, da, tr) [--soc-model SM...] [--backend htp|cpu|gpu] [--lib-dir DIR] [--seed N] [--temperature T]\n";
+               "              --lang CODE|none (en, fr, de, es, pt, ar, hi, ko, pl, sv, fi, no, it, nl, ja) [--soc-model SM...] [--backend htp|cpu|gpu] [--lib-dir DIR] [--seed N] [--temperature T]\n";
   return 2;
 }
 
