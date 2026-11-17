@@ -303,7 +303,7 @@ pub(super) fn is_extension(ext: &str) -> bool {
         "pdf", "xlsx", "xls", "csv", "tsv", "pptx", "ppt", "txt", "rtf", "png", "jpg", "svg",
         "bmp", "tif", "tiff", "webp", "mp3", "mp4", "mkv", "wav", "flac", "mov", "html", "htm",
         "xml", "css", "js", "ts", "py", "rs", "sh", "md", "sql", "php", "dll", "dmg", "zip", "rar",
-        "tar", "gz", "json", "yaml", "yml", "toml", "conf", "cfg", "log", "csv", "key",
+        "tar", "gz", "json", "yaml", "yml", "toml", "conf", "cfg", "log", "key",
     ];
     (ext.chars().all(|c| c.is_ascii_lowercase()) || ext.chars().all(|c| c.is_ascii_uppercase()))
         && (SPELLED_EXTENSIONS.contains(&lower.as_str()) || OTHERS.contains(&lower.as_str()))

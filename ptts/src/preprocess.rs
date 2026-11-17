@@ -1627,7 +1627,7 @@ mod tests {
             (Lang::No, "Sak nr. 4471 er lukket.", "Sak nr. 4471 er lukket."),
             (Lang::Nl, "Het ref.nr. is 4471.", "Het ref.nr. is 4 duizend 471."),
             (Lang::Pl, "Są m.in. psy.", "Są m.in. psy."),
-            (Lang::It, "Visita rai.it.", "Visita rai punto I-T."),
+            (Lang::It, "Visita rai.it.", "Visita rai punto i ti."),
             (Lang::Ko, "번호는 48213907입니다.", "번호는 사 팔 이 일 삼 구 공 칠 입니다."),
             (Lang::Ja, "バグ#2093", "バ グ # 2093 。"),
             (Lang::Hi, "5G तकनीक और 3D प्रिंटिंग।", "5G तकनीक और 3D प्रिंटिंग।"),
