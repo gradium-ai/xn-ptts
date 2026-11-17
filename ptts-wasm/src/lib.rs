@@ -457,8 +457,7 @@ impl Model {
     /// `rewrites` is optional and picks which word rewrites run on the
     /// normalized text: `"default"` (numbers, currency, dashed-digits, emails,
     /// urls, abbreviations, elongations), `"all"` (those and phones, times,
-    /// dates), `"none"`, or a comma-separated list of rule names. The rules
-    /// only read `"en"`, `"fr"`, `"de"`, `"es"` and `"pt"`.
+    /// dates), `"none"`, or a comma-separated list of rule names.
     ///
     /// `conditions` is optional and sets the config's conditioners, each as `"NAME=VALUE"`,
     /// e.g. `["duration_delta=0.5"]`. Those left out take their defaults.

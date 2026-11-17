@@ -100,11 +100,55 @@ impl std::str::FromStr for Rules {
     }
 }
 
-/// Rewrite `word` under `rules`, or `None` when no rule claims it, or when none reads `lang`
-/// ([`Lang::has_rules`]). The rules below are gated here, so their tables may leave the
-/// languages without rules out.
+/// Rewrite `word` under `rules`, or `None` when no rule claims it.
 pub fn rewrite_word(word: &str, lang: Lang, rules: Rules) -> Option<String> {
-    if !lang.has_rules() {
+    // Japanese and Korean join a number to the word around it, "12345人", "5,000원입니다": the
+    // rules read each run of digits inside such a word on its own.
+    if matches!(lang, Lang::Ja | Lang::Ko) && !word.is_ascii() {
+        return rewrite_runs(word, lang, rules);
+    }
+    // A plain run of seven digits or more on its own is a code there too.
+    if matches!(lang, Lang::Ja | Lang::Ko) && rules.has("numbers") {
+        let (body, end) = split_suffix(word);
+        if body.len() >= 7 && all_digits(body) {
+            return Some(format!("{}{end}", numbers::spell(body, lang)));
+        }
+    }
+    claim(word, lang, rules)
+}
+
+/// Whether `prev`, the word before, is a number sign: "nr.", "No.", "nummer". Hindi spells
+/// every number out, so it keeps its rule there too, and the languages the serving stack reads
+/// keep its readings.
+fn numbered(prev: Option<&str>, lang: Lang) -> bool {
+    let Some(prev) = prev else { return false };
+    let prev = prev.to_lowercase();
+    !matches!(lang, Lang::Hi | Lang::En | Lang::Fr | Lang::De | Lang::Es | Lang::Pt)
+        && (matches!(prev.as_str(), "nr" | "nr." | "nro" | "nro." | "no." | "n." | "nº" | "#")
+            || prev.ends_with(".nr.")
+            || prev == lang.number_sign())
+}
+
+/// The counters a Japanese or Korean count is written before.
+fn counters(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ja => "人名円個件本枚台冊回年歳点匹杯分秒時日月倍万億",
+        Lang::Ko => "명원개건권대장회년살세분초시월배점만억",
+        _ => "",
+    }
+}
+
+/// What the first rule of `rules` that claims `word` makes of it.
+fn claim(word: &str, lang: Lang, rules: Rules) -> Option<String> {
+    // A dotted abbreviation, "ref.nr.", "t.ex.", is not an address: every part short letters and
+    // a closing point.
+    let parts = word.strip_suffix('.').map(|w| w.split('.'));
+    if !matches!(lang, Lang::En | Lang::Fr | Lang::De | Lang::Es | Lang::Pt)
+        && word.contains('.')
+        && parts.is_some_and(|mut p| {
+            p.all(|p| (1..=4).contains(&p.len()) && p.chars().all(char::is_alphabetic))
+        })
+    {
         return None;
     }
     RULES
@@ -112,6 +156,76 @@ pub fn rewrite_word(word: &str, lang: Lang, rules: Rules) -> Option<String> {
         .enumerate()
         .filter(|(i, _)| rules.0 & (1 << i) != 0)
         .find_map(|(_, rule)| (rule.rewrite)(word, lang))
+}
+
+/// `word` with every run of digits inside it rewritten as a word of its own, or `None` when no
+/// run changes. A run holds digits and the points, commas, colons, slashes and dashes between
+/// them, and takes a minus or a currency symbol before it ("-3.5", "¥1500"), a symbol after
+/// it, and the currency unit written right after it ("1,500円"). A run after a Latin letter is
+/// a code ("ABC123") and stays.
+fn rewrite_runs(word: &str, lang: Lang, rules: Rules) -> Option<String> {
+    let units: &[&str] = match lang {
+        Lang::Ja => &["円", "ドル", "ユーロ"],
+        Lang::Ko => &["원", "달러", "유로", "엔"],
+        _ => &[],
+    };
+    let chars: Vec<(usize, char)> = word.char_indices().collect();
+    let mut out = String::new();
+    let mut changed = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let (start, c) = chars[i];
+        let before_digit = chars.get(i + 1).is_some_and(|(_, d)| d.is_ascii_digit());
+        let after_mark =
+            !chars.get(i.wrapping_sub(1)).is_some_and(|(_, p)| p.is_ascii_alphanumeric());
+        let leads = before_digit && (is_currency_symbol(c) || (c == '-' && after_mark));
+        if !c.is_ascii_digit() && !leads {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < chars.len() {
+            let c = chars[j].1;
+            let joins = matches!(c, '.' | ',' | ':' | '-' | '/')
+                && chars.get(j + 1).is_some_and(|(_, d)| d.is_ascii_digit());
+            if !c.is_ascii_digit() && !joins {
+                break;
+            }
+            j += 1;
+        }
+        let mut end = chars.get(j).map_or(word.len(), |(k, _)| *k);
+        if let Some(unit) = units.iter().find(|unit| word[end..].starts_with(*unit)) {
+            end += unit.len();
+        } else if let Some(symbol) =
+            chars.get(j).map(|(_, c)| *c).filter(|&c| is_currency_symbol(c))
+        {
+            end += symbol.len_utf8();
+        }
+        let segment = &word[start..end];
+        let after_letter = i > 0 && matches!(chars[i - 1].1, 'a'..='z' | 'A'..='Z' | '#');
+        // Seven digits or more are a count before a counter ("1234567人") and a code otherwise
+        // ("番号は48213907です").
+        if rules.has("numbers") && segment.len() >= 7 && all_digits(segment) && !after_letter {
+            let counter = word[end..].chars().next().is_some_and(|c| counters(lang).contains(c));
+            if !counter {
+                out.push_str(&format!(" {} ", numbers::spell(segment, lang)));
+                changed = true;
+                i = chars.iter().position(|(k, _)| *k >= end).unwrap_or(chars.len());
+                continue;
+            }
+        }
+        match claim(segment, lang, rules).filter(|rewritten| !after_letter && rewritten != segment)
+        {
+            Some(rewritten) => {
+                out.push_str(&rewritten);
+                changed = true;
+            }
+            None => out.push_str(segment),
+        }
+        i = chars.iter().position(|(k, _)| *k >= end).unwrap_or(chars.len());
+    }
+    changed.then_some(out)
 }
 
 impl Rules {
@@ -127,16 +241,28 @@ pub(super) fn rewrite_text(
     unclaimed: impl Fn(&str) -> String,
 ) -> String {
     let words: Vec<&str> = text.split(' ').collect();
-    if !lang.has_rules() {
-        return words.into_iter().map(unclaimed).collect::<Vec<_>>().join(" ");
-    }
     let mut out: Vec<String> = Vec::with_capacity(words.len());
     let mut i = 0;
     while i < words.len() {
         let prev = out.last().map(String::as_str);
+        // A number after a number sign is a code, read as written: "nr. 4471", "No. 12".
+        if numbered(prev, lang) && split_suffix(words[i]).0.bytes().all(|b| b.is_ascii_digit()) {
+            out.push(unclaimed(words[i]));
+            i += 1;
+            continue;
+        }
         let span = None
             .or_else(|| {
                 rules.has("currency").then(|| currency::scaled(&words[i..], lang)).flatten()
+            })
+            .or_else(|| {
+                rules.has("currency").then(|| currency::unit_after(&words[i..], lang)).flatten()
+            })
+            .or_else(|| {
+                rules.has("numbers").then(|| numbers::hindi_time(&words[i..], lang)).flatten()
+            })
+            .or_else(|| {
+                rules.has("numbers").then(|| numbers::hindi_fraction(&words[i..], lang)).flatten()
             })
             .or_else(|| {
                 rules.has("numbers").then(|| numbers::digit_run(&words[i..], lang)).flatten()
@@ -155,14 +281,18 @@ pub(super) fn rewrite_text(
             i += used;
             continue;
         }
-        out.push(rewrite_word(words[i], lang, rules).unwrap_or_else(|| unclaimed(words[i])));
+        // A Japanese or Korean word a rule rewrote inside may still carry symbols to spell.
+        let spelled =
+            |w: String| if matches!(lang, Lang::Ja | Lang::Ko) { unclaimed(&w) } else { w };
+        out.push(rewrite_word(words[i], lang, rules).map_or_else(|| unclaimed(words[i]), spelled));
         i += 1;
     }
     out.join(" ")
 }
 
-/// The sentence punctuation a rule carries through at the end of a word.
-const PUNCTUATION: &str = "!?.:,;…";
+/// The sentence punctuation a rule carries through at the end of a word, the other scripts'
+/// marks included: the Hindi danda, the Arabic comma and question mark, the Japanese stops.
+const PUNCTUATION: &str = "!?.:,;…।॥،؟؛。、！？，";
 
 /// The trailing punctuation a rule carries through, or `None` when `rest` is anything else --
 /// which means the rule did not account for the whole word and must not fire.
@@ -226,6 +356,38 @@ mod tests {
         assert_eq!(rewrite_word("3:45PM", Lang::En, Rules::ALL).as_deref(), Some("3-45 PM"));
     }
 
+    #[test]
+    fn japanese_and_korean_read_the_numbers_inside_their_words() {
+        let rules = Rules::DEFAULT;
+        let ja = |w| rewrite_word(w, Lang::Ja, rules);
+        assert_eq!(ja("人口は1234567人です。").as_deref(), Some("人口は123万4567人です。"));
+        assert_eq!(
+            ja("ご注文番号は48213907です。").as_deref(),
+            Some("ご注文番号は よん はち に いち さん きゅう ゼロ なな です。")
+        );
+        assert_eq!(ja("これは1,500円です。").as_deref(), Some("これは1500 円です。"));
+        assert_eq!(ja("重さは2.5キロです。").as_deref(), Some("重さは2 点 5キロです。"));
+        assert_eq!(ja("会議は10:30です。"), None);
+        assert_eq!(ja("2024年3月15日"), None);
+        assert_eq!(ja("ABC123です"), None);
+        assert_eq!(ja("3万円"), None);
+        assert_eq!(ja("価格は¥1500です。").as_deref(), Some("価格は1500 円です。"));
+        assert_eq!(ja("5€と$3").as_deref(), Some("5 ユーロと3 ドル"));
+        assert_eq!(ja("気温は-3.5度です").as_deref(), Some("気温はマイナス 3 点 5度です"));
+        assert_eq!(ja("2026/03/14の10:00"), None);
+        assert_eq!(ja("A-3"), None);
+        let ko = |w| rewrite_word(w, Lang::Ko, rules);
+        assert_eq!(ko("12345명입니다.").as_deref(), Some("1만 2345명입니다."));
+        assert_eq!(ko("5,000원입니다.").as_deref(), Some("5000 원입니다."));
+        assert_eq!(ko("61%에서"), None);
+        assert_eq!(ko("₩5,000입니다.").as_deref(), Some("5000 원입니다."));
+        assert_eq!(ko("12345").as_deref(), Some("1만 2345"));
+        assert_eq!(ko("48213907입니다.").as_deref(), Some(" 사 팔 이 일 삼 구 공 칠 입니다."));
+        assert_eq!(ko("48213907").as_deref(), Some("사 팔 이 일 삼 구 공 칠"));
+        assert_eq!(ko("1234567명").as_deref(), Some("123만 4567명"));
+        assert_eq!(ko("#773102가"), None);
+    }
+
     /// Numbers are tried before times, so a German thousand is not read as a time, while a
     /// German time, which is not a number, still is.
     #[test]
@@ -258,6 +420,8 @@ mod tests {
     fn helpers() {
         assert_eq!(split_suffix("12,..."), ("12", ",..."));
         assert_eq!(split_suffix("12"), ("12", ""));
+        assert_eq!(split_suffix("42।"), ("42", "।"));
+        assert_eq!(split_suffix("12،"), ("12", "،"));
         assert_eq!(split_suffix("..."), ("", "..."));
         assert_eq!(digits("12345x", 2, 4), Some(("1234", "5x")));
         assert_eq!(digits("1x", 2, 4), None);
