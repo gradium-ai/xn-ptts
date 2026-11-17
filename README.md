@@ -468,6 +468,12 @@ Besides each integration's guide:
 
 Report bugs or request integrations through [GitHub Issues](https://github.com/gradium-ai/xn-ptts/issues). Include your runtime version, device/OS, model revision, weight format, normalization language, and a small reproduction.
 
+## FAQ
+
+### Can I convert the weights to another format?
+
+Yes, subject to the model's [license](#license). Converting to Core ML or GGUF does not change that license or remove the Phonon 40m models' restriction on commercial use. When you redistribute, keep the license and notices. For CC BY-NC 4.0, also credit Gradium, link to the license and say what you changed.
+
 <img src="docs/readme/divider.svg" alt="" width="100%">
 
 ## Acknowledgements
