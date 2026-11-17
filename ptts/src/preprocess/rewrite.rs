@@ -138,16 +138,32 @@ fn counters(lang: Lang) -> &'static str {
     }
 }
 
+/// Whether `body`, a word without its closing point, is a short address rather than a dotted
+/// abbreviation: a first part of two letters or more and a common top-level domain, "rai.it",
+/// "nu.nl". Abbreviations start with a single letter ("t.ex", "m.in") or end on one that is no
+/// such domain ("ref.nr").
+fn ends_a_sentence_as_address(body: &str) -> bool {
+    const COMMON: &[&str] = &[
+        "com", "org", "net", "info", "eu", "io", "it", "nl", "se", "no", "fi", "pl", "dk", "de",
+        "fr", "es", "pt", "uk", "in", "jp", "kr", "ae", "sa", "eg", "ma",
+    ];
+    let labels: Vec<&str> = body.split('.').collect();
+    labels.len() >= 2
+        && labels[0].len() >= 2
+        && labels.last().is_some_and(|tld| COMMON.contains(&tld.to_lowercase().as_str()))
+}
+
 /// What the first rule of `rules` that claims `word` makes of it.
 fn claim(word: &str, lang: Lang, rules: Rules) -> Option<String> {
     // A dotted abbreviation, "ref.nr.", "t.ex.", is not an address: every part short letters and
-    // a closing point.
-    let parts = word.strip_suffix('.').map(|w| w.split('.'));
+    // a closing point. An address that ends a sentence, "rai.it.", still is one.
+    let body = word.strip_suffix('.');
     if !matches!(lang, Lang::En | Lang::Fr | Lang::De | Lang::Es | Lang::Pt)
         && word.contains('.')
-        && parts.is_some_and(|mut p| {
-            p.all(|p| (1..=4).contains(&p.len()) && p.chars().all(char::is_alphabetic))
+        && body.is_some_and(|w| {
+            w.split('.').all(|p| (1..=4).contains(&p.len()) && p.chars().all(char::is_alphabetic))
         })
+        && !body.is_some_and(ends_a_sentence_as_address)
     {
         return None;
     }
@@ -225,7 +241,9 @@ fn rewrite_runs(word: &str, lang: Lang, rules: Rules) -> Option<String> {
         }
         i = chars.iter().position(|(k, _)| *k >= end).unwrap_or(chars.len());
     }
-    changed.then_some(out)
+    // A code spelled at either end of the word would leave a second space beside the one that
+    // joins the words.
+    changed.then(|| out.trim().to_string())
 }
 
 impl Rules {
@@ -382,7 +400,7 @@ mod tests {
         assert_eq!(ko("61%에서"), None);
         assert_eq!(ko("₩5,000입니다.").as_deref(), Some("5000 원입니다."));
         assert_eq!(ko("12345").as_deref(), Some("1만 2345"));
-        assert_eq!(ko("48213907입니다.").as_deref(), Some(" 사 팔 이 일 삼 구 공 칠 입니다."));
+        assert_eq!(ko("48213907입니다.").as_deref(), Some("사 팔 이 일 삼 구 공 칠 입니다."));
         assert_eq!(ko("48213907").as_deref(), Some("사 팔 이 일 삼 구 공 칠"));
         assert_eq!(ko("1234567명").as_deref(), Some("123만 4567명"));
         assert_eq!(ko("#773102가"), None);
