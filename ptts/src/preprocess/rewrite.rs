@@ -343,7 +343,8 @@ pub(super) fn rewrite_text(
             .or_else(|| {
                 (lang == Lang::Ja && rules.has("numbers"))
                     .then(|| {
-                        japanese::weekday(prev, &words[i..])
+                        japanese::date_before_weekday(&words[i..])
+                            .or_else(|| japanese::weekday(prev, &words[i..]))
                             .or_else(|| japanese::country_code(&words[i..]))
                     })
                     .flatten()

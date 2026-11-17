@@ -24,7 +24,7 @@ pub(super) fn run(
             .or_else(|| expiry(run, before))
             .or_else(|| slashed(run))
             .or_else(|| time_range(run))
-            .or_else(|| time(run))
+            .or_else(|| time(run, after))
             .or_else(|| version(run))
             .or_else(|| range(run, before, after))
     } else {
@@ -92,6 +92,23 @@ pub(super) fn marks(word: &str) -> Option<String> {
         i += 1;
     }
     changed.then_some(out)
+}
+
+/// A month and a day before a weekday the character pass cut out of its brackets, "1/2, 火,":
+/// a date, though "1/2" alone is a half. The word may start with other text, "会議は1/2,".
+pub(super) fn date_before_weekday(words: &[&str]) -> Option<(String, usize)> {
+    let (body, end) = split_suffix(words.first()?);
+    let (next, _) = split_suffix(words.get(1)?);
+    let mut chars = next.chars();
+    if !chars.next().is_some_and(is_weekday) || chars.next().is_some() {
+        return None;
+    }
+    let start = body
+        .rfind(|c: char| !c.is_ascii_digit() && c != '/')
+        .map_or(0, |i| i + body[i..].chars().next().map_or(1, char::len_utf8));
+    let (text, run) = body.split_at(start);
+    let [month, day] = groups(run, '/')?[..] else { return None };
+    Some((format!("{text}{}{end}", month_day(month, day)?), 1))
 }
 
 /// A weekday the character pass cut out of its brackets after a date, "5日, 月,", read in full:
@@ -165,14 +182,14 @@ fn expiry(run: &str, before: &str) -> Option<String> {
     }
 }
 
-/// Two numbers with a slash: a fraction when it is one in lowest terms with a small
-/// denominator, "1/4" read "4分の1", and a month and a day otherwise, "3/15", "10/12" or "07/01".
+/// Two numbers with a slash: a half, a third or a quarter in lowest terms, "1/4" read "4分の1",
+/// and a month and a day otherwise, "3/5", "3/15", "10/12" or "07/01".
 fn slashed(run: &str) -> Option<String> {
     let [a, b] = groups(run, '/')?[..] else { return None };
     let padded = (a.len() > 1 && a.starts_with('0')) || (b.len() > 1 && b.starts_with('0'));
     if !padded && a.len() <= 2 && b.len() <= 2 {
         let (x, y) = (a.parse::<u32>().ok()?, b.parse::<u32>().ok()?);
-        if 0 < x && x < y && y <= 10 && gcd(x, y) == 1 {
+        if 0 < x && x < y && y <= 4 && gcd(x, y) == 1 {
             return Some(format!("{b}分の{a}"));
         }
     }
@@ -184,14 +201,17 @@ fn gcd(a: u32, b: u32) -> u32 {
 }
 
 /// A time of day, `H:MM`, read "7時5分", or "7時" on the hour. More than 24 hours is a duration
-/// in minutes and seconds, "48:12" read "48分12秒".
-fn time(run: &str) -> Option<String> {
+/// in minutes and seconds, "48:12" read "48分12秒", unless it is a late-night hour of a schedule
+/// before に, から or まで: "25:00に" is "25時に".
+fn time(run: &str, after: &str) -> Option<String> {
     let [h, m] = groups(run, ':')?[..] else { return None };
     if h.len() > 2 || m.len() != 2 || m.parse::<u32>().ok()? >= 60 {
         return None;
     }
     let (h, m) = (value(h), value(m));
-    if h.parse::<u32>().ok()? > 24 {
+    let hours = h.parse::<u32>().ok()?;
+    let late_night = hours < 30 && ["に", "から", "まで"].iter().any(|w| after.starts_with(w));
+    if hours > 24 && !late_night {
         return Some(format!("{h}分{m}秒"));
     }
     Some(if m == "0" { format!("{h}時") } else { format!("{h}時{m}分") })
@@ -200,7 +220,7 @@ fn time(run: &str) -> Option<String> {
 /// Two times with a dash, "14:00-16:00".
 fn time_range(run: &str) -> Option<String> {
     let (from, to) = run.split_once('-')?;
-    Some(format!("{}から{}", time(from)?, time(to)?))
+    Some(format!("{}から{}", time(from, "")?, time(to, "")?))
 }
 
 /// A version or an address with two points or more, "2.0.3" read "2 点 0 点 3". A part with a
@@ -274,6 +294,8 @@ mod tests {
             ("10/12", "", "に", Some("10月12日")),
             ("3/15", "", "", Some("3月15日")),
             ("1/4", "", "しか", Some("4分の1")),
+            ("3/5", "", "に", Some("3月5日")),
+            ("25:00", "", "に放送", Some("25時")),
             ("3/4", "", "まで", Some("4分の3")),
             ("1/3", "約", "が", Some("3分の1")),
             ("08/27", "カードの有効期限は", "です", Some("2027年8月")),
@@ -333,6 +355,8 @@ mod tests {
             ("ご予約は2026/03/14の10:00です。", "ご 予 約 は 2026 年 3 月 14 日 の 10 時 で す 。"),
             ("会議は09/23に変更", "会 議 は 9 月 23 日 に 変 更 。"),
             ("席は1/4しか", "席 は 4 分 の 1 し か 。"),
+            ("1/2(火)に会議", "1 月 2 日 , 火 曜 日 , に 会 議 。"),
+            ("会議は1/7(火)です", "会 議 は 1 月 7 日 , 火 曜 日 , で す 。"),
             ("8〜10時間", "8 か ら 10 時 間 。"),
             ("8~10時間と~5", "8 か ら 10 時 間 と 約 5 。"),
             (
