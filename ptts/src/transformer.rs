@@ -68,6 +68,9 @@ impl<T: WithDTypeF, B: Backend> StreamingMHAState<T, B> {
             if t != 1 {
                 xn::bail!("a ring cache takes one row at a time, not {t}")
             }
+            if ring.valid[ring.write] {
+                xn::bail!("ring slot {} still holds a row, evict it first", ring.write)
+            }
             self.k_cache.slice_set(k, 1usize, ring.write)?;
             self.v_cache.slice_set(v, 1usize, ring.write)?;
             ring.valid[ring.write] = true;
@@ -350,6 +353,9 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformerState<T, B> {
             let copied = match layer {
                 LayerAttentionState::Mimi(kv) => LayerAttentionState::Mimi(kv.clone()),
                 LayerAttentionState::FlowLm(mha) => {
+                    if mha.ring.is_some() {
+                        xn::bail!("a ring cache cannot be resized")
+                    }
                     let used = mha.current_end;
                     if used > seq_budget {
                         xn::bail!(
@@ -819,6 +825,11 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
         state: &mut StreamingTransformerState<Q::T, Q::B>,
         step: &DeviceStep<Q::T, Q::B>,
     ) -> Result<Tensor<Q::T, Q::B>> {
+        if let Some(LayerAttentionState::FlowLm(StreamingMHAState { ring: Some(_), .. })) =
+            state.layer_states.first()
+        {
+            xn::bail!("a ring cache steps on the host, not through a device step")
+        }
         let mut x = x.clone();
         for (layer, layer_state) in self.layers.iter().zip(state.layer_states.iter_mut()) {
             x = layer.forward(&x, &step.rope, layer_state, None, Some(step))?;
@@ -882,10 +893,13 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
             if count > mha.current_end {
                 xn::bail!("cannot evict {count} of {} positions", mha.current_end)
             }
+            // Every slot is checked before any changes, so a refused call leaves the cache as is.
             for &s in slots {
                 if s < prefix || !ring.valid.get(s).copied().unwrap_or(false) {
                     xn::bail!("slot {s} holds no row past the prefix")
                 }
+            }
+            for &s in slots {
                 ring.valid[s] = false;
             }
             // The kept rows, a run of consecutive slots at a time.
@@ -1344,30 +1358,35 @@ mod ring_tests {
 
     #[test]
     fn evicting_leaves_the_cache_of_a_sequence_without_them() {
-        // A 5-row prompt and 6 frame slots, whose oldest 3 frames go once they are full. In a
-        // single layer a row's key and value depend on its own input and position alone, so
-        // after the eviction every frame must see what it would have seen had the evicted
-        // frames never been there.
+        // A 5-row prompt and 6 frame slots, whose oldest 3 frames go whenever they are full, as
+        // a session drops them: three evictions over 15 frames, the later ones wrapping round
+        // the ring so the kept frames lie in two runs. In a single layer a row's key and value
+        // depend on its own input and position alone, so every frame must see what it would
+        // have seen had the evicted frames never been there.
         let t = q8_tests::transformer(Kind::FlowLm { attn_dim: 64, num_kv_heads: 4 });
-        let (prompt, frames) = (rows(5, 0.0), rows(9, 1.0));
+        let (prompt, frames) = (rows(5, 0.0), rows(15, 1.0));
         let frame = |i: usize| frames.narrow(1, i..i + 1).unwrap().contiguous().unwrap();
         let mut ring = t.init_state(1, 11).unwrap();
         t.forward(&prompt, &mut ring).unwrap();
         t.start_ring(&mut ring).unwrap();
-        for i in 0..9 {
-            if i == 6 {
-                t.evict(&mut ring, 5, &[5, 6, 7]).unwrap();
+        let mut in_view = 0;
+        for i in 0..15 {
+            if in_view == 6 {
+                let oldest = i - in_view;
+                let slots: Vec<usize> = (0..3).map(|j| 5 + (oldest + j) % 6).collect();
+                t.evict(&mut ring, 5, &slots).unwrap();
+                in_view -= 3;
                 let LayerAttentionState::FlowLm(mha) = &ring.layer_states[0] else { panic!() };
-                assert_eq!(mha.current_end, 8);
+                assert_eq!(mha.current_end, 5 + in_view);
             }
             t.set_ring_slot(&mut ring, 5 + i % 6).unwrap();
             let got: Vec<f32> = t.forward(&frame(i), &mut ring).unwrap().to_vec().unwrap();
+            in_view += 1;
 
             let mut plain = t.init_state(1, 11).unwrap();
             t.forward(&prompt, &mut plain).unwrap();
-            let kept = if i < 6 { 0 } else { 3 };
             let mut want = Vec::new();
-            for j in kept..=i {
+            for j in i + 1 - in_view..=i {
                 want = t.forward(&frame(j), &mut plain).unwrap().to_vec().unwrap();
             }
             let err = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
@@ -1376,16 +1395,23 @@ mod ring_tests {
     }
 
     #[test]
-    fn evicting_the_prompt_or_an_empty_slot_is_refused() {
+    fn misuse_of_a_ring_is_refused() {
         let t = q8_tests::transformer(Kind::FlowLm { attn_dim: 64, num_kv_heads: 4 });
         let mut state = t.init_state(1, 8).unwrap();
         t.forward(&rows(4, 0.0), &mut state).unwrap();
         assert!(t.set_ring_slot(&mut state, 4).is_err());
         t.start_ring(&mut state).unwrap();
+        assert!(state.with_seq_budget(10).is_err());
         t.set_ring_slot(&mut state, 4).unwrap();
         t.forward(&rows(1, 1.0), &mut state).unwrap();
         assert!(t.evict(&mut state, 4, &[2]).is_err());
         assert!(t.evict(&mut state, 4, &[5]).is_err());
+        // Refused as a whole: slot 4 stays in the cache.
+        assert!(t.evict(&mut state, 4, &[4, 5]).is_err());
+        // Writing over a row still in the cache is refused too.
+        t.set_ring_slot(&mut state, 4).unwrap();
+        assert!(t.forward(&rows(1, 2.0), &mut state).is_err());
         assert!(t.evict(&mut state, 4, &[4]).is_ok());
+        assert!(t.forward(&rows(1, 2.0), &mut state).is_ok());
     }
 }
