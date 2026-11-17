@@ -97,7 +97,7 @@ fn open(dir: &Path, unit: u32, lang: &str) -> Result<PttsHandle, String> {
 
 /// Load the model in `dir` for `unit` (`PTTS_UNIT_ANE` or `PTTS_UNIT_CPU`), normalizing text as
 /// `lang` (`en`, `fr`, `de`, `es`, `pt`, `ar`, `hi`, `ko`, `pl`, `sv`, `fi`, `no`, `it`, `nl`,
-/// `ja`, `zh`, `da`, `tr`, or `none`). On Apple, `dir` is an exported bundle,
+/// `ja`, or `none`). On Apple, `dir` is an exported bundle,
 /// compiled for this device first if it has not been (once per install); elsewhere it is a
 /// checkpoint folder, and only `PTTS_UNIT_CPU` exists. Null on failure; then
 /// `ptts_last_error(NULL)`, on the same thread, says why. A bundle without voices fails to load; a

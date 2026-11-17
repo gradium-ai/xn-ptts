@@ -117,7 +117,7 @@ Every binding follows the same rules:
   not call back into the same handle. Generation runs on its own threads with bounded buffers, so
   a callback that waits for playback pauses generation once those buffers fill.
 - **`lang` is required.** `en`, `fr`, `de`, `es` and `pt` normalize numbers and symbols for that
-  language, `ar`, `hi`, `ko`, `pl`, `sv`, `fi`, `no`, `it`, `nl`, `ja`, `zh`, `da` and `tr`
+  language, `ar`, `hi`, `ko`, `pl`, `sv`, `fi`, `no`, `it`, `nl` and `ja`
   symbols only, and `none` reads the text as written.
 - **Errors.** `ptts_new` returns `NULL` on failure, and `ptts_speak`, `ptts_set_voice`,
   `ptts_set_language` and `ptts_set_temperature` return `false`. Then `ptts_last_error` says why.

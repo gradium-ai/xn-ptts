@@ -1,7 +1,7 @@
 /** Text-normalization language. `'none'` hands text to the tokenizer as written. */
 export type Lang =
   | 'en' | 'fr' | 'de' | 'es' | 'pt' | 'ar' | 'hi' | 'ko' | 'pl' | 'sv' | 'fi' | 'no' | 'it' | 'nl'
-  | 'ja' | 'zh' | 'da' | 'tr' | 'none';
+  | 'ja' | 'none';
 
 /** Weight format. `q8` is smaller and faster on CPU. */
 export type Quant = 'f32' | 'q8';

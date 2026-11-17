@@ -97,7 +97,7 @@ impl Tts {
     /// `lang` is required and keyword-only: the language text is normalized as
     /// before it is tokenized, one of `"en"`, `"fr"`, `"de"`, `"es"`, `"pt"`,
     /// `"ar"`, `"hi"`, `"ko"`, `"pl"`, `"sv"`, `"fi"`, `"no"`, `"it"`, `"nl"`,
-    /// `"ja"`, `"zh"`, `"da"` or `"tr"`. Normalization makes the model noticeably
+    /// or `"ja"`. Normalization makes the model noticeably
     /// better, but the spoken forms of `@`, `+` and `=` differ per language, so there is nothing safe
     /// to default to. `lang="none"` or `lang=None` hands text to the tokenizer
     /// as written, for callers that normalize it themselves.

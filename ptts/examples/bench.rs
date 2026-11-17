@@ -100,7 +100,7 @@ struct Args {
     quantize_mimi: bool,
 
     /// Language the input is normalized as before tokenizing: `en`, `fr`, `de`, `es`, `pt`,
-    /// `ar`, `hi`, `ko`, `pl`, `sv`, `fi`, `no`, `it`, `nl`, `ja`, `zh`, `da` or `tr`. Required,
+    /// `ar`, `hi`, `ko`, `pl`, `sv`, `fi`, `no`, `it`, `nl` or `ja`. Required,
     /// as everywhere else: there is nothing safe to guess.
     /// `none` measures the unnormalized text, as runs that predate this flag did.
     #[arg(long)]

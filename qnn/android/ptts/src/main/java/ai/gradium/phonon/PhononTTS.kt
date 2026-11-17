@@ -65,8 +65,8 @@ class PhononTTS internal constructor(private var handle: Long, private val nativ
     companion object {
         /** The values [load] takes as its language. */
         val LANGUAGES = setOf(
-            "en", "fr", "de", "es", "pt", "ar", "hi", "ko", "pl", "sv", "fi", "no", "it", "nl", "ja", "zh",
-            "da", "tr", "none",
+            "en", "fr", "de", "es", "pt", "ar", "hi", "ko", "pl", "sv", "fi", "no", "it", "nl", "ja",
+            "none",
         )
 
         /**

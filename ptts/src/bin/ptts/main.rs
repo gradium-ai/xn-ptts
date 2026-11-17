@@ -113,7 +113,7 @@ struct Args {
     threads: Option<usize>,
 
     /// Language the text is normalized as before tokenizing: `en`, `fr`, `de`, `es`, `pt`,
-    /// `ar`, `hi`, `ko`, `pl`, `sv`, `fi`, `no`, `it`, `nl`, `ja`, `zh`, `da` or `tr`. Required:
+    /// `ar`, `hi`, `ko`, `pl`, `sv`, `fi`, `no`, `it`, `nl` or `ja`. Required:
     /// the spoken forms differ per language, so there is nothing safe to guess. `none` hands the
     /// text to the tokenizer as written, which the model reads less well.
     #[arg(long, required_unless_present = "list_voices")]

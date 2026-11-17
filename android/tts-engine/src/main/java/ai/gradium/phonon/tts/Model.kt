@@ -20,8 +20,7 @@ object Model {
 
     /** The languages the runtime normalizes text for. */
     val SUPPORTED = listOf(
-        "en", "fr", "de", "es", "pt", "ar", "hi", "ko", "pl", "sv", "fi", "no", "it", "nl", "ja", "zh",
-        "da", "tr",
+        "en", "fr", "de", "es", "pt", "ar", "hi", "ko", "pl", "sv", "fi", "no", "it", "nl", "ja",
     )
 
     /** Loaded models. Calls into one must hold its lock: the library takes one call at a time. */
