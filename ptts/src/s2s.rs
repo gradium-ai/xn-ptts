@@ -41,6 +41,8 @@ pub struct SpeechToSpeech<Q: BackendQ> {
 /// The flow LM's state after a voice prompt, which every session in that voice starts from.
 pub struct Voice<Q: BackendQ> {
     state: TTSState<Q>,
+    /// Positions the prompt fills: its frames, and the speaker sink's token if the checkpoint
+    /// has one.
     len: usize,
 }
 
@@ -118,7 +120,7 @@ impl<Q: BackendQ> SpeechToSpeech<Q> {
     /// Runs the voice prompt `voice`, a `[1, T, d_model]` embedding as
     /// [`crate::loader::load_voice_emb`] returns it.
     pub fn voice(&self, voice: &Tensor<f32, Q::B>) -> Result<Voice<Q>> {
-        let len = voice.dim(1usize)?;
+        let len = self.model.voice_prompt_len(voice.dim(1usize)?);
         let mut state = self.model.init_flow_lm_state(1, len)?;
         self.model.prompt_audio(&mut state, &voice.to::<Q::T>()?)?;
         Ok(Voice { state, len })
@@ -152,6 +154,7 @@ impl<Q: BackendQ> SpeechToSpeech<Q> {
             last_condition: None,
             samples_in: 0,
             samples_out: 0,
+            finished: false,
             times: StageTimes::default(),
         })
     }
@@ -211,6 +214,8 @@ pub struct Session<'a, Q: BackendQ> {
     last_condition: Option<Tensor<Q::T, Q::B>>,
     samples_in: usize,
     samples_out: usize,
+    /// Set by [`Session::flush`], after which the session takes no more input.
+    finished: bool,
     times: StageTimes,
 }
 
@@ -218,6 +223,9 @@ impl<Q: BackendQ> Session<'_, Q> {
     /// Feeds input audio at the checkpoint's sample rate, returning the output of every frame
     /// it completes.
     pub fn push(&mut self, pcm: &[f32]) -> Result<Vec<f32>> {
+        if self.finished {
+            xn::bail!("the session has been flushed")
+        }
         self.samples_in += pcm.len();
         self.pending.extend_from_slice(pcm);
         let frame_size = self.s2s.frame_size();
@@ -233,8 +241,13 @@ impl<Q: BackendQ> Session<'_, Q> {
     }
 
     /// Ends the stream: the last partial frame is padded with silence and the delayed frames
-    /// are generated, so that the whole output has the input's duration.
+    /// are generated, so that the whole output has the input's duration. The session takes no
+    /// input after this.
     pub fn flush(&mut self) -> Result<Vec<f32>> {
+        if self.finished {
+            xn::bail!("the session has been flushed")
+        }
+        self.finished = true;
         let mut out = Vec::new();
         if !self.pending.is_empty() {
             let mut audio = std::mem::take(&mut self.pending);

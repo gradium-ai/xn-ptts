@@ -6,10 +6,9 @@
 //!     --model /path/to/model --voice voice.safetensors input.wav -o out.wav
 //! ```
 //!
-//! The input goes in `--chunk-ms` at a time (one frame by default), as fast as it is processed
-//! or, with `--realtime`, at the pace a live input would deliver it; `--chunk-ms 0` passes it
-//! whole. Prints how long each stage took per frame and how long pushes took, which a live
-//! stream must turn around within the chunk's own duration.
+//! The input goes in `--chunk-ms` at a time (one frame by default), as fast as it is processed;
+//! `--chunk-ms 0` passes it whole. Prints how long each stage took per frame and how long pushes
+//! took, which a live stream must turn around within the chunk's own duration. Runs on the CPU.
 
 #[path = "../src/bin/ptts/model_helpers.rs"]
 mod model_helpers;
@@ -45,10 +44,6 @@ struct Args {
     #[arg(long)]
     quant: Option<String>,
 
-    /// Run on the CPU even when the build has a GPU backend.
-    #[arg(long)]
-    cpu: bool,
-
     /// Worker threads; xn's default (one per logical core) when unset.
     #[arg(long)]
     threads: Option<usize>,
@@ -65,17 +60,9 @@ struct Args {
     #[arg(long)]
     lsd_steps: Option<usize>,
 
-    /// Input frames the model keeps in view.
-    #[arg(long, default_value_t = ptts::s2s::DEFAULT_CONTEXT)]
-    context: usize,
-
     /// Milliseconds of input per push; 0 passes the whole file at once.
     #[arg(long, default_value_t = 80)]
     chunk_ms: usize,
-
-    /// Push each chunk only once a live input would have recorded it.
-    #[arg(long)]
-    realtime: bool,
 }
 
 struct Run<'a>(&'a Args);
@@ -112,7 +99,7 @@ fn run<Q: BackendQ>(args: &Args, dev: Q::B) -> Result<()> {
         temperature: args.temperature,
         seed: args.seed,
         lsd_decode_steps: args.lsd_steps,
-        context: args.context,
+        ..Default::default()
     };
     let mut session = model.session(&voice, &opts)?;
     let chunk = match args.chunk_ms {
@@ -122,12 +109,7 @@ fn run<Q: BackendQ>(args: &Args, dev: Q::B) -> Result<()> {
     let mut out = Vec::with_capacity(pcm.len());
     let mut pushes = Vec::new();
     let start = Instant::now();
-    for (i, piece) in pcm.chunks(chunk).enumerate() {
-        if args.realtime {
-            // A live input hands over each chunk once all of it has been recorded.
-            let due = Duration::from_secs_f64(((i + 1) * chunk) as f64 / sample_rate as f64);
-            std::thread::sleep(due.saturating_sub(start.elapsed()));
-        }
+    for piece in pcm.chunks(chunk) {
         let push = Instant::now();
         out.extend(session.push(piece)?);
         pushes.push(push.elapsed());
@@ -141,14 +123,12 @@ fn run<Q: BackendQ>(args: &Args, dev: Q::B) -> Result<()> {
     let frames = out.len().div_ceil(model.frame_size()) as f64;
     let times = session.times();
     let frame_ms = model.frame_size() as f64 * 1000.0 / sample_rate as f64;
-    if !args.realtime {
-        println!(
-            "wrote {} ({seconds:.2}s of audio in {:.2}s, RTF {:.3})",
-            args.output.display(),
-            elapsed.as_secs_f64(),
-            elapsed.as_secs_f64() / seconds
-        );
-    }
+    println!(
+        "wrote {} ({seconds:.2}s of audio in {:.2}s, RTF {:.3})",
+        args.output.display(),
+        elapsed.as_secs_f64(),
+        elapsed.as_secs_f64() / seconds
+    );
     println!(
         "per frame: encode {:.2} ms, flow {:.2} ms, decode {:.2} ms; voice prompt {:.1} ms",
         ms(times.encode) / frames,
@@ -185,7 +165,6 @@ fn main() -> Result<()> {
         Some(quant) => xn::DTypeQ::from_str(quant)?,
         None => xn::DTypeQ::F32,
     };
-    let cpu = args.cpu || dtype != xn::DTypeQ::F32;
-    xn::Runner::new().cpu_only(cpu).dtype(dtype).run(Run(&args), 0)?;
+    xn::Runner::new().cpu_only(true).dtype(dtype).run(Run(&args), 0)?;
     Ok(())
 }
