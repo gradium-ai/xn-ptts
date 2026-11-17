@@ -309,6 +309,8 @@ fn capitalize(word: &str, upper: bool) -> String {
 const NOT_BEFORE_A_DATE: &[&str] = &[
     "versjon", "version", "v", "utgave", "utgåva", "release", "build", "node", "python", "ios",
     "macos", "android", "windows", "kl", "kl.", "klokka", "klokken", "klockan", "nr", "nr.",
+    // Norwegian writes a time with a point too, and these come before a time: "Toget går 12.10."
+    "går", "gikk", "ankomst", "avgang", "lander", "landet",
 ];
 
 /// The dates and times that start `words`, with how many words they take, in Swedish and
@@ -587,6 +589,8 @@ mod tests {
             (Lang::No, "Versjon 20.11."),
             (Lang::No, "Oppgrader fra 0.9 til 1.0."),
             (Lang::No, "ankomst 23.50."),
+            (Lang::No, "Toget går 12.10."),
+            (Lang::No, "Flyet lander 10.05."),
             (Lang::No, "Den 2. sesongen"),
             (Lang::No, "Den 1. og 15. er betalingsdager."),
             (Lang::No, "hvert 10.-15. minutt"),
