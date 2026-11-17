@@ -1209,6 +1209,7 @@ pub fn normalize_text(input: &str, lang: Lang, rules: Rules) -> String {
             }
             // Between two numbers in Japanese, a range: the rules read the wave dash.
             '~' if lang == Lang::Ja
+                && rules.has("numbers")
                 && prev.is_some_and(|p| p.is_ascii_digit())
                 && chars.peek().is_some_and(char::is_ascii_digit) =>
             {

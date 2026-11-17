@@ -228,6 +228,11 @@ fn range(run: &str, before: &str, after: &str) -> Option<String> {
     let short = |s: &str| s.len() <= 3 && (s.len() == 1 || !s.starts_with('0'));
     let year = |s: &str| s.len() == 4 && (s.starts_with("19") || s.starts_with("20"));
     let (x, y) = (a.parse::<u32>().ok()?, b.parse::<u32>().ok()?);
+    // A score whichever side won: "2-3で負けた", "スコア 1-4".
+    let won_or_lost = ["で勝", "で負", "で引き分け"].iter().any(|w| after.starts_with(w));
+    if (won_or_lost || before.ends_with("スコア")) && a.len() <= 2 && b.len() <= 2 {
+        return Some(format!("{a}対{b}"));
+    }
     // "2024-25" a few years on, as the numbers rule reads it; "2026-77" is a code.
     let years_on = year(a) && b.len() == 2 && (x % 100 < y && y <= x % 100 + 10);
     if ((short(a) && short(b)) || (year(a) && year(b))) && x < y || years_on {
@@ -291,6 +296,9 @@ mod tests {
             ("2026-77", "ケース番号", "は", Some(" に ゼロ に ろく の なな なな ")),
             ("3-2", "", "で勝ちました", Some("3対2")),
             ("3-2", "スコア", "。", Some("3対2")),
+            ("2-3", "", "で負けました", Some("2対3")),
+            ("1-4", "スコア", "", Some("1対4")),
+            ("3-5", "", "で届きます", Some("3から5")),
             ("2-1", "第", "章", Some("2の1")),
             (
                 "090-7946-0018",
@@ -354,6 +362,7 @@ mod tests {
             normalize_text("2026/03/14の10:00", Lang::Ja, Rules::NONE),
             "2026 / 03 / 14 の 10 : 00 。"
         );
+        assert_eq!(normalize_text("8~10", Lang::Ja, Rules::NONE), "8 約 10 。");
     }
 
     #[test]

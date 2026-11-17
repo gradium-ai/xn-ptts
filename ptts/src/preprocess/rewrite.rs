@@ -119,7 +119,7 @@ pub fn rewrite_word(word: &str, lang: Lang, rules: Rules) -> Option<String> {
         let word = marked.as_deref().unwrap_or(word);
         return codes::within(word, lang, rules)
             .or_else(|| rewrite_runs(word, lang, rules))
-            .or(marked.clone());
+            .or(marked);
     }
     if lang == Lang::Ja {
         let ascii = japanese::ascii_word(word, rules.has("numbers"), rules.has("dashed-digits"));
@@ -284,7 +284,7 @@ fn rewrite_runs(word: &str, lang: Lang, rules: Rules) -> Option<String> {
 }
 
 impl Rules {
-    fn has(self, name: &str) -> bool {
+    pub(super) fn has(self, name: &str) -> bool {
         RULES.iter().position(|rule| rule.name == name).is_some_and(|i| self.0 & (1 << i) != 0)
     }
 }
@@ -343,7 +343,8 @@ pub(super) fn rewrite_text(
             .or_else(|| {
                 (lang == Lang::Ja && rules.has("numbers"))
                     .then(|| {
-                        japanese::weekday(prev, &words[i..]).or(japanese::country_code(&words[i..]))
+                        japanese::weekday(prev, &words[i..])
+                            .or_else(|| japanese::country_code(&words[i..]))
                     })
                     .flatten()
             });
