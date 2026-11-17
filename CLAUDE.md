@@ -203,9 +203,12 @@ and emitting its output `audio_delay` frames behind. `voice` runs the voice prom
 `session` starts a stream from it; `Session::push` takes input audio in pieces of any size and
 returns the output of every frame it completes, `flush` ends it. The flow LM keeps
 `SessionOptions::context` frames after the voice prompt in view (the 30 s training windows by
-default): past that, `StreamingTransformer::drop_positions` drops the oldest third and rotates
-the kept keys back, since a context far longer than training's makes the output fall apart. The
-`s2s` example streams a file through it on the CPU and reports the time per stage and per push.
+default): past that, the oldest third is dropped and the kept keys rotated back, since a context
+far longer than training's makes the output fall apart. The cache is a ring
+(`StreamingTransformer::start_ring`, `set_ring_slot`, `evict`): frames stay in their slots, new
+ones take the dropped ones' slots, and a decode mask hides the freed slots until then, so nothing
+is copied when frames are dropped. The `s2s` example streams a file through it on the CPU and
+reports the time per stage and per push.
 
 Generation is streaming and stateful: callers `init_flow_lm_state(batch, seq_len)`, then `prompt_text*` / `prompt_audio` to seed the state, then step-decode latents and feed them into `MimiDecoderState`. `lsd_decode_steps` controls flow-matching solver steps; `eos_threshold` controls termination. Every frontend reads the supplied checkpoint's own model config.
 

@@ -315,6 +315,7 @@ fn voice_from_kv_cache<B: Backend>(
             k_cache: kv(0)?,
             v_cache: kv(1)?,
             current_end: seq_len,
+            ring: None,
         }));
     }
     Ok(StreamingTransformerState { layer_states })
