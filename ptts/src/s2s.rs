@@ -130,11 +130,12 @@ impl<Q: BackendQ> SpeechToSpeech<Q> {
         if opts.context < 3 {
             xn::bail!("a session needs a context of at least 3 frames, not {}", opts.context)
         }
-        let transformer_state = voice
+        let mut transformer_state = voice
             .state
             .flow_lm_state
             .transformer_state
             .with_seq_budget(voice.len + opts.context)?;
+        self.model.flow_lm.transformer.start_ring(&mut transformer_state)?;
         let flow_lm_state = crate::flow_lm::FlowLMState { transformer_state, conditions: None };
         let d_model = self.model.flow_lm.conditioner.output_dim;
         Ok(Session {
@@ -289,15 +290,19 @@ impl<Q: BackendQ> Session<'_, Q> {
     fn step(&mut self, condition: &Tensor<Q::T, Q::B>, out: &mut Vec<f32>) -> Result<()> {
         let start = Instant::now();
         let model = &self.s2s.model;
-        if self.in_view == self.context {
-            let drop = self.context / 3;
-            model.flow_lm.transformer.drop_positions(
-                &mut self.flow.flow_lm_state.transformer_state,
-                self.voice_len,
-                drop,
-            )?;
+        let (transformer, cache) =
+            (&model.flow_lm.transformer, &mut self.flow.flow_lm_state.transformer_state);
+        let (v, context) = (self.voice_len, self.context);
+        if self.in_view == context {
+            let drop = context / 3;
+            // Frames take the slots after the voice prompt in turn, so the oldest are the next
+            // ones round.
+            let oldest = self.steps - self.in_view;
+            let slots: Vec<usize> = (0..drop).map(|j| v + (oldest + j) % context).collect();
+            transformer.evict(cache, v, &slots)?;
             self.in_view -= drop;
         }
+        transformer.set_ring_slot(cache, v + self.steps % context)?;
         self.flow.flow_lm_state.conditions = Some(condition.clone());
         let delay = self.s2s.delay;
         let input = match &self.previous {
