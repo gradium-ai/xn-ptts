@@ -50,20 +50,20 @@ pub struct Timings {
 /// order. The graph only reads it and returns each call's rows, which the host writes into slot
 /// `written % ctx`. `valid` says which slots hold a real row: padding from the batched prefill
 /// occupies slots but must never be attended to.
-struct Ring {
-    k: Buf,
-    v: Buf,
-    written: usize,
-    valid: Vec<bool>,
+pub(super) struct Ring {
+    pub(super) k: Buf,
+    pub(super) v: Buf,
+    pub(super) written: usize,
+    pub(super) valid: Vec<bool>,
 }
 
 impl Ring {
-    fn new(dm: &fl::Dims, ctx: usize) -> Result<Self, String> {
+    pub(super) fn new(dm: &fl::Dims, ctx: usize) -> Result<Self, String> {
         let shape = [dm.layers, dm.heads, ctx, dm.hd()];
         Ok(Ring { k: Buf::new(&shape)?, v: Buf::new(&shape)?, written: 0, valid: vec![false; ctx] })
     }
 
-    fn restore(&mut self, from: &Ring) {
+    pub(super) fn restore(&mut self, from: &Ring) {
         self.k.copy_from(&from.k);
         self.v.copy_from(&from.v);
         self.written = from.written;
@@ -72,7 +72,7 @@ impl Ring {
 }
 
 /// A flow LM graph for one row count, with its session bound to the live ring.
-struct Flow {
+pub(super) struct Flow {
     model: Model,
     dm: fl::Dims,
     t: usize,
@@ -80,7 +80,13 @@ struct Flow {
 }
 
 impl Flow {
-    fn new(model: Model, dm: fl::Dims, t: usize, ctx: usize, ring: &Ring) -> Result<Self, String> {
+    pub(super) fn new(
+        model: Model,
+        dm: fl::Dims,
+        t: usize,
+        ctx: usize,
+        ring: &Ring,
+    ) -> Result<Self, String> {
         let small: [(&str, &[usize]); 5] = [
             ("emb", &[1, t, dm.d]),
             ("cos", &[1, 1, t, dm.hd() / 2]),
@@ -94,7 +100,7 @@ impl Flow {
 
     /// One call of `t` rows at rope position `pos`, whose real rows are marked in `rows_valid`.
     /// Writes the rows into the ring and returns `(next_latent, eos)`.
-    fn step(
+    pub(super) fn step(
         &self,
         ring: &mut Ring,
         pos: usize,
@@ -106,6 +112,23 @@ impl Flow {
         if ring.written + t > ctx {
             return Err(format!("sequence of {} does not fit ctx {ctx}", ring.written + t));
         }
+        let out = self.step_at(ring, pos, ring.written, emb, noise, rows_valid)?;
+        ring.written += t;
+        Ok(out)
+    }
+
+    /// [`Self::step`] writing its rows from ring slot `slot` on, wrapping at the end, and
+    /// leaving `ring.written` alone: for a caller that manages the slots itself.
+    pub(super) fn step_at(
+        &self,
+        ring: &mut Ring,
+        pos: usize,
+        slot: usize,
+        emb: &[f32],
+        noise: &[f32],
+        rows_valid: &[bool],
+    ) -> Result<(Vec<f32>, f32), String> {
+        let (t, ctx) = (self.t, ring.valid.len());
         let (c, s) = rope(pos, t, self.dm.hd());
         let mask = ring_mask(&ring.valid, t, ctx);
         let mut out = self.model.predict(
@@ -114,12 +137,11 @@ impl Flow {
         )?;
         let k = out.remove("k_new").ok_or("flow LM produced no k_new")?;
         let v = out.remove("v_new").ok_or("flow LM produced no v_new")?;
-        ring_write(&self.dm, &ring.k, &k, ring.written, t, ctx);
-        ring_write(&self.dm, &ring.v, &v, ring.written, t, ctx);
+        ring_write(&self.dm, &ring.k, &k, slot, t, ctx);
+        ring_write(&self.dm, &ring.v, &v, slot, t, ctx);
         for (r, ok) in rows_valid.iter().enumerate() {
-            ring.valid[(ring.written + r) % ctx] = *ok;
+            ring.valid[(slot + r) % ctx] = *ok;
         }
-        ring.written += t;
         let next = out.remove("next_latent").ok_or("flow LM produced no latent")?;
         let eos = out.get("eos").and_then(|v| v.first().copied()).unwrap_or(0.0);
         Ok((next, eos))
@@ -156,7 +178,7 @@ pub struct Voice {
 
 /// rope cos/sin for `n` positions from `start`, half width: the graph rotates the first `HD/2`
 /// channels against the second half.
-fn rope(start: usize, n: usize, hd: usize) -> (Vec<f32>, Vec<f32>) {
+pub(super) fn rope(start: usize, n: usize, hd: usize) -> (Vec<f32>, Vec<f32>) {
     let half = hd / 2;
     let (mut c, mut s) = (vec![0f32; n * half], vec![0f32; n * half]);
     for t in 0..n {
@@ -247,7 +269,12 @@ fn ring_write(dm: &fl::Dims, buf: &Buf, rows: &[f32], written: usize, t: usize, 
     });
 }
 
-fn load(dir: &Path, name: &str, unit: Compute, function: Option<&str>) -> Result<Model, String> {
+pub(super) fn load(
+    dir: &Path,
+    name: &str,
+    unit: Compute,
+    function: Option<&str>,
+) -> Result<Model, String> {
     let package = dir.join(format!("{name}.mlpackage"));
     Model::load(&package, &package.with_extension("mlmodelc"), unit, function)
 }
@@ -266,7 +293,7 @@ fn load_flow_lm(dir: &Path, cfg: &Config) -> Result<(Model, Model), String> {
 }
 
 /// Mimi for one utterance: its session, and the streaming state it carries between frames.
-struct MimiStream<'a> {
+pub(super) struct MimiStream<'a> {
     model: &'a Model,
     session: Session,
     spec: Vec<(String, Vec<usize>)>,
@@ -276,7 +303,7 @@ struct MimiStream<'a> {
 }
 
 impl<'a> MimiStream<'a> {
-    fn new(model: &'a Model, dims: &mimi::Dims, window: usize) -> Result<Self, String> {
+    pub(super) fn new(model: &'a Model, dims: &mimi::Dims, window: usize) -> Result<Self, String> {
         let n = dims.cache_len(window);
         let spec = dims.state_spec(n);
         let latent_shape = [1, 1, dims.ldim];
@@ -292,7 +319,7 @@ impl<'a> MimiStream<'a> {
     }
 
     /// Frame `i`: latent in, one frame of PCM out, streaming state advanced.
-    fn decode(&mut self, i: usize, latent: &[f32]) -> Result<Vec<f32>, String> {
+    pub(super) fn decode(&mut self, i: usize, latent: &[f32]) -> Result<Vec<f32>, String> {
         let (rc, rs) = rope_mimi(&self.dims, i);
         let mask = mimi_mask(&self.dims, i, self.window);
         let mut ins: Vec<(&str, &[f32])> =

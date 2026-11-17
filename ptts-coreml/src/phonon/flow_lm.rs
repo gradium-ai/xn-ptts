@@ -397,6 +397,19 @@ pub fn build(
 /// and `eos` for the last position, and `k_new`/`v_new [L, H, t, HD]` for the host to store.
 /// `time_norm` is the checkpoint's time-embedding norm, baked into the graph as a constant,
 /// `gelu` its FFN activation and `flow` its flow head.
+/// The step graph alone, as a single-function package, for a checkpoint with no text to
+/// prefill.
+pub fn build_step(
+    wt: &Weights,
+    dm: &Dims,
+    ctx: usize,
+    time_norm: TimeNorm,
+    gelu: Gelu,
+    flow: FlowType,
+) -> Result<Built, String> {
+    graph(wt, dm, ctx, 1, time_norm, gelu, flow)
+}
+
 fn graph(
     wt: &Weights,
     dm: &Dims,
