@@ -156,6 +156,18 @@ fn code(body: &str, lang: Lang) -> Option<String> {
     if body.bytes().filter(u8::is_ascii_digit).count() < 2 {
         return None;
     }
+    // A designation of one or two letters and a number of one or two digits reads the number
+    // whole: "F-16", "B-52".
+    if let [prefix, n] = groups[..]
+        && (1..=2).contains(&prefix.len())
+        && prefix.chars().all(|c| c.is_ascii_uppercase())
+        && (1..=2).contains(&n.len())
+        && n.bytes().all(|b| b.is_ascii_digit())
+        && !n.starts_with('0')
+    {
+        let n = numbers::numbers(n, lang).unwrap_or_else(|| n.to_string());
+        return Some(format!("{} {n}", letters::spell(prefix, lang)));
+    }
     let mut after_word = false;
     for group in groups {
         if group.chars().all(|c| c.is_ascii_digit()) && after_word {
@@ -291,6 +303,9 @@ mod tests {
             (Lang::Fi, "AB-4471-Z.", "aa bee neljä neljä seitsemän yksi tset."),
             (Lang::Fi, "X7K-29Q", "äks seitsemän koo kaksi yhdeksän kuu"),
             (Lang::Fi, "SAVE-20", "save 20"),
+            (Lang::Fi, "F-16", "äf 16"),
+            (Lang::Fi, "ISO-9001", "ii äs oo yhdeksän nolla nolla yksi"),
+            (Lang::Sv, "A-07", "a noll sju"),
             (Lang::Fi, "QZ-7731-mt", "kuu tset seitsemän seitsemän kolme yksi äm tee"),
             (Lang::Fi, "B12", "bee 12"),
             (Lang::Fi, "14C", "14 see"),
