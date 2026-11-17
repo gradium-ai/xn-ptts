@@ -474,6 +474,10 @@ Report bugs or request integrations through [GitHub Issues](https://github.com/g
 
 Yes, subject to the model's [license](#license). Converting to Core ML or GGUF does not change that license or remove the Phonon 40m models' restriction on commercial use. When you redistribute, keep the license and notices. For CC BY-NC 4.0, also credit Gradium, link to the license and say what you changed.
 
+### Can I fine-tune Phonon?
+
+You can fine-tune the released weights under their [licenses](#license), but there is no public training code, and the Mimi and speaker encoders are not released.
+
 <img src="docs/readme/divider.svg" alt="" width="100%">
 
 ## Acknowledgements
