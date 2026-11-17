@@ -264,7 +264,9 @@ fn time(body: &str, bare: bool) -> Option<String> {
         None if bare => (body, None),
         None => return None,
     };
-    if number(hour, 2)? > 24 {
+    // "24.00" is midnight; "24.30" is no time.
+    let h = number(hour, 2)?;
+    if h > 24 || (h == 24 && minutes.is_some_and(|(_, m)| m != "00")) {
         return None;
     }
     let hour = if hour.len() == 2 { hour.strip_prefix('0').unwrap_or(hour) } else { hour };
@@ -580,6 +582,7 @@ mod tests {
             (Lang::Sv, "Order 2026-118-4409 och 2026-13-01."),
             (Lang::Sv, "Kl. är bra."),
             (Lang::Sv, "kl. 25.00"),
+            (Lang::Sv, "kl. 24.30"),
             (Lang::No, "Node 20.11 for denne."),
             (Lang::No, "Versjon 20.11."),
             (Lang::No, "Oppgrader fra 0.9 til 1.0."),
