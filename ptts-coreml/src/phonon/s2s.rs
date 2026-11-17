@@ -2,7 +2,10 @@
 //!
 //! The caller turns the input audio into the flow LM's per-frame conditions (ptts's
 //! `s2s::SourceEncoder`, which has no graph here), and [`Session::step`] runs one flow LM step
-//! for each, decoding its latent once the stream is past the checkpoint's delay.
+//! for each, decoding its latent once the stream is past the checkpoint's delay. As in ptts, a
+//! frame's condition takes the place of the conditioner vector, so the bundle's
+//! `flow_lm.conditions` is not read; the export refuses a speech-to-speech checkpoint with
+//! conditioners.
 //!
 //! The flow LM's cache is the decode graph's slot ring: the voice prompt holds the first slots
 //! and the frames cycle through the rest. When those are full, the oldest third of the frames
@@ -22,6 +25,10 @@ pub struct Config {
     pub dims: fl::Dims,
     /// Slots of the flow LM's ring: the voice prompt's, then the frames kept in view.
     pub ctx: usize,
+    /// Input frames kept in view after the voice prompt, the bundle's `s2s.context`. A voice
+    /// shorter than the longest one the bundle was sized for leaves the slots past it unused,
+    /// so every voice keeps the same window.
+    pub context: usize,
     /// The Mimi decoder's sizes, from the checkpoint's config.
     pub mimi: mimi::Dims,
     /// Mimi's attention window, the reference's `transformer_context`.
@@ -62,10 +69,10 @@ impl SpeechToSpeech {
     /// prompt.
     pub fn load(dir: &Path, cfg: Config, voice: Voice) -> Result<Self, String> {
         let dm = cfg.dims;
-        if voice.len + 3 > cfg.ctx {
+        if cfg.context < 3 || voice.len + cfg.context > cfg.ctx {
             return Err(format!(
-                "a {}-position voice leaves no room in ctx {}",
-                voice.len, cfg.ctx
+                "a {}-position voice and {} frames of context do not fit ctx {}",
+                voice.len, cfg.context, cfg.ctx
             ));
         }
         if voice.emb.len() != voice.len * dm.d {
@@ -160,7 +167,7 @@ impl Session<'_> {
             return Err(format!("a condition is {} wide, not {}", condition.len(), dm.d));
         }
         let start = Instant::now();
-        let (v, context) = (self.voice_len, cfg.ctx - self.voice_len);
+        let (v, context) = (self.voice_len, cfg.context);
         if self.in_view == context {
             let drop = context / 3;
             let oldest = self.steps - self.in_view;
@@ -231,4 +238,77 @@ fn rotate_back(dm: &fl::Dims, ring: &Ring, prefix: usize, count: usize) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `x` rotated to position `pos` the way the graph embeds keys: the first half of the
+    /// channels against the second.
+    fn embed(x: &[f32], pos: usize) -> Vec<f32> {
+        let half = x.len() / 2;
+        let (cos, sin) = rope(pos, 1, x.len());
+        let mut out = x.to_vec();
+        for i in 0..half {
+            let (lo, hi) = (x[i], x[half + i]);
+            out[i] = lo * cos[i] - hi * sin[i];
+            out[half + i] = hi * cos[i] + lo * sin[i];
+        }
+        out
+    }
+
+    #[test]
+    fn rotating_back_moves_the_kept_keys_to_earlier_positions() {
+        let dm = fl::Dims {
+            d: 16,
+            heads: 2,
+            attn: 16,
+            kv_heads: 2,
+            layers: 2,
+            ff: 32,
+            ldim: 4,
+            z: None,
+            flow_d: 8,
+            flow_blocks: 1,
+        };
+        let (hd, ctx, prefix, count) = (dm.hd(), 9, 2, 3);
+        let mut ring = Ring::new(&dm, ctx).unwrap();
+        // Slots 0..2 hold the prompt, 2..5 the dropped frames, 5..9 the kept ones; the key in
+        // slot `s` sits at position `s + 40`.
+        ring.valid = (0..ctx).map(|s| !(2..5).contains(&s)).collect();
+        let base = |lh: usize, s: usize| -> Vec<f32> {
+            (0..hd).map(|i| ((lh * 31 + s * 7 + i) as f32 * 0.37).sin()).collect()
+        };
+        let pos = |s: usize| s + 40;
+        let write = |ring: &Ring, rows: &dyn Fn(usize, usize) -> Vec<f32>| {
+            ring.k.with_bytes_mut(|p, _| {
+                let k = p as *mut half::f16;
+                for lh in 0..dm.layers * dm.heads {
+                    for s in 0..ctx {
+                        for (i, v) in rows(lh, s).into_iter().enumerate() {
+                            unsafe { *k.add((lh * ctx + s) * hd + i) = half::f16::from_f32(v) };
+                        }
+                    }
+                }
+            })
+        };
+        write(&ring, &|lh, s| embed(&base(lh, s), pos(s)));
+        rotate_back(&dm, &ring, prefix, count);
+
+        ring.k.with_bytes_mut(|p, _| {
+            let k = p as *const half::f16;
+            for lh in 0..dm.layers * dm.heads {
+                for s in 0..ctx {
+                    // The prompt and the dropped slots stay where they were.
+                    let moved = s >= prefix && ring.valid[s];
+                    let want = embed(&base(lh, s), if moved { pos(s) - count } else { pos(s) });
+                    for (i, w) in want.into_iter().enumerate() {
+                        let got = unsafe { *k.add((lh * ctx + s) * hd + i) }.to_f32();
+                        assert!((got - w).abs() < 1e-2, "layer-head {lh} slot {s} [{i}]");
+                    }
+                }
+            }
+        });
+    }
 }

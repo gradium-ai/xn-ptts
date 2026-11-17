@@ -129,6 +129,9 @@ impl Flow {
         rows_valid: &[bool],
     ) -> Result<(Vec<f32>, f32), String> {
         let (t, ctx) = (self.t, ring.valid.len());
+        if slot >= ctx || rows_valid.len() != t {
+            return Err(format!("slot {slot} of {ctx} with {} rows for {t}", rows_valid.len()));
+        }
         let (c, s) = rope(pos, t, self.dm.hd());
         let mask = ring_mask(&ring.valid, t, ctx);
         let mut out = self.model.predict(

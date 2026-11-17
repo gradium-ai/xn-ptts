@@ -389,14 +389,6 @@ pub fn build(
     program(vec![(STEP, step), (PREFILL, prefill)])
 }
 
-/// The flow LM for `t` positions against a `ctx`-slot ring cache.
-///
-/// Inputs: `emb [1, t, D]` (the host applies `input_linear` and the speaker embedding, so the
-/// same graph serves prefill and decode), `cos`/`sin [1, 1, t, HD/2]`, `mask [1, 1, t, ctx + t]`,
-/// `noise [1, LDIM]`, and the ring `k_all_in`/`v_all_in [L, H, ctx, HD]`. Outputs: `next_latent`
-/// and `eos` for the last position, and `k_new`/`v_new [L, H, t, HD]` for the host to store.
-/// `time_norm` is the checkpoint's time-embedding norm, baked into the graph as a constant,
-/// `gelu` its FFN activation and `flow` its flow head.
 /// The step graph alone, as a single-function package, for a checkpoint with no text to
 /// prefill.
 pub fn build_step(
@@ -410,6 +402,14 @@ pub fn build_step(
     graph(wt, dm, ctx, 1, time_norm, gelu, flow)
 }
 
+/// The flow LM for `t` positions against a `ctx`-slot ring cache.
+///
+/// Inputs: `emb [1, t, D]` (the host applies `input_linear` and the speaker embedding, so the
+/// same graph serves prefill and decode), `cos`/`sin [1, 1, t, HD/2]`, `mask [1, 1, t, ctx + t]`,
+/// `noise [1, LDIM]`, and the ring `k_all_in`/`v_all_in [L, H, ctx, HD]`. Outputs: `next_latent`
+/// and `eos` for the last position, and `k_new`/`v_new [L, H, t, HD]` for the host to store.
+/// `time_norm` is the checkpoint's time-embedding norm, baked into the graph as a constant,
+/// `gelu` its FFN activation and `flow` its flow head.
 fn graph(
     wt: &Weights,
     dm: &Dims,

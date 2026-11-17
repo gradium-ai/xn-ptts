@@ -245,6 +245,10 @@ fn main() -> Result<()> {
     // speech to speech, the voice and the frames in view.
     let s2s = wt.get("flow_lm.condition_provider.conditioners.source_latents.output_proj.weight");
     let s2s = s2s.is_ok();
+    if s2s && !cfg.conditioners.is_empty() {
+        // A frame's condition takes the place of the conditioner vector, as in `ptts::s2s`.
+        anyhow::bail!("a speech-to-speech checkpoint with conditioners is not supported")
+    }
     let max_frames = ptts::plan::frame_budget(args.max_tokens, m.frame_rate);
     let (ctx, prefill_len) = match s2s {
         true => (vlen + args.context, 0),
