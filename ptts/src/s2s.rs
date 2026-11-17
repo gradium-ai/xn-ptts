@@ -30,12 +30,60 @@ impl crate::Tokenizer for NoTokenizer {
 
 pub struct SpeechToSpeech<Q: BackendQ> {
     pub model: TTSModel<Q>,
+    source: SourceEncoder<Q>,
+    delay: usize,
+    lsd_decode_steps: usize,
+}
+
+/// The input side alone: audio to the flow LM's per-frame conditions, through the Mimi encoder
+/// and the source projection. [`SpeechToSpeech`] runs it, and a frontend running the flow LM
+/// elsewhere can load it on its own.
+pub struct SourceEncoder<Q: BackendQ> {
     encoder: MimiEncoder<Unquantized<f32, Q::B>>,
     source_proj: Linear<Q::T, Q::B>,
     neg_mean: Tensor<Q::T, Q::B>,
     inv_std: Tensor<Q::T, Q::B>,
-    delay: usize,
-    lsd_decode_steps: usize,
+}
+
+impl<Q: BackendQ> SourceEncoder<Q> {
+    pub fn load(vb: &Path<Q::B>, cfg: &TTSConfig) -> Result<Self> {
+        let encoder = MimiEncoder::load(&vb.pp("mimi"), &cfg.mimi_with_gelu(&cfg.mimi))?;
+        let src = vb.pp("flow_lm.condition_provider.conditioners.source_latents");
+        let ldim = cfg.flow_lm.ldim;
+        let source_proj = Linear::load(src.pp("output_proj"), ldim, cfg.flow_lm.d_model)?;
+        let mean = src.tensor::<f32>("latent_mean", (ldim,))?.to_vec()?;
+        let std = src.tensor::<f32>("latent_std", (ldim,))?.to_vec()?;
+        let dev = vb.device();
+        let neg_mean = mean.iter().map(|m| Q::T::from_f32(-m)).collect();
+        let inv_std = std.iter().map(|s| Q::T::from_f32(1.0 / s)).collect();
+        Ok(Self {
+            encoder,
+            source_proj,
+            neg_mean: Tensor::from_vec(neg_mean, (ldim,), dev)?,
+            inv_std: Tensor::from_vec(inv_std, (ldim,), dev)?,
+        })
+    }
+
+    /// Audio samples per frame.
+    pub fn frame_size(&self) -> usize {
+        self.encoder.frame_size()
+    }
+
+    pub fn init_state(&self) -> Result<MimiEncoderState<f32, Q::B>> {
+        self.encoder.init_state(1)
+    }
+
+    /// The conditions, `[1, T, d_model]`, of `audio`, `[1, 1, T * frame_size]`.
+    pub fn encode(
+        &self,
+        audio: &Tensor<f32, Q::B>,
+        state: &mut MimiEncoderState<f32, Q::B>,
+    ) -> Result<Tensor<Q::T, Q::B>> {
+        let latents = self.encoder.encode_step(audio, state)?;
+        let latents = latents.transpose(1, 2)?.contiguous()?.to::<Q::T>()?;
+        let normalized = latents.broadcast_add(&self.neg_mean)?.broadcast_mul(&self.inv_std)?;
+        self.source_proj.forward(&normalized)
+    }
 }
 
 /// The flow LM's state after a voice prompt, which every session in that voice starts from.
@@ -81,21 +129,9 @@ pub struct StageTimes {
 impl<Q: BackendQ> SpeechToSpeech<Q> {
     pub fn load(vb: &Path<Q::B>, cfg: &TTSConfig) -> Result<Self> {
         let model = TTSModel::load(vb, Box::new(NoTokenizer), cfg, &Default::default())?;
-        let encoder = MimiEncoder::load(&vb.pp("mimi"), &cfg.mimi_with_gelu(&cfg.mimi))?;
-        let src = vb.pp("flow_lm.condition_provider.conditioners.source_latents");
-        let ldim = cfg.flow_lm.ldim;
-        let source_proj = Linear::load(src.pp("output_proj"), ldim, cfg.flow_lm.d_model)?;
-        let mean = src.tensor::<f32>("latent_mean", (ldim,))?.to_vec()?;
-        let std = src.tensor::<f32>("latent_std", (ldim,))?.to_vec()?;
-        let dev = vb.device();
-        let neg_mean = mean.iter().map(|m| Q::T::from_f32(-m)).collect();
-        let inv_std = std.iter().map(|s| Q::T::from_f32(1.0 / s)).collect();
         Ok(Self {
             model,
-            encoder,
-            source_proj,
-            neg_mean: Tensor::from_vec(neg_mean, (ldim,), dev)?,
-            inv_std: Tensor::from_vec(inv_std, (ldim,), dev)?,
+            source: SourceEncoder::load(vb, cfg)?,
             delay: cfg.audio_delay,
             lsd_decode_steps: cfg.lsd_decode_steps,
         })
@@ -107,7 +143,7 @@ impl<Q: BackendQ> SpeechToSpeech<Q> {
 
     /// Audio samples per frame, in and out.
     pub fn frame_size(&self) -> usize {
-        self.encoder.frame_size()
+        self.source.frame_size()
     }
 
     /// Frames the output lags the input by, beyond the frame being filled.
@@ -128,16 +164,17 @@ impl<Q: BackendQ> SpeechToSpeech<Q> {
         if opts.context < 3 {
             xn::bail!("a session needs a context of at least 3 frames, not {}", opts.context)
         }
-        let transformer_state = voice
+        let mut transformer_state = voice
             .state
             .flow_lm_state
             .transformer_state
             .with_seq_budget(voice.len + opts.context)?;
+        self.model.flow_lm.transformer.start_ring(&mut transformer_state)?;
         let flow_lm_state = crate::flow_lm::FlowLMState { transformer_state, conditions: None };
         let d_model = self.model.flow_lm.conditioner.output_dim;
         Ok(Session {
             s2s: self,
-            encoder_state: self.encoder.init_state(1)?,
+            encoder_state: self.source.init_state()?,
             flow: TTSState { flow_lm_state },
             decoder_state: self.model.init_mimi_state(1)?,
             rng: NormalRng::new(opts.temperature, opts.seed)?,
@@ -177,13 +214,6 @@ impl<Q: BackendQ> SpeechToSpeech<Q> {
         let mut out = session.push(pcm)?;
         out.extend(session.flush()?);
         Ok(out)
-    }
-
-    /// The flow LM's per-frame conditions, `[1, T, d_model]`, from encoder latents `[1, C, T]`.
-    fn conditions(&self, latents: &Tensor<f32, Q::B>) -> Result<Tensor<Q::T, Q::B>> {
-        let latents = latents.transpose(1, 2)?.contiguous()?.to::<Q::T>()?;
-        let normalized = latents.broadcast_add(&self.neg_mean)?.broadcast_mul(&self.inv_std)?;
-        self.source_proj.forward(&normalized)
     }
 }
 
@@ -261,8 +291,7 @@ impl<Q: BackendQ> Session<'_, Q> {
         let start = Instant::now();
         let len = audio.len();
         let audio = Tensor::from_vec(audio, (1, 1, len), self.s2s.model.device())?;
-        let latents = self.s2s.encoder.encode_step(&audio, &mut self.encoder_state)?;
-        let conditions = self.s2s.conditions(&latents)?;
+        let conditions = self.s2s.source.encode(&audio, &mut self.encoder_state)?;
         self.times.encode += start.elapsed();
         let frames = conditions.dim(1usize)?;
         for t in 0..frames {
@@ -276,15 +305,19 @@ impl<Q: BackendQ> Session<'_, Q> {
     fn step(&mut self, condition: &Tensor<Q::T, Q::B>, out: &mut Vec<f32>) -> Result<()> {
         let start = Instant::now();
         let model = &self.s2s.model;
-        if self.in_view == self.context {
-            let drop = self.context / 3;
-            model.flow_lm.transformer.drop_positions(
-                &mut self.flow.flow_lm_state.transformer_state,
-                self.voice_len,
-                drop,
-            )?;
+        let (transformer, cache) =
+            (&model.flow_lm.transformer, &mut self.flow.flow_lm_state.transformer_state);
+        let (v, context) = (self.voice_len, self.context);
+        if self.in_view == context {
+            let drop = context / 3;
+            // Frames take the slots after the voice prompt in turn, so the oldest are the next
+            // ones round.
+            let oldest = self.steps - self.in_view;
+            let slots: Vec<usize> = (0..drop).map(|j| v + (oldest + j) % context).collect();
+            transformer.evict(cache, v, &slots)?;
             self.in_view -= drop;
         }
+        transformer.set_ring_slot(cache, v + self.steps % context)?;
         self.flow.flow_lm_state.conditions = Some(condition.clone());
         let delay = self.s2s.delay;
         let input = match &self.previous {

@@ -16,8 +16,40 @@ pub struct StreamingMHAState<T: WithDTypeF, B: Backend> {
     pub k_cache: Tensor<T, B>,
     /// Value cache: shape [batch_size, sequence_length, num_heads, dim_per_head]
     pub v_cache: Tensor<T, B>,
-    /// Current end position (number of tokens seen so far).
+    /// Current end position (number of tokens seen so far). With a ring, the position of the
+    /// next row, wherever its slot is.
     pub current_end: usize,
+    /// Set when the cache is a ring of slots rather than appended to, see
+    /// [`StreamingTransformer::start_ring`].
+    pub ring: Option<RingSlots>,
+}
+
+/// A flow-LM cache used as a ring: rows stay in their slots, and new rows take the slots of
+/// those dropped. Every layer's state carries one, all alike.
+#[derive(Debug, Clone)]
+pub struct RingSlots {
+    /// Which slots hold a row attention may see.
+    pub valid: Vec<bool>,
+    /// The slot the next row goes into.
+    pub write: usize,
+    /// One past the highest slot written: attention spans `0..filled`.
+    pub filled: usize,
+}
+
+impl RingSlots {
+    /// The decode step's mask over `0..filled`, the row being written included, or `None` when
+    /// it would hide nothing.
+    fn decode_mask<T: WithDTypeF, B: Backend>(&self, dev: &B) -> Result<Option<Tensor<T, B>>> {
+        let filled = self.filled.max(self.write + 1);
+        let seen = |s: usize| s == self.write || self.valid[s];
+        if (0..filled).all(seen) {
+            return Ok(None);
+        }
+        let data = (0..filled)
+            .map(|s| T::from_f32(if seen(s) { 0.0 } else { f32::NEG_INFINITY }))
+            .collect();
+        Ok(Some(Tensor::from_vec(data, (1, filled), dev)?))
+    }
 }
 
 impl<T: WithDTypeF, B: Backend> StreamingMHAState<T, B> {
@@ -32,6 +64,19 @@ impl<T: WithDTypeF, B: Backend> StreamingMHAState<T, B> {
         v: &Tensor<T, B>,
     ) -> Result<(TensorView<T, B>, TensorView<T, B>)> {
         let t = k.dim(1usize)?;
+        if let Some(ring) = self.ring.as_mut() {
+            if t != 1 {
+                xn::bail!("a ring cache takes one row at a time, not {t}")
+            }
+            self.k_cache.slice_set(k, 1usize, ring.write)?;
+            self.v_cache.slice_set(v, 1usize, ring.write)?;
+            ring.valid[ring.write] = true;
+            ring.filled = ring.filled.max(ring.write + 1);
+            self.current_end += 1;
+            let keys = self.k_cache.narrow(1, 0..ring.filled)?;
+            let values = self.v_cache.narrow(1, 0..ring.filled)?;
+            return Ok((keys, values));
+        }
 
         self.k_cache.slice_set(k, 1usize, self.current_end)?;
         self.v_cache.slice_set(v, 1usize, self.current_end)?;
@@ -128,7 +173,7 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
         let dev = &self.device;
         let k_cache = Tensor::zeros(shape, dev)?;
         let v_cache = Tensor::zeros(shape, dev)?;
-        Ok(StreamingMHAState { k_cache, v_cache, current_end: 0 })
+        Ok(StreamingMHAState { k_cache, v_cache, current_end: 0, ring: None })
     }
 
     #[tracing::instrument(name = "attn", skip_all)]
@@ -331,6 +376,7 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformerState<T, B> {
                         k_cache,
                         v_cache,
                         current_end: used,
+                        ring: None,
                     })
                 }
             };
@@ -700,7 +746,13 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
         // that mask means filling a Vec on the host, uploading it and adding it per layer, all
         // to add zero.
         let mask = if seq_len == 1 {
-            None
+            // A ring hides the slots of dropped rows until new rows take them.
+            match state.layer_states.first() {
+                Some(LayerAttentionState::FlowLm(StreamingMHAState { ring: Some(r), .. })) => {
+                    r.decode_mask(x.device())?
+                }
+                _ => None,
+            }
         } else {
             match state.layer_states.first() {
                 Some(LayerAttentionState::Mimi(kv_cache)) => {
@@ -774,40 +826,90 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
         Ok(x)
     }
 
-    /// Drops the `count` cached positions from `start` on, moving the later ones back to
-    /// `start` with their keys rotated to match, so the next position is `count` lower and
-    /// every distance between kept positions is unchanged. The kept keys and values were
-    /// computed with the dropped positions in view, so this is a sliding window, not the state
-    /// a sequence without them would have reached. Flow-LM attention only.
-    pub fn drop_positions(
-        &self,
-        state: &mut StreamingTransformerState<Q::T, Q::B>,
-        start: usize,
-        count: usize,
-    ) -> Result<()> {
+    /// Makes the flow-LM cache a ring of its slots: rows stay where they are written, and
+    /// [`Self::set_ring_slot`] picks the slot of the next one. The rows cached so far stay.
+    pub fn start_ring(&self, state: &mut StreamingTransformerState<Q::T, Q::B>) -> Result<()> {
         for layer in state.layer_states.iter_mut() {
             let LayerAttentionState::FlowLm(mha) = layer else {
-                xn::bail!("only a flow-LM cache can drop positions")
+                xn::bail!("only a flow-LM cache can be a ring")
             };
-            let end = mha.current_end;
-            if start + count > end {
-                xn::bail!("cannot drop positions {start}..{} of {end}", start + count)
+            let (slots, used) = (mha.k_cache.dim(1usize)?, mha.current_end);
+            let valid = (0..slots).map(|s| s < used).collect();
+            mha.ring = Some(RingSlots { valid, write: used, filled: used });
+        }
+        Ok(())
+    }
+
+    /// The slot of a ring cache's next row.
+    pub fn set_ring_slot(
+        &self,
+        state: &mut StreamingTransformerState<Q::T, Q::B>,
+        slot: usize,
+    ) -> Result<()> {
+        for layer in state.layer_states.iter_mut() {
+            let LayerAttentionState::FlowLm(StreamingMHAState { ring: Some(ring), .. }) = layer
+            else {
+                xn::bail!("not a ring cache, see start_ring")
+            };
+            if slot >= ring.valid.len() {
+                xn::bail!("slot {slot} of a {}-slot ring", ring.valid.len())
             }
-            let kept = end - start - count;
-            if kept > 0 {
+            ring.write = slot;
+        }
+        Ok(())
+    }
+
+    /// Drops the rows in `slots` from a ring cache without moving anything: they are hidden from
+    /// attention until new rows take their slots, and every other row past the first `prefix`
+    /// slots has its key rotated back by `slots.len()` positions where it lies, so the next
+    /// position is that much lower and every distance between kept rows is unchanged. The kept
+    /// keys and values were computed with the dropped rows in view, so this is a sliding window,
+    /// not the state a sequence without them would have reached.
+    pub fn evict(
+        &self,
+        state: &mut StreamingTransformerState<Q::T, Q::B>,
+        prefix: usize,
+        slots: &[usize],
+    ) -> Result<()> {
+        let count = slots.len();
+        for layer in state.layer_states.iter_mut() {
+            let LayerAttentionState::FlowLm(mha) = layer else {
+                xn::bail!("only a flow-LM cache can evict")
+            };
+            let Some(ring) = mha.ring.as_mut() else {
+                xn::bail!("not a ring cache, see start_ring")
+            };
+            if count > mha.current_end {
+                xn::bail!("cannot evict {count} of {} positions", mha.current_end)
+            }
+            for &s in slots {
+                if s < prefix || !ring.valid.get(s).copied().unwrap_or(false) {
+                    xn::bail!("slot {s} holds no row past the prefix")
+                }
+                ring.valid[s] = false;
+            }
+            // The kept rows, a run of consecutive slots at a time.
+            let mut s = prefix;
+            while s < ring.filled {
+                if !ring.valid[s] {
+                    s += 1;
+                    continue;
+                }
+                let start = s;
+                while s < ring.filled && ring.valid[s] {
+                    s += 1;
+                }
                 let rope = RotaryEmbedding::shift_back(
                     self.head_dim,
                     count,
-                    kept,
+                    s - start,
                     self.max_period,
-                    mha.device(),
+                    mha.k_cache.device(),
                 )?;
-                let k = mha.k_cache.narrow(1, start + count..end)?.contiguous()?;
-                let v = mha.v_cache.narrow(1, start + count..end)?.contiguous()?;
+                let k = mha.k_cache.narrow(1, start..s)?.contiguous()?;
                 mha.k_cache.slice_set(&rope.rotate(&k)?, 1usize, start)?;
-                mha.v_cache.slice_set(&v, 1usize, start)?;
             }
-            mha.current_end = end - count;
+            mha.current_end -= count;
         }
         Ok(())
     }
@@ -927,6 +1029,7 @@ mod with_seq_budget_tests {
                 k_cache: k,
                 v_cache: v,
                 current_end: used,
+                ring: None,
             })],
         }
     }
@@ -1229,7 +1332,7 @@ mod q8_tests {
 }
 
 #[cfg(test)]
-mod drop_positions_tests {
+mod ring_tests {
     use super::*;
     use xn::CpuDevice;
 
@@ -1240,38 +1343,49 @@ mod drop_positions_tests {
     }
 
     #[test]
-    fn dropping_positions_leaves_the_cache_of_a_sequence_without_them() {
-        // In a single layer, a position's key and value depend on its own input alone, so
-        // dropping the filler must give back exactly the cache of prompt + text.
+    fn evicting_leaves_the_cache_of_a_sequence_without_them() {
+        // A 5-row prompt and 6 frame slots, whose oldest 3 frames go once they are full. In a
+        // single layer a row's key and value depend on its own input and position alone, so
+        // after the eviction every frame must see what it would have seen had the evicted
+        // frames never been there.
         let t = q8_tests::transformer(Kind::FlowLm { attn_dim: 64, num_kv_heads: 4 });
-        let (prompt, filler, text, query) =
-            (rows(5, 0.0), rows(7, 1.0), rows(4, 2.0), rows(1, 3.0));
+        let (prompt, frames) = (rows(5, 0.0), rows(9, 1.0));
+        let frame = |i: usize| frames.narrow(1, i..i + 1).unwrap().contiguous().unwrap();
+        let mut ring = t.init_state(1, 11).unwrap();
+        t.forward(&prompt, &mut ring).unwrap();
+        t.start_ring(&mut ring).unwrap();
+        for i in 0..9 {
+            if i == 6 {
+                t.evict(&mut ring, 5, &[5, 6, 7]).unwrap();
+                let LayerAttentionState::FlowLm(mha) = &ring.layer_states[0] else { panic!() };
+                assert_eq!(mha.current_end, 8);
+            }
+            t.set_ring_slot(&mut ring, 5 + i % 6).unwrap();
+            let got: Vec<f32> = t.forward(&frame(i), &mut ring).unwrap().to_vec().unwrap();
 
-        let mut state = t.init_state(1, 16).unwrap();
-        for x in [&prompt, &text] {
-            t.forward(x, &mut state).unwrap();
+            let mut plain = t.init_state(1, 11).unwrap();
+            t.forward(&prompt, &mut plain).unwrap();
+            let kept = if i < 6 { 0 } else { 3 };
+            let mut want = Vec::new();
+            for j in kept..=i {
+                want = t.forward(&frame(j), &mut plain).unwrap().to_vec().unwrap();
+            }
+            let err = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            assert!(err < 1e-4, "frame {i}: {err}");
         }
-        let want: Vec<f32> = t.forward(&query, &mut state).unwrap().to_vec().unwrap();
-
-        let mut state = t.init_state(1, 17).unwrap();
-        for x in [&prompt, &filler, &text] {
-            t.forward(x, &mut state).unwrap();
-        }
-        t.drop_positions(&mut state, 5, 7).unwrap();
-        let LayerAttentionState::FlowLm(mha) = &state.layer_states[0] else { panic!() };
-        assert_eq!(mha.current_end, 9);
-        let got: Vec<f32> = t.forward(&query, &mut state).unwrap().to_vec().unwrap();
-
-        let err = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
-        assert!(err < 1e-4, "{err}");
     }
 
     #[test]
-    fn dropping_past_the_end_is_refused() {
+    fn evicting_the_prompt_or_an_empty_slot_is_refused() {
         let t = q8_tests::transformer(Kind::FlowLm { attn_dim: 64, num_kv_heads: 4 });
         let mut state = t.init_state(1, 8).unwrap();
         t.forward(&rows(4, 0.0), &mut state).unwrap();
-        assert!(t.drop_positions(&mut state, 2, 3).is_err());
-        assert!(t.drop_positions(&mut state, 2, 2).is_ok());
+        assert!(t.set_ring_slot(&mut state, 4).is_err());
+        t.start_ring(&mut state).unwrap();
+        t.set_ring_slot(&mut state, 4).unwrap();
+        t.forward(&rows(1, 1.0), &mut state).unwrap();
+        assert!(t.evict(&mut state, 4, &[2]).is_err());
+        assert!(t.evict(&mut state, 4, &[5]).is_err());
+        assert!(t.evict(&mut state, 4, &[4]).is_ok());
     }
 }
