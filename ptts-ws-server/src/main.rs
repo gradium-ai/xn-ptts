@@ -64,7 +64,7 @@ struct Args {
     quant: Option<String>,
 
     /// Language incoming text is normalized as before tokenizing: `en`, `fr`, `de`, `es`, `pt`,
-    /// `ar`, `hi`, `ko`, `pl`, `sv`, `fi`, `no`, `it`, `nl`, `ja`, `zh`, `da` or `tr`. Required:
+    /// `ar`, `hi`, `ko`, `pl`, `sv`, `fi`, `no`, `it`, `nl` or `ja`. Required:
     /// the spoken forms differ per language, so there is nothing safe to guess.
     /// `none` serves the text as written, which the model reads less well.
     #[arg(long)]

@@ -194,39 +194,6 @@ pub const SPECIAL_CHARS_JA: SpecialChars = SpecialChars {
     underscore: "アンダーバー",
 };
 
-pub const SPECIAL_CHARS_ZH: SpecialChars = SpecialChars {
-    at: "艾特",
-    plus: "加",
-    equals: "等于",
-    colon: "冒号",
-    slash: "斜杠",
-    dash: "横杠",
-    dot: "点",
-    underscore: "下划线",
-};
-
-pub const SPECIAL_CHARS_DA: SpecialChars = SpecialChars {
-    at: "snabel-a",
-    plus: "plus",
-    equals: "er lig med",
-    colon: "kolon",
-    slash: "skråstreg",
-    dash: "bindestreg",
-    dot: "punktum",
-    underscore: "understreg",
-};
-
-pub const SPECIAL_CHARS_TR: SpecialChars = SpecialChars {
-    at: "et",
-    plus: "artı",
-    equals: "eşittir",
-    colon: "iki nokta",
-    slash: "eğik çizgi",
-    dash: "tire",
-    dot: "nokta",
-    underscore: "alt çizgi",
-};
-
 /// Language driving the spoken forms used by [`normalize_text`].
 ///
 /// Deliberately has no `Default`: the spoken forms differ per language, so a caller that has not
@@ -252,9 +219,6 @@ pub enum Lang {
     It,
     Nl,
     Ja,
-    Zh,
-    Da,
-    Tr,
 }
 
 impl std::str::FromStr for Lang {
@@ -292,9 +256,6 @@ impl Lang {
         Lang::It,
         Lang::Nl,
         Lang::Ja,
-        Lang::Zh,
-        Lang::Da,
-        Lang::Tr,
     ];
 
     /// The language code this variant parses from.
@@ -315,9 +276,6 @@ impl Lang {
             Lang::It => "it",
             Lang::Nl => "nl",
             Lang::Ja => "ja",
-            Lang::Zh => "zh",
-            Lang::Da => "da",
-            Lang::Tr => "tr",
         }
     }
 
@@ -345,9 +303,6 @@ impl Lang {
             Lang::It => &SPECIAL_CHARS_IT,
             Lang::Nl => &SPECIAL_CHARS_NL,
             Lang::Ja => &SPECIAL_CHARS_JA,
-            Lang::Zh => &SPECIAL_CHARS_ZH,
-            Lang::Da => &SPECIAL_CHARS_DA,
-            Lang::Tr => &SPECIAL_CHARS_TR,
         }
     }
 
@@ -361,13 +316,11 @@ impl Lang {
             Lang::Hi => "लगभग",
             Lang::Ko => "약",
             Lang::Pl => "około",
-            Lang::Sv | Lang::No | Lang::Da => "cirka",
+            Lang::Sv | Lang::No => "cirka",
             Lang::Fi => "noin",
             Lang::It => "circa",
             Lang::Nl => "ongeveer",
             Lang::Ja => "約",
-            Lang::Zh => "约",
-            Lang::Tr => "yaklaşık",
         }
     }
 
@@ -381,14 +334,12 @@ impl Lang {
             Lang::Ar => "زائد أو ناقص",
             Lang::Hi => "प्लस माइनस",
             Lang::Ko => "플러스 마이너스",
-            Lang::Pl | Lang::Sv | Lang::Da => "plus minus",
-            Lang::Tr => "artı eksi",
+            Lang::Pl | Lang::Sv => "plus minus",
             Lang::Fi => "plus miinus",
             Lang::No => "pluss minus",
             Lang::It => "più o meno",
             Lang::Nl => "plus of min",
             Lang::Ja => "プラスマイナス",
-            Lang::Zh => "正负",
         }
     }
 
@@ -408,9 +359,6 @@ impl Lang {
             Lang::It => "amo",
             Lang::Nl => "hou van",
             Lang::Ja => "大好き",
-            Lang::Zh => "爱",
-            Lang::Da => "elsker",
-            Lang::Tr => "seviyorum",
         }
     }
 
@@ -426,11 +374,9 @@ impl Lang {
             Lang::Pl => "gwiazdka",
             Lang::Sv => "stjärna",
             Lang::Fi => "tähti",
-            Lang::No | Lang::Da => "stjerne",
+            Lang::No => "stjerne",
             Lang::Nl => "sterretje",
-            Lang::Tr => "yıldız",
             Lang::Ja => "アスタリスク",
-            Lang::Zh => "星号",
         }
     }
 
@@ -445,11 +391,9 @@ impl Lang {
             Lang::Hi => "नंबर",
             Lang::Ko => "번호",
             Lang::Pl => "numer",
-            Lang::Sv | Lang::No | Lang::Nl | Lang::Da => "nummer",
+            Lang::Sv | Lang::No | Lang::Nl => "nummer",
             Lang::Fi | Lang::It => "numero",
-            Lang::Tr => "numara",
             Lang::Ja => "番号",
-            Lang::Zh => "号",
         }
     }
 
@@ -470,16 +414,15 @@ impl Lang {
             (Lang::Ko, _) => "도",
             (Lang::Pl, true) => "stopień",
             (Lang::Pl, false) => "stopni",
-            (Lang::Sv | Lang::No | Lang::Da, true) => "grad",
-            (Lang::Sv | Lang::No | Lang::Da, false) => "grader",
-            (Lang::Tr, _) => "derece",
+            (Lang::Sv | Lang::No, true) => "grad",
+            (Lang::Sv | Lang::No, false) => "grader",
             (Lang::Fi, true) => "aste",
             (Lang::Fi, false) => "astetta",
             (Lang::It, true) => "grado",
             (Lang::It, false) => "gradi",
             (Lang::Nl, true) => "graad",
             (Lang::Nl, false) => "graden",
-            (Lang::Ja | Lang::Zh, _) => "度",
+            (Lang::Ja, _) => "度",
         }
     }
 
@@ -531,13 +474,6 @@ impl Lang {
                 "keer|gedeeld door|kleiner dan of gelijk aan|groter dan of gelijk aan|is niet gelijk aan|ongeveer|wortel van|oneindig|sigma|promille"
             }
             Lang::Ja => "かける|わる|以下|以上|ノットイコール|約|ルート|無限大|シグマ|パーミル",
-            Lang::Zh => "乘以|除以|小于等于|大于等于|不等于|约等于|根号|无穷大|西格玛|千分之",
-            Lang::Da => {
-                "gange|divideret med|mindre end eller lig med|større end eller lig med|ikke lig med|cirka|kvadratroden af|uendelig|sigma|promille"
-            }
-            Lang::Tr => {
-                "çarpı|bölü|küçük eşit|büyük eşit|eşit değil|yaklaşık|karekök|sonsuz|sigma|binde"
-            }
         };
         row.split('|').nth(i)
     }
@@ -574,12 +510,6 @@ impl Lang {
             (Lang::Nl, None) => format!("{n} sterren"),
             (Lang::Ja, Some(of)) => format!("{of}つ星のうち{n}つ"),
             (Lang::Ja, None) => format!("星{n}つ"),
-            (Lang::Zh, Some(of)) => format!("{n}星，满分{of}星"),
-            (Lang::Zh, None) => format!("{n}星"),
-            (Lang::Da, Some(of)) => format!("{n} ud af {of} stjerner"),
-            (Lang::Da, None) => format!("{n} stjerner"),
-            (Lang::Tr, Some(of)) => format!("{of} üzerinden {n} yıldız"),
-            (Lang::Tr, None) => format!("{n} yıldız"),
         }
     }
 
@@ -624,15 +554,6 @@ impl Lang {
             (Lang::Nl, "3") => "tot de derde".into(),
             (Lang::Nl, n) => format!("tot de macht {n}"),
             (Lang::Ja, n) => format!("の{n}乗"),
-            (Lang::Zh, "2") => "的平方".into(),
-            (Lang::Zh, "3") => "的立方".into(),
-            (Lang::Zh, n) => format!("的{n}次方"),
-            (Lang::Da, "2") => "i anden".into(),
-            (Lang::Da, "3") => "i tredje".into(),
-            (Lang::Da, n) => format!("opløftet i {n}"),
-            (Lang::Tr, "2") => "kare".into(),
-            (Lang::Tr, "3") => "küp".into(),
-            (Lang::Tr, n) => format!("üzeri {n}"),
         }
     }
 
@@ -667,7 +588,7 @@ impl Lang {
             Lang::Fi => {
                 "alfa|beeta|gamma|delta|epsilon|zeeta|eeta|theeta|ioota|kappa|lambda|myy|nyy|ksii|omikron|pii|rhoo|sigma|tau|ypsilon|fii|khii|psii|oomega"
             }
-            Lang::No | Lang::Da => {
+            Lang::No => {
                 "alfa|beta|gamma|delta|epsilon|zeta|eta|theta|jota|kappa|lambda|my|ny|ksi|omikron|pi|rho|sigma|tau|ypsilon|fi|khi|psi|omega"
             }
             Lang::It => {
@@ -678,12 +599,6 @@ impl Lang {
             }
             Lang::Ja => {
                 "アルファ|ベータ|ガンマ|デルタ|イプシロン|ゼータ|イータ|シータ|イオタ|カッパ|ラムダ|ミュー|ニュー|クシー|オミクロン|パイ|ロー|シグマ|タウ|ウプシロン|ファイ|カイ|プサイ|オメガ"
-            }
-            Lang::Zh => {
-                "阿尔法|贝塔|伽马|德尔塔|艾普西隆|泽塔|伊塔|西塔|约塔|卡帕|拉姆达|缪|纽|克西|奥密克戎|派|柔|西格玛|陶|宇普西龙|斐|卡|普西|欧米伽"
-            }
-            Lang::Tr => {
-                "alfa|beta|gama|delta|epsilon|zeta|eta|teta|iota|kapa|lambda|mü|nü|ksi|omikron|pi|ro|sigma|tau|ipsilon|fi|ki|psi|omega"
             }
         };
         let name = names.split('|').nth(i)?;
@@ -702,7 +617,6 @@ impl Lang {
             // for these letters; a checkpoint that speaks the language must.
             Lang::It if "ìòÌÒ".contains(c) => None,
             Lang::Pl if "ąćęńśźżĄĆĘŃŚŹŻ".contains(c) => None,
-            Lang::Tr if "ğşİĞŞ".contains(c) => None,
             Lang::Ar
             | Lang::Hi
             | Lang::Ko
@@ -712,10 +626,7 @@ impl Lang {
             | Lang::No
             | Lang::It
             | Lang::Nl
-            | Lang::Ja
-            | Lang::Zh
-            | Lang::Da
-            | Lang::Tr => unaccented(c),
+            | Lang::Ja => unaccented(c),
         }
     }
 
@@ -730,11 +641,10 @@ impl Lang {
             Lang::Hi => "दशमलव",
             Lang::Ko => "점",
             Lang::Pl => "przecinek",
-            Lang::Sv | Lang::No | Lang::Nl | Lang::Da => "komma",
+            Lang::Sv | Lang::No | Lang::Nl => "komma",
             Lang::Fi => "pilkku",
             Lang::It => "virgola",
-            Lang::Ja | Lang::Zh => "点",
-            Lang::Tr => "virgül",
+            Lang::Ja => "点",
         }
     }
 }
@@ -1091,7 +1001,7 @@ pub fn normalize_text(input: &str, lang: Lang, rules: Rules) -> String {
                 let half = chars.next_if_eq(&'½').is_some();
                 let n = match (half, lang) {
                     (false, _) => full.to_string(),
-                    (true, Lang::En | Lang::Ar | Lang::Hi | Lang::Ko | Lang::Ja | Lang::Zh) => {
+                    (true, Lang::En | Lang::Ar | Lang::Hi | Lang::Ko | Lang::Ja) => {
                         format!("{full}.5")
                     }
                     (true, _) => format!("{full},5"),
@@ -1141,11 +1051,6 @@ pub fn normalize_text(input: &str, lang: Lang, rules: Rules) -> String {
                 }
             }
             c if lang.greek(c).is_some() => res.push_spoken(&lang.greek(c).unwrap_or_default()),
-            '‰' if lang == Lang::Zh && res.buffer.last().is_some_and(char::is_ascii_digit) => {
-                let from = res.buffer.iter().rposition(|c| !c.is_ascii_digit() && *c != '.');
-                let n: String = res.buffer.drain(from.map_or(0, |i| i + 1)..).collect();
-                res.push_spoken(&format!("千分之{n}"));
-            }
             c if lang.symbol(c).is_some() => res.push_spoken(lang.symbol(c).unwrap_or_default()),
             '±' => res.push_spoken(lang.plus_minus()),
             '❤' | '♥' => {
@@ -1415,16 +1320,10 @@ mod tests {
         assert_eq!(normalize_text("1+1=2", Lang::Es, Rules::DEFAULT), "1 mas 1 igual 2");
         assert_eq!(normalize_text("1+1=2", Lang::Pt, Rules::DEFAULT), "1 mais 1 igual 2");
         assert_eq!(normalize_text("a@b", Lang::It, Rules::DEFAULT), "a chiocciola b");
-        assert_eq!(normalize_text("1+1=2", Lang::Tr, Rules::DEFAULT), "1 artı 1 eşittir 2");
         assert_eq!(normalize_text("1+1=2", Lang::Ko, Rules::DEFAULT), "1 플러스 1은 2");
         assert_eq!(normalize_text("2 + 2 = 4", Lang::Ko, Rules::DEFAULT), "2 플러스 2는 4");
         assert_eq!(normalize_text("x=y, n=값", Lang::Ko, Rules::DEFAULT), "x는 y, n은 값");
         assert_eq!(normalize_text("값=3, 나=4", Lang::Ko, Rules::DEFAULT), "값은 3, 나는 4");
-        assert_eq!(normalize_text("α, β, π", Lang::Zh, Rules::DEFAULT), "阿尔法, 贝塔, 派");
-        assert_eq!(
-            normalize_text("5‰, 2.5‰, ‰", Lang::Zh, Rules::DEFAULT),
-            "千分之5, 千分之2.5, 千分之"
-        );
         assert_eq!(normalize_text("Δ, ρ, π", Lang::Fi, Rules::DEFAULT), "delta, rhoo, pii");
         assert_eq!(normalize_text("π, Ω", Lang::It, Rules::DEFAULT), "pi greco, omega");
         assert_eq!(normalize_text("π≈3", Lang::De, Rules::DEFAULT), "Pi ungefähr 3");
@@ -1464,10 +1363,6 @@ mod tests {
         assert_eq!(it("Così è più bello, ťuk"), "Così è più bello, tuk");
         assert_eq!(normalize_text("Źle, więc", Lang::Pl, Rules::DEFAULT), "Źle, więc");
         assert_eq!(normalize_text("Źle, więc", Lang::En, Rules::DEFAULT), "Zle, wiec");
-        assert_eq!(
-            normalize_text("Işık, ağaç, İzmir", Lang::Tr, Rules::DEFAULT),
-            "Işık, ağaç, İzmir"
-        );
         assert_eq!(
             normalize_text("Işık, ağaç, İzmir", Lang::En, Rules::DEFAULT),
             "Isık, agaç, Izmir"

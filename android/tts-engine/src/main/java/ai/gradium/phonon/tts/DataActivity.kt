@@ -73,9 +73,6 @@ class DataActivity : Activity() {
             "it" to "Questo è un esempio di sintesi vocale in italiano.",
             "nl" to "Dit is een voorbeeld van spraaksynthese in het Nederlands.",
             "ja" to "これは日本語の音声合成の例です。",
-            "zh" to "这是一个中文语音合成的示例。",
-            "da" to "Dette er et eksempel på talesyntese på dansk.",
-            "tr" to "Bu, Türkçe konuşma sentezinin bir örneğidir.",
         )
     }
 }

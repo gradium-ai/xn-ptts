@@ -448,8 +448,8 @@ impl Model {
     ///
     /// `lang` is required: the language text is normalized as before it is
     /// tokenized, one of `"en"`, `"fr"`, `"de"`, `"es"`, `"pt"`, `"ar"`, `"hi"`,
-    /// `"ko"`, `"pl"`, `"sv"`, `"fi"`, `"no"`, `"it"`, `"nl"`, `"ja"`, `"zh"`,
-    /// `"da"`, `"tr"`, or `"none"`
+    /// `"ko"`, `"pl"`, `"sv"`, `"fi"`, `"no"`, `"it"`, `"nl"`, `"ja"`,
+    /// or `"none"`
     /// to hand text to the tokenizer as written. The spoken forms of `@`, `+`
     /// and `=` differ per language, so there is nothing safe to default to.
     ///

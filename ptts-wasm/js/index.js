@@ -13,8 +13,8 @@ export { DEFAULT_MODEL } from './hub.js';
 export { encodeWav, concatPcm } from './wav.js';
 
 const LANGS = [
-  'en', 'fr', 'de', 'es', 'pt', 'ar', 'hi', 'ko', 'pl', 'sv', 'fi', 'no', 'it', 'nl', 'ja', 'zh',
-  'da', 'tr', 'none',
+  'en', 'fr', 'de', 'es', 'pt', 'ar', 'hi', 'ko', 'pl', 'sv', 'fi', 'no', 'it', 'nl', 'ja',
+  'none',
 ];
 /** Rewrite rules the Rust side knows, beyond the whole-string values below. */
 const RULES = [
