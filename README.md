@@ -468,6 +468,38 @@ Besides each integration's guide:
 
 Report bugs or request integrations through [GitHub Issues](https://github.com/gradium-ai/xn-ptts/issues). Include your runtime version, device/OS, model revision, weight format, normalization language, and a small reproduction.
 
+To tell us how Phonon works for you (the model, your device, languages and ratings), use the [Phonon feedback form](https://gradium.ai/feedback?product=on-device-tts&type=improvement).
+
+## FAQ
+
+### Can I convert the weights to another format?
+
+Yes, subject to the model's [license](#license). Converting to Core ML or GGUF does not change that license or remove the Phonon 40m models' restriction on commercial use. When you redistribute, keep the license and notices. For CC BY-NC 4.0, also credit Gradium, link to the license and say what you changed.
+
+### Can I fine-tune Phonon?
+
+You can fine-tune the released weights under their [licenses](#license), but there is no public training code, and the Mimi and speaker encoders are not released.
+
+### How much memory does Phonon need?
+
+On an iPhone, speaking takes about 95 MB, according to the [Swift guide](ios/PhononTTS/README.md). The other guides give no figure. The q8 weights file is 64.5 MB for Phonon 31m and 74.6 MB for each Phonon 40m model, as the [model card](https://huggingface.co/gradium/phonon-31m-en) lists.
+
+### How does it handle numbers, names and mixed-language text?
+
+Text is normalized for one language, the one you pass when you load the model (`--lang`, `lang=`, `language:`). In English, French, German, Spanish and Portuguese, numbers, amounts, emails, URLs and symbols are spelled out the way that language reads them. The other languages get symbols spelled out only, and `none` keeps the text as written. Names are not rewritten: the model reads raw text, with no phoneme conversion or pronunciation dictionary. A sentence that switches language is normalized and spoken as the language you chose, so the other language's words get that language's pronunciation and its numbers are read in the language you chose. Swift (`setLanguage`) and C (`ptts_set_language`) can change the language between utterances without reloading the model.
+
+### Does Phonon support word-level timestamps or emotion and non-verbal tags?
+
+Not today. Every API returns audio only, with no word timings, and there are no emotion or non-verbal tags. You can set the speaking rate with the `duration_delta` condition. Request features through [GitHub Issues](https://github.com/gradium-ai/xn-ptts/issues).
+
+### Can Phonon run on a microcontroller, or with MLX?
+
+Not on a microcontroller: the runtime has no microcontroller build, and the smallest device in the [performance table](#performance) is a Raspberry Pi 5, at 2.3x real time on one core with Phonon 31m. This runtime does not use MLX, but the [launch post](https://gradium.ai/blog/release-phonon-open-weight) lists MLX-Audio as running Phonon on Apple silicon. On Apple devices, this runtime uses the Neural Engine through Core ML ([Swift guide](ios/PhononTTS/README.md)).
+
+### Is Phonon distilled from a bigger model?
+
+Yes. The [launch post](https://gradium.ai/blog/release-phonon-open-weight) says every Phonon model is distilled from a larger Phonon teacher. The sizes differ in the number of transformer layers: 6 for Phonon 31m and 9 for Phonon 40m, both 512 wide.
+
 <img src="docs/readme/divider.svg" alt="" width="100%">
 
 ## Acknowledgements
