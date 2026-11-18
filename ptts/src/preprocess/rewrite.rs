@@ -11,6 +11,7 @@ mod dates;
 mod elongations;
 mod emails;
 mod hindi;
+mod japanese;
 mod letters;
 mod local_dates;
 mod numbers;
@@ -113,7 +114,18 @@ pub fn rewrite_word(word: &str, lang: Lang, rules: Rules) -> Option<String> {
     // Japanese and Korean join a number to the word around it, "12345人", "5,000원입니다": the
     // rules read each run of digits inside such a word on its own.
     if matches!(lang, Lang::Ja | Lang::Ko) && !word.is_ascii() {
-        return codes::within(word, lang, rules).or_else(|| rewrite_runs(word, lang, rules));
+        let marked = (lang == Lang::Ja && rules.has("numbers")).then(|| japanese::marks(word));
+        let marked = marked.flatten();
+        let word = marked.as_deref().unwrap_or(word);
+        return codes::within(word, lang, rules)
+            .or_else(|| rewrite_runs(word, lang, rules))
+            .or(marked);
+    }
+    if lang == Lang::Ja {
+        let ascii = japanese::ascii_word(word, rules.has("numbers"), rules.has("dashed-digits"));
+        if ascii.is_some() {
+            return ascii;
+        }
     }
     // A plain run of seven digits or more on its own is a code there too.
     if matches!(lang, Lang::Ja | Lang::Ko) && rules.has("numbers") {
@@ -228,6 +240,23 @@ fn rewrite_runs(word: &str, lang: Lang, rules: Rules) -> Option<String> {
         }
         let segment = &word[start..end];
         let after_letter = i > 0 && matches!(chars[i - 1].1, 'a'..='z' | 'A'..='Z' | '#');
+        // Japanese dates, times, ranges and codes; after a "v", a version alone.
+        let next = chars.iter().position(|(k, _)| *k >= end).unwrap_or(chars.len());
+        if lang == Lang::Ja {
+            let (numbers, codes) = (rules.has("numbers"), rules.has("dashed-digits"));
+            let version = matches!(chars.get(i.wrapping_sub(1)), Some((_, 'v' | 'V')));
+            let read = match (after_letter, version) {
+                (false, _) => japanese::run(segment, &word[..start], &word[end..], numbers, codes),
+                (true, true) => japanese::version_after_v(segment, numbers),
+                (true, false) => None,
+            };
+            if let Some(read) = read {
+                out.push_str(&read);
+                changed = true;
+                i = next;
+                continue;
+            }
+        }
         // Seven digits or more are a count before a counter ("1234567人") and a code otherwise
         // ("番号は48213907です").
         if rules.has("numbers") && segment.len() >= 7 && all_digits(segment) && !after_letter {
@@ -255,7 +284,7 @@ fn rewrite_runs(word: &str, lang: Lang, rules: Rules) -> Option<String> {
 }
 
 impl Rules {
-    fn has(self, name: &str) -> bool {
+    pub(super) fn has(self, name: &str) -> bool {
         RULES.iter().position(|rule| rule.name == name).is_some_and(|i| self.0 & (1 << i) != 0)
     }
 }
@@ -309,6 +338,15 @@ pub(super) fn rewrite_text(
                 rules
                     .has("local-dates")
                     .then(|| local_dates::span(prev, &words[i..], lang))
+                    .flatten()
+            })
+            .or_else(|| {
+                (lang == Lang::Ja && rules.has("numbers"))
+                    .then(|| {
+                        japanese::date_before_weekday(&words[i..])
+                            .or_else(|| japanese::weekday(prev, &words[i..]))
+                            .or_else(|| japanese::country_code(&words[i..]))
+                    })
                     .flatten()
             });
         if let Some((rewritten, used)) = span {
@@ -403,14 +441,14 @@ mod tests {
         );
         assert_eq!(ja("これは1,500円です。").as_deref(), Some("これは1500 円です。"));
         assert_eq!(ja("重さは2.5キロです。").as_deref(), Some("重さは2 点 5キロです。"));
-        assert_eq!(ja("会議は10:30です。"), None);
+        assert_eq!(ja("会議は10:30です。").as_deref(), Some("会議は10時30分です。"));
         assert_eq!(ja("2024年3月15日"), None);
         assert_eq!(ja("ABC123です"), None);
         assert_eq!(ja("3万円"), None);
         assert_eq!(ja("価格は¥1500です。").as_deref(), Some("価格は1500 円です。"));
         assert_eq!(ja("5€と$3").as_deref(), Some("5 ユーロと3 ドル"));
         assert_eq!(ja("気温は-3.5度です").as_deref(), Some("気温はマイナス 3 点 5度です"));
-        assert_eq!(ja("2026/03/14の10:00"), None);
+        assert_eq!(ja("2026/03/14の10:00").as_deref(), Some("2026年3月14日の10時"));
         assert_eq!(ja("A-3"), None);
         let ko = |w| rewrite_word(w, Lang::Ko, rules);
         assert_eq!(ko("12345명입니다.").as_deref(), Some("1만 2345명입니다."));
