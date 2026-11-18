@@ -1094,8 +1094,6 @@ pub fn normalize_text(input: &str, lang: Lang, rules: Rules) -> String {
     // Where the digits of a French number joined across a thousands space end, so that a further
     // group joins too: "1 000 000".
     let mut grouped = 0;
-    // The languages the serving stack reads, whose readings stay as they were.
-    let serving = matches!(lang, Lang::En | Lang::Fr | Lang::De | Lang::Es | Lang::Pt);
     while let Some(c) = chars.next() {
         match c {
             c if is_double_quote(c) => res.push('"'),
@@ -1131,7 +1129,7 @@ pub fn normalize_text(input: &str, lang: Lang, rules: Rules) -> String {
                     res.push_spoken(word);
                 }
             }
-            '°' | '℃' | '℉' if c == '°' || !serving => {
+            '°' | '℃' | '℉' => {
                 // Korean reads a temperature below zero as "영하 12 도", not "minus 12".
                 if lang == Lang::Ko {
                     res.minus_to_below_zero();
@@ -1160,22 +1158,23 @@ pub fn normalize_text(input: &str, lang: Lang, rules: Rules) -> String {
                 }
             }
             // Digits of the other scripts, and full-width ones, as ASCII: the tokenizers have
-            // pieces for those alone. The arms down to the full-width ones leave the languages
-            // the serving stack reads as they were.
-            c if !serving && native_digit(c).is_some() => res.push(native_digit(c).unwrap_or(c)),
-            '٫' if !serving => res.push('.'),
-            '٬' if !serving => res.push(','),
-            '٪' if !serving => res.push('%'),
+            // pieces for those alone.
+            c if native_digit(c).is_some() => res.push(native_digit(c).unwrap_or(c)),
+            '٫' => res.push('.'),
+            '٬' => res.push(','),
+            '٪' => res.push('%'),
             // Bidirectional and byte-order marks say nothing aloud.
             '\u{200E}'
             | '\u{200F}'
             | '\u{061C}'
             | '\u{202A}'..='\u{202E}'
             | '\u{2066}'..='\u{2069}'
-            | '\u{FEFF}'
-                if !serving => {}
-            '−' if !serving => res.push('-'),
-            c if !serving && fullwidth(c).is_some() => res.push(fullwidth(c).unwrap_or(c)),
+            | '\u{FEFF}' => {}
+            // The minus sign, in the languages the serving stack does not read.
+            '−' if !matches!(lang, Lang::En | Lang::Fr | Lang::De | Lang::Es | Lang::Pt) => {
+                res.push('-')
+            }
+            c if fullwidth(c).is_some() => res.push(fullwidth(c).unwrap_or(c)),
             '|' if lang == Lang::Hi => res.push('।'),
             c if lang.fold(c).is_some() => res.push(lang.fold(c).unwrap_or(c)),
             c if subscript(c).is_some() => res.push(subscript(c).unwrap_or(c)),
@@ -1222,8 +1221,7 @@ pub fn normalize_text(input: &str, lang: Lang, rules: Rules) -> String {
                 res.push_spoken(lang.star())
             }
             // An en dash between two numbers is a range, which the numbers rule reads.
-            '–' if !serving
-                && res.ends_with_plain_number()
+            '–' if res.ends_with_plain_number()
                 && chars.peek().is_some_and(char::is_ascii_digit) =>
             {
                 res.push('-')
@@ -1247,7 +1245,6 @@ pub fn normalize_text(input: &str, lang: Lang, rules: Rules) -> String {
             // write it, joins the number the same way. Not after a letter ("R$ 40", which has
             // its own rule below), and not before a range, which the numbers rule reads.
             c if rewrite::is_currency_symbol(c)
-                && !serving
                 && !prev.is_some_and(|p| p.is_ascii_alphabetic())
                 && spaced_amount_follows(&chars) =>
             {
@@ -1655,10 +1652,11 @@ mod tests {
             (Lang::Ko, "기온은 -12°C입니다.", "기온은 영하 12 도 입니다."),
             (Lang::Ko, "인구는 70449명입니다.", "인구는 7만 449명입니다."),
             (Lang::Sv, "Säsongen 2024–25.", "Säsongen 2024 till 25."),
-            // The languages the serving stack reads keep its readings.
-            (Lang::En, "The 2024–25 season.", "The 2024 25 season."),
-            (Lang::En, "It costs $ 5 and ２０ ٣.", "It costs $ 5 and ２０ ٣."),
-            (Lang::Fr, "Ça coûte € 5,50.", "Ça coûte € 5 virgule 50."),
+            (Lang::En, "The 2024–25 season.", "The 2024 to 25 season."),
+            (Lang::En, "It costs $ 5 and ２０ ٣.", "It costs 5 dollars and 20 3."),
+            (Lang::En, "It is 20℃ and 68℉.", "It is 20 degrees Celsius and 68 degrees Fahrenheit."),
+            (Lang::Fr, "Ça coûte € 5,50.", "Ça coûte 5 euros et 50 centimes."),
+            (Lang::De, "Es kostet € 5.", "Es kostet 5 Euro."),
         ];
         for (lang, input, expected) in cases {
             assert_eq!(normalize_text(input, lang, Rules::DEFAULT), expected, "{lang:?} {input:?}");
