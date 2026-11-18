@@ -299,9 +299,9 @@ mod tests {
         ring.k.with_bytes_mut(|p, _| {
             let k = p as *const half::f16;
             for lh in 0..dm.layers * dm.heads {
-                for s in 0..ctx {
+                for (s, &valid) in ring.valid.iter().enumerate() {
                     // The prompt and the dropped slots stay where they were.
-                    let moved = s >= prefix && ring.valid[s];
+                    let moved = s >= prefix && valid;
                     let want = embed(&base(lh, s), if moved { pos(s) - count } else { pos(s) });
                     for (i, w) in want.into_iter().enumerate() {
                         let got = unsafe { *k.add((lh * ctx + s) * hd + i) }.to_f32();
