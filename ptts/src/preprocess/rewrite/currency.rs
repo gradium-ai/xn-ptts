@@ -389,12 +389,18 @@ fn scale_word(word: &str, lang: Lang) -> bool {
         Lang::De => &["Tausend", "Million", "Millionen", "Milliarde", "Milliarden"],
         Lang::Es => &["mil", "millón", "millones"],
         Lang::Pt => &["mil", "milhão", "milhões", "bilhão", "bilhões"],
+        Lang::Hi => &["हजार", "हज़ार", "लाख", "करोड़", "अरब", "मिलियन", "बिलियन"],
         _ => &[],
     };
     words.contains(&word)
 }
 
 fn with_scale(amount: &str, scale: &str, currency: Currency, lang: Lang) -> Option<String> {
+    // Hindi reads "₹1.5 लाख" as "डेढ़ लाख रुपये".
+    if let Some((amount, _)) = super::numbers::hindi_fraction(&[amount, scale], lang) {
+        let (_, name) = currency.name(lang)?;
+        return Some(with_name(&format!("{amount} {scale}"), name, lang));
+    }
     let (amount, rest) = number_words(amount, lang)?;
     if !rest.is_empty() {
         return None;

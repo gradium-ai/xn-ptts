@@ -4,7 +4,7 @@
 //! digits below a thousand (ten thousand in Japanese and Korean) on their own, with the
 //! agreement and the sound changes of the language, and lose their place above that. Hindi is
 //! the exception: its model reads round numbers in English ("500" as "five hundred"), so every
-//! number is spelled out in words there, years apart.
+//! number is spelled out in words there, years included.
 
 use super::{all_digits, split_suffix, suffix};
 use crate::preprocess::Lang;
@@ -288,11 +288,9 @@ pub(super) fn number_words(word: &str, lang: Lang) -> Option<(String, &str)> {
     if lang == Lang::Ko && value < small && decimal.is_some() && !negative {
         return None;
     }
-    let mut words = if (1900..2100).contains(&value) {
-        value.to_string()
-    } else if lang == Lang::Hi {
+    let mut words = if lang == Lang::Hi {
         hindi_words(value)
-    } else if value < small {
+    } else if value < small || (1900..2100).contains(&value) {
         value.to_string()
     } else {
         with_scales(value, lang)
@@ -514,8 +512,15 @@ pub(super) fn hindi_group(n: i64) -> String {
 }
 
 /// `value` in Hindi words, in groups of a hundred above a thousand as Hindi counts: a kharab,
-/// an arab, a crore, a lakh, a thousand, "बारह लाख चौंतीस हजार पाँच सौ सड़सठ".
-fn hindi_words(value: i64) -> String {
+/// an arab, a crore, a lakh, a thousand, "बारह लाख चौंतीस हजार पाँच सौ सड़सठ". The years of the
+/// last century are read in hundreds: "उन्नीस सौ पचासी".
+pub(super) fn hindi_words(value: i64) -> String {
+    if (1900..2000).contains(&value) {
+        return match value % 100 {
+            0 => "उन्नीस सौ".to_string(),
+            rest => format!("उन्नीस सौ {}", HINDI[rest as usize]),
+        };
+    }
     let scales = [
         (100_000_000_000, 100, "खरब"),
         (1_000_000_000, 100, "अरब"),
@@ -555,24 +560,6 @@ fn myriads(value: i64, lang: Lang) -> String {
         parts.push((value % 10_000).to_string());
     }
     parts.join(between)
-}
-
-/// Hindi writes a clock time with a period before "बजे": "11.30 बजे" is "11:30 बजे", which the
-/// model reads as a time, where "11.30" alone would be a decimal.
-pub(super) fn hindi_time(words: &[&str], lang: Lang) -> Option<(String, usize)> {
-    let [word, next, ..] = words else { return None };
-    if lang != Lang::Hi || !next.starts_with("बज") {
-        return None;
-    }
-    let (body, end) = split_suffix(word);
-    let (hours, minutes) = body.split_once('.')?;
-    let ok = (1..=2).contains(&hours.len())
-        && minutes.len() == 2
-        && all_digits(hours)
-        && all_digits(minutes)
-        && hours.parse::<u32>().ok()? <= 24
-        && minutes.parse::<u32>().ok()? <= 59;
-    ok.then(|| (format!("{hours}:{minutes}{end}"), 1))
 }
 
 /// Hindi reads a half or a quarter before a scale word by its own name: "1.5 लाख" is "डेढ़ लाख",
@@ -638,7 +625,9 @@ mod tests {
             (Lang::Hi, "6,48,78,30,00,000", Some("छह खरब अड़तालीस अरब अठहत्तर करोड़ तीस लाख")),
             (Lang::Hi, "2.5", Some("दो दशमलव पाँच")),
             (Lang::Hi, "-3", Some("माइनस तीन")),
-            (Lang::Hi, "1985", Some("1985")),
+            (Lang::Hi, "1985", Some("उन्नीस सौ पचासी")),
+            (Lang::Hi, "1900", Some("उन्नीस सौ")),
+            (Lang::Hi, "2026", Some("दो हजार छब्बीस")),
             (Lang::Hi, "007", Some("शून्य शून्य सात")),
             (Lang::Hi, "20-25", Some("20 से 25")),
             (Lang::Ja, "1500", Some("1500")),
@@ -725,12 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn hindi_reads_times_and_fractions_before_their_words() {
-        assert_eq!(hindi_time(&["11.30", "बजे"], Lang::Hi), Some(("11:30".into(), 1)));
-        assert_eq!(hindi_time(&["11.30,", "बजकर"], Lang::Hi), Some(("11:30,".into(), 1)));
-        assert_eq!(hindi_time(&["11.30", "मिनट"], Lang::Hi), None);
-        assert_eq!(hindi_time(&["11.3", "बजे"], Lang::Hi), None);
-        assert_eq!(hindi_time(&["11.30", "बजे"], Lang::En), None);
+    fn hindi_reads_fractions_before_their_words() {
         assert_eq!(hindi_fraction(&["1.5", "लाख"], Lang::Hi), Some(("डेढ़".into(), 1)));
         assert_eq!(hindi_fraction(&["2.5", "करोड़"], Lang::Hi), Some(("ढाई".into(), 1)));
         assert_eq!(hindi_fraction(&["3.5", "हजार"], Lang::Hi), Some(("साढ़े तीन".into(), 1)));
