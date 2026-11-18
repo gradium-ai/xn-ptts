@@ -1,4 +1,10 @@
 //! Numbers read out with their scale words.
+//!
+//! The digits stay and the scale words go in between them, "1 thousand 234": the models read
+//! digits below a thousand (ten thousand in Japanese and Korean) on their own, with the
+//! agreement and the sound changes of the language, and lose their place above that. Hindi is
+//! the exception: its model reads round numbers in English ("500" as "five hundred"), so every
+//! number is spelled out in words there, years apart.
 
 use super::{all_digits, split_suffix, suffix};
 use crate::preprocess::Lang;
@@ -11,8 +17,30 @@ pub(super) fn numbers(word: &str, lang: Lang) -> Option<String> {
     if body.len() >= 2 && body.starts_with('0') && all_digits(body) {
         return Some(format!("{}{end}", spell(body, lang)));
     }
+    if is_identifier(body, lang) {
+        return Some(format!("{}{end}", spell(body, lang)));
+    }
+    // Korean needs no rewriting below ten thousand: the model reads "1,000" as written.
+    if lang == Lang::Ko
+        && body.chars().all(|c| c.is_ascii_digit() || c == ',')
+        && body.replace(',', "").parse::<u32>().is_ok_and(|n| n < 10_000)
+    {
+        return None;
+    }
     if let Some(range) = range(body, lang) {
         return Some(format!("{range}{end}"));
+    }
+    // Arabic marks a year's calendar with a letter: "2024م" (Gregorian) is read as the year
+    // alone, "1445هـ" with the calendar's name.
+    if lang == Lang::Ar {
+        if let Some(year) = body.strip_suffix('م').filter(|y| y.len() == 4 && all_digits(y)) {
+            return Some(format!("{year}{end}"));
+        }
+        if let Some(year) =
+            body.strip_suffix("هـ").filter(|y| (3..=4).contains(&y.len()) && all_digits(y))
+        {
+            return Some(format!("{year} هجري{end}"));
+        }
     }
     // The Spanish ordinals written "1.er" and "3.er", which the URL rule would otherwise read
     // as a domain.
@@ -36,6 +64,20 @@ pub(super) fn numbers(word: &str, lang: Lang) -> Option<String> {
     }
 }
 
+/// The languages whose readings follow the serving stack's, quirks included.
+fn serving(lang: Lang) -> bool {
+    matches!(lang, Lang::En | Lang::Fr | Lang::De | Lang::Es | Lang::Pt)
+}
+
+/// Whether `body`, a plain run of seven or more digits, is an identifier, an order or a case
+/// number, read digit by digit. The other languages group a quantity that long ("1 234 567",
+/// "1.234.567"), so an ungrouped one is a code; the languages the serving stack reads keep its
+/// reading as a quantity. Japanese and Korean decide by the counter after the digits, in
+/// [`super::rewrite_word`].
+pub(super) fn is_identifier(body: &str, lang: Lang) -> bool {
+    !serving(lang) && !matches!(lang, Lang::Ja | Lang::Ko) && body.len() >= 7 && all_digits(body)
+}
+
 fn range(body: &str, lang: Lang) -> Option<String> {
     let (from, to) = body.split_once('-')?;
     // German ranges start from a single digit too: "8-10 Stunden", "0-2 Jahren".
@@ -48,7 +90,13 @@ fn range(body: &str, lang: Lang) -> Option<String> {
     let ok = match (from.len(), to.len()) {
         _ if small(from) && small(to) => from.parse::<u32>().ok()? < to.parse::<u32>().ok()?,
         (4, 4) => year(from) && year(to) && from < to,
-        (4, 2) => year(from) && all_digits(to) && &from[2..] < to,
+        // "2024-25"; in the new languages only a few years on, as "nr. 2026-77" is a code.
+        (4, 2) => {
+            year(from)
+                && all_digits(to)
+                && &from[2..] < to
+                && (serving(lang) || to.parse::<u32>().ok()? <= from[2..].parse::<u32>().ok()? + 10)
+        }
         _ => false,
     };
     if !ok {
@@ -58,13 +106,21 @@ fn range(body: &str, lang: Lang) -> Option<String> {
         Lang::En => "to",
         Lang::Fr => "à",
         Lang::De => "bis",
-        Lang::Es | Lang::Pt => "a",
+        Lang::Es | Lang::Pt | Lang::It => "a",
+        Lang::Ar => "إلى",
+        Lang::Hi => "से",
+        Lang::Ja => "から",
+        Lang::Sv => "till",
+        Lang::No => "til",
+        Lang::Nl => "tot",
+        Lang::Pl => "do",
+        // Finnish reads a range in two cases or with a pause: nothing to put between.
         _ => return None,
     };
     Some(format!("{from} {word} {to}"))
 }
 
-fn spell(s: &str, lang: Lang) -> String {
+pub(super) fn spell(s: &str, lang: Lang) -> String {
     let words: [&str; 10] = match lang {
         Lang::En => {
             ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]
@@ -81,7 +137,53 @@ fn spell(s: &str, lang: Lang) -> String {
         Lang::Pt => {
             ["zero", "um", "dois", "três", "quatro", "cinco", "seis", "sete", "oito", "nove"]
         }
-        _ => return s.to_string(),
+        Lang::Ar => {
+            ["صفر", "واحد", "اثنان", "ثلاثة", "أربعة", "خمسة", "ستة", "سبعة", "ثمانية", "تسعة"]
+        }
+        Lang::Hi => {
+            return s
+                .chars()
+                .filter(|&c| c != '-')
+                .map(|c| match c.to_digit(10) {
+                    Some(d) => HINDI[d as usize].to_string(),
+                    None => c.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+        Lang::Ja => ["ゼロ", "いち", "に", "さん", "よん", "ご", "ろく", "なな", "はち", "きゅう"],
+        // The zero of a digit string, not of a quantity.
+        Lang::Ko => ["공", "일", "이", "삼", "사", "오", "육", "칠", "팔", "구"],
+        Lang::Fi => [
+            "nolla",
+            "yksi",
+            "kaksi",
+            "kolme",
+            "neljä",
+            "viisi",
+            "kuusi",
+            "seitsemän",
+            "kahdeksan",
+            "yhdeksän",
+        ],
+        Lang::Sv => ["noll", "ett", "två", "tre", "fyra", "fem", "sex", "sju", "åtta", "nio"],
+        Lang::No => ["null", "en", "to", "tre", "fire", "fem", "seks", "sju", "åtte", "ni"],
+        Lang::It => {
+            ["zero", "uno", "due", "tre", "quattro", "cinque", "sei", "sette", "otto", "nove"]
+        }
+        Lang::Nl => ["nul", "een", "twee", "drie", "vier", "vijf", "zes", "zeven", "acht", "negen"],
+        Lang::Pl => [
+            "zero",
+            "jeden",
+            "dwa",
+            "trzy",
+            "cztery",
+            "pięć",
+            "sześć",
+            "siedem",
+            "osiem",
+            "dziewięć",
+        ],
     };
     let spoken = s.chars().filter(|&c| c != '-').map(|c| match c.to_digit(10) {
         Some(d) => words[d as usize].to_string(),
@@ -142,13 +244,14 @@ pub(super) fn number_words(word: &str, lang: Lang) -> Option<(String, &str)> {
     if lead.next() == Some('0') && lead.next().is_some_and(|c| c.is_ascii_digit()) {
         return None;
     }
-    // English groups thousands with commas and marks decimals with a dot. French does neither.
-    // The other three mark decimals with a comma and may group with dots, but a dot only groups
-    // when every group after the first has three digits: "1.234" is a thousand, "1.23" is not a
-    // number at all.
+    // English, Arabic, Hindi, Japanese and Korean group thousands with commas and mark decimals
+    // with a dot. French, Finnish, Swedish, Norwegian and Polish do neither, once the character
+    // pass has joined the groups they space. The others mark decimals with a comma and may group
+    // with dots, but a dot only groups when every group after the first has three digits:
+    // "1.234" is a thousand, "1.23" is not a number at all.
     let (group, point) = match lang {
-        Lang::En => (Some(','), '.'),
-        Lang::Fr => (None, ','),
+        Lang::En | Lang::Ar | Lang::Hi | Lang::Ja | Lang::Ko => (Some(','), '.'),
+        Lang::Fr | Lang::Fi | Lang::Sv | Lang::No | Lang::Pl => (None, ','),
         _ => {
             let int = word.rsplit_once(',').map_or(word, |(before, _)| before);
             let grouped = int.contains('.')
@@ -179,76 +282,463 @@ pub(super) fn number_words(word: &str, lang: Lang) -> Option<(String, &str)> {
     if value >= 1_000_000_000_000 {
         return None;
     }
-    let mut words = if value < 1000 || (1900..2100).contains(&value) {
+    // Japanese and Korean count in myriads, so their first scale word is at ten thousand.
+    let small = if matches!(lang, Lang::Ja | Lang::Ko) { 10_000 } else { 1000 };
+    // The Korean model reads a small decimal as written ("4.2%"), better than spelled.
+    if lang == Lang::Ko && value < small && decimal.is_some() && !negative {
+        return None;
+    }
+    let mut words = if (1900..2100).contains(&value) {
+        value.to_string()
+    } else if lang == Lang::Hi {
+        hindi_words(value)
+    } else if value < small {
         value.to_string()
     } else {
-        // Scale words from a milliard down, singular and plural.
-        let scales = match lang {
-            Lang::En => [
-                (1_000_000_000, "billion", "billion"),
-                (1_000_000, "million", "million"),
-                (1000, "thousand", "thousand"),
-            ],
-            Lang::Fr => [
-                (1_000_000_000, "milliard", "milliards"),
-                (1_000_000, "million", "millions"),
-                (1000, "mille", "mille"),
-            ],
-            Lang::De => [
-                (1_000_000_000, "Milliarde", "Milliarden"),
-                (1_000_000, "Million", "Millionen"),
-                (1000, "Tausend", "Tausend"),
-            ],
-            Lang::Es => [
-                (1_000_000_000, "mil millones", "mil millones"),
-                (1_000_000, "millón", "millones"),
-                (1000, "mil", "mil"),
-            ],
-            Lang::Pt => [
-                (1_000_000_000, "bilhão", "bilhões"),
-                (1_000_000, "milhão", "milhões"),
-                (1000, "mil", "mil"),
-            ],
-            _ => return None,
-        };
-        let mut parts: Vec<String> = scales
-            .iter()
-            .filter_map(|(div, one, many)| match (value / div) % 1000 {
-                0 => None,
-                1 => Some(match (lang, *div) {
-                    // "mille" and "mil" are numeral adjectives: no "1" in front of them.
-                    (Lang::Fr | Lang::Es | Lang::Pt, 1000) => (*one).to_string(),
-                    // A bare "1" would be read "eins", so German inflects the count like an
-                    // article, with the gender of the scale noun.
-                    (Lang::De, 1000) => format!("ein {one}"),
-                    (Lang::De, _) => format!("eine {one}"),
-                    _ => format!("1 {one}"),
-                }),
-                group => Some(format!("{group} {many}")),
-            })
-            .collect();
-        if value % 1000 != 0 {
-            parts.push((value % 1000).to_string());
-        }
-        parts.join(" ")
+        with_scales(value, lang)
     };
     if let Some(decimal) = decimal {
+        // Hindi spells the digits after the point one by one; Japanese and Korean read them one
+        // by one too, which the models only do when they stand apart ("3 点 1 0", not "3 点 10").
+        let decimal = match lang {
+            Lang::Hi => spell(decimal, lang),
+            Lang::Ja | Lang::Ko => decimal.chars().map(String::from).collect::<Vec<_>>().join(" "),
+            _ => decimal.to_string(),
+        };
         words = format!("{words} {} {decimal}", lang.decimal_separator());
     }
     if negative {
-        let minus = match lang {
-            Lang::Fr => "moins",
-            Lang::Es | Lang::Pt => "menos",
-            _ => "minus",
-        };
-        words = format!("{minus} {words}");
+        words = format!("{} {words}", minus(lang));
     }
     Some((words, suffix))
+}
+
+fn minus(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Fr => "moins",
+        Lang::Es | Lang::Pt => "menos",
+        Lang::Fi => "miinus",
+        Lang::It => "meno",
+        Lang::Nl => "min",
+        Lang::Ar => "سالب",
+        Lang::Hi => "माइनस",
+        Lang::Ja => "マイナス",
+        Lang::Ko => "마이너스",
+        _ => "minus",
+    }
+}
+
+/// `value`, a thousand or more, with its scale words between its groups of digits: "1 thousand
+/// 234", "12 लाख 34 हजार 567", "123万4567".
+fn with_scales(value: i64, lang: Lang) -> String {
+    match lang {
+        Lang::Ja | Lang::Ko => myriads(value, lang),
+        Lang::Hi => hindi_words(value),
+        _ => thousands(value, lang),
+    }
+}
+
+/// Groups of a thousand, each with its scale word: a milliard, a million, a thousand.
+/// Norwegian says "og" before a last group under a hundred: "tusen og én".
+fn thousands(value: i64, lang: Lang) -> String {
+    let mut parts: Vec<String> = [1_000_000_000, 1_000_000, 1000]
+        .into_iter()
+        .enumerate()
+        .filter_map(|(scale, div)| match (value / div) % 1000 {
+            0 => None,
+            n => Some(scale_words(n, scale, lang)),
+        })
+        .collect();
+    if value % 1000 != 0 {
+        if lang == Lang::No && value % 1000 < 100 {
+            parts.push("og".to_string());
+        }
+        parts.push((value % 1000).to_string());
+    }
+    parts.join(" ")
+}
+
+/// `n` of the scale `scale`, 0 a milliard, 1 a million and 2 a thousand, with the form the
+/// count takes in `lang`: the bare word for one where the language says it so ("mille",
+/// "tusen"), an article where it needs one ("eine Million", "en miljon"), the Arabic dual for
+/// two and plural from three to ten, and the Polish few form from two to four.
+pub(super) fn scale_words(n: i64, scale: usize, lang: Lang) -> String {
+    let (one, many): ([&str; 3], [&str; 3]) = match lang {
+        Lang::En => (["1 billion", "1 million", "1 thousand"], ["billion", "million", "thousand"]),
+        Lang::Fr => (["1 milliard", "1 million", "mille"], ["milliards", "millions", "mille"]),
+        Lang::De => (
+            ["eine Milliarde", "eine Million", "ein Tausend"],
+            ["Milliarden", "Millionen", "Tausend"],
+        ),
+        Lang::Es => (["1 mil millones", "1 millón", "mil"], ["mil millones", "millones", "mil"]),
+        Lang::Pt => (["1 bilhão", "1 milhão", "mil"], ["bilhões", "milhões", "mil"]),
+        Lang::Ar => (["مليار", "مليون", "ألف"], ["مليار", "مليون", "ألف"]),
+        Lang::Fi => (["miljardi", "miljoona", "tuhat"], ["miljardia", "miljoonaa", "tuhatta"]),
+        Lang::Sv => (["en miljard", "en miljon", "tusen"], ["miljarder", "miljoner", "tusen"]),
+        Lang::No => (["en milliard", "en million", "tusen"], ["milliarder", "millioner", "tusen"]),
+        Lang::It => (["1 miliardo", "1 milione", "mille"], ["miliardi", "milioni", "mila"]),
+        Lang::Nl => (["1 miljard", "1 miljoen", "duizend"], ["miljard", "miljoen", "duizend"]),
+        Lang::Pl => (["miliard", "milion", "tysiąc"], ["miliardów", "milionów", "tysięcy"]),
+        // Hindi, Japanese and Korean group differently: see `indian` and `myriads`.
+        Lang::Hi | Lang::Ja | Lang::Ko => {
+            return format!("{n} {}", ["billion", "million", "thousand"][scale]);
+        }
+    };
+    let word = match (lang, n) {
+        (_, 1) => return one[scale].to_string(),
+        (Lang::Ar, 2) => return ["مليارين", "مليونين", "ألفين"][scale].to_string(),
+        (Lang::Ar, 3..=10) => ["مليارات", "ملايين", "آلاف"][scale],
+        (Lang::Pl, n) if polish_few(n) => ["miliardy", "miliony", "tysiące"][scale],
+        _ => many[scale],
+    };
+    format!("{n} {word}")
+}
+
+/// Whether a Polish count takes the few form of its noun, "2 tysiące" against "5 tysięcy": a
+/// last digit from 2 to 4, except in the teens.
+pub(super) fn polish_few(n: i64) -> bool {
+    matches!(n % 10, 2..=4) && !matches!(n % 100, 12..=14)
+}
+
+/// The Hindi numbers up to ninety-nine, each a word of its own.
+const HINDI: [&str; 100] = [
+    "शून्य",
+    "एक",
+    "दो",
+    "तीन",
+    "चार",
+    "पाँच",
+    "छह",
+    "सात",
+    "आठ",
+    "नौ",
+    "दस",
+    "ग्यारह",
+    "बारह",
+    "तेरह",
+    "चौदह",
+    "पन्द्रह",
+    "सोलह",
+    "सत्रह",
+    "अठारह",
+    "उन्नीस",
+    "बीस",
+    "इक्कीस",
+    "बाईस",
+    "तेईस",
+    "चौबीस",
+    "पच्चीस",
+    "छब्बीस",
+    "सत्ताईस",
+    "अट्ठाईस",
+    "उनतीस",
+    "तीस",
+    "इकतीस",
+    "बत्तीस",
+    "तैंतीस",
+    "चौंतीस",
+    "पैंतीस",
+    "छत्तीस",
+    "सैंतीस",
+    "अड़तीस",
+    "उनतालीस",
+    "चालीस",
+    "इकतालीस",
+    "बयालीस",
+    "तैंतालीस",
+    "चौवालीस",
+    "पैंतालीस",
+    "छियालीस",
+    "सैंतालीस",
+    "अड़तालीस",
+    "उनचास",
+    "पचास",
+    "इक्यावन",
+    "बावन",
+    "तिरेपन",
+    "चौवन",
+    "पचपन",
+    "छप्पन",
+    "सत्तावन",
+    "अट्ठावन",
+    "उनसठ",
+    "साठ",
+    "इकसठ",
+    "बासठ",
+    "तिरेसठ",
+    "चौंसठ",
+    "पैंसठ",
+    "छियासठ",
+    "सड़सठ",
+    "अड़सठ",
+    "उनहत्तर",
+    "सत्तर",
+    "इकहत्तर",
+    "बहत्तर",
+    "तिहत्तर",
+    "चौहत्तर",
+    "पचहत्तर",
+    "छिहत्तर",
+    "सतहत्तर",
+    "अठहत्तर",
+    "उनासी",
+    "अस्सी",
+    "इक्यासी",
+    "बयासी",
+    "तिरासी",
+    "चौरासी",
+    "पचासी",
+    "छियासी",
+    "सत्तासी",
+    "अट्ठासी",
+    "नवासी",
+    "नब्बे",
+    "इक्यानबे",
+    "बानबे",
+    "तिरानबे",
+    "चौरानबे",
+    "पंचानबे",
+    "छियानबे",
+    "सत्तानबे",
+    "अट्ठानबे",
+    "निन्यानबे",
+];
+
+/// `n`, under a thousand, in Hindi words: "नौ सौ निन्यानबे".
+pub(super) fn hindi_group(n: i64) -> String {
+    match (n / 100, n % 100) {
+        (0, rest) => HINDI[rest as usize].to_string(),
+        (hundreds, 0) => format!("{} सौ", HINDI[hundreds as usize]),
+        (hundreds, rest) => format!("{} सौ {}", HINDI[hundreds as usize], HINDI[rest as usize]),
+    }
+}
+
+/// `value` in Hindi words, in groups of a hundred above a thousand as Hindi counts: a kharab,
+/// an arab, a crore, a lakh, a thousand, "बारह लाख चौंतीस हजार पाँच सौ सड़सठ".
+fn hindi_words(value: i64) -> String {
+    let scales = [
+        (100_000_000_000, 100, "खरब"),
+        (1_000_000_000, 100, "अरब"),
+        (10_000_000, 100, "करोड़"),
+        (100_000, 100, "लाख"),
+        (1000, 100, "हजार"),
+    ];
+    let mut parts: Vec<String> = scales
+        .into_iter()
+        .filter_map(|(div, modulus, word)| match (value / div) % modulus {
+            0 => None,
+            n => Some(format!("{} {word}", hindi_group(n))),
+        })
+        .collect();
+    if value % 1000 != 0 || value == 0 {
+        parts.push(hindi_group(value % 1000));
+    }
+    parts.join(" ")
+}
+
+/// Groups of ten thousand, as Japanese and Korean count: "123万4567", "1억 2345만 6789". Korean
+/// spaces the groups, as its spelling rules have it.
+fn myriads(value: i64, lang: Lang) -> String {
+    let (words, between) = match lang {
+        Lang::Ja => (["億", "万"], ""),
+        _ => (["억", "만"], " "),
+    };
+    let mut parts: Vec<String> = [100_000_000, 10_000]
+        .into_iter()
+        .zip(words)
+        .filter_map(|(div, word)| match (value / div) % 10_000 {
+            0 => None,
+            n => Some(format!("{n}{word}")),
+        })
+        .collect();
+    if value % 10_000 != 0 {
+        parts.push((value % 10_000).to_string());
+    }
+    parts.join(between)
+}
+
+/// Hindi writes a clock time with a period before "बजे": "11.30 बजे" is "11:30 बजे", which the
+/// model reads as a time, where "11.30" alone would be a decimal.
+pub(super) fn hindi_time(words: &[&str], lang: Lang) -> Option<(String, usize)> {
+    let [word, next, ..] = words else { return None };
+    if lang != Lang::Hi || !next.starts_with("बज") {
+        return None;
+    }
+    let (body, end) = split_suffix(word);
+    let (hours, minutes) = body.split_once('.')?;
+    let ok = (1..=2).contains(&hours.len())
+        && minutes.len() == 2
+        && all_digits(hours)
+        && all_digits(minutes)
+        && hours.parse::<u32>().ok()? <= 24
+        && minutes.parse::<u32>().ok()? <= 59;
+    ok.then(|| (format!("{hours}:{minutes}{end}"), 1))
+}
+
+/// Hindi reads a half or a quarter before a scale word by its own name: "1.5 लाख" is "डेढ़ लाख",
+/// "2.5 करोड़" "ढाई करोड़", "3.5 हजार" "साढ़े 3 हजार", "1.25 लाख" "सवा लाख" and "1.75 लाख"
+/// "पौने 2 लाख".
+pub(super) fn hindi_fraction(words: &[&str], lang: Lang) -> Option<(String, usize)> {
+    let [word, next, ..] = words else { return None };
+    let scale = split_suffix(next).0;
+    if lang != Lang::Hi || !matches!(scale, "सौ" | "हजार" | "हज़ार" | "लाख" | "करोड़" | "अरब")
+    {
+        return None;
+    }
+    let (body, end) = split_suffix(word);
+    let (int, fraction) = body.split_once('.')?;
+    if !(1..=3).contains(&int.len()) || !all_digits(int) || int.starts_with('0') {
+        return None;
+    }
+    let n: i64 = int.parse().ok()?;
+    let spoken = match (fraction, n) {
+        ("5", 1) => "डेढ़".to_string(),
+        ("5", 2) => "ढाई".to_string(),
+        ("5", n) => format!("साढ़े {}", hindi_group(n)),
+        ("25", 1) => "सवा".to_string(),
+        ("25", n) => format!("सवा {}", hindi_group(n)),
+        ("75", n) => format!("पौने {}", hindi_group(n + 1)),
+        _ => return None,
+    };
+    Some((format!("{spoken}{end}"), 1))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_new_languages_read_numbers_with_their_scale_words() {
+        let cases = [
+            (Lang::Ar, "123", Some("123")),
+            (Lang::Ar, "1985", Some("1985")),
+            (Lang::Ar, "1234", Some("ألف 234")),
+            (Lang::Ar, "2000", Some("2000")),
+            (Lang::Ar, "2500", Some("ألفين 500")),
+            (Lang::Ar, "3000", Some("3 آلاف")),
+            (Lang::Ar, "12345", Some("12 ألف 345")),
+            (Lang::Ar, "1,234,567", Some("مليون 234 ألف 567")),
+            (Lang::Ar, "2,000,000", Some("مليونين")),
+            (Lang::Ar, "3.5", Some("3 فاصلة 5")),
+            (Lang::Ar, "-5", Some("سالب 5")),
+            (Lang::Ar, "2024م.", Some("2024.")),
+            (Lang::Ar, "1445هـ", Some("1445 هجري")),
+            (Lang::Ar, "20-25", Some("20 إلى 25")),
+            (Lang::Hi, "0", Some("शून्य")),
+            (Lang::Hi, "7", Some("सात")),
+            (Lang::Hi, "123", Some("एक सौ तेईस")),
+            (Lang::Hi, "250", Some("दो सौ पचास")),
+            (Lang::Hi, "500", Some("पाँच सौ")),
+            (Lang::Hi, "999", Some("नौ सौ निन्यानबे")),
+            (Lang::Hi, "1500", Some("एक हजार पाँच सौ")),
+            (Lang::Hi, "12345", Some("बारह हजार तीन सौ पैंतालीस")),
+            (Lang::Hi, "12,34,567", Some("बारह लाख चौंतीस हजार पाँच सौ सड़सठ")),
+            (Lang::Hi, "1,234,567", Some("बारह लाख चौंतीस हजार पाँच सौ सड़सठ")),
+            (Lang::Hi, "1,00,00,000", Some("एक करोड़")),
+            (Lang::Hi, "6,48,78,30,00,000", Some("छह खरब अड़तालीस अरब अठहत्तर करोड़ तीस लाख")),
+            (Lang::Hi, "2.5", Some("दो दशमलव पाँच")),
+            (Lang::Hi, "-3", Some("माइनस तीन")),
+            (Lang::Hi, "1985", Some("1985")),
+            (Lang::Hi, "007", Some("शून्य शून्य सात")),
+            (Lang::Hi, "20-25", Some("20 से 25")),
+            (Lang::Ja, "1500", Some("1500")),
+            (Lang::Ja, "12345", Some("1万2345")),
+            (Lang::Ja, "70449", Some("7万449")),
+            (Lang::Ja, "1,234,567", Some("123万4567")),
+            (Lang::Ja, "100,000,000", Some("1億")),
+            (Lang::Ja, "123,456,789", Some("1億2345万6789")),
+            (Lang::Ja, "2.5", Some("2 点 5")),
+            (Lang::Ja, "-3", Some("マイナス 3")),
+            (Lang::Ja, "007", Some("ゼロ ゼロ なな")),
+            (Lang::Ko, "12345", Some("1만 2345")),
+            (Lang::Ko, "1,234,567", Some("123만 4567")),
+            (Lang::Ko, "100,000,000", Some("1억")),
+            (Lang::Ko, "100,010,000", Some("1억 1만")),
+            (Lang::Ko, "010", Some("공 일 공")),
+            (Lang::Fi, "1000", Some("tuhat")),
+            (Lang::Fi, "1234", Some("tuhat 234")),
+            (Lang::Fi, "12345", Some("12 tuhatta 345")),
+            (Lang::Fi, "1000000,5", Some("miljoona pilkku 5")),
+            (Lang::Fi, "123456", Some("123 tuhatta 456")),
+            (Lang::Fi, "2,5", Some("2 pilkku 5")),
+            (Lang::Fi, "-5", Some("miinus 5")),
+            (Lang::Fi, "20-25", None),
+            (Lang::Sv, "1234", Some("tusen 234")),
+            (Lang::Sv, "12345", Some("12 tusen 345")),
+            (Lang::Sv, "1000000,0", Some("en miljon komma 0")),
+            (Lang::Sv, "2,5", Some("2 komma 5")),
+            (Lang::Sv, "20-25", Some("20 till 25")),
+            (Lang::No, "1234", Some("tusen 234")),
+            (Lang::No, "1001", Some("tusen og 1")),
+            (Lang::No, "81079", Some("81 tusen og 79")),
+            (Lang::No, "-5", Some("minus 5")),
+            (Lang::It, "1234", Some("mille 234")),
+            (Lang::It, "1.500", Some("mille 500")),
+            (Lang::It, "12.345", Some("12 mila 345")),
+            (Lang::It, "1.234.567", Some("1 milione 234 mila 567")),
+            (Lang::It, "2.000.000", Some("2 milioni")),
+            (Lang::It, "2,5", Some("2 virgola 5")),
+            (Lang::It, "-5", Some("meno 5")),
+            (Lang::Nl, "1.500", Some("duizend 500")),
+            (Lang::Nl, "70449", Some("70 duizend 449")),
+            (Lang::Nl, "2.000.000", Some("2 miljoen")),
+            (Lang::Nl, "1.234.567", Some("1 miljoen 234 duizend 567")),
+            (Lang::Nl, "-5", Some("min 5")),
+            (Lang::Nl, "20-25", Some("20 tot 25")),
+            (Lang::Pl, "1000", Some("tysiąc")),
+            (Lang::Pl, "2500", Some("2 tysiące 500")),
+            (Lang::Pl, "5000", Some("5 tysięcy")),
+            (Lang::Pl, "12000", Some("12 tysięcy")),
+            (Lang::Pl, "22000", Some("22 tysiące")),
+            (Lang::Pl, "1234567,5", Some("milion 234 tysiące 567 przecinek 5")),
+            (Lang::Pl, "2000000,5", Some("2 miliony przecinek 5")),
+            (Lang::Pl, "5000000,5", Some("5 milionów przecinek 5")),
+            (Lang::Pl, "2,5", Some("2 przecinek 5")),
+            (Lang::Pl, "20-25", Some("20 do 25")),
+            // Identifiers: a plain run of seven or more digits, digit by digit.
+            (
+                Lang::Fi,
+                "48213907",
+                Some("neljä kahdeksan kaksi yksi kolme yhdeksän nolla seitsemän"),
+            ),
+            (Lang::Pl, "1234567.", Some("jeden dwa trzy cztery pięć sześć siedem.")),
+            (Lang::Ar, "48213907", Some("أربعة ثمانية اثنان واحد ثلاثة تسعة صفر سبعة")),
+            (Lang::Hi, "1234567", Some("एक दो तीन चार पाँच छह सात")),
+            (Lang::It, "123456", Some("123 mila 456")),
+            (Lang::En, "48213907", Some("48 million 213 thousand 907")),
+            // A year and two digits is a range a few years on only.
+            (Lang::No, "2026-77", None),
+            (Lang::No, "2024-27", Some("2024 til 27")),
+            (Lang::Ja, "3.10", Some("3 点 1 0")),
+            (Lang::Ko, "2.75", None),
+            (Lang::Ko, "12345.75", Some("1만 2345 점 7 5")),
+            // Not claimed: a time, a word, a value past a trillion.
+            (Lang::Fi, "10.30", None),
+            (Lang::It, "10.30", None),
+            (Lang::Pl, "10:30", None),
+            (Lang::Ja, "hello", None),
+            (Lang::Ko, "1234567890123", None),
+        ];
+        for (lang, input, expected) in cases {
+            assert_eq!(numbers(input, lang).as_deref(), expected, "{lang:?} {input:?}");
+        }
+    }
+
+    #[test]
+    fn hindi_reads_times_and_fractions_before_their_words() {
+        assert_eq!(hindi_time(&["11.30", "बजे"], Lang::Hi), Some(("11:30".into(), 1)));
+        assert_eq!(hindi_time(&["11.30,", "बजकर"], Lang::Hi), Some(("11:30,".into(), 1)));
+        assert_eq!(hindi_time(&["11.30", "मिनट"], Lang::Hi), None);
+        assert_eq!(hindi_time(&["11.3", "बजे"], Lang::Hi), None);
+        assert_eq!(hindi_time(&["11.30", "बजे"], Lang::En), None);
+        assert_eq!(hindi_fraction(&["1.5", "लाख"], Lang::Hi), Some(("डेढ़".into(), 1)));
+        assert_eq!(hindi_fraction(&["2.5", "करोड़"], Lang::Hi), Some(("ढाई".into(), 1)));
+        assert_eq!(hindi_fraction(&["3.5", "हजार"], Lang::Hi), Some(("साढ़े तीन".into(), 1)));
+        assert_eq!(hindi_fraction(&["1.25", "लाख"], Lang::Hi), Some(("सवा".into(), 1)));
+        assert_eq!(hindi_fraction(&["1.75", "लाख."], Lang::Hi), Some(("पौने दो".into(), 1)));
+        assert_eq!(hindi_fraction(&["1.5", "किलो"], Lang::Hi), None);
+        assert_eq!(hindi_fraction(&["1.4", "लाख"], Lang::Hi), None);
+    }
 
     #[test]
     fn numbers_are_read_out() {

@@ -198,9 +198,6 @@ pub const SPECIAL_CHARS_JA: SpecialChars = SpecialChars {
 ///
 /// Deliberately has no `Default`: the spoken forms differ per language, so a caller that has not
 /// said which language it has is better off not normalizing at all. See [`Normalize`].
-///
-/// The first five have word [`Rules`] of their own; the others get the character pass alone,
-/// see [`Lang::has_rules`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Lang {
@@ -277,13 +274,6 @@ impl Lang {
             Lang::Nl => "nl",
             Lang::Ja => "ja",
         }
-    }
-
-    /// Whether the word rewrite [`Rules`] read this language. They know the five languages the
-    /// serving stack rewrites, numbers, amounts, addresses and the rest; the others get the
-    /// character pass alone, whatever rules a caller asks for.
-    pub fn has_rules(self) -> bool {
-        matches!(self, Lang::En | Lang::Fr | Lang::De | Lang::Es | Lang::Pt)
     }
 
     pub fn special_chars(self) -> &'static SpecialChars {
@@ -378,6 +368,54 @@ impl Lang {
             Lang::Nl => "sterretje",
             Lang::Ja => "アスタリスク",
         }
+    }
+
+    /// The word for `&`, in the languages whose tokenizers have no piece for the sign. The
+    /// others keep it for the model to read.
+    fn ampersand(self) -> Option<&'static str> {
+        Some(match self {
+            Lang::Ar => "و",
+            Lang::Hi => "और",
+            Lang::Fi => "ja",
+            Lang::Sv => "och",
+            Lang::No => "og",
+            Lang::It => "e",
+            Lang::Nl => "en",
+            Lang::Pl => "i",
+            _ => return None,
+        })
+    }
+
+    /// Whether a `#` before a number is spelled as the number sign, where the tokenizer has no
+    /// piece for it.
+    fn spells_number_sign(self) -> bool {
+        matches!(
+            self,
+            Lang::Ar | Lang::Hi | Lang::Fi | Lang::Sv | Lang::No | Lang::It | Lang::Nl | Lang::Pl
+        )
+    }
+
+    /// The word after the degrees for `°C`, or `None` where it goes unsaid, as Finnish,
+    /// Italian, Swedish, Norwegian, Japanese and Korean read a temperature.
+    fn celsius(self) -> Option<&'static str> {
+        Some(match self {
+            Lang::Fi | Lang::It | Lang::Sv | Lang::No | Lang::Ja | Lang::Ko => return None,
+            Lang::Pl => "Celsjusza",
+            Lang::Hi => "सेल्सियस",
+            Lang::Ar => "مئوية",
+            _ => "Celsius",
+        })
+    }
+
+    /// The word after the degrees for `°F`, as [`Self::celsius`].
+    fn fahrenheit(self) -> Option<&'static str> {
+        Some(match self {
+            Lang::Ja | Lang::Ko => return None,
+            Lang::Pl => "Fahrenheita",
+            Lang::Hi => "फ़ारेनहाइट",
+            Lang::Ar => "فهرنهايت",
+            _ => "Fahrenheit",
+        })
     }
 
     /// The word "n°" abbreviates, as in "le n°5" or "el n.º 5".
@@ -815,9 +853,36 @@ impl StringAppender {
         let word_before = before.iter().rev().find(|c| !c.is_whitespace());
         ((1..=3).contains(&n)
             && b[b.len() - n] != '0'
-            && !before.last().is_some_and(|&c| c.is_alphanumeric() || ",.".contains(c))
+            && !before.last().is_some_and(|&c| c.is_alphanumeric() || ",.+".contains(c))
             && !word_before.is_some_and(char::is_ascii_digit))
         .then_some(n)
+    }
+
+    /// Whether the text ends with a word of plain digits, as "9" before the dash of "9–17" and
+    /// not "1/7" before the dash between two dates.
+    fn ends_with_plain_number(&self) -> bool {
+        let word = self.buffer.iter().rev().take_while(|c| !c.is_whitespace());
+        let mut any = false;
+        for c in word {
+            if !c.is_ascii_digit() {
+                return false;
+            }
+            any = true;
+        }
+        any
+    }
+
+    /// Turn the minus of the number the text ends with into Korean "영하", below zero.
+    fn minus_to_below_zero(&mut self) {
+        let b = &self.buffer;
+        let n = b.iter().rev().take_while(|c| c.is_ascii_digit() || matches!(c, '.' | ',')).count();
+        let Some(minus) = b.len().checked_sub(n + 1) else { return };
+        if n == 0 || b[minus] != '-' || (minus > 0 && !b[minus - 1].is_whitespace()) {
+            return;
+        }
+        let number: Vec<char> = self.buffer.drain(minus..).skip(1).collect();
+        self.push_str("영하 ");
+        self.buffer.extend(number);
     }
 
     /// `word` as a word of its own, for a symbol read aloud.
@@ -865,6 +930,50 @@ pub(crate) fn unaccented(c: char) -> Option<char> {
         }
     }
     None
+}
+
+/// The ASCII digit `c` stands for, when it is an Arabic-Indic, Persian, Devanagari or
+/// full-width digit.
+fn native_digit(c: char) -> Option<char> {
+    let zero = match c {
+        '٠'..='٩' => '٠',
+        '۰'..='۹' => '۰',
+        '०'..='९' => '०',
+        '０'..='９' => '０',
+        _ => return None,
+    };
+    char::from_u32('0' as u32 + (c as u32 - zero as u32))
+}
+
+/// The ASCII form of a full-width Latin letter or symbol, and the narrow yen and won signs.
+/// Full-width punctuation stays: the Japanese and Korean tokenizers have pieces for it.
+fn fullwidth(c: char) -> Option<char> {
+    match c {
+        'Ａ'..='Ｚ'
+        | 'ａ'..='ｚ'
+        | '＄'
+        | '％'
+        | '＋'
+        | '＝'
+        | '＠'
+        | '／'
+        | '＃'
+        | '＆'
+        | '＊'
+        | '－' => char::from_u32(c as u32 - 0xFEE0),
+        '￥' => Some('¥'),
+        '￦' => Some('₩'),
+        _ => None,
+    }
+}
+
+/// Whether one space and then an amount follow, as after the symbol of "€ 5,50": digits that
+/// do not run into a dash, which would make them a range.
+fn spaced_amount_follows(chars: &std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    let mut ahead = chars.clone();
+    ahead.next().is_some_and(char::is_whitespace)
+        && ahead.clone().next().is_some_and(|c| c.is_ascii_digit())
+        && ahead.find(|c| !c.is_ascii_digit()) != Some('-')
 }
 
 fn subscript(c: char) -> Option<char> {
@@ -985,6 +1094,8 @@ pub fn normalize_text(input: &str, lang: Lang, rules: Rules) -> String {
     // Where the digits of a French number joined across a thousands space end, so that a further
     // group joins too: "1 000 000".
     let mut grouped = 0;
+    // The languages the serving stack reads, whose readings stay as they were.
+    let serving = matches!(lang, Lang::En | Lang::Fr | Lang::De | Lang::Es | Lang::Pt);
     while let Some(c) = chars.next() {
         match c {
             c if is_double_quote(c) => res.push('"'),
@@ -1020,22 +1131,52 @@ pub fn normalize_text(input: &str, lang: Lang, rules: Rules) -> String {
                     res.push_spoken(word);
                 }
             }
-            '°' => {
+            '°' | '℃' | '℉' if c == '°' || !serving => {
+                // Korean reads a temperature below zero as "영하 12 도", not "minus 12".
+                if lang == Lang::Ko {
+                    res.minus_to_below_zero();
+                }
                 res.push_spoken(lang.degrees(res.ends_with_one()));
-                let scale = match chars.peek() {
-                    Some('C') => Some("Celsius"),
-                    Some('F') => Some("Fahrenheit"),
+                // The scale letter, or Arabic's own markers; the languages that leave the
+                // scale unsaid still take the letter.
+                let scale = match (c, chars.peek()) {
+                    ('℃', _) | ('°', Some('C' | 'م')) => Some(lang.celsius()),
+                    ('℉', _) | ('°', Some('F' | 'ف')) => Some(lang.fahrenheit()),
                     _ => None,
                 };
                 let mut after = chars.clone();
-                after.next();
+                if c == '°' {
+                    after.next();
+                }
                 if let Some(scale) =
-                    scale.filter(|_| !after.peek().is_some_and(|c| c.is_alphanumeric()))
+                    scale.filter(|_| !after.peek().is_some_and(|c| c.is_ascii_alphanumeric()))
                 {
-                    chars.next();
-                    res.push_str(scale);
+                    if c == '°' {
+                        chars.next();
+                    }
+                    if let Some(scale) = scale {
+                        res.push_str(scale);
+                    }
                 }
             }
+            // Digits of the other scripts, and full-width ones, as ASCII: the tokenizers have
+            // pieces for those alone. The arms down to the full-width ones leave the languages
+            // the serving stack reads as they were.
+            c if !serving && native_digit(c).is_some() => res.push(native_digit(c).unwrap_or(c)),
+            '٫' if !serving => res.push('.'),
+            '٬' if !serving => res.push(','),
+            '٪' if !serving => res.push('%'),
+            // Bidirectional and byte-order marks say nothing aloud.
+            '\u{200E}'
+            | '\u{200F}'
+            | '\u{061C}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+                if !serving => {}
+            '−' if !serving => res.push('-'),
+            c if !serving && fullwidth(c).is_some() => res.push(fullwidth(c).unwrap_or(c)),
+            '|' if lang == Lang::Hi => res.push('।'),
             c if lang.fold(c).is_some() => res.push(lang.fold(c).unwrap_or(c)),
             c if subscript(c).is_some() => res.push(subscript(c).unwrap_or(c)),
             c if superscript(c).is_some() => {
@@ -1053,6 +1194,15 @@ pub fn normalize_text(input: &str, lang: Lang, rules: Rules) -> String {
             c if lang.greek(c).is_some() => res.push_spoken(&lang.greek(c).unwrap_or_default()),
             c if lang.symbol(c).is_some() => res.push_spoken(lang.symbol(c).unwrap_or_default()),
             '±' => res.push_spoken(lang.plus_minus()),
+            '&' if lang.ampersand().is_some()
+                && !(prev.is_some_and(|p| p.is_ascii_uppercase())
+                    && chars.peek().is_some_and(char::is_ascii_uppercase)) =>
+            {
+                res.push_spoken(lang.ampersand().unwrap_or_default())
+            }
+            '#' if lang.spells_number_sign() && chars.peek().is_some_and(char::is_ascii_digit) => {
+                res.push_spoken(lang.number_sign())
+            }
             '❤' | '♥' => {
                 chars.next_if_eq(&'\u{FE0F}');
                 res.push_spoken(lang.love());
@@ -1062,6 +1212,13 @@ pub fn normalize_text(input: &str, lang: Lang, rules: Rules) -> String {
                 && chars.peek().is_some_and(char::is_ascii_digit) =>
             {
                 res.push_spoken(lang.star())
+            }
+            // An en dash between two numbers is a range, which the numbers rule reads.
+            '–' if !serving
+                && res.ends_with_plain_number()
+                && chars.peek().is_some_and(char::is_ascii_digit) =>
+            {
+                res.push('-')
             }
             // The two dashes below are not - (ascii 45) but similar unicode chars.
             '–' | '*' | '—' | '[' | ']' | '{' | '}' => res.push_whitespace(),
@@ -1078,11 +1235,23 @@ pub fn normalize_text(input: &str, lang: Lang, rules: Rules) -> String {
                 res.pop_whitespace();
                 res.push(c);
             }
-            // "40 000", "1 234,56": French groups thousands with a space, plain or non-breaking,
-            // which goes so that the numbers rule reads one number rather than two. Three groups
-            // of three digits are a code, as the digit runs of the numbers rule have it.
+            // "€ 5,50", "₹ 500": the symbol before the number and a space, as Dutch and Hindi
+            // write it, joins the number the same way. Not after a letter ("R$ 40", which has
+            // its own rule below), and not before a range, which the numbers rule reads.
+            c if rewrite::is_currency_symbol(c)
+                && !serving
+                && !prev.is_some_and(|p| p.is_ascii_alphabetic())
+                && spaced_amount_follows(&chars) =>
+            {
+                res.push(c);
+                chars.next();
+            }
+            // "40 000", "1 234,56": French, Finnish, Swedish, Norwegian and Polish group thousands
+            // with a space, plain or non-breaking, which goes so that the numbers rule reads one
+            // number rather than two. Three groups of three digits are a code, as the digit runs
+            // of the numbers rule have it.
             c if c.is_whitespace()
-                && lang == Lang::Fr
+                && matches!(lang, Lang::Fr | Lang::Fi | Lang::Sv | Lang::No | Lang::Pl)
                 && (res.buffer.len() == grouped
                     || res
                         .thousands_lead()
@@ -1105,6 +1274,12 @@ pub fn normalize_text(input: &str, lang: Lang, rules: Rules) -> String {
                 res.push_whitespace();
             }
             '=' => res.push_spoken(lang.special_chars().equals),
+            ':' if lang == Lang::Fi
+                && !prev.is_none_or(|p| p.is_alphabetic() || p.is_whitespace())
+                && chars.peek().is_some_and(|c| c.is_lowercase()) =>
+            {
+                while chars.next_if(|c| c.is_lowercase()).is_some() {}
+            }
             ':' if !prev.is_none_or(char::is_whitespace)
                 && !chars.peek().is_none_or(|c| c.is_whitespace()) =>
             {
@@ -1149,16 +1324,23 @@ fn korean_topic_particle(before: Option<&char>) -> &'static str {
 fn space_chars(text: &str) -> String {
     let mut out = String::new();
     let mut run = false;
-    for c in text.chars() {
+    let chars: Vec<char> = text.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
         if c.is_whitespace() {
             run = false;
             continue;
         }
-        if !(run && c.is_ascii_alphanumeric()) && !out.is_empty() {
+        // A point or comma between two digits stays in the run: "2.5", "1,500".
+        let joins = run
+            && (c.is_ascii_alphanumeric()
+                || (matches!(c, '.' | ',')
+                    && chars.get(i.wrapping_sub(1)).is_some_and(char::is_ascii_digit)
+                    && chars.get(i + 1).is_some_and(char::is_ascii_digit)));
+        if !joins && !out.is_empty() {
             out.push(' ');
         }
         out.push(c);
-        run = c.is_ascii_alphanumeric();
+        run = joins || c.is_ascii_alphanumeric();
     }
     if out.chars().last().is_some_and(char::is_alphanumeric) {
         out.push_str(" 。");
@@ -1347,19 +1529,16 @@ mod tests {
         }
     }
 
-    /// The languages without rules get the character pass alone, whatever rules are asked for,
-    /// and keep the letters of their own the five with rules fold.
+    /// The rules read every language, and without them the character pass runs alone.
     #[test]
-    fn languages_without_rules_get_the_character_pass() {
-        let it = |text| normalize_text(text, Lang::It, Rules::ALL);
+    fn rules_read_every_language_and_none_leaves_the_character_pass() {
+        assert_eq!(rewrite_word("1234", Lang::Nl, Rules::ALL).as_deref(), Some("duizend 234"));
+        let it = |text| normalize_text(text, Lang::It, Rules::NONE);
         assert_eq!(
             it("Costa $1,234.56, ~5 ★★★☆☆ e 3²."),
             "Costa $1,234.56, circa 5 3 stelle su 5 e 3 al quadrato."
         );
-        assert_eq!(
-            it("jane@x.it, N°5 a 20°C"),
-            "jane chiocciola x.it, Numero 5 a 20 gradi Celsius"
-        );
+        assert_eq!(it("jane@x.it, N°5 a 20°C"), "jane chiocciola x.it, Numero 5 a 20 gradi");
         assert_eq!(it("Così è più bello, ťuk"), "Così è più bello, tuk");
         assert_eq!(normalize_text("Źle, więc", Lang::Pl, Rules::DEFAULT), "Źle, więc");
         assert_eq!(normalize_text("Źle, więc", Lang::En, Rules::DEFAULT), "Zle, wiec");
@@ -1369,8 +1548,112 @@ mod tests {
         );
         assert_eq!(normalize_text("n°5", Lang::Ar, Rules::DEFAULT), "رقم 5");
         assert_eq!(normalize_text("N°5", Lang::Ar, Rules::DEFAULT), "رقم 5");
-        assert_eq!(rewrite_word("1234", Lang::Nl, Rules::ALL), None);
-        assert!(!Lang::Nl.has_rules() && Lang::Pt.has_rules());
+    }
+
+    /// The digits of the other scripts, full-width forms, the bidirectional marks and the
+    /// separators that come with them, as the tokenizers have pieces for ASCII alone.
+    #[test]
+    fn the_other_scripts_digits_and_symbols_fold_to_ascii() {
+        let none = |text, lang| normalize_text(text, lang, Rules::NONE);
+        assert_eq!(none("الرقم ٣٤ و ١٢٫٥٪ و ۱۲", Lang::Ar), "الرقم 34 و 12.5% و 12");
+        assert_eq!(none("\u{200F}مرحبا\u{200E} بك\u{061C}", Lang::Ar), "مرحبا بك");
+        assert_eq!(none("१२ लड़के आए।", Lang::Hi), "12 लड़के आए।");
+        assert_eq!(none("वह गया| फिर सो गया|", Lang::Hi), "वह गया। फिर सो गया।");
+        assert_eq!(none("１２人が来ました。", Lang::Ja), "12 人 が 来 ま し た 。");
+        assert_eq!(none("ＡＢＣ１２３と５０％", Lang::Ja), "ABC123 と 50 %");
+        assert_eq!(none("￥１５００", Lang::Ja), "¥ 1500 。");
+        assert_eq!(none("−5 °C", Lang::Fi), "-5 astetta");
+        assert_eq!(none("−12 °C:een", Lang::Fi), "-12 astetta");
+        assert_eq!(none("15 %:n alennus, 22:n", Lang::Fi), "15 % alennus, 22");
+        assert_eq!(none("-3,5 °C", Lang::Pl), "-3,5 stopni Celsjusza");
+        assert_eq!(none("-12°C까지", Lang::Ko), "영하 12 도 까지");
+        assert_eq!(none("기온은 -3.5°C입니다", Lang::Ko), "기온은 영하 3.5 도 입니다");
+        assert_eq!(none("2-3°C", Lang::Ko), "2-3 도");
+        assert_eq!(none("36.8℃でした", Lang::Ja), "36.8 度 で し た 。");
+        assert_eq!(none("-12°م", Lang::Ar), "-12 درجات مئوية");
+        assert_eq!(none("21°C", Lang::Hi), "21 डिग्री सेल्सियस");
+        assert_eq!(none("21°C", Lang::En), "21 degrees Celsius");
+        assert_eq!(none("R&D, #1", Lang::Sv), "R&D, nummer 1");
+        assert_eq!(none("Tom & Jerry", Lang::Sv), "Tom och Jerry");
+        assert_eq!(none("Tom & Jerry #1", Lang::En), "Tom & Jerry #1");
+        // A decimal stays one run in Japanese.
+        assert_eq!(none("重さは2.5キロです。", Lang::Ja), "重 さ は 2.5 キ ロ で す 。");
+        assert_eq!(none("1,500円", Lang::Ja), "1,500 円 。");
+        assert_eq!(none("町でNo.1の店", Lang::Ja), "町 で No . 1 の 店 。");
+        assert_eq!(none("1/7–30/9 ja 9–17", Lang::Sv), "1/7 30/9 ja 9-17");
+    }
+
+    /// The new languages' rules at work on whole texts: spaced thousands joined, a currency
+    /// symbol before a spaced amount joined, en-dash ranges, and the spans around a number.
+    #[test]
+    fn the_new_languages_read_sentences() {
+        let cases = [
+            (
+                Lang::Fi,
+                "Budjetti on 1 234 567 euroa.",
+                "Budjetti on miljoona 234 tuhatta 567 euroa.",
+            ),
+            (Lang::Fi, "Hinta on 5,99 €.", "Hinta on 5 euroa 99 senttiä."),
+            (Lang::Fi, "Kokous on klo 10.30.", "Kokous on klo 10.30."),
+            (Lang::Sv, "Det bor 12 345 personer där.", "Det bor 12 tusen 345 personer där."),
+            (Lang::Sv, "Priset är 5,99 kr.", "Priset är 5 kronor och 99 öre."),
+            (Lang::Sv, "Öppet 20–25 maj.", "Öppet 20 till 25 maj."),
+            (
+                Lang::No,
+                "Budsjettet er 1 234 567 kroner.",
+                "Budsjettet er en million 234 tusen 567 kroner.",
+            ),
+            (Lang::Pl, "Mieszka tam 12 345 osób.", "Mieszka tam 12 tysięcy 345 osób."),
+            (Lang::Pl, "To kosztuje 5,99 zł.", "To kosztuje 5 złotych 99 groszy."),
+            (
+                Lang::Pl,
+                "Zadzwoń pod +48 123 456 789.",
+                "Zadzwoń pod plus cztery osiem, jeden dwa trzy, cztery pięć sześć, siedem osiem dziewięć.",
+            ),
+            (
+                Lang::It,
+                "Il bilancio è di 1.234.567 euro.",
+                "Il bilancio è di 1 milione 234 mila 567 euro.",
+            ),
+            (Lang::It, "Costa €5.", "Costa 5 euro."),
+            (Lang::Nl, "Het kost € 5,50.", "Het kost 5 euro 50."),
+            (Lang::Nl, "Er wonen 70449 mensen.", "Er wonen 70 duizend 449 mensen."),
+            (Lang::Hi, "इसकी कीमत ₹ 500 है।", "इसकी कीमत पाँच सौ रुपये है।"),
+            (Lang::Hi, "बजट 1.5 लाख रुपये है।", "बजट डेढ़ लाख रुपये है।"),
+            (Lang::Hi, "बैठक सुबह 11.30 बजे है।", "बैठक सुबह 11:30 बजे है।"),
+            (Lang::Hi, "कुल 12,34,567 लोग आए।", "कुल बारह लाख चौंतीस हजार पाँच सौ सड़सठ लोग आए।"),
+            (Lang::Hi, "ऑर्डर नंबर 48213907 है।", "ऑर्डर नंबर चार आठ दो एक तीन नौ शून्य सात है।"),
+            (Lang::No, "Ordre 48213907 sendes.", "Ordre fire åtte to en tre ni null sju sendes."),
+            (Lang::No, "Sak nr. 4471 er lukket.", "Sak nr. 4471 er lukket."),
+            (Lang::Nl, "Het ref.nr. is 4471.", "Het ref.nr. is 4 duizend 471."),
+            (Lang::Pl, "Są m.in. psy.", "Są m.in. psy."),
+            (Lang::It, "Visita rai.it.", "Visita rai punto I-T."),
+            (Lang::Ko, "번호는 48213907입니다.", "번호는 사 팔 이 일 삼 구 공 칠 입니다."),
+            (Lang::Ja, "バグ#2093", "バ グ # 2093 。"),
+            (Lang::Ko, "나나크(1469–1539)가 1,000파운드", "나나크, 1469-1539, 가 1,000파운드"),
+            (Lang::It, "I B&B più alti", "I B&B più alti"),
+            (Lang::Sv, "Ärende nummer 773102.", "Ärende nummer 773102."),
+            (Lang::Hi, "मेरे पास 123 किताबें हैं।", "मेरे पास एक सौ तेईस किताबें हैं।"),
+            (Lang::Hi, "कुल: €42।", "कुल, बयालीस यूरो।"),
+            (Lang::Ar, "السعر $50؟", "السعر 50 دولار؟"),
+            (Lang::Hi, "वह 1985 में पैदा हुआ।", "वह 1985 में पैदा हुआ।"),
+            (Lang::Ar, "السعر 50 ر.س فقط.", "السعر 50 ريال فقط."),
+            (Lang::Ar, "تأسست عام 2024م.", "تأسست عام 2024."),
+            (Lang::Ar, "عدد السكان 1,234,567 نسمة.", "عدد السكان مليون 234 ألف 567 نسمة."),
+            (Lang::Ja, "予算は1,234,567円です。", "予 算 は 123 万 4567 円 で す 。"),
+            (Lang::Ja, "人口は12345人です。", "人 口 は 1 万 2345 人 で す 。"),
+            (Lang::Ko, "예산은 1234567원입니다.", "예산은 123만 4567 원입니다."),
+            (Lang::Ko, "기온은 -12°C입니다.", "기온은 영하 12 도 입니다."),
+            (Lang::Ko, "인구는 70449명입니다.", "인구는 7만 449명입니다."),
+            (Lang::Sv, "Säsongen 2024–25.", "Säsongen 2024 till 25."),
+            // The languages the serving stack reads keep its readings.
+            (Lang::En, "The 2024–25 season.", "The 2024 25 season."),
+            (Lang::En, "It costs $ 5 and ２０ ٣.", "It costs $ 5 and ２０ ٣."),
+            (Lang::Fr, "Ça coûte € 5,50.", "Ça coûte € 5 virgule 50."),
+        ];
+        for (lang, input, expected) in cases {
+            assert_eq!(normalize_text(input, lang, Rules::DEFAULT), expected, "{lang:?} {input:?}");
+        }
     }
 
     /// Japanese is spaced one character at a time, as the checkpoints were trained, with runs of
