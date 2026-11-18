@@ -2,7 +2,7 @@
 //! dot F-R".
 
 use super::tlds::is_tld;
-use super::{spell_short, suffix};
+use super::{letters, spell_short, suffix};
 use crate::preprocess::{Lang, SpecialChars};
 use std::borrow::Cow;
 
@@ -47,6 +47,11 @@ pub(super) fn urls(word: &str, lang: Lang) -> Option<String> {
     let capitalized = tld.chars().any(char::is_uppercase) && tld.chars().any(char::is_lowercase);
     if capitalized && words.is_empty() && !labels[0].eq_ignore_ascii_case("www") {
         return None;
+    }
+    // The languages with letter names of their own spell with them.
+    if letters::names(lang).is_some() {
+        let address = &word[..word.len() - suffix.len()];
+        return Some(format!("{}{suffix}", letters::read(address, lang)));
     }
 
     for (i, label) in labels.into_iter().enumerate() {

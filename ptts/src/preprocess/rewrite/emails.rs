@@ -1,6 +1,6 @@
 //! Email addresses: "jane.smith@gmail.com" becomes "jane dot smith at gmail dot com".
 
-use super::{spell_short, suffix};
+use super::{letters, spell_short, suffix};
 use crate::preprocess::Lang;
 
 /// An email address with its separators spoken in `lang` and a two-letter top-level domain
@@ -19,6 +19,11 @@ pub(super) fn emails(word: &str, lang: Lang) -> Option<String> {
     }
     let suffix = suffix(rest)?;
     let (tld, domain) = labels.split_last().filter(|(_, domain)| !domain.is_empty())?;
+    // The languages with letter names of their own spell with them.
+    if letters::names(lang).is_some() {
+        let address = &word[..word.len() - suffix.len()];
+        return Some(format!("{}{suffix}", letters::read(address, lang)));
+    }
 
     let sc = lang.special_chars();
     let mut words = vec![];
