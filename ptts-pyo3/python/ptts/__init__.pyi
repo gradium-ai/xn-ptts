@@ -50,8 +50,8 @@ class TTS:
     normalizing.
 
     `rewrites` picks which word rewrites run on the normalized text: `"default"` (what `None`
-    means: numbers, currency, dashed-digits, emails, urls, abbreviations, elongations), `"all"`
-    (those and phones, times, dates), `"none"`, or a comma-separated list of rule names.
+    means: numbers, currency, dashed-digits, emails, urls, abbreviations, elongations, local-dates),
+    `"all"` (those and phones, times, dates), `"none"`, or a comma-separated list of rule names.
 
     `voice_catalog` is where a voice the checkpoint does not have is looked up: a Hugging Face
     repo as `"hf://owner/name[@revision]"`, or a local `voices.jsonl` or folder holding one.

@@ -42,7 +42,7 @@ export interface LoadOptions {
   lang: Lang;
   /**
    * Which word rewrites run on the normalized text: `'default'` (the default: numbers,
-   * currency, dashed-digits, emails, urls, abbreviations, elongations), `'all'` (those and phones, times, dates), `'none'`
+   * currency, dashed-digits, emails, urls, abbreviations, elongations, local-dates), `'all'` (those and phones, times, dates), `'none'`
    * (or `'off'`), or a comma-separated list of rule names. Case and surrounding space do not
    * matter, and `'default'` / `'all'` / `'none'` / `'off'` count only on their own, not inside a
    * list. Ignored when `lang` is `'none'`, which does

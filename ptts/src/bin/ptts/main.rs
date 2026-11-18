@@ -120,8 +120,9 @@ struct Args {
     lang: Option<String>,
 
     /// Which word rewrites run on the normalized text: `default` (numbers, currency,
-    /// dashed-digits, emails, urls, abbreviations, elongations), `all` (those and phones, times,
-    /// dates), `none`, or a comma-separated list of rule names. Has no effect with `--lang none`.
+    /// dashed-digits, emails, urls, abbreviations, elongations, local-dates), `all` (those and phones,
+    /// times, dates), `none`, or a comma-separated list of rule names. Has no effect with
+    /// `--lang none`.
     #[arg(long, default_value = "default")]
     rewrites: String,
 }
