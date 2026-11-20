@@ -1074,9 +1074,9 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "xn"
-version = "0.2.14"
+version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "940d8e12d2ab81c93ca7a19d236329dcc4df0782fcaeb0891c188077e43f6e0f"
+checksum = "01354edeeb5f30afc9afd1c0b2a5593b59368c33565aca4577500195da86ec67"
 dependencies = [
  "byteorder",
  "half",
