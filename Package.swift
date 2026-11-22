@@ -6,9 +6,9 @@ import PackageDescription
 
 let package = Package(
     name: "ptts",
-    // iOS 18 / macOS 15: the models are Core ML 8 programs. Apple silicon only; the Neural
-    // Engine is what makes this fast.
-    platforms: [.iOS(.v18), .macOS(.v15)],
+    // iOS 18 / macOS 15 / visionOS 2: the models are Core ML 8 programs. Apple silicon only; the
+    // Neural Engine is what makes this fast.
+    platforms: [.iOS(.v18), .macOS(.v15), .visionOS(.v2)],
     products: [
         .library(name: "ptts", targets: ["PhononTTS"]),
     ],

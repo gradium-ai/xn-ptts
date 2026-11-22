@@ -286,7 +286,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           components: clippy
-          targets: aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-ios-macabi
+          targets: aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-ios-macabi aarch64-apple-visionos aarch64-apple-visionos-sim
           cache-key: coreml
           audio-deps: "false"
       # The Core ML runtime and the C interface's Core ML engine only exist on Apple targets, so
@@ -295,8 +295,8 @@ jobs:
         run: cargo clippy -p ptts-coreml -p ptts-ffi --features ptts-coreml/gguf --all-targets -- -D warnings
       - name: Clippy, iOS
         run: cargo clippy -p ptts-ffi --target aarch64-apple-ios -- -D warnings
-      # What an app actually consumes: the framework for iPhone, simulator, Mac and Mac Catalyst,
-      # and the Swift package compiled against it, in Swift 6 language mode.
+      # What an app actually consumes: the framework for iPhone, simulator, Mac, Mac Catalyst
+      # and visionOS, and the Swift package compiled against it, in Swift 6 language mode.
       - name: Framework and Swift package
         run: |
           ./ios/build-xcframework.sh

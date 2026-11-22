@@ -53,7 +53,7 @@ Phones and Apple apps have their own build scripts:
   the emulator. See the [Android guide](../android/README.md#1-build-the-library).
 - **iOS and macOS apps:** [`ios/build-xcframework.sh`](../ios/build-xcframework.sh) builds
   `PhononCore.xcframework`: the static library and `ptts.h` for iPhone, the simulator,
-  Apple-silicon Macs and Mac Catalyst. Each
+  Apple-silicon Macs, Mac Catalyst and visionOS. Each
   [release](https://github.com/gradium-ai/xn-ptts/releases) has it prebuilt as
   `PhononCore.xcframework.zip`, so an Xcode project needs no Rust.
 
