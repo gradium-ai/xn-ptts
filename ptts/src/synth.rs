@@ -240,6 +240,10 @@ pub struct SpeechOptions {
     pub max_tokens_per_chunk: Option<usize>,
     /// Audio modules run over the PCM, in order, before it is handed out.
     pub post_process: Option<Vec<ModuleConfig>>,
+    /// How this request's or session's text is normalized, instead of the builder's: the whole
+    /// policy, rewrite rules included (a bare [`crate::preprocess::Lang`] brings
+    /// `Rules::DEFAULT`). Lets one [`Synth`] serve several languages over the same weights.
+    pub normalize: Option<Normalize>,
 }
 
 impl SpeechOptions {
@@ -268,6 +272,11 @@ impl SpeechOptions {
         self
     }
 
+    pub fn normalize(mut self, normalize: impl Into<Normalize>) -> Self {
+        self.normalize = Some(normalize.into());
+        self
+    }
+
     pub fn post_process(mut self, modules: impl IntoIterator<Item = ModuleConfig>) -> Self {
         self.post_process = Some(modules.into_iter().collect());
         self
@@ -283,6 +292,7 @@ struct Defaults {
     cfg_coef: Option<f32>,
     max_tokens_per_chunk: usize,
     post_process: Vec<ModuleConfig>,
+    normalize: Normalize,
 }
 
 /// Merge per-request overrides onto the settings a [`SynthBuilder`] was given.
@@ -314,6 +324,7 @@ fn resolve(defaults: &Defaults, opts: &SpeechOptions) -> Result<Defaults> {
         },
         max_tokens_per_chunk: opts.max_tokens_per_chunk.unwrap_or(defaults.max_tokens_per_chunk),
         post_process: opts.post_process.clone().unwrap_or_else(|| defaults.post_process.clone()),
+        normalize: opts.normalize.unwrap_or(defaults.normalize),
     })
 }
 
@@ -335,7 +346,8 @@ struct SynthOf<Q: BackendQ> {
     cfg: TTSConfig,
     voices: BTreeMap<String, Voice<Q>>,
     defaults: Defaults,
-    /// How every request's text is normalized. See [`SynthBuilder::new`].
+    /// How a request is normalized when its [`SpeechOptions`] set none. See
+    /// [`SynthBuilder::new`].
     normalize: Normalize,
     /// Each voice's primed KV prefix, keyed by name and by whether guidance is on: the null
     /// branch's prefix differs, the coefficient does not enter the state. Sized to the prompt;
@@ -419,7 +431,7 @@ impl<Q: BackendQ> SynthOf<Q> {
             base,
             cfg_base,
             seq_budget,
-            normalize: self.normalize,
+            normalize: settings.normalize,
             post_process: settings.post_process.clone(),
             inline_decode: self.inline_decode,
             graphs: Arc::clone(&self.graphs),
@@ -803,7 +815,7 @@ impl<Q: BackendQ> SynthApi for SynthOf<Q> {
             self.cfg.mimi.frame_rate,
             text,
             settings.max_tokens_per_chunk,
-            self.normalize,
+            settings.normalize,
             Some(plan::MAX_FIT_TOKENS),
         )?;
         // A one-shot call is a session sized to this text and dropped afterwards,
@@ -894,8 +906,8 @@ struct SessionOf<Q: BackendQ> {
     base: TTSState<Q>,
     cfg_base: Option<(f32, TTSState<Q>)>,
     seq_budget: usize,
-    /// How text is normalized, inherited from the [`Synth`] this session was
-    /// built from.
+    /// How text is normalized: the session's own policy if its options set one, else the
+    /// [`Synth`]'s.
     normalize: Normalize,
     /// Slots the voice prompt already occupies, so the budget check can use it
     /// instead of [`plan::PROMPT_SEQ_HEADROOM`]'s fixed reserve.
@@ -1889,6 +1901,7 @@ impl SynthBuilder {
                 cfg_coef: self.cfg_coef,
                 max_tokens_per_chunk: self.max_tokens_per_chunk,
                 post_process: self.post_process.clone(),
+                normalize: self.normalize,
             },
             normalize: self.normalize,
             conditioners,
@@ -2327,7 +2340,20 @@ mod tests {
             cfg_coef: None,
             max_tokens_per_chunk: 50,
             post_process: vec![],
+            normalize: Normalize::OFF,
         }
+    }
+
+    #[test]
+    fn a_requests_normalization_replaces_the_builders_for_that_request_only() {
+        use crate::preprocess::Lang;
+        let builder = Defaults { normalize: Normalize::for_lang(Lang::En), ..defaults() };
+        let pt = SpeechOptions::default().normalize(Lang::Pt);
+        assert_eq!(resolve(&builder, &pt).unwrap().normalize, Normalize::for_lang(Lang::Pt));
+        assert_eq!(
+            resolve(&builder, &SpeechOptions::default()).unwrap().normalize,
+            Normalize::for_lang(Lang::En)
+        );
     }
 
     #[test]

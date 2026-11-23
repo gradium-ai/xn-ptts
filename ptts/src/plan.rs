@@ -423,6 +423,19 @@ mod tests {
     }
 
     #[test]
+    fn the_same_text_plans_differently_per_language() {
+        use crate::preprocess::Lang;
+        let tok = Words::default();
+        let plan = |lang| {
+            let chunks =
+                chunks(&tok, "custa 10,50 R$", Normalize::for_lang(lang), 50, 12.5).unwrap();
+            chunks.into_iter().map(|c| c.text).collect::<Vec<_>>()
+        };
+        let (pt, en) = (plan(Lang::Pt), plan(Lang::En));
+        assert_ne!(pt, en, "pt {pt:?} en {en:?}");
+    }
+
+    #[test]
     fn empty_text_is_an_error() {
         let err = chunks(&Words::default(), "   ", Normalize::OFF, 50, 12.5).unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");

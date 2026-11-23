@@ -187,12 +187,17 @@ fn speech_options_build_up_fluently() {
         .temperature(0.5)
         .seed(7)
         .cfg_coef(1.5)
-        .max_tokens_per_chunk(32);
+        .max_tokens_per_chunk(32)
+        .normalize(ptts::preprocess::Lang::Pt);
     assert_eq!(opts.voice.as_deref(), Some("alba"));
     assert_eq!(opts.temperature, Some(0.5));
     assert_eq!(opts.seed, Some(7));
     assert_eq!(opts.cfg_coef, Some(1.5));
     assert_eq!(opts.max_tokens_per_chunk, Some(32));
+    assert_eq!(
+        opts.normalize,
+        Some(ptts::preprocess::Normalize::for_lang(ptts::preprocess::Lang::Pt))
+    );
 }
 
 #[test]
@@ -202,6 +207,7 @@ fn speech_options_default_to_the_builders_settings() {
     assert!(opts.temperature.is_none());
     assert!(opts.seed.is_none());
     assert!(opts.cfg_coef.is_none());
+    assert!(opts.normalize.is_none());
 }
 
 /// A session is the fix for re-priming the voice on every call, so the type has
