@@ -1015,6 +1015,7 @@ impl<Q: BackendQ> SessionOf<Q> {
             let decode_handle = std::thread::spawn(move || {
                 let mut first_tx = Some(first_tx);
                 let mut state = mimi_init.clone();
+                let mut fade = FadeIn::new(decode_model.sample_rate());
                 // The post-processing chain delays its output: its first `skip` samples are the
                 // zeros it was primed with, dropped here, and the stream's last are flushed below.
                 let mut skip = post.latency();
@@ -1022,6 +1023,7 @@ impl<Q: BackendQ> SessionOf<Q> {
                     let first = match frame {
                         Frame::ChunkEnd => {
                             state = mimi_init.clone();
+                            fade.restart();
                             continue;
                         }
                         Frame::Latent(latent) => match decode_model.mimi_latent(latent) {
@@ -1070,13 +1072,7 @@ impl<Q: BackendQ> SessionOf<Q> {
                     let pcm = decode_model
                         .decode_latent(&latent, &mut state)
                         .and_then(|audio| audio.narrow(0, ..1)?.contiguous()?.to_vec())
-                        .map(|mut pcm| {
-                            post.process(&mut pcm);
-                            let n = skip.min(pcm.len());
-                            skip -= n;
-                            pcm.drain(..n);
-                            pcm
-                        })
+                        .map(|pcm| finish_pcm(pcm, &mut fade, &mut post, &mut skip))
                         .map_err(Error::from);
                     let failed = pcm.is_err();
                     if decode_tx.send(pcm).is_err() || failed {
@@ -1087,6 +1083,7 @@ impl<Q: BackendQ> SessionOf<Q> {
                     }
                     if reset_after {
                         state = mimi_init.clone();
+                        fade.restart();
                     }
                 }
                 let latency = post.latency();
@@ -1217,6 +1214,55 @@ impl Drop for InFlight {
 const PCM_QUEUE: usize = 4;
 const LATENT_QUEUE: usize = 16;
 const DECODE_BATCH: usize = LATENT_QUEUE;
+
+/// Length of the fade-in at the start of each chunk's audio.
+const FADE_IN_MS: usize = 20;
+
+/// Fades in the start of each chunk's audio.
+///
+/// The Mimi decoder starts every chunk from a blank state, and the first few milliseconds it
+/// decodes from that state hold a short burst: a click in the silence before each sentence. The
+/// speech itself starts well after the fade, so fading in removes the click and leaves the
+/// speech alone.
+struct FadeIn {
+    len: usize,
+    pos: usize,
+}
+
+impl FadeIn {
+    fn new(sample_rate: usize) -> Self {
+        Self { len: sample_rate * FADE_IN_MS / 1000, pos: 0 }
+    }
+
+    /// Start the fade again, for the next chunk.
+    fn restart(&mut self) {
+        self.pos = 0;
+    }
+
+    /// Fade in the next samples of the chunk, carrying on from where the last call stopped.
+    fn apply(&mut self, pcm: &mut [f32]) {
+        for sample in pcm.iter_mut().take(self.len.saturating_sub(self.pos)) {
+            let t = self.pos as f32 / self.len as f32;
+            *sample *= 0.5 - 0.5 * (std::f32::consts::PI * t).cos();
+            self.pos += 1;
+        }
+    }
+}
+
+/// Fade, post-process and drop the chain's primed samples from one decoded block.
+fn finish_pcm(
+    mut pcm: Vec<f32>,
+    fade: &mut FadeIn,
+    post: &mut Chain,
+    skip: &mut usize,
+) -> Vec<f32> {
+    fade.apply(&mut pcm);
+    post.process(&mut pcm);
+    let n = (*skip).min(pcm.len());
+    *skip -= n;
+    pcm.drain(..n);
+    pcm
+}
 
 /// Messages from the flow-LM thread to the decoder thread.
 enum Frame<Q: BackendQ> {
@@ -1381,6 +1427,7 @@ fn run_inline<Q: BackendQ>(
     mut post: Chain,
 ) -> Result<()> {
     let mut mimi_state = mimi_init.clone();
+    let mut fade = FadeIn::new(model.sample_rate());
     // The post-processing chain delays its output: its first `skip` samples are the zeros it
     // was primed with, dropped here, and the stream's last are flushed below.
     let mut skip = post.latency();
@@ -1395,13 +1442,7 @@ fn run_inline<Q: BackendQ>(
             let pcm = model
                 .decode_latent(&next, &mut mimi_state)
                 .and_then(|audio| audio.narrow(0, ..1)?.contiguous()?.to_vec())
-                .map(|mut pcm| {
-                    post.process(&mut pcm);
-                    let n = skip.min(pcm.len());
-                    skip -= n;
-                    pcm.drain(..n);
-                    pcm
-                })
+                .map(|pcm| finish_pcm(pcm, &mut fade, &mut post, &mut skip))
                 .map_err(Error::from);
             let failed = pcm.is_err();
             // A closed channel means the consumer went away; stop quietly and let the caller
@@ -1417,6 +1458,7 @@ fn run_inline<Q: BackendQ>(
             prev = Some(next);
         }
         mimi_state = mimi_init.clone();
+        fade.restart();
     }
     let latency = post.latency();
     if latency > skip {
@@ -2265,6 +2307,41 @@ mod tests {
         assert!(Quant::Q80.check_device(DeviceKind::Auto).is_ok());
         assert_eq!(DeviceKind::Auto.resolve_for(Quant::F32), DeviceKind::Auto.resolve());
         assert_eq!(DeviceKind::Metal.resolve_for(Quant::Q80), DeviceKind::Metal);
+    }
+
+    #[test]
+    fn the_fade_in_rises_from_silence_and_leaves_the_rest_alone() {
+        let mut fade = FadeIn::new(24_000);
+        let len = 24_000 * FADE_IN_MS / 1000;
+        let mut pcm = vec![1.0f32; len + 10];
+        fade.apply(&mut pcm);
+        assert_eq!(pcm[0], 0.0);
+        assert!(pcm[..len].windows(2).all(|w| w[0] <= w[1]));
+        assert!(pcm[len - 1] > 0.99);
+        assert!(pcm[len..].iter().all(|&s| s == 1.0));
+        // Done: later audio of the same chunk is untouched.
+        let mut more = vec![1.0f32; 4];
+        fade.apply(&mut more);
+        assert_eq!(more, vec![1.0; 4]);
+    }
+
+    #[test]
+    fn the_fade_in_carries_across_calls_and_restarts_per_chunk() {
+        let len = 24_000 * FADE_IN_MS / 1000;
+        let mut whole = vec![1.0f32; len + 5];
+        FadeIn::new(24_000).apply(&mut whole);
+
+        let mut fade = FadeIn::new(24_000);
+        let mut split = vec![1.0f32; len + 5];
+        let (a, b) = split.split_at_mut(7);
+        fade.apply(a);
+        fade.apply(b);
+        assert_eq!(split, whole);
+
+        fade.restart();
+        let mut next = vec![1.0f32; len + 5];
+        fade.apply(&mut next);
+        assert_eq!(next, whole);
     }
 
     fn primed_key(i: usize) -> (String, bool) {
