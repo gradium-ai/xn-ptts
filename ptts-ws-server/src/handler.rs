@@ -4,6 +4,7 @@ use crate::protocol::{TtsReply, TtsRequest, error_codes};
 use anyhow::Result;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use ptts::preprocess::{Normalize, Rules};
 use ptts::synth::{Session, SpeechOptions};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -187,13 +188,15 @@ async fn run_session(
         match (&mut sess, req) {
             (
                 SessionState::Awaiting,
-                TtsRequest::Setup { output_format, voice, voice_id, voice_emb, .. },
-            ) => match handle_setup(&app, output_format, voice, voice_id, voice_emb, reply_tx)
-                .await?
-            {
-                Some(new_state) => sess = new_state,
-                None => continue,
-            },
+                TtsRequest::Setup { output_format, voice, voice_id, voice_emb, lang, .. },
+            ) => {
+                match handle_setup(&app, output_format, voice, voice_id, voice_emb, lang, reply_tx)
+                    .await?
+                {
+                    Some(new_state) => sess = new_state,
+                    None => continue,
+                }
+            }
             (SessionState::Awaiting, _) => {
                 send_error(
                     reply_tx,
@@ -275,12 +278,27 @@ async fn flush_buffer(
     Ok(())
 }
 
+/// The normalization a session runs with: its own `lang`, parsed like `--lang`, else the
+/// server's. An empty or blank `lang` counts as absent, like an empty `voice`.
+fn session_normalize(
+    requested: Option<&str>,
+    default: Normalize,
+    rules: Rules,
+) -> std::result::Result<Normalize, String> {
+    let Some(lang) = requested.filter(|l| !l.trim().is_empty()) else {
+        return Ok(default);
+    };
+    let parsed = lang.parse::<Normalize>().map_err(|e| format!("invalid lang in setup: {e}"))?;
+    Ok(parsed.with_rules(rules))
+}
+
 async fn handle_setup(
     app: &AppState,
     output_format: String,
     voice: Option<String>,
     voice_id: Option<String>,
     voice_emb: Option<String>,
+    lang: Option<String>,
     reply_tx: &mpsc::Sender<TtsReply>,
 ) -> Result<Option<SessionState>> {
     if voice_emb.as_deref().is_some_and(|s| !s.is_empty()) {
@@ -291,6 +309,16 @@ async fn handle_setup(
         )
         .await?;
         return Ok(None);
+    }
+    let normalize = match session_normalize(lang.as_deref(), app.default_lang, app.rules) {
+        Ok(n) => n,
+        Err(message) => {
+            send_error(reply_tx, error_codes::BAD_REQUEST, message).await?;
+            return Ok(None);
+        }
+    };
+    if let Some(warning) = normalize.language_warning(app.synth.languages()) {
+        tracing::warn!("{warning}");
     }
     let format = match output_format.parse::<Format>() {
         Ok(f) => f,
@@ -331,6 +359,7 @@ async fn handle_setup(
     // request that fits in one chunk should be spoken as one.
     let opts = SpeechOptions::default()
         .voice(voice_name.clone())
+        .normalize(normalize)
         .max_tokens_per_chunk(ptts::plan::MAX_FIT_TOKENS);
     let session = match app.synth.session(&opts, app.max_seq_len) {
         Ok(session) => session,
@@ -489,6 +518,7 @@ mod tests {
             7,
             1024,
             "en".parse().unwrap(),
+            ptts::preprocess::Rules::DEFAULT,
             &[],
             std::num::NonZeroUsize::new(1).unwrap(),
         )

@@ -64,9 +64,10 @@ struct Args {
     quant: Option<String>,
 
     /// Language incoming text is normalized as before tokenizing: `en`, `fr`, `de`, `es`, `pt`,
-    /// `ar`, `hi`, `ko`, `pl`, `sv`, `fi`, `no`, `it`, `nl` or `ja`. Required:
-    /// the spoken forms differ per language, so there is nothing safe to guess.
-    /// `none` serves the text as written, which the model reads less well.
+    /// `ar`, `hi`, `ko`, `pl`, `sv`, `fi`, `no`, `it`, `nl` or `ja`. Required: the spoken forms
+    /// differ per language, so there is nothing safe to guess. `none` serves the text as written,
+    /// which the model reads less well. It is the default for sessions that send no `lang` in
+    /// `setup`.
     #[arg(long)]
     lang: String,
 
@@ -140,7 +141,8 @@ async fn build_app_state(args: &Args) -> Result<model::AppState> {
     // Device and weight-format checks run before downloading: `SynthBuilder`
     // would catch them, but only after the checkpoint is on disk.
     quant.check_device(device)?;
-    let normalize = args.lang.parse::<Normalize>()?.with_rules(args.rewrites.parse::<Rules>()?);
+    let rules = args.rewrites.parse::<Rules>()?;
+    let normalize = args.lang.parse::<Normalize>()?.with_rules(rules);
     let mut conditions = Vec::new();
     for condition in &args.conditions {
         let (name, value) = condition.split_once('=').context("--condition takes NAME=VALUE")?;
@@ -156,6 +158,7 @@ async fn build_app_state(args: &Args) -> Result<model::AppState> {
         args.seed,
         args.max_seq_len,
         normalize,
+        rules,
         &conditions,
         args.max_concurrent_requests,
     )
@@ -194,5 +197,12 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn lang_is_required() {
+        assert!(Args::try_parse_from(["server", "--model", "model"]).is_err());
+        let args = Args::try_parse_from(["server", "--model", "model", "--lang", "pt"]).unwrap();
+        assert_eq!(args.lang, "pt");
     }
 }

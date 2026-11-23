@@ -7,7 +7,7 @@
 use anyhow::{Context as _, Result};
 use ptts::checkpoint::{Checkpoint, ResolveOptions};
 use ptts::hub::HubSource;
-use ptts::preprocess::Normalize;
+use ptts::preprocess::{Normalize, Rules};
 use ptts::synth::{DeviceKind, Quant, Synth};
 use ptts::voice_catalog::{DEFAULT_VOICE_CATALOG, VoiceCatalog};
 use std::sync::Arc;
@@ -23,6 +23,10 @@ pub struct Inner {
     pub model_name: String,
     pub voices: Vec<String>,
     pub default_voice: String,
+    /// What a session that sends no `lang` is normalized as.
+    pub default_lang: Normalize,
+    /// The rewrite rules every session's language is combined with.
+    pub rules: Rules,
     pub max_seq_len: usize,
     pub seed_base: u64,
     pub sample_rate: u32,
@@ -97,6 +101,7 @@ pub async fn load_ptts(
     seed_base: u64,
     max_seq_len: usize,
     normalize: Normalize,
+    rules: Rules,
     conditions: &[(String, String)],
     max_concurrent_requests: std::num::NonZeroUsize,
 ) -> Result<AppState> {
@@ -159,6 +164,8 @@ pub async fn load_ptts(
         model_name,
         voices,
         default_voice,
+        default_lang: normalize,
+        rules,
         max_seq_len,
         seed_base,
         sample_rate,
@@ -227,6 +234,7 @@ mod checkpoint_tests {
             7,
             1024,
             Normalize::OFF,
+            Rules::DEFAULT,
             &[],
             std::num::NonZeroUsize::new(1).unwrap(),
         )

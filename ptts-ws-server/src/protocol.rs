@@ -10,6 +10,9 @@ pub enum TtsRequest {
         voice: Option<String>,
         voice_id: Option<String>,
         voice_emb: Option<String>,
+        /// Language this session's text is normalized as. Absent: the server's `--lang`.
+        #[serde(default)]
+        lang: Option<String>,
     },
     Text {
         text: String,
