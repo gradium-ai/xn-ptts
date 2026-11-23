@@ -8,3 +8,8 @@ target_compile_features(qnn_bundle_test PRIVATE cxx_std_17)
 target_include_directories(qnn_bundle_test PRIVATE ..)
 target_link_libraries(qnn_bundle_test PRIVATE nlohmann_json::nlohmann_json)
 add_test(NAME qnn_bundle COMMAND qnn_bundle_test)
+
+add_executable(qnn_fade_test fade.cpp)
+target_compile_features(qnn_fade_test PRIVATE cxx_std_17)
+target_include_directories(qnn_fade_test PRIVATE ..)
+add_test(NAME qnn_fade COMMAND qnn_fade_test)

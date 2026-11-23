@@ -25,6 +25,8 @@ export const CHUNKS = [1, 2, 4, 8];
 const C_MAX = 8;
 /** Samples per 80 ms frame. */
 export const FRAME = 1920;
+/** Samples the start of each chunk fades in over: 20 ms, as `ptts::plan::FadeIn`. */
+export const FADE_IN = 480;
 const D = 512;
 const RING = K.CODEC_RING;
 
@@ -137,4 +139,17 @@ export class GpuCodec {
   encode(pass, C) { encode(pass, this.lists[C]); }
 
   dispatchesPerChunk(C) { return this.lists[C].length; }
+}
+
+/**
+ * Fades in the start of a chunk, as `ptts::plan::FadeIn` does: the decoder starts each chunk from
+ * a blank state, and the first few milliseconds it decodes from it hold a short burst, a click in
+ * the silence before each sentence. `pcm` is the chunk's audio from sample `offset` on.
+ * @param {Float32Array} pcm
+ * @param {number} offset
+ */
+export function fadeIn(pcm, offset) {
+  for (let i = 0; i < pcm.length && offset + i < FADE_IN; i++) {
+    pcm[i] *= 0.5 - 0.5 * Math.cos((Math.PI * (offset + i)) / FADE_IN);
+  }
 }
