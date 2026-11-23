@@ -64,17 +64,22 @@ async fn locate(model: &str, quant: Quant) -> Result<(Checkpoint, String)> {
     Ok((checkpoint, name))
 }
 
-/// The voices of the catalog `source` names, each downloaded on first use: those in `lang` and
-/// those with no language, or all of them when `lang` is `none`. A voice that cannot be fetched
-/// is logged and skipped.
-async fn catalog_voices(source: &str, lang: &str) -> Result<Vec<(String, std::path::PathBuf)>> {
-    let (source, lang) = (source.to_string(), lang.to_string());
+/// The voices of the catalog `source` names, each downloaded on first use: those in one of
+/// `langs` and those with no language, or all of them when `langs` is `None`. A voice that
+/// cannot be fetched is logged and skipped.
+async fn catalog_voices(
+    source: &str,
+    langs: Option<Vec<String>>,
+) -> Result<Vec<(String, std::path::PathBuf)>> {
+    let source = source.to_string();
     // The blocking Hub client runs its own runtime, which cannot be started inside this one.
     tokio::task::spawn_blocking(move || {
         let catalog = VoiceCatalog::new(&source)?;
         let mut voices = vec![];
         for voice in catalog.voices()? {
-            if lang != "none" && voice.language.as_deref().is_some_and(|l| l != lang) {
+            let unwanted =
+                |l: &str| langs.as_ref().is_some_and(|langs| !langs.iter().any(|x| x == l));
+            if voice.language.as_deref().is_some_and(unwanted) {
                 continue;
             }
             match catalog.fetch(voice) {
@@ -122,7 +127,14 @@ pub async fn load_ptts(
         Vec::new()
     };
     if let Some(catalog) = voice_catalog {
-        match catalog_voices(catalog, normalize.as_str()).await {
+        // Sessions pick their language, so offer the voices of every language the checkpoint
+        // lists. A config that lists none, or `--lang none`, falls back to the default.
+        let langs = match (normalize.as_str(), m.config.languages.as_slice()) {
+            ("none", _) => None,
+            (lang, []) => Some(vec![lang.to_string()]),
+            (_, listed) => Some(listed.to_vec()),
+        };
+        match catalog_voices(catalog, langs).await {
             Ok(voices) => extra_voices.extend(voices),
             // Offline, a server that needs no catalog voice still starts.
             Err(e) if catalog == DEFAULT_VOICE_CATALOG => {
@@ -193,14 +205,16 @@ mod tests {
         let names = |voices: Vec<(String, std::path::PathBuf)>| -> Vec<String> {
             voices.into_iter().map(|(name, _)| name).collect()
         };
-        assert_eq!(names(catalog_voices(source, "en").await.unwrap()), ["Zoey", "Mine"]);
+        let langs = |langs: &[&str]| Some(langs.iter().map(|l| l.to_string()).collect());
+        assert_eq!(names(catalog_voices(source, langs(&["en"])).await.unwrap()), ["Zoey", "Mine"]);
         assert_eq!(
-            names(catalog_voices(source, "none").await.unwrap()),
+            names(catalog_voices(source, langs(&["en", "de"])).await.unwrap()),
             ["Zoey", "Annika", "Mine"]
         );
-        let (_, path) = catalog_voices(source, "de").await.unwrap().remove(0);
+        assert_eq!(names(catalog_voices(source, None).await.unwrap()), ["Zoey", "Annika", "Mine"]);
+        let (_, path) = catalog_voices(source, langs(&["de"])).await.unwrap().remove(0);
         assert_eq!(path, dir.join("voices/b.safetensors"));
-        assert!(catalog_voices(dir.join("missing").to_str().unwrap(), "en").await.is_err());
+        assert!(catalog_voices(dir.join("missing").to_str().unwrap(), None).await.is_err());
     }
 }
 
