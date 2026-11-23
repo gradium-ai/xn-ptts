@@ -18,8 +18,8 @@ use xn::{BackendQ, Result, Tensor};
 #[cfg(feature = "cuda")]
 pub use cuda::StepGraph;
 
-/// The cache sizes a graph is recorded for; a generation takes the smallest that holds its
-/// sequence budget. A one-shot generation's budget is its text plus at least
+/// The cache sizes a graph is recorded for; a generation takes the smallest that holds the
+/// positions it needs. A one-shot generation's budget is its text plus at least
 /// [`PROMPT_SEQ_HEADROOM`](crate::plan::PROMPT_SEQ_HEADROOM), so always above 512, and stays
 /// under 2048 with a voice prompt of up to 512 frames. Every slot is attended over, masked or
 /// not, so steps of 512 keep the unused ones, which cost time per frame, to fewer than 512.
@@ -41,10 +41,11 @@ impl<Q: BackendQ> GraphPool<Q> {
         Self { steps: Mutex::new(steps) }
     }
 
-    /// The smallest free step graph that generations from `base` fit, if any.
-    pub fn take(&self, base: &TTSState<Q>) -> Option<StepGraph<Q>> {
+    /// The smallest free step graph that a generation from `base`, filling up to `needed`
+    /// positions, fits, if any.
+    pub fn take(&self, base: &TTSState<Q>, needed: usize) -> Option<StepGraph<Q>> {
         let mut steps = self.steps.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let fitting = steps.iter().enumerate().filter(|(_, g)| g.fits(base));
+        let fitting = steps.iter().enumerate().filter(|(_, g)| g.fits(base, needed));
         fitting.min_by_key(|(_, g)| g.kv()).map(|(i, _)| i).map(|i| steps.swap_remove(i))
     }
 
@@ -68,7 +69,7 @@ impl<Q: BackendQ> StepGraph<Q> {
         xn::bail!("CUDA graphs need the cuda feature")
     }
 
-    fn fits(&self, _: &TTSState<Q>) -> bool {
+    fn fits(&self, _: &TTSState<Q>, _: usize) -> bool {
         match self.0 {}
     }
 
@@ -196,12 +197,13 @@ mod cuda {
             Ok(step)
         }
 
-        /// Whether generations from `base` can run in this graph's state: one of at most this
-        /// graph's size, since the mask hides the slots it leaves unfilled.
-        pub(super) fn fits(&self, base: &TTSState<Q>) -> bool {
+        /// Whether a generation from `base` that fills up to `needed` positions can run in
+        /// this graph's state: one of up to this graph's size, since the mask hides the slots it
+        /// leaves unfilled, whatever the size of `base`'s own caches.
+        pub(super) fn fits(&self, base: &TTSState<Q>, needed: usize) -> bool {
             let ours = self.state.flow_lm_state.conditions.as_ref().map(|c| c.dims().to_vec());
             let theirs = base.flow_lm_state.conditions.as_ref().map(|c| c.dims().to_vec());
-            matches!(cache(base), Some((_, [1, budget, _, _])) if budget <= self.kv)
+            matches!(cache(base), Some((filled, [1, _, _, _])) if filled.max(needed) <= self.kv)
                 && ours == theirs
         }
 
