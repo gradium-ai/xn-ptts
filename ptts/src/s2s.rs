@@ -7,6 +7,7 @@
 
 use crate::flow_lm::{NormalRng, StepInput};
 use crate::mimi::{MimiDecoderState, MimiEncoder, MimiEncoderState};
+use crate::plan::FadeIn;
 use crate::tts_model::{TTSConfig, TTSModel, TTSState};
 use std::time::{Duration, Instant};
 use xn::nn::{Linear, var_builder::Path};
@@ -179,6 +180,7 @@ impl<Q: BackendQ> SpeechToSpeech<Q> {
             encoder_state: self.source.init_state()?,
             flow: TTSState { flow_lm_state },
             decoder_state: self.model.init_mimi_state(1)?,
+            fade: FadeIn::new(self.model.sample_rate()),
             rng: NormalRng::new(opts.temperature, opts.seed)?,
             lsd_decode_steps: opts.lsd_decode_steps.unwrap_or(self.lsd_decode_steps),
             empty_text: Tensor::zeros((1, 0, d_model), self.model.device())?,
@@ -226,6 +228,9 @@ pub struct Session<'a, Q: BackendQ> {
     encoder_state: MimiEncoderState<f32, Q::B>,
     flow: TTSState<Q>,
     decoder_state: MimiDecoderState<f32, Q::B>,
+    /// The fade-in over the stream's first output samples, which hides the decoder's start
+    /// from a blank state.
+    fade: FadeIn,
     rng: NormalRng,
     lsd_decode_steps: usize,
     empty_text: Tensor<Q::T, Q::B>,
@@ -349,7 +354,9 @@ impl<Q: BackendQ> Session<'_, Q> {
         let decode = Instant::now();
         self.times.flow += decode - start;
         if self.steps > delay {
-            out.extend(model.decode_latent(&latent, &mut self.decoder_state)?.to_vec()?);
+            let mut pcm = model.decode_latent(&latent, &mut self.decoder_state)?.to_vec()?;
+            self.fade.apply(&mut pcm);
+            out.extend(pcm);
             self.times.decode += decode.elapsed();
         }
         self.previous = Some(latent);
