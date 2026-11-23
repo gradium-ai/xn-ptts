@@ -197,7 +197,10 @@ impl Session<'_> {
 
         let pcm = if self.steps > cfg.delay {
             let start = Instant::now();
-            let pcm = self.mimi.decode(self.decoded, &latent)?;
+            let mut pcm = self.mimi.decode(self.decoded, &latent)?;
+            if self.decoded == 0 {
+                fade_in(&mut pcm);
+            }
             self.decoded += 1;
             self.times.decode += start.elapsed();
             Some(pcm)
@@ -211,6 +214,18 @@ impl Session<'_> {
     /// Time spent in each stage so far.
     pub fn times(&self) -> StageTimes {
         self.times
+    }
+}
+
+/// Samples the stream's first output fades in over: 20 ms of Mimi's 24 kHz.
+const FADE_IN: usize = 480;
+
+/// Fades in the stream's first output, as ptts's `plan::FadeIn` does: Mimi starts from a blank
+/// state, and the first few milliseconds it decodes from it hold a short burst, a click at the
+/// start of the stream. A frame is longer than the fade, so the first one holds all of it.
+fn fade_in(pcm: &mut [f32]) {
+    for (i, sample) in pcm.iter_mut().take(FADE_IN).enumerate() {
+        *sample *= 0.5 - 0.5 * (std::f32::consts::PI * i as f32 / FADE_IN as f32).cos();
     }
 }
 
@@ -243,6 +258,16 @@ fn rotate_back(dm: &fl::Dims, ring: &Ring, prefix: usize, count: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_first_frame_fades_in_over_its_first_20_ms_only() {
+        let mut pcm = vec![1.0f32; 1920];
+        fade_in(&mut pcm);
+        assert_eq!(pcm[0], 0.0);
+        assert!(pcm[..FADE_IN].windows(2).all(|w| w[0] <= w[1]));
+        assert!(pcm[FADE_IN - 1] > 0.99);
+        assert!(pcm[FADE_IN..].iter().all(|&s| s == 1.0));
+    }
 
     /// `x` rotated to position `pos` the way the graph embeds keys: the first half of the
     /// channels against the second.
