@@ -1072,14 +1072,7 @@ impl<Q: BackendQ> SessionOf<Q> {
                     let pcm = decode_model
                         .decode_latent(&latent, &mut state)
                         .and_then(|audio| audio.narrow(0, ..1)?.contiguous()?.to_vec())
-                        .map(|mut pcm| {
-                            fade.apply(&mut pcm);
-                            post.process(&mut pcm);
-                            let n = skip.min(pcm.len());
-                            skip -= n;
-                            pcm.drain(..n);
-                            pcm
-                        })
+                        .map(|pcm| finish_pcm(pcm, &mut fade, &mut post, &mut skip))
                         .map_err(Error::from);
                     let failed = pcm.is_err();
                     if decode_tx.send(pcm).is_err() || failed {
@@ -1254,6 +1247,21 @@ impl FadeIn {
             self.pos += 1;
         }
     }
+}
+
+/// Fade, post-process and drop the chain's primed samples from one decoded block.
+fn finish_pcm(
+    mut pcm: Vec<f32>,
+    fade: &mut FadeIn,
+    post: &mut Chain,
+    skip: &mut usize,
+) -> Vec<f32> {
+    fade.apply(&mut pcm);
+    post.process(&mut pcm);
+    let n = (*skip).min(pcm.len());
+    *skip -= n;
+    pcm.drain(..n);
+    pcm
 }
 
 /// Messages from the flow-LM thread to the decoder thread.
@@ -1434,14 +1442,7 @@ fn run_inline<Q: BackendQ>(
             let pcm = model
                 .decode_latent(&next, &mut mimi_state)
                 .and_then(|audio| audio.narrow(0, ..1)?.contiguous()?.to_vec())
-                .map(|mut pcm| {
-                    fade.apply(&mut pcm);
-                    post.process(&mut pcm);
-                    let n = skip.min(pcm.len());
-                    skip -= n;
-                    pcm.drain(..n);
-                    pcm
-                })
+                .map(|pcm| finish_pcm(pcm, &mut fade, &mut post, &mut skip))
                 .map_err(Error::from);
             let failed = pcm.is_err();
             // A closed channel means the consumer went away; stop quietly and let the caller
