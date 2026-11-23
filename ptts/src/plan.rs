@@ -94,6 +94,45 @@ impl EosPolicy {
     }
 }
 
+/// Length of the fade-in at the start of each chunk's audio, in milliseconds.
+pub const FADE_IN_MS: usize = 20;
+
+/// Fades in the start of each chunk's audio.
+///
+/// The Mimi decoder starts every chunk from a blank state, and the first few milliseconds it
+/// decodes from that state hold a short burst: a click in the silence before each sentence. The
+/// speech itself starts well after the fade, so fading in removes the click and leaves the
+/// speech alone.
+///
+/// `Synth` applies it itself; a frontend that decodes chunks on its own runs
+/// each chunk's decoded audio through one, restarted wherever it resets the decoder.
+#[derive(Clone, Debug)]
+pub struct FadeIn {
+    len: usize,
+    pos: usize,
+}
+
+impl FadeIn {
+    /// A fade of [`FADE_IN_MS`] at `sample_rate`, at the start of a chunk.
+    pub fn new(sample_rate: usize) -> Self {
+        Self { len: sample_rate * FADE_IN_MS / 1000, pos: 0 }
+    }
+
+    /// Start the fade again, for the next chunk.
+    pub fn restart(&mut self) {
+        self.pos = 0;
+    }
+
+    /// Fade in the next samples of the chunk, carrying on from where the last call stopped.
+    pub fn apply(&mut self, pcm: &mut [f32]) {
+        for sample in pcm.iter_mut().take(self.len.saturating_sub(self.pos)) {
+            let t = self.pos as f32 / self.len as f32;
+            *sample *= 0.5 - 0.5 * (std::f32::consts::PI * t).cos();
+            self.pos += 1;
+        }
+    }
+}
+
 /// One piece of the text, ready to prompt the model with.
 ///
 /// Built by [`chunks`] or [`Chunk::new`], so the budgets always match the tokens.
@@ -612,5 +651,40 @@ mod tests {
         assert!(!policy.saw_eos());
         policy.should_stop(true);
         assert!(policy.saw_eos());
+    }
+
+    #[test]
+    fn the_fade_in_rises_from_silence_and_leaves_the_rest_alone() {
+        let mut fade = FadeIn::new(24_000);
+        let len = 24_000 * FADE_IN_MS / 1000;
+        let mut pcm = vec![1.0f32; len + 10];
+        fade.apply(&mut pcm);
+        assert_eq!(pcm[0], 0.0);
+        assert!(pcm[..len].windows(2).all(|w| w[0] <= w[1]));
+        assert!(pcm[len - 1] > 0.99);
+        assert!(pcm[len..].iter().all(|&s| s == 1.0));
+        // Done: later audio of the same chunk is untouched.
+        let mut more = vec![1.0f32; 4];
+        fade.apply(&mut more);
+        assert_eq!(more, vec![1.0; 4]);
+    }
+
+    #[test]
+    fn the_fade_in_carries_across_calls_and_restarts_per_chunk() {
+        let len = 24_000 * FADE_IN_MS / 1000;
+        let mut whole = vec![1.0f32; len + 5];
+        FadeIn::new(24_000).apply(&mut whole);
+
+        let mut fade = FadeIn::new(24_000);
+        let mut split = vec![1.0f32; len + 5];
+        let (a, b) = split.split_at_mut(7);
+        fade.apply(a);
+        fade.apply(b);
+        assert_eq!(split, whole);
+
+        fade.restart();
+        let mut next = vec![1.0f32; len + 5];
+        fade.apply(&mut next);
+        assert_eq!(next, whole);
     }
 }

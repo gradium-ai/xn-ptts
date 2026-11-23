@@ -79,7 +79,7 @@
 import { parseGguf } from './gguf.js';
 import { buildWeights, toHalf } from './weights.js';
 import { GpuLM, S_MAX, F_MAX, ROWS_MAX } from './lm.js';
-import { GpuCodec, CHUNKS, FRAME } from './codec.js';
+import { GpuCodec, CHUNKS, FRAME, fadeIn } from './codec.js';
 import { ST, ST_WORDS } from './kernels.js';
 import { DispatchBuilder } from './dispatch.js';
 import { unsupportedConfig, unsupportedWeights } from './support.js';
@@ -267,6 +267,7 @@ class ChunkRun {
         if (!stopped && this.cancelled()) stopped = true;
         const pcm = this.#take(oldest, !stopped);
         if (pcm) {
+          fadeIn(pcm, this.delivered * FRAME);
           this.delivered += pcm.length / FRAME;
           this.onAudio(pcm);
         }

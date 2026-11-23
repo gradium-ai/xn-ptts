@@ -132,6 +132,9 @@ fn plan_chunks(
 struct ChunkState<Q: BackendQ<T = f32>> {
     tts_state: TTSState<Q>,
     mimi_state: MimiDecoderState<f32, Q::B>,
+    /// The fade-in over the chunk's first samples, which hides the decoder's start from a blank
+    /// state.
+    fade: plan::FadeIn,
     prev_latent: Option<Tensor<f32, Q::B>>,
     frame_budget: usize,
     eos: EosPolicy,
@@ -252,6 +255,7 @@ impl<Q: BackendQ<T = f32>> Engine<Q> {
         gen_state.current = Some(ChunkState {
             tts_state,
             mimi_state,
+            fade: plan::FadeIn::new(self.model.sample_rate()),
             prev_latent: None,
             frame_budget: chunk.frame_budget,
             eos: EosPolicy::new(chunk.frames_after_eos),
@@ -277,7 +281,8 @@ impl<Q: BackendQ<T = f32>> Engine<Q> {
         let (latent, eos_logit) = model.generate_step_parts(&mut chunk.tts_state, input, rng)?;
         let pcm = model.decode_latent(&latent, &mut chunk.mimi_state)?;
         let pcm = pcm.narrow(0, ..1)?.contiguous()?;
-        let pcm = pcm.reshape(pcm.elem_count())?.to_vec()?;
+        let mut pcm = pcm.reshape(pcm.elem_count())?.to_vec()?;
+        chunk.fade.apply(&mut pcm);
         chunk.prev_latent = Some(latent);
         chunk.step += 1;
         // `should_stop` is asked after each frame, so that frame itself is part of the

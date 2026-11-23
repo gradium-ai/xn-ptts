@@ -7,6 +7,7 @@ import { chooseReductions, seed32, unsupportedConfig, unsupportedWeights } from 
 import { GGML, parseGguf, safetensorsOf, tensorBytes } from '../gpu/gguf.js';
 import { fromHalf, tensorF32, toHalf } from '../gpu/weights.js';
 import * as K from '../gpu/kernels.js';
+import { FADE_IN, fadeIn } from '../gpu/codec.js';
 import { settleDevice } from '../device.js';
 
 /** The parts of `gradium/phonon-31m-en`'s config.json the engine reads. */
@@ -218,3 +219,18 @@ test('every kernel generates for both reduction styles', () => {
   }
   assert.throws(() => K.gemv({ sg: true, K: 48, N: 8, wmode: 'q8' }), /multiple of 32 words/);
 });
+
+test('each chunk fades in over its first 20 ms, in any number of pieces, and no further', () => {
+  const whole = new Float32Array(FADE_IN + 100).fill(1);
+  fadeIn(whole, 0);
+  assert.equal(whole[0], 0);
+  assert.ok(whole.subarray(0, FADE_IN).every((v, i, a) => i === 0 || a[i - 1] <= v));
+  assert.ok(whole[FADE_IN - 1] > 0.99);
+  assert.ok(whole.subarray(FADE_IN).every((v) => v === 1));
+
+  const pieces = new Float32Array(FADE_IN + 100).fill(1);
+  fadeIn(pieces.subarray(0, 7), 0);
+  fadeIn(pieces.subarray(7), 7);
+  assert.deepEqual(pieces, whole);
+});
+

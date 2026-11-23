@@ -4,12 +4,15 @@
 //! `ptts_coreml`'s.
 
 use crate::{PTTS_UNIT_ANE, PTTS_UNIT_CPU, PttsResult};
-use ptts::plan::Chunk;
+use ptts::plan::{Chunk, FadeIn};
 use ptts::preprocess::Normalize;
 use ptts_coreml::Weights;
 use ptts_coreml::phonon::driver::{Config, Phonon, Voice};
 use ptts_coreml::run::Compute;
 use std::path::{Path, PathBuf};
+
+/// The rate of the audio the C API hands out.
+const SAMPLE_RATE: usize = 24_000;
 
 pub struct Engine {
     phonon: Phonon,
@@ -166,6 +169,8 @@ impl Engine {
         let mut pcm_buf = Vec::new();
         for chunk in chunks {
             let (tokens, budget) = (&chunk.tokens, chunk.frame_budget);
+            // Mimi starts each chunk from a blank state; the fade hides the burst that makes.
+            let mut fade = FadeIn::new(SAMPLE_RATE);
             let t = self.phonon.generate(
                 tokens,
                 chunk.frames_after_eos,
@@ -175,6 +180,7 @@ impl Engine {
                     // rather than send it to the speaker.
                     pcm_buf.clear();
                     pcm_buf.extend(pcm.iter().map(|v| if v.is_finite() { *v } else { 0.0 }));
+                    fade.apply(&mut pcm_buf);
                     sink(&pcm_buf)
                 },
             )?;

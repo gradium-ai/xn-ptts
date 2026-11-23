@@ -1,5 +1,6 @@
 #include "phonon.hpp"
 #include "bundle.hpp"
+#include "fade.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -259,6 +260,8 @@ void Phonon::generate_chunk(const Chunk& chunk, const Voice& voice,
 
   int eos_frame = -1;
   std::vector<float> pcm(buf_.audio_count);
+  const size_t fade_len = fade_in_len(sample_rate_);
+  size_t delivered = 0;  // samples of this chunk so far, for the fade-in
   for (int frame = 0; frame < max_frames; frame++) {
     if (should_stop && should_stop()) { stats.cancelled = true; return; }
     auto t = Clock::now();
@@ -284,6 +287,8 @@ void Phonon::generate_chunk(const Chunk& chunk, const Voice& voice,
     if (eos_frame >= 0 && frame >= eos_frame + frames_after_eos) break;
 
     for (size_t k = 0; k < buf_.audio_count; k++) pcm[k] = float(buf_.audio[k]);
+    fade_in(pcm.data(), pcm.size(), delivered, fade_len);
+    delivered += pcm.size();
     if (collect_audio) out.insert(out.end(), pcm.begin(), pcm.end());
     stats.samples += pcm.size();
     stats.frames++;
