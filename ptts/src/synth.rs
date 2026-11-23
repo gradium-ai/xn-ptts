@@ -825,11 +825,14 @@ impl<Q: BackendQ> SynthApi for SynthOf<Q> {
 }
 
 /// A step graph for each of [`GRAPH_SIZES`], from the default voice's primed state at that
-/// size. One the voice prompt does not leave room in is skipped; a failure ends the recording
-/// with a warning, as generation runs without graphs too.
-fn record_step_graphs<Q: BackendQ>(synth: &SynthOf<Q>) -> Vec<StepGraph<Q>> {
+/// size, then `extra` more of the largest, which every generation with a graph fits. A
+/// generation takes the smallest free graph it fits, so with `extra` of them `extra + 1`
+/// generations at once each find one. One the voice prompt does not leave room in is skipped;
+/// a failure ends the recording with a warning, as generation runs without graphs too.
+fn record_step_graphs<Q: BackendQ>(synth: &SynthOf<Q>, extra: usize) -> Vec<StepGraph<Q>> {
     let mut steps = Vec::new();
-    for size in GRAPH_SIZES {
+    let largest = GRAPH_SIZES[GRAPH_SIZES.len() - 1];
+    for size in GRAPH_SIZES.into_iter().chain(std::iter::repeat_n(largest, extra)) {
         let recorded = match synth.primed_state(None, size, None) {
             Ok((base, _)) => StepGraph::record(&synth.model, &base).map_err(Error::from),
             Err(Error::VoicePromptTooLong { .. }) => continue,
@@ -991,7 +994,7 @@ impl<Q: BackendQ> SessionOf<Q> {
             let graphs = Arc::clone(&self.graphs);
             let handle = std::thread::spawn(move || {
                 let _in_flight = in_flight;
-                let result = with_step_graph(&graphs, &base_state, &cfg_base, |graph| {
+                let result = with_step_graph(&graphs, &base_state, needed, &cfg_base, |graph| {
                     let (base, cfg) = (&base_state, &cfg_base);
                     run_inline(&model, graph, chunks, base, cfg, rng, mimi_init, &pcm_tx, post)
                 });
@@ -1104,7 +1107,7 @@ impl<Q: BackendQ> SessionOf<Q> {
             let backbone_handle = std::thread::spawn(move || {
                 // Dropped when this thread ends, which is after its last write.
                 let _in_flight = in_flight;
-                let result = with_step_graph(&graphs, &base_state, &cfg_base, |graph| {
+                let result = with_step_graph(&graphs, &base_state, needed, &cfg_base, |graph| {
                     let (base, cfg) = (&base_state, &cfg_base);
                     run_backbone(&model, graph, chunks, base, cfg, rng, &latent_tx, first_rx)
                 });
@@ -1299,16 +1302,18 @@ impl<Q: BackendQ> FrameEos<Q> {
     }
 }
 
-/// Run a generation from `base_state` with a recorded step graph if one is free and fits it,
-/// never under guidance, and give the graph back to the pool afterwards.
+/// Run a generation from `base_state`, filling up to `needed` positions, with a recorded step
+/// graph if one is free and fits it, never under guidance, and give the graph back to the pool
+/// afterwards.
 fn with_step_graph<Q: BackendQ>(
     graphs: &GraphPool<Q>,
     base_state: &TTSState<Q>,
+    needed: usize,
     cfg_base: &Option<(f32, TTSState<Q>)>,
     run: impl FnOnce(Option<&mut StepGraph<Q>>) -> Result<()>,
 ) -> Result<()> {
     let mut graph = match cfg_base {
-        None => graphs.take(base_state),
+        None => graphs.take(base_state, needed),
         Some(_) => None,
     };
     let result = run(graph.as_mut());
@@ -1528,6 +1533,7 @@ pub struct SynthBuilder {
     device: DeviceKind,
     quant: Quant,
     quantize_mimi: bool,
+    concurrent_generations: usize,
     tokenizer: Option<Box<dyn crate::Tokenizer + Send + Sync>>,
     temperature: f32,
     seed: u64,
@@ -1582,6 +1588,7 @@ impl SynthBuilder {
             device: DeviceKind::Auto,
             quant: Quant::F32,
             quantize_mimi: false,
+            concurrent_generations: 1,
             tokenizer: None,
             temperature: 0.3,
             seed: 4242424242424242,
@@ -1617,6 +1624,17 @@ impl SynthBuilder {
     /// [`TTSModel::quantize_mimi`]. Off by default. CPU only.
     pub fn quantize_mimi(mut self, on: bool) -> Self {
         self.quantize_mimi = on;
+        self
+    }
+
+    /// How many generations the caller runs at once, one by default. On CUDA, each generation
+    /// replays its flow-LM step from a recorded graph (see `step_graph`), and one that finds
+    /// none free launches the step's few hundred kernels one by one instead: several times
+    /// slower, and slowing every other generation on the device with it. So the `Synth` records
+    /// a graph more for each generation past the first, about 25 MB of device memory each,
+    /// mostly its caches, and a few milliseconds at build. Ignored off CUDA; zero counts as one.
+    pub fn concurrent_generations(mut self, n: usize) -> Self {
+        self.concurrent_generations = n.max(1);
         self
     }
 
@@ -1907,7 +1925,8 @@ impl SynthBuilder {
         }
         // Now, while nothing else can use the device: see `step_graph`.
         if StepGraph::wanted(&synth.model) {
-            synth.graphs = Arc::new(GraphPool::new(record_step_graphs(&synth)));
+            let steps = record_step_graphs(&synth, self.concurrent_generations - 1);
+            synth.graphs = Arc::new(GraphPool::new(steps));
         }
         Ok(synth)
     }

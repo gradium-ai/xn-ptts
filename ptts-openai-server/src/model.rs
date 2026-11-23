@@ -156,7 +156,12 @@ pub async fn load_ptts(
         }
     }
     let frame_rate = m.config.mimi.frame_rate;
-    let mut builder = m.builder(normalize).device(device).quant(quant).temperature(temperature);
+    let mut builder = m
+        .builder(normalize)
+        .device(device)
+        .quant(quant)
+        .temperature(temperature)
+        .concurrent_generations(max_concurrent_requests.get());
     for (name, value) in conditions {
         builder = builder.condition(name, value);
     }

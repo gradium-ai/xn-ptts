@@ -191,11 +191,15 @@ private. `ptts-wasm` still drives `TTSModel` directly.
 
 On CUDA, `Synth` replays the flow LM's per-frame step as a CUDA graph (`step_graph.rs`): the
 step keeps its position on the device (`transformer::DeviceStep`), so one recording serves every
-position. The graphs, for caches of 1024, 1536 and 2048 positions, are recorded in
-`SynthBuilder::build` and only replayed after, because a capture takes in everything the
-device's one stream runs meanwhile, from any thread, frees included: never record one while
-anything else can use the device. A generation with guidance, or whose budget is larger, or that
-finds no free graph, runs without one. `PTTS_CUDA_GRAPHS=0` turns them off.
+position. The graphs, for caches of 1024, 1536 and 2048 positions, and one more of 2048 for
+each generation past the first that `SynthBuilder::concurrent_generations` says run at once
+(both servers pass their `--max-concurrent-requests`), are recorded in `SynthBuilder::build` and
+only replayed after, because a capture takes in everything the device's one stream runs
+meanwhile, from any thread, frees included: never record one while anything else can use the
+device. A generation takes the smallest free graph that holds the positions it needs, which a
+session sized larger than any graph (the WebSocket server's `--max-seq-len` 4096) still finds. A
+generation with guidance, or that needs more than 2048 positions, or that finds no free graph,
+runs without one. `PTTS_CUDA_GRAPHS=0` turns them off.
 
 `s2s::SpeechToSpeech` runs speech-to-speech checkpoints: the flow LM with no text, conditioned
 per frame on the input's own Mimi latents (`source_latents`, through `FlowLMState.conditions`)
