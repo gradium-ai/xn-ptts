@@ -17,9 +17,9 @@ let player = try PhononPlayer()
 try await player.play(tts.stream("Hello! This is running entirely on the phone."))
 ```
 
-It needs iOS 18 or macOS 15 on Apple silicon and Xcode 16. Mac Catalyst apps work too, on Apple
-silicon. Installed models take about twice the size of the model folder, because Core ML keeps a
-compiled copy beside each model, and a folder bundled in the app also stays in the app. Speaking
+It needs iOS 18, macOS 15 or visionOS 2 on Apple silicon and Xcode 16. Mac Catalyst apps work too,
+on Apple silicon. Installed models take about twice the size of the model folder, because Core ML
+keeps a compiled copy beside each model, and a folder bundled in the app also stays in the app. Speaking
 takes about 95 MB of memory. The simulator works, but without a Neural Engine it is several times
 slower than a device. The compiled core is built for arm64 only: set Excluded Architectures to
 `x86_64` in your app target, or a build for Any Mac, a Mac archive, a Mac Catalyst release build or
