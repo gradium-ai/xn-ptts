@@ -197,3 +197,205 @@ async fn closing_a_full_request_queue_releases_the_reader() {
     tokio::time::timeout(Duration::from_secs(2), reader).await.unwrap().unwrap();
     assert!(*cancel_rx.borrow());
 }
+
+mod language_per_session {
+    use super::*;
+    use crate::model::load_ptts;
+    use ptts::preprocess::Lang;
+
+    const PT: &str = "Temos R$ 10,50 e a Dra. Ana, em 2 de março, às 15h.";
+    const EN: &str = "We have $10.50 and Dr. Smith, on March 2nd at 3pm.";
+
+    #[test]
+    fn a_session_without_lang_gets_the_servers() {
+        let en = Normalize::for_lang(Lang::En);
+        assert_eq!(session_normalize(None, en, Rules::DEFAULT).unwrap(), en);
+        for blank in ["", "  "] {
+            assert_eq!(session_normalize(Some(blank), en, Rules::DEFAULT).unwrap(), en);
+        }
+    }
+
+    #[test]
+    fn lang_in_setup_is_parsed_like_the_flag() {
+        let en = Normalize::for_lang(Lang::En);
+        for (lang, want) in [("pt", "pt"), (" FR ", "fr"), ("nb", "no"), ("none", "none")] {
+            let got = session_normalize(Some(lang), en, Rules::DEFAULT).unwrap();
+            assert_eq!(got.as_str(), want, "{lang}");
+        }
+        assert_eq!(session_normalize(Some("off"), en, Rules::DEFAULT).unwrap(), Normalize::OFF);
+    }
+
+    #[test]
+    fn a_session_language_takes_the_servers_rewrite_rules() {
+        let en = Normalize::for_lang(Lang::En);
+        let all = session_normalize(Some("pt"), en, Rules::ALL).unwrap();
+        assert_eq!(all.rules(), Rules::ALL);
+    }
+
+    #[test]
+    fn an_unparseable_lang_names_it_and_the_accepted_ones() {
+        let en = Normalize::for_lang(Lang::En);
+        let message = session_normalize(Some("xx"), en, Rules::DEFAULT).unwrap_err();
+        assert!(message.contains("xx") && message.contains("pt"), "{message}");
+        assert!(message.contains("invalid lang"), "{message}");
+    }
+
+    #[test]
+    fn a_language_the_checkpoint_does_not_list_warns() {
+        let listed: Vec<String> = ["en", "fr", "de", "pt", "es"].map(String::from).into();
+        let norm = |lang: &str| session_normalize(Some(lang), Normalize::OFF, Rules::DEFAULT);
+        assert!(norm("pt").unwrap().language_warning(&listed).is_none());
+        assert!(norm("none").unwrap().language_warning(&listed).is_none());
+        let warning = norm("ja").unwrap().language_warning(&listed).unwrap();
+        assert!(warning.contains("ja") && warning.contains("fr"), "{warning}");
+    }
+
+    async fn load(catalog: bool) -> AppState {
+        let model = std::env::var("PTTS_TEST_MODEL").expect("set PTTS_TEST_MODEL");
+        load_ptts(
+            &model,
+            None,
+            catalog.then_some(ptts::voice_catalog::DEFAULT_VOICE_CATALOG),
+            ptts::synth::DeviceKind::Cpu,
+            ptts::synth::Quant::Q80,
+            0.3,
+            7,
+            1024,
+            Normalize::for_lang(Lang::En),
+            Rules::DEFAULT,
+            &[],
+            std::num::NonZeroUsize::new(2).unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Runs one session through `setup`, one text and `end_of_stream`: the PCM, or the error.
+    async fn speak(
+        app: &AppState,
+        voice: Option<&str>,
+        lang: Option<&str>,
+        text: &str,
+    ) -> Result<Vec<u8>, (u32, String)> {
+        let (req_tx, mut req_rx) = mpsc::channel(REQUEST_QUEUE);
+        let (reply_tx, mut reply_rx) = mpsc::channel(256);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let mut setup = serde_json::json!({"type": "setup", "output_format": "pcm"});
+        if let Some(voice) = voice {
+            setup["voice"] = voice.into();
+        }
+        if let Some(lang) = lang {
+            setup["lang"] = lang.into();
+        }
+        let msgs = [
+            setup.to_string(),
+            serde_json::json!({"type": "text", "text": text}).to_string(),
+            r#"{"type":"end_of_stream"}"#.to_string(),
+        ];
+        for m in msgs {
+            req_tx.send(Message::Text(m.into())).await.unwrap();
+        }
+        drop(req_tx);
+        let app = app.clone();
+        let run =
+            tokio::spawn(
+                async move { run_session(app, &mut req_rx, &reply_tx, &mut cancel_rx).await },
+            );
+        let mut pcm = Vec::new();
+        while let Some(reply) = reply_rx.recv().await {
+            match reply {
+                TtsReply::Audio { audio, .. } => {
+                    use base64::Engine;
+                    pcm.extend(base64::engine::general_purpose::STANDARD.decode(audio).unwrap());
+                }
+                TtsReply::Error { message, code } => return Err((code, message)),
+                _ => {}
+            }
+        }
+        run.await.unwrap().unwrap();
+        Ok(pcm)
+    }
+
+    fn is_speech(pcm: &[u8]) -> bool {
+        pcm.as_chunks::<2>().0.iter().any(|b| i16::from_le_bytes(*b).abs() > 300)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PTTS_TEST_MODEL: a multilingual checkpoint folder or hf:// repo"]
+    async fn setup_accepts_any_lang_on_a_multilingual_checkpoint() {
+        let app = load(false).await;
+        for lang in [None, Some("pt"), Some("fr"), Some("none")] {
+            let pcm = speak(&app, None, lang, PT).await.unwrap();
+            assert!(is_speech(&pcm), "{lang:?}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PTTS_TEST_MODEL: a multilingual checkpoint folder or hf:// repo"]
+    async fn a_lang_the_checkpoint_does_not_list_still_speaks() {
+        let app = load(false).await;
+        assert!(app.synth.languages().iter().all(|l| l != "ja"));
+        let pcm = speak(&app, None, Some("ja"), EN).await.unwrap();
+        assert!(is_speech(&pcm));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PTTS_TEST_MODEL: a multilingual checkpoint folder or hf:// repo"]
+    async fn a_bad_lang_is_a_400_and_an_unknown_voice_a_404() {
+        let app = load(false).await;
+        let (code, message) = speak(&app, None, Some("xx"), EN).await.unwrap_err();
+        assert_eq!(code, error_codes::BAD_REQUEST, "{message}");
+        let (code, _) = speak(&app, Some("NoSuchVoice"), Some("pt"), PT).await.unwrap_err();
+        assert_eq!(code, error_codes::NOT_FOUND);
+    }
+
+    /// Catalog voices speak with their own accent; `lang` only picks the reading rules.
+    #[tokio::test]
+    #[ignore = "requires PTTS_TEST_MODEL and the Hub voice catalog"]
+    async fn any_catalog_voice_reads_any_language() {
+        let app = load(true).await;
+        let catalog =
+            ptts::voice_catalog::VoiceCatalog::new(ptts::voice_catalog::DEFAULT_VOICE_CATALOG)
+                .unwrap();
+        let listed = app.synth.languages();
+        let mut spoken = Vec::new();
+        for voice in catalog.voices().unwrap() {
+            let in_checkpoint = voice.language.as_ref().is_none_or(|l| listed.contains(l));
+            assert_eq!(app.voices.contains(&voice.name), in_checkpoint, "{}", voice.name);
+            if let Some(language) = &voice.language
+                && !spoken.contains(language)
+                && in_checkpoint
+            {
+                spoken.push(language.clone());
+            }
+        }
+        assert!(spoken.len() > 1, "the catalog should cover several languages: {spoken:?}");
+        let by_language = |lang: &str| {
+            catalog
+                .voices()
+                .unwrap()
+                .iter()
+                .find(|v| v.language.as_deref() == Some(lang))
+                .map(|v| v.name.clone())
+        };
+        let (pt_voice, en_voice) = (by_language("pt").unwrap(), by_language("en").unwrap());
+        for (voice, lang, text) in
+            [(&pt_voice, "en", EN), (&en_voice, "pt", PT), (&pt_voice, "pt", PT)]
+        {
+            let pcm = speak(&app, Some(voice), Some(lang), text).await.unwrap();
+            assert!(is_speech(&pcm), "{voice} as {lang}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PTTS_TEST_MODEL: a multilingual checkpoint folder or hf:// repo"]
+    async fn concurrent_sessions_in_different_languages_do_not_affect_each_other() {
+        let app = load(false).await;
+        let alone = speak(&app, None, Some("pt"), PT).await.unwrap();
+        let (pt, en) =
+            tokio::join!(speak(&app, None, Some("pt"), PT), speak(&app, None, Some("en"), PT));
+        let (pt, en) = (pt.unwrap(), en.unwrap());
+        assert_eq!(pt, alone, "a session's audio must not depend on its neighbours' language");
+        assert_ne!(pt, en, "the language must change how the same text is read");
+    }
+}
