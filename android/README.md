@@ -4,6 +4,11 @@ For supported Snapdragon NPUs, the [QNN AAR](../qnn/android/README.md) provides 
 Kotlin API and compiled model support on Android 12+ ARM64. Build it from this repository;
 the Maven package is not published yet. This guide covers the CPU library.
 
+The same library built with `FEATURES=litert ./android/build.sh` also runs models exported for
+[LiteRT](../ptts-litert/README.md), on the CPU, the GPU, or a Qualcomm or MediaTek NPU, through the
+same calls and the same Kotlin wrapper. [`ptts-litert/README.md`](../ptts-litert/README.md#in-an-android-app)
+lists the LiteRT libraries the app adds for that.
+
 Phonon runs on Android on the CPU as a C library: `libptts_ffi.so` and its header,
 [`ptts.h`](../ptts-ffi/include/ptts.h). Anything that can call C can use it: Kotlin and Java, C++
 through the NDK, Flutter, Unity, .NET and others. The iOS package exports the same calls, so one

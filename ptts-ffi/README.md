@@ -47,6 +47,9 @@ library can crash on an older CPU. To ship it to other machines, set a baseline 
 RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -p ptts-ffi
 ```
 
+With `--features litert`, the library also runs models exported for LiteRT, on the CPU, the GPU
+or an NPU: [`ptts-litert/README.md`](../ptts-litert/README.md#run-it) explains it.
+
 Phones and Apple apps have their own build scripts:
 
 - **Android:** [`android/build.sh`](../android/build.sh) builds `libptts_ffi.so` for phones and

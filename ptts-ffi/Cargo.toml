@@ -3,7 +3,7 @@ name = "ptts-ffi"
 version.workspace = true
 edition = "2024"
 publish = false
-description = "C interface to Phonon: Core ML on Apple, which the PhononTTS Swift package wraps, and the CPU elsewhere"
+description = "C interface to Phonon: Core ML on Apple, which the PhononTTS Swift package wraps, the CPU elsewhere, and LiteRT with the litert feature"
 repository.workspace = true
 license.workspace = true
 
@@ -16,6 +16,16 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # same prompt the other frontends do.
 ptts = { workspace = true, features = ["hf"] }
 serde_json = { workspace = true }
+# The LiteRT engine (`src/litert`), which loads LiteRT itself at run time.
+libc = { workspace = true, optional = true }
+rand = { workspace = true, features = ["std_rng"], optional = true }
+rand_distr = { workspace = true, optional = true }
+safetensors = { workspace = true, optional = true }
+
+[features]
+# Run bundles `ptts-litert export` wrote through LiteRT, on the CPU, the GPU or an NPU. Needs no
+# LiteRT SDK to build: the app ships LiteRT's libLiteRt.so and the engine loads it.
+litert = ["dep:libc", "dep:rand", "dep:rand_distr", "dep:safetensors"]
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 ptts-coreml = { path = "../ptts-coreml" }

@@ -2,7 +2,8 @@
 //
 //     speak MODEL LANG TEXT OUT.wav [VOICE [TEMPERATURE [SEED]]]
 //
-// MODEL is a checkpoint folder, or on Apple platforms a Core ML bundle. ../README.md shows how to
+// MODEL is a checkpoint folder, on Apple platforms a Core ML bundle, or with the library's litert
+// feature a LiteRT bundle. ../README.md shows how to
 // build the library and this program. A TEMPERATURE or SEED other than the model's gives another
 // take of the same text.
 
@@ -65,8 +66,20 @@ int main(int argc, char **argv) {
 #ifdef __APPLE__
     uint32_t unit = PTTS_UNIT_ANE;  // the Neural Engine
 #else
-    uint32_t unit = PTTS_UNIT_CPU;  // the only unit elsewhere
+    uint32_t unit = PTTS_UNIT_CPU;  // the only unit elsewhere, but for a LiteRT bundle
 #endif
+    // PTTS_UNIT picks another: cpu, gpu, ane or npu. A LiteRT bundle takes cpu, gpu or npu.
+    const char *u = getenv("PTTS_UNIT");
+    if (u) {
+        if (!strcmp(u, "cpu")) unit = PTTS_UNIT_CPU;
+        else if (!strcmp(u, "gpu")) unit = PTTS_UNIT_GPU;
+        else if (!strcmp(u, "ane")) unit = PTTS_UNIT_ANE;
+        else if (!strcmp(u, "npu")) unit = PTTS_UNIT_NPU;
+        else {
+            fprintf(stderr, "PTTS_UNIT is cpu, gpu, ane or npu, not %s\n", u);
+            return 2;
+        }
+    }
     // The slow call. An app loads once and keeps the handle.
     PttsHandle *h = ptts_new(model, unit, lang);
     if (!h) {
@@ -127,7 +140,9 @@ int main(int argc, char **argv) {
         perror(path);
         ok = false;
     }
-    if (ok) printf("%s: %.1f s of audio\n", path, (double)result.samples / SAMPLE_RATE);
+    if (ok)
+        printf("%s: %.1f s of audio in %.0f ms, the first after %.0f ms\n", path,
+               (double)result.samples / SAMPLE_RATE, result.total_ms, result.ttfa_ms);
     ptts_free(h);
     return ok ? 0 : 1;
 }

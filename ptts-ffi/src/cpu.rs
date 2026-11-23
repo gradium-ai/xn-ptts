@@ -5,7 +5,7 @@
 //! [`WEIGHTS`]), its own `config.json` and its voices
 //! in `voices/` or `embeddings/`, or as `default-voice.safetensors`.
 
-use crate::{PTTS_UNIT_CPU, PttsResult};
+use crate::{PTTS_UNIT_ANE, PTTS_UNIT_CPU, PttsResult};
 use ptts::checkpoint::read_config;
 use ptts::preprocess::Normalize;
 use ptts::synth::{DeviceKind, Quant, SpeechOptions, Synth, SynthBuilder};
@@ -32,8 +32,16 @@ pub struct Engine {
 
 impl Engine {
     pub fn open(dir: &Path, unit: u32, lang: &str) -> Result<Self, String> {
-        if unit != PTTS_UNIT_CPU {
-            return Err(format!("compute unit {unit} is Apple only; use PTTS_UNIT_CPU"));
+        match unit {
+            PTTS_UNIT_CPU => {}
+            PTTS_UNIT_ANE => {
+                return Err("the Neural Engine is Apple only; use PTTS_UNIT_CPU".into());
+            }
+            _ => {
+                return Err(format!(
+                    "compute unit {unit} needs a LiteRT bundle and the litert feature; a checkpoint folder runs on PTTS_UNIT_CPU"
+                ));
+            }
         }
         let normalize = lang.parse::<Normalize>().map_err(|e| e.to_string())?;
         let config = dir.join("config.json");
@@ -137,7 +145,6 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PTTS_UNIT_ANE;
 
     fn open_error(unit: u32, lang: &str) -> String {
         match Engine::open(Path::new("no-such-checkpoint"), unit, lang) {

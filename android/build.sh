@@ -4,6 +4,8 @@
 # Needs cargo-ndk (`cargo install cargo-ndk`) and an NDK it can find (ANDROID_NDK_HOME).
 #
 # Output: android/jniLibs/<abi>/libptts_ffi.so, to copy to an app's src/main/jniLibs.
+#
+# FEATURES=litert adds the LiteRT engine, for bundles ptts-litert writes (README.md).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -24,5 +26,5 @@ rustup target add aarch64-linux-android x86_64-linux-android >/dev/null
 # cargo-ndk skips the copy when the file already there is newer, so a cached build would leave a
 # library of other flags in place.
 rm -rf android/jniLibs
-cargo ndk -t arm64-v8a -t x86_64 -o android/jniLibs build --release -p ptts-ffi
+cargo ndk -t arm64-v8a -t x86_64 -o android/jniLibs build --release -p ptts-ffi ${FEATURES:+--features "$FEATURES"}
 du -sh android/jniLibs/*/libptts_ffi.so

@@ -65,6 +65,12 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS: -C target-feature=+dotprod,+fp16
         run: cargo clippy -p ptts-ffi --all-targets --target aarch64-linux-android -- -D warnings
+      # The LiteRT engine, on the host and for Android, where it picks a model by SoC. It loads
+      # LiteRT at run time, so this needs no LiteRT either.
+      - name: ptts-ffi with LiteRT
+        run: |
+          cargo clippy -p ptts-ffi --features litert --all-targets -- -D warnings
+          cargo clippy -p ptts-ffi --features litert --all-targets --target aarch64-linux-android -- -D warnings
 
   test:
     name: Test ${{ matrix.os }} / ${{ matrix.rust }}

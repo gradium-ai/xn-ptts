@@ -14,12 +14,14 @@ import com.sun.jna.Structure
  *
  * Every call blocks, so make them off the main thread, and from one thread at a time.
  *
- * @param modelDir a checkpoint folder: `tokenizer.json`, the weights and the voices.
+ * @param modelDir a checkpoint folder: `tokenizer.json`, the weights and the voices. With the
+ *   library built with its `litert` feature, a LiteRT bundle (`ptts-litert/README.md`) instead.
  * @param lang how to normalize text: `en`, `fr`, `de`, `es`, `pt`, or `none` to read it as written.
+ * @param unit where the model runs: [UNIT_CPU], or for a LiteRT bundle [UNIT_GPU] or [UNIT_NPU].
  */
-class PhononTTS(modelDir: String, lang: String) : AutoCloseable {
+class PhononTTS(modelDir: String, lang: String, unit: Int = UNIT_CPU) : AutoCloseable {
     private var handle: Pointer? =
-        lib.ptts_new(modelDir, 0, lang) ?: throw IllegalStateException(lib.ptts_last_error(null))
+        lib.ptts_new(modelDir, unit, lang) ?: throw IllegalStateException(lib.ptts_last_error(null))
 
     private var onAudio: (FloatArray) -> Boolean = { true }
 
@@ -133,7 +135,12 @@ class PhononTTS(modelDir: String, lang: String) : AutoCloseable {
         }
     }
 
-    private companion object {
-        val lib: Lib = Native.load("ptts_ffi", Lib::class.java)
+    companion object {
+        /** `PTTS_UNIT_*` in ptts.h. */
+        const val UNIT_CPU = 0
+        const val UNIT_GPU = 1
+        const val UNIT_NPU = 3
+
+        private val lib: Lib = Native.load("ptts_ffi", Lib::class.java)
     }
 }

@@ -1,5 +1,6 @@
 // C interface to Phonon: the Core ML driver on Apple, which the PhononTTS Swift package wraps,
-// and the CPU everywhere else, which android/PhononTTS.kt wraps.
+// the CPU everywhere else, which android/PhononTTS.kt wraps, and with the litert feature, LiteRT
+// on the CPU, GPU or an NPU.
 // Declared by hand: keep it in step with ../src/lib.rs, which documents each call in full.
 #ifndef PTTS_H
 #define PTTS_H
@@ -8,8 +9,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Where the model runs. Core ML takes ANE or CPU; a checkpoint folder CPU alone; a LiteRT bundle
+// (the library built with its litert feature) CPU, GPU or NPU.
 #define PTTS_UNIT_CPU 0
+#define PTTS_UNIT_GPU 1
 #define PTTS_UNIT_ANE 2
+#define PTTS_UNIT_NPU 3
 
 typedef struct PttsHandle PttsHandle;
 
@@ -27,7 +32,8 @@ typedef bool (*PttsFrameFn)(const float *pcm, size_t n, void *user);
 
 /// Load a model. On Apple, `dir` is an exported bundle, compiled for this device first if needed
 /// (once per install), and `unit` is PTTS_UNIT_ANE or PTTS_UNIT_CPU. Elsewhere, `dir` is a
-/// checkpoint folder and `unit` is PTTS_UNIT_CPU. `lang` is en, fr, de, es, pt, ar, hi, ko, pl, sv,
+/// checkpoint folder and `unit` is PTTS_UNIT_CPU. With the litert feature, a `dir` holding a
+/// model.tflite is a LiteRT bundle, and `unit` is PTTS_UNIT_CPU, PTTS_UNIT_GPU or PTTS_UNIT_NPU. `lang` is en, fr, de, es, pt, ar, hi, ko, pl, sv,
 /// fi, no, it, nl, ja or none. NULL on
 /// failure; then ptts_last_error(NULL), on the same thread, says why. A bundle without voices fails
 /// to load; a checkpoint folder without voices loads, lists none, and speaks in no particular

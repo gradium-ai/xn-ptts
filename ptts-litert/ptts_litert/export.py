@@ -155,6 +155,7 @@ def export(args):
         "temperature": args.temperature,
         "dims": {"d": fl["d_model"], "heads": fl["num_heads"], "layers": fl["num_layers"], "ldim": fl["ldim"]},
         "voices": [n for n, _ in voices],
+        "languages": cfg.get("languages", []),
         "conditions": given,
         "files": files,
     }

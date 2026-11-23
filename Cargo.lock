@@ -2861,8 +2861,12 @@ dependencies = [
 name = "ptts-ffi"
 version = "0.7.1"
 dependencies = [
+ "libc",
  "ptts",
  "ptts-coreml",
+ "rand 0.9.4",
+ "rand_distr",
+ "safetensors",
  "serde_json",
 ]
 

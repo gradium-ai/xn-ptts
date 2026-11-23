@@ -3,7 +3,9 @@
 //!
 //! The same calls run on one of two engines. On Apple platforms, `coreml` drives the Core ML
 //! driver, and `dir` is a bundle `export_coreml` wrote. Everywhere else, `cpu` runs
-//! `ptts::synth::Synth` on the CPU, and `dir` is a checkpoint folder.
+//! `ptts::synth::Synth` on the CPU, and `dir` is a checkpoint folder. With the `litert` feature,
+//! a `dir` holding a `model.tflite`, a bundle `ptts-litert export` wrote, runs on LiteRT instead,
+//! on the CPU, the GPU or an NPU (`litert`).
 //!
 //! `ptts_new` loads the model; it is the expensive call. `ptts_speak` may then be called
 //! repeatedly, streaming the audio to a callback as it is decoded.
@@ -19,15 +21,81 @@ use std::path::Path;
 #[cfg(target_vendor = "apple")]
 mod coreml;
 #[cfg(target_vendor = "apple")]
-use coreml::Engine;
+use coreml::Engine as Native;
 #[cfg(not(target_vendor = "apple"))]
 mod cpu;
 #[cfg(not(target_vendor = "apple"))]
-use cpu::Engine;
+use cpu::Engine as Native;
+#[cfg(feature = "litert")]
+mod litert;
 
-/// Where the flow LM runs. Only `PTTS_UNIT_CPU` exists off Apple.
+/// Where the model runs. Core ML takes `PTTS_UNIT_ANE` and `PTTS_UNIT_CPU`, the CPU engine
+/// `PTTS_UNIT_CPU` alone, and a LiteRT bundle `PTTS_UNIT_CPU`, `PTTS_UNIT_GPU` or
+/// `PTTS_UNIT_NPU`.
 pub const PTTS_UNIT_CPU: u32 = 0;
+pub const PTTS_UNIT_GPU: u32 = 1;
 pub const PTTS_UNIT_ANE: u32 = 2;
+pub const PTTS_UNIT_NPU: u32 = 3;
+
+/// The platform's own engine, or with the `litert` feature, LiteRT for a bundle
+/// `ptts-litert export` wrote. Boxed, as each is large and they differ in size.
+enum Engine {
+    Native(Box<Native>),
+    #[cfg(feature = "litert")]
+    LiteRt(Box<litert::Engine>),
+}
+
+macro_rules! each {
+    ($self:expr, $e:ident => $body:expr) => {
+        match $self {
+            Engine::Native($e) => $body,
+            #[cfg(feature = "litert")]
+            Engine::LiteRt($e) => $body,
+        }
+    };
+}
+
+impl Engine {
+    fn open(dir: &Path, unit: u32, lang: &str) -> Result<Self, String> {
+        #[cfg(feature = "litert")]
+        if litert::is_bundle(dir) {
+            return litert::Engine::open(dir, unit, lang).map(|e| Engine::LiteRt(Box::new(e)));
+        }
+        Native::open(dir, unit, lang).map(|e| Engine::Native(Box::new(e)))
+    }
+
+    fn voices(&self) -> &[String] {
+        each!(self, e => e.voices())
+    }
+
+    fn languages(&self) -> &[String] {
+        each!(self, e => e.languages())
+    }
+
+    fn set_voice(&mut self, name: &str) -> Result<(), String> {
+        each!(self, e => e.set_voice(name))
+    }
+
+    fn set_language(&mut self, lang: &str) -> Result<(), String> {
+        each!(self, e => e.set_language(lang))
+    }
+
+    fn set_temperature(&mut self, temperature: f32) {
+        each!(self, e => e.set_temperature(temperature))
+    }
+
+    fn set_seed(&mut self, seed: u64) {
+        each!(self, e => e.set_seed(seed))
+    }
+
+    fn speak(
+        &mut self,
+        text: &str,
+        sink: &mut dyn FnMut(&[f32]) -> bool,
+    ) -> Result<PttsResult, String> {
+        each!(self, e => e.speak(text, sink))
+    }
+}
 
 pub struct PttsHandle {
     engine: Engine,
@@ -95,7 +163,7 @@ fn open(dir: &Path, unit: u32, lang: &str) -> Result<PttsHandle, String> {
     Ok(PttsHandle { engine, voice_blob, language_blob, last_error: None })
 }
 
-/// Load the model in `dir` for `unit` (`PTTS_UNIT_ANE` or `PTTS_UNIT_CPU`), normalizing text as
+/// Load the model in `dir` for `unit` (a `PTTS_UNIT_*` the engine takes), normalizing text as
 /// `lang` (`en`, `fr`, `de`, `es`, `pt`, `ar`, `hi`, `ko`, `pl`, `sv`, `fi`, `no`, `it`, `nl`,
 /// `ja`, or `none`). On Apple, `dir` is an exported bundle,
 /// compiled for this device first if it has not been (once per install); elsewhere it is a
