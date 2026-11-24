@@ -360,7 +360,7 @@ mod language_per_session {
     }
 
     #[tokio::test]
-    #[ignore = "requires PTTS_TEST_MODEL: a multilingual checkpoint folder or hf:// repo"]
+    #[ignore = "requires PTTS_TEST_MODEL pointing to a multilingual q8 checkpoint"]
     async fn setup_accepts_any_lang_on_a_multilingual_checkpoint() {
         let app = load(false).await;
         for lang in [None, Some("pt"), Some("fr"), Some("none")] {
@@ -370,7 +370,7 @@ mod language_per_session {
     }
 
     #[tokio::test]
-    #[ignore = "requires PTTS_TEST_MODEL: a multilingual checkpoint folder or hf:// repo"]
+    #[ignore = "requires PTTS_TEST_MODEL pointing to a multilingual q8 checkpoint"]
     async fn a_lang_the_checkpoint_does_not_list_still_speaks() {
         let app = load(false).await;
         assert!(app.synth.languages().iter().all(|l| l != "ja"));
@@ -379,7 +379,7 @@ mod language_per_session {
     }
 
     #[tokio::test]
-    #[ignore = "requires PTTS_TEST_MODEL: a multilingual checkpoint folder or hf:// repo"]
+    #[ignore = "requires PTTS_TEST_MODEL pointing to a multilingual q8 checkpoint"]
     async fn a_bad_lang_is_a_400_and_an_unknown_voice_a_404() {
         let app = load(false).await;
         let (code, message) = speak(&app, None, Some("xx"), EN).await.unwrap_err();
@@ -390,7 +390,7 @@ mod language_per_session {
 
     /// Catalog voices speak with their own accent; `lang` only picks the reading rules.
     #[tokio::test]
-    #[ignore = "requires PTTS_TEST_MODEL and the Hub voice catalog"]
+    #[ignore = "requires PTTS_TEST_MODEL pointing to a multilingual q8 checkpoint and the Hub voice catalog"]
     async fn any_catalog_voice_reads_any_language() {
         let app = load(true).await;
         let catalog =
@@ -427,7 +427,7 @@ mod language_per_session {
     }
 
     #[tokio::test]
-    #[ignore = "requires PTTS_TEST_MODEL: a multilingual checkpoint folder or hf:// repo"]
+    #[ignore = "requires PTTS_TEST_MODEL pointing to a multilingual q8 checkpoint"]
     async fn setup_gives_the_session_the_normalization_of_its_lang() {
         let app = load(false).await;
         let cases = [
@@ -457,7 +457,7 @@ mod language_per_session {
     }
 
     #[tokio::test]
-    #[ignore = "requires PTTS_TEST_MODEL (the multilingual checkpoint: en, fr, de, pt, es) and the Hub voice catalog"]
+    #[ignore = "requires PTTS_TEST_MODEL pointing to a multilingual q8 checkpoint (en, fr, de, pt, es) and the Hub voice catalog"]
     async fn one_instance_serves_several_languages_per_session() {
         let app = load(true).await;
         let catalog =
