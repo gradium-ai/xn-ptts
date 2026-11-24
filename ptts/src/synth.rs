@@ -1974,11 +1974,12 @@ pub trait SynthApi: sealed::Sealed + Send + Sync {
     /// The config the model was loaded with.
     fn config(&self) -> &TTSConfig;
 
-    /// How requests are normalized.
+    /// The builder's normalization: what a request gets unless its [`SpeechOptions`] set their
+    /// own, and what [`SpeechOptions::normalize`] replaces.
     ///
-    /// Every text-taking method here applies it already; it is public for
-    /// callers that drive [`SessionApi::stream_tokens`] and so tokenize
-    /// themselves, and want [`Normalize::apply`] first.
+    /// Every text-taking method here applies the right one already; it is public for callers
+    /// that drive [`SessionApi::stream_tokens`] and so tokenize themselves, and want
+    /// [`Normalize::apply`] first: they take [`SessionApi::normalization`], the session's own.
     fn normalization(&self) -> Normalize;
 
     /// Name of the device the model is running on, e.g. `"cpu"` or `"cuda:0"`.
@@ -2348,8 +2349,10 @@ mod tests {
     fn a_requests_normalization_replaces_the_builders_for_that_request_only() {
         use crate::preprocess::Lang;
         let builder = Defaults { normalize: Normalize::for_lang(Lang::En), ..defaults() };
-        let pt = SpeechOptions::default().normalize(Lang::Pt);
-        assert_eq!(resolve(&builder, &pt).unwrap().normalize, Normalize::for_lang(Lang::Pt));
+        for &lang in Lang::ALL {
+            let own = SpeechOptions::default().normalize(lang);
+            assert_eq!(resolve(&builder, &own).unwrap().normalize, Normalize::for_lang(lang));
+        }
         assert_eq!(
             resolve(&builder, &SpeechOptions::default()).unwrap().normalize,
             Normalize::for_lang(Lang::En)

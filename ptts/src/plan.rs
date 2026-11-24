@@ -436,6 +436,22 @@ mod tests {
     }
 
     #[test]
+    fn a_decimal_comma_and_euro_plan_differently_in_german_and_french_than_in_english() {
+        use crate::preprocess::Lang;
+        let tok = Words::default();
+        let plan = |lang| {
+            let chunks =
+                chunks(&tok, "kostet 10,50 €", Normalize::for_lang(lang), 50, 12.5).unwrap();
+            chunks.into_iter().map(|c| c.text).collect::<Vec<_>>()
+        };
+        let en = plan(Lang::En);
+        for lang in [Lang::De, Lang::Fr] {
+            let own = plan(lang);
+            assert_ne!(own, en, "{lang:?} {own:?} en {en:?}");
+        }
+    }
+
+    #[test]
     fn empty_text_is_an_error() {
         let err = chunks(&Words::default(), "   ", Normalize::OFF, 50, 12.5).unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
