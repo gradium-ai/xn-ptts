@@ -64,6 +64,35 @@ async fn locate(model: &str, quant: Quant) -> Result<(Checkpoint, String)> {
     Ok((checkpoint, name))
 }
 
+/// The languages whose catalog voices a server offers. Sessions pick their language, so these are
+/// the languages the checkpoint lists plus the server's own `--lang`, which keeps a single-language
+/// checkpoint offering the voices of its `--lang`. `--lang none` offers them all (`None`).
+fn catalog_languages(lang: &str, listed: &[String]) -> Option<Vec<String>> {
+    if lang == "none" {
+        return None;
+    }
+    let mut langs = listed.to_vec();
+    if !langs.iter().any(|l| l == lang) {
+        langs.push(lang.to_string());
+    }
+    Some(langs)
+}
+
+/// Adds the catalog's voices after those of `--voice-dir`, which win a name both have: a user's own
+/// voice must not be replaced by a catalog voice that happens to share its name.
+fn add_catalog_voices(
+    extra_voices: &mut Vec<(String, std::path::PathBuf)>,
+    catalog: Vec<(String, std::path::PathBuf)>,
+) {
+    for (name, path) in catalog {
+        if extra_voices.iter().any(|(own, _)| *own == name) {
+            tracing::warn!(voice = %name, "catalog voice skipped: --voice-dir has one of that name");
+        } else {
+            extra_voices.push((name, path));
+        }
+    }
+}
+
 /// The voices of the catalog `source` names, each downloaded on first use: those in one of
 /// `langs` and those with no language, or all of them when `langs` is `None`. A voice that
 /// cannot be fetched is logged and skipped.
@@ -127,15 +156,9 @@ pub async fn load_ptts(
         Vec::new()
     };
     if let Some(catalog) = voice_catalog {
-        // Sessions pick their language, so offer the voices of every language the checkpoint
-        // lists. A config that lists none falls back to `--lang`; `--lang none` offers them all.
-        let langs = match (normalize.as_str(), m.config.languages.as_slice()) {
-            ("none", _) => None,
-            (lang, []) => Some(vec![lang.to_string()]),
-            (_, listed) => Some(listed.to_vec()),
-        };
+        let langs = catalog_languages(normalize.as_str(), &m.config.languages);
         match catalog_voices(catalog, langs).await {
-            Ok(voices) => extra_voices.extend(voices),
+            Ok(voices) => add_catalog_voices(&mut extra_voices, voices),
             // Offline, a server that needs no catalog voice still starts.
             Err(e) if catalog == DEFAULT_VOICE_CATALOG => {
                 tracing::warn!(error = %e, "the default voice catalog could not be read")
@@ -188,6 +211,31 @@ pub async fn load_ptts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_voice_dir_voice_wins_a_name_the_catalog_also_has() {
+        let voice = |name: &str, file: &str| (name.to_string(), std::path::PathBuf::from(file));
+        let mut extra = vec![voice("Alba", "mine.safetensors")];
+        add_catalog_voices(
+            &mut extra,
+            vec![voice("Alba", "catalog.safetensors"), voice("Zoey", "z")],
+        );
+        assert_eq!(extra, [voice("Alba", "mine.safetensors"), voice("Zoey", "z")]);
+    }
+
+    #[test]
+    fn the_catalog_languages_are_the_checkpoints_plus_the_servers() {
+        let listed = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let multi = listed(&["en", "fr", "de", "pt", "es"]);
+        assert_eq!(catalog_languages("pt", &multi), Some(multi.clone()));
+        assert_eq!(
+            catalog_languages("ja", &multi),
+            Some(listed(&["en", "fr", "de", "pt", "es", "ja"]))
+        );
+        assert_eq!(catalog_languages("fr", &listed(&["en"])), Some(listed(&["en", "fr"])));
+        assert_eq!(catalog_languages("fr", &[]), Some(listed(&["fr"])));
+        assert_eq!(catalog_languages("none", &multi), None);
+    }
 
     #[tokio::test]
     async fn the_catalog_voices_served_are_those_in_the_language() {
