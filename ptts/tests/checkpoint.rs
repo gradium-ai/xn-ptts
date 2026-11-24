@@ -250,3 +250,37 @@ fn private_checkpoint_synthesizes_through_the_public_api() {
     assert!(audio.iter().all(|x| x.is_finite()));
     assert!(audio.iter().any(|x| x.abs() > 0.01));
 }
+
+#[cfg(feature = "hf")]
+#[test]
+#[ignore = "requires PTTS_TEST_MODEL pointing to a multilingual checkpoint"]
+fn a_one_shot_call_normalizes_with_the_requests_language() {
+    use ptts::preprocess::Lang;
+    use ptts::synth::{DeviceKind, SpeechOptions};
+
+    let path = std::env::var("PTTS_TEST_MODEL").expect("set PTTS_TEST_MODEL");
+    let ck =
+        Checkpoint::resolve(path, ResolveOptions { quant: Quant::Q80, weights: None }).unwrap();
+    let synth_for = |lang| {
+        let mut synth = ck.builder(lang).device(DeviceKind::Cpu).build().unwrap();
+        ck.register_voices(&mut synth);
+        synth
+    };
+    let text = "A Dra. Ana tem R$ 10,50.";
+    let greedy = SpeechOptions::default().temperature(0.0).seed(1);
+    let in_pt = greedy.clone().normalize(Lang::Pt);
+
+    let overridden = synth_for(Lang::En).say_with(text, &in_pt).unwrap();
+    let native = synth_for(Lang::Pt).say_with(text, &greedy).unwrap();
+    let ignored = synth_for(Lang::En).say_with(text, &greedy).unwrap();
+
+    let gap = |a: &[f32], b: &[f32]| a.len().abs_diff(b.len());
+    assert!(
+        gap(&overridden, &native) < gap(&overridden, &ignored),
+        "the request's language must decide how its text is read: {} samples against {} in its \
+         language and {} in the builder's",
+        overridden.len(),
+        native.len(),
+        ignored.len(),
+    );
+}
