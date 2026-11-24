@@ -427,6 +427,36 @@ mod language_per_session {
     }
 
     #[tokio::test]
+    #[ignore = "requires PTTS_TEST_MODEL: a multilingual checkpoint folder or hf:// repo"]
+    async fn setup_gives_the_session_the_normalization_of_its_lang() {
+        let app = load(false).await;
+        let cases = [
+            (None, app.default_lang),
+            (Some("pt"), Normalize::for_lang(Lang::Pt)),
+            (Some("fr"), Normalize::for_lang(Lang::Fr)),
+            (Some("none"), Normalize::OFF),
+        ];
+        for (lang, expected) in cases {
+            let (reply_tx, _reply_rx) = mpsc::channel(8);
+            let state = handle_setup(
+                &app,
+                "pcm".into(),
+                None,
+                None,
+                None,
+                lang.map(String::from),
+                &reply_tx,
+            )
+            .await
+            .unwrap();
+            let Some(SessionState::Ready { session, .. }) = state else {
+                panic!("setup with lang {lang:?} did not produce a ready session");
+            };
+            assert_eq!(session.normalization(), expected, "{lang:?}");
+        }
+    }
+
+    #[tokio::test]
     #[ignore = "requires PTTS_TEST_MODEL (the multilingual checkpoint: en, fr, de, pt, es) and the Hub voice catalog"]
     async fn one_instance_serves_several_languages_per_session() {
         let app = load(true).await;
