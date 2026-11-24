@@ -292,6 +292,18 @@ fn session_normalize(
     Ok(parsed.with_rules(rules))
 }
 
+/// What `setup` fixes for a session before its voice is known: its own text normalization (`lang`,
+/// else the server's) and how much it speaks in one chunk.
+fn setup_options(
+    lang: Option<&str>,
+    default: Normalize,
+    rules: Rules,
+) -> std::result::Result<SpeechOptions, String> {
+    Ok(SpeechOptions::default()
+        .normalize(session_normalize(lang, default, rules)?)
+        .max_tokens_per_chunk(ptts::plan::MAX_FIT_TOKENS))
+}
+
 async fn handle_setup(
     app: &AppState,
     output_format: String,
@@ -310,16 +322,13 @@ async fn handle_setup(
         .await?;
         return Ok(None);
     }
-    let normalize = match session_normalize(lang.as_deref(), app.default_lang, app.rules) {
-        Ok(n) => n,
+    let session_opts = match setup_options(lang.as_deref(), app.default_lang, app.rules) {
+        Ok(opts) => opts,
         Err(message) => {
             send_error(reply_tx, error_codes::BAD_REQUEST, message).await?;
             return Ok(None);
         }
     };
-    if let Some(warning) = normalize.language_warning(app.synth.languages()) {
-        tracing::warn!("{warning}");
-    }
     let format = match output_format.parse::<Format>() {
         Ok(f) => f,
         Err(e) => {
@@ -351,16 +360,20 @@ async fn handle_setup(
             .await?;
         return Ok(None);
     }
+    // The server's own `--lang` was already checked when the model was built.
+    if lang.as_deref().is_some_and(|l| !l.trim().is_empty())
+        && let Some(normalize) = session_opts.normalize
+        && let Some(warning) = normalize.language_warning(app.synth.languages())
+    {
+        tracing::warn!("{warning}");
+    }
     tracing::info!(?voice_name, "starting new TTS session");
     // Conditioning on the voice happens once here, not per request: every
     // generation below clones this primed state.
     // Sentences are grouped up to the most a session speaks in one chunk, not
     // the usual few dozen tokens: every chunk boundary adds a pause, and a
     // request that fits in one chunk should be spoken as one.
-    let opts = SpeechOptions::default()
-        .voice(voice_name.clone())
-        .normalize(normalize)
-        .max_tokens_per_chunk(ptts::plan::MAX_FIT_TOKENS);
+    let opts = session_opts.voice(voice_name.clone());
     let session = match app.synth.session(&opts, app.max_seq_len) {
         Ok(session) => session,
         Err(e) => {

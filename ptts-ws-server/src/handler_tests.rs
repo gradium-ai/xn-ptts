@@ -226,6 +226,17 @@ mod language_per_session {
     }
 
     #[test]
+    fn setup_fixes_the_sessions_normalization_and_chunk_size() {
+        let en = Normalize::for_lang(Lang::En);
+        let own = setup_options(Some("pt"), en, Rules::DEFAULT).unwrap();
+        assert_eq!(own.normalize, Some(Normalize::for_lang(Lang::Pt)));
+        let servers = setup_options(None, en, Rules::DEFAULT).unwrap();
+        assert_eq!(servers.normalize, Some(en));
+        assert_eq!(own.max_tokens_per_chunk, Some(ptts::plan::MAX_FIT_TOKENS));
+        assert!(setup_options(Some("xx"), en, Rules::DEFAULT).is_err());
+    }
+
+    #[test]
     fn a_session_language_takes_the_servers_rewrite_rules() {
         let en = Normalize::for_lang(Lang::En);
         let all = session_normalize(Some("pt"), en, Rules::ALL).unwrap();
@@ -388,14 +399,38 @@ mod language_per_session {
     }
 
     #[tokio::test]
-    #[ignore = "requires PTTS_TEST_MODEL: a multilingual checkpoint folder or hf:// repo"]
-    async fn concurrent_sessions_in_different_languages_do_not_affect_each_other() {
-        let app = load(false).await;
-        let alone = speak(&app, None, Some("pt"), PT).await.unwrap();
-        let (pt, en) =
-            tokio::join!(speak(&app, None, Some("pt"), PT), speak(&app, None, Some("en"), PT));
-        let (pt, en) = (pt.unwrap(), en.unwrap());
-        assert_eq!(pt, alone, "a session's audio must not depend on its neighbours' language");
-        assert_ne!(pt, en, "the language must change how the same text is read");
+    #[ignore = "requires PTTS_TEST_MODEL (the multilingual checkpoint: en, fr, de, pt, es) and the Hub voice catalog"]
+    async fn one_instance_serves_several_languages_per_session() {
+        let app = load(true).await;
+        let catalog =
+            ptts::voice_catalog::VoiceCatalog::new(ptts::voice_catalog::DEFAULT_VOICE_CATALOG)
+                .unwrap();
+        let voices = catalog.voices().unwrap();
+        let voice_for = |lang: &str| {
+            voices.iter().find(|v| v.language.as_deref() == Some(lang)).unwrap().name.clone()
+        };
+        let en = Normalize::for_lang(Lang::En);
+        let opts = setup_options(Some("pt"), en, Rules::DEFAULT).unwrap().voice(voice_for("pt"));
+        let session = app.synth.session(&opts, 1024).unwrap();
+        assert_eq!(session.normalization(), Normalize::for_lang(Lang::Pt));
+        let cases = [
+            ("pt", "Temos R$ 10,50 e a Dra. Ana, em 2 de março, às 15h."),
+            ("en", "We have $10.50 and Dr. Smith, on March 2nd at 3pm."),
+            ("fr", "Nous avons 10,50 € et le Dr Martin, le 2 mars à 15 h."),
+            ("de", "Wir haben 10,50 € und Dr. Müller, am 2. März um 15 Uhr."),
+            ("es", "Tenemos 10,50 € y la Dra. Ana, el 2 de marzo a las 15 h."),
+            ("pt", "We have $10.50 and Dr. Smith, on March 2nd at 3pm."),
+        ];
+        for pair in cases.chunks(2) {
+            let app = &app;
+            let runs = pair.iter().map(|&(lang, text)| {
+                let voice = voice_for(lang);
+                async move { (lang, text, speak(app, Some(&voice), Some(lang), text).await) }
+            });
+            for (lang, text, pcm) in futures_util::future::join_all(runs).await {
+                let pcm = pcm.unwrap();
+                assert!(is_speech(&pcm), "{lang}: {text}");
+            }
+        }
     }
 }

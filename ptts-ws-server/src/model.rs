@@ -128,7 +128,7 @@ pub async fn load_ptts(
     };
     if let Some(catalog) = voice_catalog {
         // Sessions pick their language, so offer the voices of every language the checkpoint
-        // lists. A config that lists none, or `--lang none`, falls back to the default.
+        // lists. A config that lists none falls back to `--lang`; `--lang none` offers them all.
         let langs = match (normalize.as_str(), m.config.languages.as_slice()) {
             ("none", _) => None,
             (lang, []) => Some(vec![lang.to_string()]),
