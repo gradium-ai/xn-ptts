@@ -237,6 +237,34 @@ mod language_per_session {
     }
 
     #[test]
+    fn the_language_warning_is_for_a_lang_the_session_sent() {
+        let listed: Vec<String> = ["en", "fr"].map(String::from).into();
+        let ja = Normalize::for_lang(Lang::Ja);
+        assert!(setup_language_warning(None, ja, &listed).is_none());
+        assert!(setup_language_warning(Some(" "), ja, &listed).is_none());
+        assert!(setup_language_warning(Some("ja"), ja, &listed).is_some());
+        assert!(
+            setup_language_warning(Some("fr"), Normalize::for_lang(Lang::Fr), &listed).is_none()
+        );
+    }
+
+    #[test]
+    fn every_supported_language_is_accepted_in_setup() {
+        let en = Normalize::for_lang(Lang::En);
+        for &lang in Lang::ALL {
+            let want = Normalize::for_lang(lang);
+            let code = lang.as_str();
+            assert_eq!(session_normalize(Some(code), en, Rules::DEFAULT).unwrap(), want, "{code}");
+            let upper = format!(" {} ", code.to_uppercase());
+            assert_eq!(
+                session_normalize(Some(&upper), en, Rules::DEFAULT).unwrap(),
+                want,
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
     fn a_session_language_takes_the_servers_rewrite_rules() {
         let en = Normalize::for_lang(Lang::En);
         let all = session_normalize(Some("pt"), en, Rules::ALL).unwrap();

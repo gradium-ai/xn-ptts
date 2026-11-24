@@ -57,3 +57,24 @@ pub mod error_codes {
     pub const INTERNAL: u32 = 500;
     pub const NOT_IMPLEMENTED: u32 = 501;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lang_of(json: &str) -> Result<Option<String>, serde_json::Error> {
+        match serde_json::from_str::<TtsRequest>(json)? {
+            TtsRequest::Setup { lang, .. } => Ok(lang),
+            other => panic!("not a setup: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lang_in_setup_is_optional_and_a_string() {
+        let setup = |lang: &str| format!(r#"{{"type":"setup","output_format":"pcm"{lang}}}"#);
+        assert_eq!(lang_of(&setup("")).unwrap(), None);
+        assert_eq!(lang_of(&setup(r#","lang":null"#)).unwrap(), None);
+        assert_eq!(lang_of(&setup(r#","lang":"pt""#)).unwrap().as_deref(), Some("pt"));
+        assert!(lang_of(&setup(r#","lang":5"#)).is_err());
+    }
+}

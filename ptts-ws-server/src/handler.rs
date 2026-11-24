@@ -304,6 +304,17 @@ fn setup_options(
         .max_tokens_per_chunk(ptts::plan::MAX_FIT_TOKENS))
 }
 
+/// The warning for a `lang` the session sent that the checkpoint does not list. A session that
+/// sent none gets the server's `--lang`, which was already checked when the model was built.
+fn setup_language_warning(
+    sent: Option<&str>,
+    normalize: Normalize,
+    languages: &[String],
+) -> Option<String> {
+    sent.filter(|l| !l.trim().is_empty())?;
+    normalize.language_warning(languages)
+}
+
 async fn handle_setup(
     app: &AppState,
     output_format: String,
@@ -360,11 +371,11 @@ async fn handle_setup(
             .await?;
         return Ok(None);
     }
-    // The server's own `--lang` was already checked when the model was built.
-    if lang.as_deref().is_some_and(|l| !l.trim().is_empty())
-        && let Some(normalize) = session_opts.normalize
-        && let Some(warning) = normalize.language_warning(app.synth.languages())
-    {
+    if let Some(warning) = setup_language_warning(
+        lang.as_deref(),
+        session_opts.normalize.unwrap_or(app.default_lang),
+        app.synth.languages(),
+    ) {
         tracing::warn!("{warning}");
     }
     tracing::info!(?voice_name, "starting new TTS session");
