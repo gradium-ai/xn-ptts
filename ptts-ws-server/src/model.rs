@@ -273,11 +273,20 @@ mod checkpoint_tests {
     #[tokio::test]
     #[ignore = "requires PTTS_TEST_MODEL pointing to a private q8 checkpoint"]
     async fn private_checkpoint_loads_with_the_shared_default_voice() {
-        let path = std::path::PathBuf::from(
-            std::env::var("PTTS_TEST_MODEL").expect("set PTTS_TEST_MODEL"),
-        );
+        let source = std::env::var("PTTS_TEST_MODEL").expect("set PTTS_TEST_MODEL");
+        check_private_checkpoint(&source).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PTTS_TEST_MODEL_DIR pointing to a local folder of the private q8 checkpoint"]
+    async fn private_checkpoint_folder_loads_with_the_shared_default_voice() {
+        let source = std::env::var("PTTS_TEST_MODEL_DIR").expect("set PTTS_TEST_MODEL_DIR");
+        check_private_checkpoint(&source).await;
+    }
+
+    async fn check_private_checkpoint(source: &str) {
         let checkpoint =
-            Checkpoint::resolve(&path, ResolveOptions { quant: Quant::Q80, weights: None })
+            Checkpoint::locate(source, ResolveOptions { quant: Quant::Q80, weights: None })
                 .unwrap();
         let suffix =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -287,7 +296,7 @@ mod checkpoint_tests {
         std::fs::write(extra_dir.join("invalid.safetensors"), b"unreadable optional voice")
             .unwrap();
         let loaded = load_ptts(
-            path.to_str().unwrap(),
+            source,
             Some(&extra_dir),
             None,
             DeviceKind::Cpu,
