@@ -26,6 +26,7 @@ Reads a checkpoint directory (`config.json`, safetensors weights, `tokenizer.jso
 | `voices/<name>.safetensors` | Each voice as the embedding the flow LM is prompted with, `emb` [1, T, d]. |
 | `tokenizer.json` | The checkpoint's tokenizer. |
 | `bundle.json` | Sizes the runtime needs (KV cache slots, prefill rows, frame budget), the EOS threshold, the temperature, the voices, the languages, and every file's size and SHA-256. |
+| `model.mediatek.tflite` | The model again, with Mimi's ELU in a form MediaTek's compiler takes. Only `compile` reads it: it is not listed in `bundle.json` and does not go on the phone. |
 
 `--voices` takes the voices from a directory instead of the checkpoint. `--condition NAME=VALUE` sets a conditioner, as on the other frontends. `--max-tokens` is the number of rows one prefill call takes; together with the longest voice and the frames that much text may generate, it sizes the KV cache.
 
@@ -45,7 +46,7 @@ The check replays the dump's own noise. `--teacher` feeds each step ptts's previ
 
 ### compile
 
-Compiles `model.tflite` for each `VENDOR:SOC` into `npu/<Vendor>_<SoC>.tflite` and records it in `bundle.json` under `npu`. Only the three model signatures are offered to the NPU; the two table signatures stay on the CPU. The report says, per signature, how many ops reached the NPU and in how many pieces. One piece per signature is the goal: every boundary is a round trip between the CPU and the NPU.
+Compiles `model.tflite` (`model.mediatek.tflite` for MediaTek) for each `VENDOR:SOC` into `npu/<Vendor>_<SoC>.tflite` and records it in `bundle.json` under `npu`. Only the three model signatures are offered to the NPU; the two table signatures stay on the CPU. The report says, per signature, how many ops reached the NPU and in how many pieces. One piece per signature is the goal: every boundary is a round trip between the CPU and the NPU.
 
 The vendor compilers run on Linux x86_64 only. Installing the `compile` extra downloads the vendors' SDKs; the Qualcomm one unpacks to several gigabytes. Google Tensor's compiler is not public.
 
@@ -81,6 +82,10 @@ For `PTTS_UNIT_NPU` on Android, the engine reads the SoC from the `ro.soc.manufa
 
 `PTTS_LITERT_THREADS` sets how many CPU threads LiteRT uses. The default is the number of cores, at most 4.
 
+On a Qualcomm NPU the engine asks for the HTP's burst performance mode, which clocks it up while it runs, and has QNN log errors only. LiteRT's default mode leaves the NPU several times slower. `PTTS_LITERT_QNN_OPTIONS` adds to or replaces these settings with `key = value` pairs separated by `;`, from LiteRT's Qualcomm options (`litert/c/options/litert_qualcomm_options.cc`): `htp_performance_mode = 8` trades speed for power with the balanced mode, for example.
+
+`PTTS_LITERT_PROFILE`, set to anything, prints the time spent in each stage after every `ptts_speak`.
+
 ### In an Android app
 
 LiteRT's libraries come from Google's Maven repository, and the QNN runtime comes from Maven Central:
@@ -110,10 +115,10 @@ val tts = PhononTTS(File(filesDir, "phonon-litert").path, "en", PhononTTS.UNIT_N
 
 ### What has been checked
 
-- On macOS (CPU and Metal GPU) and on the Android emulator's CPU, the engine speaks the default model. On the CPU, with the same seed, its audio matches ptts's: same length and about 70 dB SNR. Whisper reads back the text in every case.
-- `compile` puts all three model signatures on the NPU in one piece each for Qualcomm SM8550, SM8650, SM8750 and SM8850, and MediaTek MT6989 and MT6991.
-- On a device without an NPU (the emulator), `PTTS_UNIT_NPU` falls back to the CPU and still speaks.
-- Not yet run on a phone's NPU.
+- On macOS (CPU and Metal GPU), on the Android emulator's CPU, and on Android phones' CPUs and GPUs, the engine speaks the default model. On the CPU, with the same seed, its audio matches ptts's: same length and over 70 dB SNR. Whisper reads back the text in every case.
+- On a Snapdragon phone (SM8850), `PTTS_UNIT_NPU` runs the three model signatures on the NPU, and Whisper reads back the text.
+- `compile` puts all three model signatures on the NPU in one piece each for Qualcomm SM8550, SM8650, SM8750 and SM8850, and MediaTek MT6989 and MT6991. The MediaTek models have not run on a phone yet.
+- On a phone whose SoC the bundle has no model for (an Exynos one), and on the emulator, `PTTS_UNIT_NPU` falls back to the CPU and still speaks.
 
 ## The model
 
@@ -131,6 +136,6 @@ val tts = PhononTTS(File(filesDir, "phonon-litert").path, "en", PhononTTS.UNIT_N
 2. Each step feeds `input_linear(previous latent) + conditions` to `flow_step`, with `bos_emb` in place of the latent at the first step. Its latent goes to `mimi_step`, which returns a frame of audio and Mimi's next states.
 3. An EOS logit above the threshold ends the text: that frame and a few more are kept, as in `plan::EosPolicy`.
 
-The graphs are shaped by what NPU compilers accept. All shapes are static, and no graph keeps state. The NPU signatures take and return only floats: positions become RoPE tables and masks in the CPU signatures, since some compilers reject gathers and integer compares. Transposes stay at rank 4, masks have the rank of the attention scores, and Mimi's ELU is written with tanh instead of exp; each of those is something one vendor's compiler rejects. Mimi's transposed convolutions are written as a matmul and an overlap-add, with the same values.
+The graphs are shaped by what NPU compilers accept. All shapes are static, and no graph keeps state. The NPU signatures take and return only floats: positions become RoPE tables and masks in the CPU signatures, since some compilers reject gathers and integer compares. Transposes stay at rank 4, and masks have the rank of the attention scores; each of those is something one vendor's compiler rejects. Mimi's ELU comes in two forms (`model.elu`): with exp in `model.tflite`, and with tanh in `model.mediatek.tflite`, since MediaTek's compiler has no exp. The exp form clamps its input on both sides: Qualcomm's compiler swaps the plain ELU, and the exp form clamped on one side, for its own ELU kernel, whose output is wrong for some inputs.
 
 The conditions are applied by the host, not baked into the graph, so one compiled model serves any condition values.

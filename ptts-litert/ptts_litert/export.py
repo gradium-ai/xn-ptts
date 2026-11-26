@@ -10,6 +10,8 @@ The bundle has the Core ML export's layout (`ptts/examples/export_coreml.rs`):
   the summed conditions (`flow_lm.conditions`).
 - `voices/<name>.safetensors`: each voice as the embedding the flow LM is prompted with, `emb`.
 - `tokenizer.json`, and `bundle.json` describing it all with every file's size and SHA-256.
+- `model.mediatek.tflite`: the same signatures with an ELU MediaTek's compiler takes, which
+  `compile` reads for MediaTek SoCs. Only `compile` needs it, so the bundle does not list it.
 """
 
 import hashlib
@@ -23,16 +25,17 @@ from safetensors.torch import save_file
 
 from . import model as M
 from .checkpoint import Checkpoint, frame_budget
+from .compile import MEDIATEK_SOURCE
 
 
-def build(ck: Checkpoint, prefill_len: int, ctx: int) -> tuple[dict, dict]:
-    """The signatures as modules, and sample inputs for each."""
+def build(ck: Checkpoint, prefill_len: int, ctx: int, exp_elu: bool = True) -> tuple[dict, dict]:
+    """The signatures as modules, and sample inputs for each. `exp_elu`: see `model.elu`."""
     W, cfg = ck.weights, ck.config
     fl, mc = cfg["flow_lm"], cfg["mimi"]
     heads = fl["num_heads"]
     head_dim = fl["d_model"] // heads
     backbone = M.Transformer(W, "flow_lm.transformer", fl["num_layers"], heads, ck.gelu(fl))
-    mimi = M.Mimi(W, mc, ck.gelu(mc))
+    mimi = M.Mimi(W, mc, ck.gelu(mc), exp_elu)
     prefill_tables = M.FlowTables(ctx, prefill_len, head_dim, fl["max_period"])
     step_tables = M.FlowTables(ctx, 1, head_dim, fl["max_period"])
     mimi_tables = M.MimiTables(mimi.window, mimi.steps, mimi.head_dim, mc["transformer_max_period"])
@@ -88,7 +91,7 @@ def convert(modules: dict, samples: dict, path: Path):
 def list_files(root: Path) -> list[dict]:
     files = []
     for p in sorted(root.rglob("*")):
-        if p.is_file() and p.name != "bundle.json":
+        if p.is_file() and p.name not in ("bundle.json", MEDIATEK_SOURCE):
             data = p.read_bytes()
             files.append(
                 {"path": p.relative_to(root).as_posix(), "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
@@ -124,6 +127,7 @@ def export(args):
     print(f"{len(voices)} voices, prefill {args.max_tokens} rows, KV cache {ctx} slots")
     modules, samples = build(ck, args.max_tokens, ctx)
     convert(modules, samples, out / "model.tflite")
+    convert(*build(ck, args.max_tokens, ctx, exp_elu=False), out / MEDIATEK_SOURCE)
 
     W = ck.weights
     host = {

@@ -51,12 +51,18 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat([-x[..., half:], x[..., :half]], -1)
 
 
-def elu(x):
-    """ELU without exp: for x <= 0, exp(x) - 1 = 2 tanh(x / 2) / (1 - tanh(x / 2)).
+def elu(x, exp: bool):
+    """ELU in a form NPU compilers take.
 
-    As close to the exact ELU in f32 as `F.elu` is, and accurate near zero. Some NPUs have
-    tanh but not exp.
+    `exp`: `relu(x) + exp(x) - 1` with x clamped to [-30, 0] inside the exp. Qualcomm's compiler
+    replaces `F.elu`, and the same form clamped on one side only, with its own ELU, whose output
+    is wrong for some inputs; clamped on both sides it is left alone.
+
+    Otherwise without exp, for compilers that lack it (MediaTek's): for x <= 0,
+    exp(x) - 1 = 2 tanh(x / 2) / (1 - tanh(x / 2)). Slower, and as close to the exact ELU in f32.
     """
+    if exp:
+        return F.relu(x) + torch.exp(torch.clamp(x, -30.0, 0.0)) - 1
     t = torch.tanh(0.5 * torch.clamp(x, max=0.0))
     return F.relu(x) + 2 * t / (1 - t)
 
@@ -232,9 +238,10 @@ def conv1d(W, prefix) -> nn.Conv1d:
 
 
 class ConvTr(nn.Module):
-    """A transposed conv whose kernel is twice its stride, as a matmul and an overlap-add.
+    """A transposed conv whose kernel is twice its stride.
 
-    The same values as `nn.ConvTranspose1d`, without the op: not every NPU compiler takes it.
+    A depthwise one is written as a product and an overlap-add, with the same values as
+    `nn.ConvTranspose1d`: the converter cannot lower a grouped transposed conv.
     """
 
     def __init__(self, W, prefix, stride, depthwise=False):
@@ -248,12 +255,11 @@ class ConvTr(nn.Module):
         self.out_channels = w.shape[0] if depthwise else w.shape[1]
 
     def forward(self, x):
+        if not self.depthwise:
+            return F.conv_transpose1d(x, self.weight, self.bias, stride=self.stride)
         b, _, t = x.shape
         s = self.stride
-        if self.depthwise:
-            z = x[..., None] * self.weight[None, :, 0, None, :]  # [B, C, T, K]
-        else:
-            z = torch.einsum("bit,iok->botk", x, self.weight)
+        z = x[..., None] * self.weight[None, :, 0, None, :]  # [B, C, T, K]
         zero = torch.zeros_like(z[:, :, :1, :s])
         y = torch.cat([z[..., :s], zero], 2) + torch.cat([zero, z[..., s:]], 2)  # [B, C, T + 1, S]
         y = y.reshape(b, y.shape[1], (t + 1) * s)
@@ -287,8 +293,9 @@ class Mimi(nn.Module):
     [2L, H, W, D] holding the last W keys and values, right-aligned.
     """
 
-    def __init__(self, W, mc: dict, gelu: str):
+    def __init__(self, W, mc: dict, gelu: str, exp_elu: bool = True):
         super().__init__()
+        self.exp_elu = exp_elu
         self.register_buffer("emb_std", W["flow_lm.emb_std"].clone())
         self.register_buffer("emb_mean", W["flow_lm.emb_mean"].clone())
         ow = W["mimi.quantizer.output_proj.weight"][..., 0]
@@ -345,12 +352,12 @@ class Mimi(nn.Module):
         x, s = conv_step(self.init_conv, next(it), x)
         new_states.append(s)
         for ct, r1, r2 in zip(self.convtrs, self.res1, self.res2):
-            x, s = convtr_step(ct, next(it), elu(x))
+            x, s = convtr_step(ct, next(it), elu(x, self.exp_elu))
             new_states.append(s)
-            v, s = conv_step(r1, next(it), elu(x))
+            v, s = conv_step(r1, next(it), elu(x, self.exp_elu))
             new_states.append(s)
-            x = x + r2(elu(v))
-        x, s = conv_step(self.final_conv, next(it), elu(x))
+            x = x + r2(elu(v, self.exp_elu))
+        x, s = conv_step(self.final_conv, next(it), elu(x, self.exp_elu))
         new_states.append(s)
         return (x, *new_states, kv_out)
 

@@ -14,6 +14,8 @@ import tempfile
 from pathlib import Path
 
 NPU_SIGNATURES = ["prefill", "flow_step", "mimi_step"]
+# The model with an ELU MediaTek's compiler takes, which `export` writes beside `model.tflite`.
+MEDIATEK_SOURCE = "model.mediatek.tflite"
 
 
 def target(spec: str):
@@ -52,26 +54,37 @@ def subgraphs(path: Path, names: list[str]) -> list[int]:
 def compile(args):
     from ai_edge_litert.aot import aot_compile
 
-    model = args.bundle / "model.tflite"
     out = args.bundle / "npu"
     out.mkdir(exist_ok=True)
-    targets = [target(t) for t in args.targets]
-    with tempfile.TemporaryDirectory() as tmp:
-        result = aot_compile.aot_compile(
-            str(model),
-            output_dir=tmp,
-            target=targets,
-            keep_going=True,
-            subgraphs_to_compile=subgraphs(model, NPU_SIGNATURES),
-        )
-        print(result.compilation_report())
-        compiled = {}
-        for p in sorted(Path(tmp).glob("*.tflite")):
-            if p.stat().st_size == 0:
-                continue
-            name = p.name.removeprefix("model_").removesuffix("_apply_plugin.tflite")
-            shutil.move(p, out / f"{name}.tflite")
-            compiled[name] = f"npu/{name}.tflite"
+    # Each target's vendor picks the model it compiles.
+    sources: dict[str, list] = {}
+    for spec in args.targets:
+        mediatek = spec.partition(":")[0] == "mediatek"
+        source = MEDIATEK_SOURCE if mediatek else "model.tflite"
+        if not (args.bundle / source).is_file():
+            raise SystemExit(f"{args.bundle / source} is missing: export the bundle again")
+        sources.setdefault(source, []).append(target(spec))
+    compiled = {}
+    for source, targets in sources.items():
+        with tempfile.TemporaryDirectory() as tmp:
+            # Named `model.tflite` so each output is `model_<Vendor>_<SoC>_apply_plugin.tflite`.
+            model = Path(tmp) / "in" / "model.tflite"
+            model.parent.mkdir()
+            shutil.copy(args.bundle / source, model)
+            result = aot_compile.aot_compile(
+                str(model),
+                output_dir=tmp,
+                target=targets,
+                keep_going=True,
+                subgraphs_to_compile=subgraphs(model, NPU_SIGNATURES),
+            )
+            print(result.compilation_report())
+            for p in sorted(Path(tmp).glob("*.tflite")):
+                if p.stat().st_size == 0:
+                    continue
+                name = p.name.removeprefix("model_").removesuffix("_apply_plugin.tflite")
+                shutil.move(p, out / f"{name}.tflite")
+                compiled[name] = f"npu/{name}.tflite"
     if not compiled:
         raise SystemExit("nothing compiled")
     # Recorded in bundle.json, so a runtime can pick the file for the SoC it runs on.
