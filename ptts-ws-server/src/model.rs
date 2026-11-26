@@ -7,7 +7,7 @@
 use anyhow::{Context as _, Result};
 use ptts::checkpoint::{Checkpoint, ResolveOptions};
 use ptts::hub::HubSource;
-use ptts::preprocess::Normalize;
+use ptts::preprocess::{Normalize, Rules};
 use ptts::synth::{DeviceKind, Quant, Synth};
 use ptts::voice_catalog::{DEFAULT_VOICE_CATALOG, VoiceCatalog};
 use std::sync::Arc;
@@ -23,6 +23,10 @@ pub struct Inner {
     pub model_name: String,
     pub voices: Vec<String>,
     pub default_voice: String,
+    /// What a session that sends no `lang` is normalized as.
+    pub default_lang: Normalize,
+    /// The rewrite rules every session's language is combined with.
+    pub rules: Rules,
     pub max_seq_len: usize,
     pub seed_base: u64,
     pub sample_rate: u32,
@@ -60,17 +64,51 @@ async fn locate(model: &str, quant: Quant) -> Result<(Checkpoint, String)> {
     Ok((checkpoint, name))
 }
 
-/// The voices of the catalog `source` names, each downloaded on first use: those in `lang` and
-/// those with no language, or all of them when `lang` is `none`. A voice that cannot be fetched
-/// is logged and skipped.
-async fn catalog_voices(source: &str, lang: &str) -> Result<Vec<(String, std::path::PathBuf)>> {
-    let (source, lang) = (source.to_string(), lang.to_string());
+/// The languages whose catalog voices a server offers. Sessions pick their language, so these are
+/// the languages the checkpoint lists plus the server's own `--lang`, which keeps a single-language
+/// checkpoint offering the voices of its `--lang`. `--lang none` offers them all (`None`).
+fn catalog_languages(lang: &str, listed: &[String]) -> Option<Vec<String>> {
+    if lang == "none" {
+        return None;
+    }
+    let mut langs = listed.to_vec();
+    if !langs.iter().any(|l| l == lang) {
+        langs.push(lang.to_string());
+    }
+    Some(langs)
+}
+
+/// Adds the catalog's voices after those of `--voice-dir`, which win a name both have: a user's own
+/// voice must not be replaced by a catalog voice that happens to share its name.
+fn add_catalog_voices(
+    extra_voices: &mut Vec<(String, std::path::PathBuf)>,
+    catalog: Vec<(String, std::path::PathBuf)>,
+) {
+    for (name, path) in catalog {
+        if extra_voices.iter().any(|(own, _)| *own == name) {
+            tracing::warn!(voice = %name, "catalog voice skipped: --voice-dir has one of that name");
+        } else {
+            extra_voices.push((name, path));
+        }
+    }
+}
+
+/// The voices of the catalog `source` names, each downloaded on first use: those in one of
+/// `langs` and those with no language, or all of them when `langs` is `None`. A voice that
+/// cannot be fetched is logged and skipped.
+async fn catalog_voices(
+    source: &str,
+    langs: Option<Vec<String>>,
+) -> Result<Vec<(String, std::path::PathBuf)>> {
+    let source = source.to_string();
     // The blocking Hub client runs its own runtime, which cannot be started inside this one.
     tokio::task::spawn_blocking(move || {
         let catalog = VoiceCatalog::new(&source)?;
         let mut voices = vec![];
         for voice in catalog.voices()? {
-            if lang != "none" && voice.language.as_deref().is_some_and(|l| l != lang) {
+            let unwanted =
+                |l: &str| langs.as_ref().is_some_and(|langs| !langs.iter().any(|x| x == l));
+            if voice.language.as_deref().is_some_and(unwanted) {
                 continue;
             }
             match catalog.fetch(voice) {
@@ -97,6 +135,7 @@ pub async fn load_ptts(
     seed_base: u64,
     max_seq_len: usize,
     normalize: Normalize,
+    rules: Rules,
     conditions: &[(String, String)],
     max_concurrent_requests: std::num::NonZeroUsize,
 ) -> Result<AppState> {
@@ -117,8 +156,9 @@ pub async fn load_ptts(
         Vec::new()
     };
     if let Some(catalog) = voice_catalog {
-        match catalog_voices(catalog, normalize.as_str()).await {
-            Ok(voices) => extra_voices.extend(voices),
+        let langs = catalog_languages(normalize.as_str(), &m.config.languages);
+        match catalog_voices(catalog, langs).await {
+            Ok(voices) => add_catalog_voices(&mut extra_voices, voices),
             // Offline, a server that needs no catalog voice still starts.
             Err(e) if catalog == DEFAULT_VOICE_CATALOG => {
                 tracing::warn!(error = %e, "the default voice catalog could not be read")
@@ -159,6 +199,8 @@ pub async fn load_ptts(
         model_name,
         voices,
         default_voice,
+        default_lang: normalize,
+        rules,
         max_seq_len,
         seed_base,
         sample_rate,
@@ -169,6 +211,31 @@ pub async fn load_ptts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_voice_dir_voice_wins_a_name_the_catalog_also_has() {
+        let voice = |name: &str, file: &str| (name.to_string(), std::path::PathBuf::from(file));
+        let mut extra = vec![voice("Alba", "mine.safetensors")];
+        add_catalog_voices(
+            &mut extra,
+            vec![voice("Alba", "catalog.safetensors"), voice("Zoey", "z")],
+        );
+        assert_eq!(extra, [voice("Alba", "mine.safetensors"), voice("Zoey", "z")]);
+    }
+
+    #[test]
+    fn the_catalog_languages_are_the_checkpoints_plus_the_servers() {
+        let listed = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let multi = listed(&["en", "fr", "de", "pt", "es"]);
+        assert_eq!(catalog_languages("pt", &multi), Some(multi.clone()));
+        assert_eq!(
+            catalog_languages("ja", &multi),
+            Some(listed(&["en", "fr", "de", "pt", "es", "ja"]))
+        );
+        assert_eq!(catalog_languages("fr", &listed(&["en"])), Some(listed(&["en", "fr"])));
+        assert_eq!(catalog_languages("fr", &[]), Some(listed(&["fr"])));
+        assert_eq!(catalog_languages("none", &multi), None);
+    }
 
     #[tokio::test]
     async fn the_catalog_voices_served_are_those_in_the_language() {
@@ -186,14 +253,16 @@ mod tests {
         let names = |voices: Vec<(String, std::path::PathBuf)>| -> Vec<String> {
             voices.into_iter().map(|(name, _)| name).collect()
         };
-        assert_eq!(names(catalog_voices(source, "en").await.unwrap()), ["Zoey", "Mine"]);
+        let langs = |langs: &[&str]| Some(langs.iter().map(|l| l.to_string()).collect());
+        assert_eq!(names(catalog_voices(source, langs(&["en"])).await.unwrap()), ["Zoey", "Mine"]);
         assert_eq!(
-            names(catalog_voices(source, "none").await.unwrap()),
+            names(catalog_voices(source, langs(&["en", "de"])).await.unwrap()),
             ["Zoey", "Annika", "Mine"]
         );
-        let (_, path) = catalog_voices(source, "de").await.unwrap().remove(0);
+        assert_eq!(names(catalog_voices(source, None).await.unwrap()), ["Zoey", "Annika", "Mine"]);
+        let (_, path) = catalog_voices(source, langs(&["de"])).await.unwrap().remove(0);
         assert_eq!(path, dir.join("voices/b.safetensors"));
-        assert!(catalog_voices(dir.join("missing").to_str().unwrap(), "en").await.is_err());
+        assert!(catalog_voices(dir.join("missing").to_str().unwrap(), None).await.is_err());
     }
 }
 
@@ -204,11 +273,20 @@ mod checkpoint_tests {
     #[tokio::test]
     #[ignore = "requires PTTS_TEST_MODEL pointing to a private q8 checkpoint"]
     async fn private_checkpoint_loads_with_the_shared_default_voice() {
-        let path = std::path::PathBuf::from(
-            std::env::var("PTTS_TEST_MODEL").expect("set PTTS_TEST_MODEL"),
-        );
+        let source = std::env::var("PTTS_TEST_MODEL").expect("set PTTS_TEST_MODEL");
+        check_private_checkpoint(&source).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PTTS_TEST_MODEL_DIR pointing to a local folder of the private q8 checkpoint"]
+    async fn private_checkpoint_folder_loads_with_the_shared_default_voice() {
+        let source = std::env::var("PTTS_TEST_MODEL_DIR").expect("set PTTS_TEST_MODEL_DIR");
+        check_private_checkpoint(&source).await;
+    }
+
+    async fn check_private_checkpoint(source: &str) {
         let checkpoint =
-            Checkpoint::resolve(&path, ResolveOptions { quant: Quant::Q80, weights: None })
+            Checkpoint::locate(source, ResolveOptions { quant: Quant::Q80, weights: None })
                 .unwrap();
         let suffix =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -218,7 +296,7 @@ mod checkpoint_tests {
         std::fs::write(extra_dir.join("invalid.safetensors"), b"unreadable optional voice")
             .unwrap();
         let loaded = load_ptts(
-            path.to_str().unwrap(),
+            source,
             Some(&extra_dir),
             None,
             DeviceKind::Cpu,
@@ -227,6 +305,7 @@ mod checkpoint_tests {
             7,
             1024,
             Normalize::OFF,
+            Rules::DEFAULT,
             &[],
             std::num::NonZeroUsize::new(1).unwrap(),
         )

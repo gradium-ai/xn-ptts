@@ -8,7 +8,9 @@ cargo run --release -p ptts-ws-server -- --quant q8 --lang en
 
 `--model` loads another one: a checkpoint folder, or a Hugging Face repo as `hf://owner/name`, such as `--model hf://gradium/phonon-40m-fr` with `--lang fr`. The Phonon 40m models are gated: accept the terms on the model's Hugging Face page, then set `HF_TOKEN` or run `hf auth login`.
 
-The server listens on `0.0.0.0:8080`, with WebSocket connections at `/speech/tts`. `--addr` changes the address. The checkpoint supplies its config, tokenizer, weights, and voices; `--model hf://owner/name@revision` selects a Hub revision. The server also offers the voices in its `--lang` from the voice catalog [`gradium/phonon-voices`](https://huggingface.co/gradium/phonon-voices), downloaded on first start, or from the one `--voice-catalog` names: an `hf://` repo or a local `voices.jsonl`. `--voice-catalog ''` offers only the checkpoint's voices. Building requires libopus (`apt-get install libopus-dev` or `brew install opus`).
+The server listens on `0.0.0.0:8080`, with WebSocket connections at `/speech/tts`. `--addr` changes the address. The checkpoint supplies its config, tokenizer, weights, and voices; `--model hf://owner/name@revision` selects a Hub revision. The server also offers the catalog voices of every language the checkpoint's `config.json` lists (plus those of `--lang`, and all of them with `--lang none`) from the voice catalog [`gradium/phonon-voices`](https://huggingface.co/gradium/phonon-voices), downloaded on first start, or from the one `--voice-catalog` names: an `hf://` repo or a local `voices.jsonl`. `--voice-catalog ''` offers only the checkpoint's voices. Building requires libopus (`apt-get install libopus-dev` or `brew install opus`).
+
+`--lang` is required: it is the language text is normalized as for sessions that send no `lang` in `setup` (`none` serves the text as written). The checkpoint has no language input, so a language only selects the text normalization; any voice can read any language.
 
 By default, one WebSocket session is accepted at a time. `--max-concurrent-requests N` sets a positive limit. Excess connections receive HTTP 429 before the WebSocket upgrade, with a message asking the client to retry after an active session closes.
 
@@ -18,9 +20,9 @@ A session retains its primed voice and KV cache between messages. Its slot is he
 
 Messages are JSON text frames.
 
-1. Send `{"type": "setup", "output_format": "pcm", "voice": "Zoey"}` first. `output_format` is `pcm` (16-bit mono at the model's rate), `pcm_8000`, `pcm_16000`, `pcm_22050`, `pcm_24000`, `pcm_44100`, `pcm_48000`, `ulaw_8000` (or `mulaw_8000`), `alaw_8000`, `wav` or `opus`. Leave out `voice` for the default voice. The server answers `{"type": "ready", "sample_rate": ..., "frame_size": ..., ...}`, or an `error`.
+1. Send `{"type": "setup", "output_format": "pcm", "voice": "Zoey", "lang": "pt"}` first. `output_format` is `pcm` (16-bit mono at the model's rate), `pcm_8000`, `pcm_16000`, `pcm_22050`, `pcm_24000`, `pcm_44100`, `pcm_48000`, `ulaw_8000` (or `mulaw_8000`), `alaw_8000`, `wav` or `opus`. Leave out `voice` for the default voice. `lang` is optional and takes the same values as `--lang`, including `none`: without it (or with an empty value) the session uses `--lang`. A `lang` the checkpoint does not list is logged as a warning and the session continues. The server answers `{"type": "ready", "sample_rate": ..., "frame_size": ..., ...}`, or an `error`.
 2. Send text with `{"type": "text", "text": "..."}`. Text is buffered, up to 4096 characters.
 3. `{"type": "flush", "flush_id": 1}` speaks the buffered text. The server answers with `audio` messages, then `{"type": "flushed", "flush_id": 1}`. The session stays open.
 4. `{"type": "end_of_stream"}` speaks the rest, answers `{"type": "end_of_stream"}` and ends the session.
 
-Audio arrives as `{"type": "audio", "audio": "<base64>", "start_s": ..., "stop_s": ..., "stream_id": ...}`. Errors are `{"type": "error", "message": ..., "code": ...}`, with codes 400, 404, 408, 500 and 501.
+Audio arrives as `{"type": "audio", "audio": "<base64>", "start_s": ..., "stop_s": ..., "stream_id": ...}`. Errors are `{"type": "error", "message": ..., "code": ...}`, with codes 400, 404, 408, 500 and 501. 404 means the voice does not exist; a `lang` that cannot be parsed is a 400.

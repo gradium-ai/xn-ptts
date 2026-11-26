@@ -4,6 +4,7 @@ use crate::protocol::{TtsReply, TtsRequest, error_codes};
 use anyhow::Result;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use ptts::preprocess::{Normalize, Rules};
 use ptts::synth::{Session, SpeechOptions};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -187,13 +188,15 @@ async fn run_session(
         match (&mut sess, req) {
             (
                 SessionState::Awaiting,
-                TtsRequest::Setup { output_format, voice, voice_id, voice_emb, .. },
-            ) => match handle_setup(&app, output_format, voice, voice_id, voice_emb, reply_tx)
-                .await?
-            {
-                Some(new_state) => sess = new_state,
-                None => continue,
-            },
+                TtsRequest::Setup { output_format, voice, voice_id, voice_emb, lang, .. },
+            ) => {
+                match handle_setup(&app, output_format, voice, voice_id, voice_emb, lang, reply_tx)
+                    .await?
+                {
+                    Some(new_state) => sess = new_state,
+                    None => continue,
+                }
+            }
             (SessionState::Awaiting, _) => {
                 send_error(
                     reply_tx,
@@ -275,12 +278,50 @@ async fn flush_buffer(
     Ok(())
 }
 
+/// The normalization a session runs with: its own `lang`, parsed like `--lang`, else the
+/// server's. An empty or blank `lang` counts as absent, like an empty `voice`.
+fn session_normalize(
+    requested: Option<&str>,
+    default: Normalize,
+    rules: Rules,
+) -> std::result::Result<Normalize, String> {
+    let Some(lang) = requested.filter(|l| !l.trim().is_empty()) else {
+        return Ok(default);
+    };
+    let parsed = lang.parse::<Normalize>().map_err(|e| format!("invalid lang in setup: {e}"))?;
+    Ok(parsed.with_rules(rules))
+}
+
+/// What `setup` fixes for a session before its voice is known: its own text normalization (`lang`,
+/// else the server's) and how much it speaks in one chunk.
+fn setup_options(
+    lang: Option<&str>,
+    default: Normalize,
+    rules: Rules,
+) -> std::result::Result<SpeechOptions, String> {
+    Ok(SpeechOptions::default()
+        .normalize(session_normalize(lang, default, rules)?)
+        .max_tokens_per_chunk(ptts::plan::MAX_FIT_TOKENS))
+}
+
+/// The warning for a `lang` the session sent that the checkpoint does not list. A session that
+/// sent none gets the server's `--lang`, which was already checked when the model was built.
+fn setup_language_warning(
+    sent: Option<&str>,
+    normalize: Normalize,
+    languages: &[String],
+) -> Option<String> {
+    sent.filter(|l| !l.trim().is_empty())?;
+    normalize.language_warning(languages)
+}
+
 async fn handle_setup(
     app: &AppState,
     output_format: String,
     voice: Option<String>,
     voice_id: Option<String>,
     voice_emb: Option<String>,
+    lang: Option<String>,
     reply_tx: &mpsc::Sender<TtsReply>,
 ) -> Result<Option<SessionState>> {
     if voice_emb.as_deref().is_some_and(|s| !s.is_empty()) {
@@ -292,6 +333,13 @@ async fn handle_setup(
         .await?;
         return Ok(None);
     }
+    let session_opts = match setup_options(lang.as_deref(), app.default_lang, app.rules) {
+        Ok(opts) => opts,
+        Err(message) => {
+            send_error(reply_tx, error_codes::BAD_REQUEST, message).await?;
+            return Ok(None);
+        }
+    };
     let format = match output_format.parse::<Format>() {
         Ok(f) => f,
         Err(e) => {
@@ -323,15 +371,20 @@ async fn handle_setup(
             .await?;
         return Ok(None);
     }
+    if let Some(warning) = setup_language_warning(
+        lang.as_deref(),
+        session_opts.normalize.unwrap_or(app.default_lang),
+        app.synth.languages(),
+    ) {
+        tracing::warn!("{warning}");
+    }
     tracing::info!(?voice_name, "starting new TTS session");
     // Conditioning on the voice happens once here, not per request: every
     // generation below clones this primed state.
     // Sentences are grouped up to the most a session speaks in one chunk, not
     // the usual few dozen tokens: every chunk boundary adds a pause, and a
     // request that fits in one chunk should be spoken as one.
-    let opts = SpeechOptions::default()
-        .voice(voice_name.clone())
-        .max_tokens_per_chunk(ptts::plan::MAX_FIT_TOKENS);
+    let opts = session_opts.voice(voice_name.clone());
     let session = match app.synth.session(&opts, app.max_seq_len) {
         Ok(session) => session,
         Err(e) => {
@@ -489,6 +542,7 @@ mod tests {
             7,
             1024,
             "en".parse().unwrap(),
+            ptts::preprocess::Rules::DEFAULT,
             &[],
             std::num::NonZeroUsize::new(1).unwrap(),
         )

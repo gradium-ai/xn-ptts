@@ -250,3 +250,39 @@ fn private_checkpoint_synthesizes_through_the_public_api() {
     assert!(audio.iter().all(|x| x.is_finite()));
     assert!(audio.iter().any(|x| x.abs() > 0.01));
 }
+
+#[cfg(feature = "hf")]
+#[test]
+#[ignore = "requires PTTS_TEST_MODEL pointing to a multilingual q8 checkpoint"]
+fn a_one_shot_call_normalizes_with_the_requests_language() {
+    use ptts::preprocess::Lang;
+    use ptts::synth::{DeviceKind, SpeechOptions};
+
+    let path = std::env::var("PTTS_TEST_MODEL").expect("set PTTS_TEST_MODEL");
+    let ck =
+        Checkpoint::resolve(path, ResolveOptions { quant: Quant::Q80, weights: None }).unwrap();
+    let synth_for = |lang| {
+        let mut synth = ck.builder(lang).device(DeviceKind::Cpu).build().unwrap();
+        ck.register_voices(&mut synth);
+        synth
+    };
+    let text = "Pago R$ 1.234.567,89.";
+    let greedy = SpeechOptions::default().temperature(0.0).seed(1);
+    let in_pt = greedy.clone().normalize(Lang::Pt);
+
+    let en = synth_for(Lang::En);
+    let overridden = en.say_with(text, &in_pt).unwrap().len();
+    let ignored = en.say_with(text, &greedy).unwrap().len();
+    let native = synth_for(Lang::Pt).say_with(text, &greedy).unwrap().len();
+
+    // Greedy audio is not bit-stable, so compare against the distance between the two readings
+    // instead of requiring an exact match.
+    let readings_apart = native.abs_diff(ignored);
+    let off_by = overridden.abs_diff(native);
+    eprintln!("overridden={overridden} native_pt={native} builder_en={ignored}");
+    assert!(
+        off_by * 2 < readings_apart,
+        "the request's language must decide how its text is read: {overridden} samples against \
+         {native} in its language and {ignored} in the builder's"
+    );
+}
