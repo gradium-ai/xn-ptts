@@ -54,6 +54,9 @@ struct Sigs {
     step_tables: usize,
 }
 
+/// A profiled stage: its name, total time and calls.
+type Stage = (&'static str, std::time::Duration, u32);
+
 pub struct Engine {
     model: Compiled,
     sigs: Sigs,
@@ -63,7 +66,7 @@ pub struct Engine {
     /// `[2L * H, ctx, D]` of `kv`.
     kv_dims: (usize, usize, usize),
     /// The cache just after the voice, restored before every chunk of text.
-    voice_kv: Vec<f32>,
+    voice_kv: Vec<u8>,
     voice_len: usize,
     /// Mimi's streaming state: each `mimi_step` input and the output that replaces it.
     mimi_states: Vec<(String, String)>,
@@ -76,6 +79,8 @@ pub struct Engine {
     languages: Vec<String>,
     temperature: f32,
     seed: u64,
+    /// Time spent per stage, when `PTTS_LITERT_PROFILE` is set.
+    profile: Option<std::cell::RefCell<Vec<Stage>>>,
 }
 
 /// Whether `dir` is a LiteRT bundle rather than what the platform's own engine takes.
@@ -226,6 +231,12 @@ impl Engine {
             [g, h, ctx, hd] => (g * h, ctx, hd),
             ref s => return Err(format!("flow_step's kv is {s:?}, not [2L, H, ctx, D]")),
         };
+        // Rows of `kv_new` are copied into the cache as bytes, so the two share an element type.
+        for sig in [sigs.prefill, sigs.flow_step] {
+            if model.signatures[sig].output("kv_new")?.ty().elem_size() != kv.ty().elem_size() {
+                return Err("kv_new and kv have different element types".into());
+            }
+        }
         let mimi = &model.signatures[sigs.mimi_step];
         let mimi_states = mimi
             .input_names()
@@ -255,6 +266,7 @@ impl Engine {
             dir: dir.to_path_buf(),
             voices,
             languages,
+            profile: std::env::var_os("PTTS_LITERT_PROFILE").map(|_| Default::default()),
         };
         let first = me.voices.first().ok_or("no voices in the bundle")?.clone();
         me.set_voice(&first)?;
@@ -276,9 +288,9 @@ impl Engine {
         if len > room {
             return Err(format!("voice {name} is {len} positions; the bundle has room for {room}"));
         }
-        self.kv.with_f32(|kv| kv.fill(0.0))?;
+        self.kv.with_bytes(|kv| kv.fill(0))?;
         self.prefill(0, &emb)?;
-        self.kv.read_f32(&mut self.voice_kv)?;
+        self.kv.read_bytes(&mut self.voice_kv)?;
         self.voice_len = len;
         Ok(())
     }
@@ -303,17 +315,37 @@ impl Engine {
         self.model.run(sig)
     }
 
+    /// Run `f`, adding its time to `what` when profiling.
+    fn timed<T>(
+        &self,
+        what: &'static str,
+        f: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let Some(profile) = &self.profile else { return f() };
+        let start = Instant::now();
+        let r = f();
+        let dt = start.elapsed();
+        let mut p = profile.borrow_mut();
+        match p.iter_mut().find(|(w, ..)| *w == what) {
+            Some((_, t, n)) => (*t += dt, *n += 1).1,
+            None => p.push((what, dt, 1)),
+        }
+        r
+    }
+
     fn sig(&self, i: usize) -> &api::Signature {
         &self.model.signatures[i]
     }
 
     /// Write `t` rows of keys and values, `[2L, H, t, D]`, into the cache from slot `pos`.
-    fn write_kv(&self, rows: &[f32], t: usize, n: usize, pos: usize) -> Result<(), String> {
+    /// `rows` are the bytes of a `kv_new` output, of the cache's element type.
+    fn write_kv(&self, rows: &[u8], t: usize, n: usize, pos: usize) -> Result<(), String> {
         let (g, ctx, hd) = self.kv_dims;
-        self.kv.with_f32(|kv| {
+        let row = hd * self.kv.ty().elem_size();
+        self.kv.with_bytes(|kv| {
             for gi in 0..g {
-                let src = &rows[gi * t * hd..][..n * hd];
-                kv[(gi * ctx + pos) * hd..][..n * hd].copy_from_slice(src);
+                let src = &rows[gi * t * row..][..n * row];
+                kv[(gi * ctx + pos) * row..][..n * row].copy_from_slice(src);
             }
         })
     }
@@ -336,7 +368,7 @@ impl Engine {
             }
             prefill.input("x")?.write_f32(&x)?;
             self.run(self.sigs.prefill)?;
-            prefill.output("kv_new")?.read_f32(&mut kv_new)?;
+            prefill.output("kv_new")?.read_bytes(&mut kv_new)?;
             self.write_kv(&kv_new, p, n, pos)?;
             pos += n;
         }
@@ -376,13 +408,13 @@ impl Engine {
     ) -> Result<(usize, bool), String> {
         use rand::{Rng, SeedableRng};
         let (d, ldim) = (self.meta.d, self.meta.ldim);
-        self.kv.write_f32(&self.voice_kv)?;
+        self.timed("restore voice", || self.kv.write_bytes(&self.voice_kv))?;
         let mut text = Vec::with_capacity(chunk.tokens.len() * d);
         for &tok in &chunk.tokens {
             let row = self.host.text_emb.get(tok as usize * d..(tok as usize + 1) * d);
             text.extend_from_slice(row.ok_or("token outside the vocabulary")?);
         }
-        let mut pos = self.prefill(self.voice_len, &text)?;
+        let mut pos = self.timed("prefill text", || self.prefill(self.voice_len, &text))?;
 
         let (tables, flow, mimi) = (
             self.sig(self.sigs.step_tables),
@@ -390,7 +422,7 @@ impl Engine {
             self.sig(self.sigs.mimi_step),
         );
         for (input, _) in &self.mimi_states {
-            mimi.input(input)?.with_f32(|s| s.fill(0.0))?;
+            mimi.input(input)?.with_bytes(|s| s.fill(0))?;
         }
         // The same generator and distribution as every other frontend, so a seed means the same.
         let mut rng = rand::rngs::StdRng::seed_from_u64(self.seed);
@@ -411,28 +443,37 @@ impl Engine {
             }
             noise.iter_mut().for_each(|n| *n = rng.sample(normal));
 
-            tables.input("pos")?.write_i32(&[pos as i32])?;
-            tables.input("frame")?.write_i32(&[frame as i32])?;
-            self.run(self.sigs.step_tables)?;
-            for name in ["cos", "sin", "mask"] {
-                flow.input(name)?.copy_from(tables.output(name)?)?;
-                mimi.input(name)?.copy_from(tables.output(&format!("mimi_{name}"))?)?;
-            }
-            flow.input("emb")?.write_f32(&emb)?;
-            flow.input("noise")?.write_f32(&noise)?;
-            self.run(self.sigs.flow_step)?;
-            flow.output("kv_new")?.read_f32(&mut kv_new)?;
-            self.write_kv(&kv_new, 1, 1, pos)?;
+            self.timed("step_tables", || {
+                tables.input("pos")?.write_i32(&[pos as i32])?;
+                tables.input("frame")?.write_i32(&[frame as i32])?;
+                self.run(self.sigs.step_tables)?;
+                for name in ["cos", "sin", "mask"] {
+                    flow.input(name)?.copy_from(tables.output(name)?)?;
+                    mimi.input(name)?.copy_from(tables.output(&format!("mimi_{name}"))?)?;
+                }
+                Ok(())
+            })?;
+            self.timed("flow_step in", || {
+                flow.input("emb")?.write_f32(&emb)?;
+                flow.input("noise")?.write_f32(&noise)
+            })?;
+            self.timed("flow_step", || self.run(self.sigs.flow_step))?;
+            self.timed("flow_step out", || {
+                flow.output("kv_new")?.read_bytes(&mut kv_new)?;
+                self.write_kv(&kv_new, 1, 1, pos)?;
+                flow.output("eos")?.read_f32(&mut eos)?;
+                flow.output("latent")?.read_f32(&mut latent)
+            })?;
             pos += 1;
-            flow.output("eos")?.read_f32(&mut eos)?;
-            flow.output("latent")?.read_f32(&mut latent)?;
 
-            mimi.input("latent")?.write_f32(&latent)?;
-            self.run(self.sigs.mimi_step)?;
-            for (input, output) in &self.mimi_states {
-                mimi.input(input)?.copy_from(mimi.output(output)?)?;
-            }
-            mimi.output("audio")?.read_f32(&mut pcm)?;
+            self.timed("mimi_step in", || mimi.input("latent")?.write_f32(&latent))?;
+            self.timed("mimi_step", || self.run(self.sigs.mimi_step))?;
+            self.timed("mimi_step out", || {
+                for (input, output) in &self.mimi_states {
+                    mimi.input(input)?.copy_from(mimi.output(output)?)?;
+                }
+                mimi.output("audio")?.read_f32(&mut pcm)
+            })?;
             frames += 1;
             if !sink(&pcm) {
                 return Ok((frames, true));
@@ -466,6 +507,15 @@ impl Engine {
             frames += n;
             if stopped {
                 break;
+            }
+        }
+        if let Some(profile) = &self.profile {
+            for (what, t, n) in profile.borrow_mut().drain(..) {
+                let ms = t.as_secs_f64() * 1e3;
+                eprintln!(
+                    "{what:>14}: {ms:9.2} ms over {n:4} calls, {:7.3} ms each",
+                    ms / n as f64
+                );
             }
         }
         Ok(PttsResult {

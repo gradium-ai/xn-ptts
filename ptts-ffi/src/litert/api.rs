@@ -20,6 +20,7 @@ pub const ACCEL_NPU: c_int = 1 << 2;
 
 const ELEMENT_FLOAT32: c_int = 1;
 const ELEMENT_INT32: c_int = 2;
+const ELEMENT_FLOAT16: c_int = 10;
 
 const LOCK_READ: c_int = 0;
 const LOCK_WRITE: c_int = 1;
@@ -269,6 +270,15 @@ impl TensorType {
     fn is_i32(&self) -> bool {
         self.0.element_type == ELEMENT_INT32
     }
+
+    /// Bytes per element of the types a bundle uses.
+    pub fn elem_size(&self) -> usize {
+        if self.0.element_type == ELEMENT_FLOAT16 { 2 } else { 4 }
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.len() * self.elem_size()
+    }
 }
 
 /// A tensor buffer allocated by LiteRT in whatever memory the compiled model wants for it.
@@ -296,16 +306,37 @@ impl Buffer {
         check(f, unsafe { (f.LiteRtUnlockTensorBuffer)(self.raw) }, &self.name)
     }
 
-    /// The buffer as f32s, for reading and writing.
-    pub fn with_f32<R>(&self, f: impl FnOnce(&mut [f32]) -> R) -> Result<R, String> {
-        if !self.ty.is_f32() {
-            return Err(format!("{} is not f32", self.name));
-        }
-        // Read and write: a caller may change only some of it, and the rest has to survive.
+    /// The buffer's bytes, for reading and writing, whatever its element type.
+    pub fn with_bytes<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> Result<R, String> {
         let p = self.lock(LOCK_READ_WRITE)?;
-        let r = f(unsafe { std::slice::from_raw_parts_mut(p as *mut f32, self.ty.len()) });
+        let r = f(unsafe { std::slice::from_raw_parts_mut(p as *mut u8, self.ty.bytes()) });
         self.unlock()?;
         Ok(r)
+    }
+
+    /// Overwrite the buffer with `data`, which must be its size in bytes.
+    pub fn write_bytes(&self, data: &[u8]) -> Result<(), String> {
+        if data.len() != self.ty.bytes() {
+            return Err(format!(
+                "{} takes {} bytes, not {}",
+                self.name,
+                self.ty.bytes(),
+                data.len()
+            ));
+        }
+        let p = self.lock(LOCK_WRITE)?;
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), p as *mut u8, data.len()) };
+        self.unlock()
+    }
+
+    /// Copy the buffer's bytes into `out`, resized to fit.
+    pub fn read_bytes(&self, out: &mut Vec<u8>) -> Result<(), String> {
+        let p = self.lock(LOCK_READ)?;
+        out.clear();
+        out.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(p as *const u8, self.ty.bytes())
+        });
+        self.unlock()
     }
 
     /// Overwrite the buffer with `data`, which must be its size.
@@ -348,7 +379,7 @@ impl Buffer {
         let src = from.lock(LOCK_READ)?;
         let dst = self.lock(LOCK_WRITE);
         let r = dst.map(|dst| unsafe {
-            std::ptr::copy_nonoverlapping(src as *const u32, dst as *mut u32, self.ty.len())
+            std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, self.ty.bytes())
         });
         let u = if r.is_ok() { self.unlock() } else { Ok(()) };
         from.unlock()?;
@@ -414,6 +445,18 @@ pub struct Compiled {
     pub signatures: Vec<Signature>,
 }
 
+/// Qualcomm's settings: the NPU clocked up while it runs, and only errors logged.
+/// `PTTS_LITERT_QNN_OPTIONS`, `key = value` pairs split by `;`, adds settings or replaces these.
+fn qualcomm_options() -> String {
+    let mut set = vec![("htp_performance_mode", "2".to_string()), ("log_level", "1".to_string())];
+    let extra = std::env::var("PTTS_LITERT_QNN_OPTIONS").unwrap_or_default();
+    for (key, value) in extra.split(';').filter_map(|kv| kv.split_once('=')) {
+        set.retain(|(k, _)| *k != key.trim());
+        set.push((key.trim(), value.trim().to_string()));
+    }
+    set.iter().map(|(k, v)| format!("{k} = {v}\n")).collect()
+}
+
 impl Compiled {
     /// Load `path` and compile it for `accelerators` (`ACCEL_*`), running the CPU parts on
     /// `threads` threads.
@@ -443,7 +486,10 @@ impl Compiled {
                 unsafe { (f.LiteRtSetOptionsHardwareAccelerators)(options, accelerators) },
                 "accelerators",
             )?;
-            add_cpu_threads(f, options, threads)?;
+            add_opaque(f, options, c"xnnpack", &format!("num_threads = {threads}\n"))?;
+            if accelerators & ACCEL_NPU != 0 {
+                add_opaque(f, options, c"qualcomm", &qualcomm_options())?;
+            }
             check(
                 f,
                 unsafe { (f.LiteRtCreateCompiledModel)(env.raw, model, options, &mut me.raw) },
@@ -565,21 +611,22 @@ impl Drop for Compiled {
     }
 }
 
-/// XNNPACK's thread count, as LiteRT's CPU options pass it: a TOML payload under `xnnpack`.
-fn add_cpu_threads(f: &Fns, options: Handle, threads: usize) -> Result<(), String> {
+/// Options for one of LiteRT's accelerators, which it takes as a TOML payload under the
+/// accelerator's name: `xnnpack` for the CPU, `qualcomm` for Qualcomm NPUs.
+fn add_opaque(f: &Fns, options: Handle, id: &CStr, toml: &str) -> Result<(), String> {
     unsafe extern "C" fn free_payload(p: *mut c_void) {
         drop(unsafe { CString::from_raw(p as *mut c_char) });
     }
-    let payload = CString::new(format!("num_threads = {threads}\n")).expect("no NULs");
-    let payload = payload.into_raw() as *mut c_void;
+    let what = format!("{} options", id.to_string_lossy());
+    let payload = CString::new(toml).map_err(|e| e.to_string())?.into_raw() as *mut c_void;
     let mut opaque = std::ptr::null_mut();
     let status = unsafe {
-        (f.LiteRtCreateOpaqueOptions)(c"xnnpack".as_ptr(), payload, Some(free_payload), &mut opaque)
+        (f.LiteRtCreateOpaqueOptions)(id.as_ptr(), payload, Some(free_payload), &mut opaque)
     };
     if status != STATUS_OK {
         unsafe { free_payload(payload) };
     }
-    check(f, status, "CPU options")?;
+    check(f, status, &what)?;
     // `options` owns `opaque` from here on.
-    check(f, unsafe { (f.LiteRtAddOpaqueOptions)(options, opaque) }, "CPU options")
+    check(f, unsafe { (f.LiteRtAddOpaqueOptions)(options, opaque) }, &what)
 }
