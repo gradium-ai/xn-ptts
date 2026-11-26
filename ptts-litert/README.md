@@ -80,6 +80,8 @@ PTTS_UNIT=cpu ./speak out/litert en "Hello from Phonon." speech.wav
 
 For `PTTS_UNIT_NPU` on Android, the engine reads the SoC from the `ro.soc.manufacturer` and `ro.soc.model` properties and loads the model `compile` wrote for it, `npu/Qualcomm_SM8650.tflite` for example. `PTTS_LITERT_MODEL` names another file in the bundle instead. If the bundle has no model for the SoC, the engine gives LiteRT `model.tflite`. LiteRT then compiles it on the phone if the app ships the vendor's compiler plugin, and runs it on the CPU if not. Only the file for the phone's SoC needs to be on the phone, so an app can download that one file and leave out the rest of `npu/`.
 
+On Snapdragon phones, compiling on the phone works with the Gradle dependencies below (`libLiteRtCompilerPlugin_Qualcomm.so` and QNN's `libQnnHtpPrepare.so`), and the model runs as fast as one compiled ahead of time. It adds seconds to loading the model, so set `PTTS_LITERT_CACHE_DIR` to a folder the app keeps, `noBackupFilesDir` for example: LiteRT stores what it compiled there, and only the first load compiles. That way an app reaches a Snapdragon NPU the bundle has no model for. MediaTek NPUs need a model from `compile`, since `model.tflite` has an op their compiler lacks.
+
 `PTTS_LITERT_THREADS` sets how many CPU threads LiteRT uses. The default is the number of cores, at most 4.
 
 On a Qualcomm NPU the engine asks for the HTP's burst performance mode, which clocks it up while it runs, and has QNN log errors only. LiteRT's default mode leaves the NPU several times slower. `PTTS_LITERT_QNN_OPTIONS` adds to or replaces these settings with `key = value` pairs separated by `;`, from LiteRT's Qualcomm options (`litert/c/options/litert_qualcomm_options.cc`): `htp_performance_mode = 8` trades speed for power with the balanced mode, for example.
@@ -110,13 +112,14 @@ dependencies {
 
 ```kotlin
 android.system.Os.setenv("ADSP_LIBRARY_PATH", applicationInfo.nativeLibraryDir, true)
+android.system.Os.setenv("PTTS_LITERT_CACHE_DIR", noBackupFilesDir.path, true)
 val tts = PhononTTS(File(filesDir, "phonon-litert").path, "en", PhononTTS.UNIT_NPU)
 ```
 
 ### What has been checked
 
 - On macOS (CPU and Metal GPU), on the Android emulator's CPU, and on Android phones' CPUs and GPUs, the engine speaks the default model. On the CPU, with the same seed, its audio matches ptts's: same length and over 70 dB SNR. Whisper reads back the text in every case.
-- On a Snapdragon phone (SM8850), `PTTS_UNIT_NPU` runs the three model signatures on the NPU, and Whisper reads back the text.
+- On a Snapdragon phone (SM8850), `PTTS_UNIT_NPU` runs the three model signatures on the NPU, and Whisper reads back the text, with the model `compile` wrote and with `model.tflite` compiled on the phone.
 - `compile` puts all three model signatures on the NPU in one piece each for Qualcomm SM8550, SM8650, SM8750 and SM8850, and MediaTek MT6989 and MT6991. The MediaTek models have not run on a phone yet.
 - On a phone whose SoC the bundle has no model for (an Exynos one), and on the emulator, `PTTS_UNIT_NPU` falls back to the CPU and still speaks.
 

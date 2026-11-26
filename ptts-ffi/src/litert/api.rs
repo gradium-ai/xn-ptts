@@ -28,6 +28,7 @@ const LOCK_READ_WRITE: c_int = 2;
 
 const ENV_COMPILER_PLUGIN_DIR: c_int = 0;
 const ENV_DISPATCH_DIR: c_int = 1;
+const ENV_COMPILER_CACHE_DIR: c_int = 18;
 const ENV_RUNTIME_DIR: c_int = 22;
 const ENV_MIN_LOG_SEVERITY: c_int = 25;
 const ANY_INT: c_int = 2;
@@ -228,6 +229,16 @@ impl Env {
             .collect();
         let severity = Any { kind: ANY_INT, value: AnyValue { int: LOG_WARNING } };
         opts.push(EnvOption { tag: ENV_MIN_LOG_SEVERITY, value: severity });
+        // Where LiteRT keeps what it compiles for an NPU on the device, so that only the first
+        // load of a model compiles it.
+        let cache = std::env::var_os("PTTS_LITERT_CACHE_DIR")
+            .map(|d| CString::new(d.to_string_lossy().as_bytes()))
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        if let Some(d) = &cache {
+            let value = Any { kind: ANY_STRING, value: AnyValue { string: d.as_ptr() } };
+            opts.push(EnvOption { tag: ENV_COMPILER_CACHE_DIR, value });
+        }
         let mut raw = std::ptr::null_mut();
         let f = &lib.fns;
         check(
